@@ -1,25 +1,29 @@
 # Subreddit Sentiment
 
-A desktop app (Python + Qt) that pulls posts and comments from a subreddit, scores their
-sentiment, and lets you explore and export the results.
+Pull a subreddit's posts and comments, score their sentiment, and explore the results in a
+desktop app. Built with Python and Qt for Windows, macOS and Linux.
 
 ## Features
 
-- Fetch from any subreddit by sort (hot/new/top/rising/controversial) and time range, or search within it.
-- Optionally fetch comments for each post (full reply trees, "load more" stubs skipped).
-- Sentiment scoring with a small bundled offline classifier (TF-IDF plus
-  [VADER](https://github.com/cjhutto/vaderSentiment) features, trained on GoEmotions Reddit
-  comments with `tools/train_model.py`). It is built for accurate totals over many comments, not
-  for every single one: on the GoEmotions test split it gets 73% of labels right (plain VADER: 65%)
-  and its overall positive/neutral/negative split is off by 4 points (VADER: 14). Quoted text, code
-  blocks and URLs are stripped before scoring. Plain VADER is the fallback if the model is missing.
-- Overview tab: summary numbers, sentiment distribution, mean sentiment per day, and the most
-  positive/negative items.
-- Posts and Comments tabs: sortable, filterable tables. Double-click a row to open it on Reddit.
-- Glass interface: translucent panels over a soft gradient, light and dark themes (View menu, or
-  follow the system), and a **Reduce transparency** option that makes every panel opaque.
-- Everything is saved to a local SQLite database, so earlier fetches stay available under
-  "Saved data". Fetching again updates existing rows. File → Export writes CSV.
+- **Fetch** any subreddit by sort (hot, new, top, rising, controversial) and time range, or search
+  within it.
+- **Comments** are optional and come with full reply trees; "load more" stubs are skipped.
+- **Sentiment** comes from a small bundled offline classifier (TF-IDF plus
+  [VADER](https://github.com/cjhutto/vaderSentiment) features), trained on GoEmotions Reddit
+  comments with `tools/train_model.py`. It is tuned for accurate totals over many comments rather
+  than every single one. On the GoEmotions test split it gets 73% of labels right (plain VADER:
+  65%), and its overall positive/neutral/negative split is off by 4 points (VADER: 14). Quoted
+  text, code blocks and URLs are stripped before scoring. Plain VADER is the fallback if the model
+  is missing.
+- **Overview** shows summary numbers, the sentiment distribution, mean sentiment per day, and the
+  most positive and negative items.
+- **Posts and Comments** are sortable, filterable tables. Double-click a row to open it on Reddit.
+- **Saved data**: everything goes to a local SQLite database. Fetching again updates existing rows,
+  and File → Export writes CSV.
+- **Glass interface** with light and dark themes (View menu, or follow the system). The
+  **Reduce transparency** option makes every panel opaque.
+- **Updates**: Help → Check for updates… looks for a newer release on GitHub, downloads it, and
+  hands off to the installer. It also checks at startup, which you can turn off in the Help menu.
 
 ## Download
 
@@ -108,13 +112,19 @@ none is available is it kept in the app's settings unencrypted.
 ## Design notes
 
 - Type: [Manrope](https://fonts.google.com/specimen/Manrope) for the interface and
-  [Sora](https://fonts.google.com/specimen/Sora) for headings and big numbers. Both are SIL Open Font
-  License fonts, bundled in `src/subsentiment/gui/assets/` as static weights cut from the variable
-  fonts (Qt's variable-font weight matching is unreliable). Tabular figures are on so numbers line up.
+  [Sora](https://fonts.google.com/specimen/Sora) for headings and big numbers. Tabular figures are
+  on so numbers line up. Qt's variable-font weight matching is unreliable, so the fonts are bundled
+  as static weights in `src/subsentiment/gui/assets/`.
 - Glass is used for the sidebar, stat tiles and chart cards. Tables and lists sit on near-solid
   panels so dense text stays readable, and glass is never stacked on glass.
 - Chart colors: blue for positive, red for negative, gray for neutral, checked for color-blind
   separation. Bars are always labelled, so color is never the only cue.
+
+### Licenses
+
+- Manrope and Sora are licensed under the [SIL Open Font License 1.1](https://openfontlicense.org/).
+  Their license texts ship with the app as `src/subsentiment/gui/assets/Manrope-OFL.txt` and
+  `src/subsentiment/gui/assets/Sora-OFL.txt`.
 
 ## Development
 
@@ -128,7 +138,11 @@ Layout:
 |---|---|
 | `src/subsentiment/reddit.py` | Reddit client: anonymous or OAuth, pagination, rate limiting, comment trees |
 | `src/subsentiment/sentiment.py` | Text cleanup + scoring (bundled model, VADER fallback) |
+| `src/subsentiment/sentiment_model.py` | Loads the bundled classifier and its feature code |
 | `src/subsentiment/store.py` | SQLite storage, CSV export, summary helpers |
+| `src/subsentiment/updater.py` | Looks up the latest GitHub release and downloads it |
+| `tools/train_model.py` | Trains the bundled sentiment classifier on GoEmotions |
+| `tools/eval_sentiment.py` | Scores accuracy against GoEmotions (the numbers in Features) |
 | `src/subsentiment/collect.py` | One fetch job: fetch → score → store |
 | `src/subsentiment/gui/` | Qt main window, charts, table models, background worker, settings |
 | `src/subsentiment/gui/theme.py` | Glass theme: color tokens, stylesheet, fonts, backdrop |
