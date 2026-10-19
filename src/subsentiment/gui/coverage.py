@@ -32,7 +32,8 @@ SLACK = 25  # extra posts asked for beyond the count, in case it lags the archiv
 
 NOTE = ("Totals come from Arctic Shift and include posts and comments later removed from Reddit, which ikari "
         "skips, so some days and threads stop short of 100%. A check mark means everything the archive still "
-        "has is saved. Days are UTC. Downloads use the Comments setting in the sidebar.")
+        "has is saved. Days are UTC. A day's Download all fetches its posts only; comments download only from the "
+        "buttons on the right.")
 
 
 def day_text(day: int) -> str:
@@ -182,6 +183,9 @@ class ElidedLabel(QLabel):
 def small_button(text: str) -> QPushButton:
     b = QPushButton(text)
     b.setStyleSheet("padding: 5px 12px;")
+    # Downloads start from a click only: no Enter or Space on a button that kept focus after a click.
+    b.setAutoDefault(False)
+    b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
     b.setCursor(Qt.CursorShape.PointingHandCursor)
     return b
 
@@ -523,10 +527,9 @@ class CoverageWindow(QDialog):
             limit = MAX_DAY_POSTS
         else:
             limit = UNKNOWN_DAY_POSTS if total is None else max(total - have, 0) + SLACK
-        comments, per_post = self.window_.comment_settings()
+        # Posts only: comments are fetched from the posts list, one post or one day at a time, when asked.
         req = collect.FetchRequest(subreddit=self.subreddit, after=day, before=day + DAY,
-                                   limit=min(limit, MAX_DAY_POSTS), include_comments=comments,
-                                   comments_per_post=per_post, everything=True)
+                                   limit=min(limit, MAX_DAY_POSTS), include_comments=False, everything=True)
         what = "so far today" if day >= today() else f"from {day_text(day)}"
         self.window_.start_request(req, f"Downloading every post {what} in r/{self.subreddit}…")
 
