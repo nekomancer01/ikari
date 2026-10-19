@@ -122,6 +122,9 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
                 failed_in_row += 1
                 if failed_in_row >= GIVE_UP_AFTER:  # the archive is struggling; don't hammer it
                     errors += len(todo) - i
+                    for rest in todo[i:]:  # not tried this time: retried on the next fetch
+                        store.mark_comments(rest.id, ok=False, settled=False)
+                    store.commit()
                     break
                 continue
             failed_in_row = 0
@@ -185,9 +188,9 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
 
 
 def _comments_missing(r) -> bool:
-    if r["comments_ok"] is None:  # never asked (or saved by an older version, before this was tracked)
-        return not r["has_comments"]
-    return not r["comments_ok"]
+    # Only a post whose comments were asked for and failed is retried. Saved posts nobody asked comments
+    # for are left alone: a fetch must not quietly download comments for posts it wasn't fetching.
+    return r["comments_ok"] is not None and not r["comments_ok"]
 
 
 def _stored_post(r) -> Post:

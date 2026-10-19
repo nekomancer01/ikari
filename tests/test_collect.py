@@ -182,3 +182,10 @@ def test_each_post_and_comment_is_saved_and_announced_as_it_arrives(tmp_path):
     collect.run(FakeClient(posts=[mk(1), mk(2), mk(3)]), s, collect.FetchRequest("python"),
                 saved=lambda: counts.append(len(s.posts("python"))))
     assert counts[:3] == [1, 2, 3]  # the table grows one post at a time
+
+
+def test_a_fetch_does_not_download_comments_for_saved_posts_nobody_asked_about(tmp_path):
+    s = store_with(tmp_path, [mk(1), mk(2)])  # saved earlier, comments never requested
+    c = FakeClient(posts=[mk(3)])
+    collect.run(c, s, collect.FetchRequest("python"))
+    assert [call[1] for call in c.calls if call[0] == "comments"] == ["p3"]
