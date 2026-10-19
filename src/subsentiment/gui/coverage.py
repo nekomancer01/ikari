@@ -62,10 +62,16 @@ def today() -> int:
     return int(time.time() // DAY * DAY)
 
 
+COUNT_LAG_DAYS = 1  # days before today whose archive count is still filling in
+
+
 def no_total(day: int, saved: int, total: int | None, complete: bool) -> bool:
-    """True for a day whose archive count can't be shown: today (not over yet), or a recent day whose
-    count is still catching up and is below what's already saved."""
-    return day >= today() or (not complete and total is not None and total < saved)
+    """True for a day whose archive count can't be shown: today (not over yet), the day before (the
+    archive's daily counts lag by more than a day: on 19 Oct at 18:00 UTC, 18 Oct read about 55% of a
+    normal day while 17 Oct was settled), or any day whose count is below what's already saved."""
+    if day >= today() - COUNT_LAG_DAYS * DAY:
+        return True
+    return not complete and total is not None and total < saved
 
 
 def share_text(saved: int, total: int | None, complete: bool, noun: str) -> tuple[str, str, float | None, str]:
@@ -147,8 +153,8 @@ class Cell(QWidget):
         self.bar.setVisible(False)  # an empty bar would read as 0%
         self.setToolTip("Today isn't over, so there's no total yet. Download all fetches everything "
                         "posted today so far." if is_today else
-                        "Arctic Shift's count for this day is still catching up (it's lower than what's "
-                        "already saved). Download all fetches everything posted that day.")
+                        "Arctic Shift's count for this day is still filling in, so there's no total yet. "
+                        "Download all fetches everything posted that day.")
 
     def set(self, saved: int, total: int | None, complete: bool, noun: str) -> None:
         main, side, share, tip = share_text(saved, total, complete, noun)
