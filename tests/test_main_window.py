@@ -282,8 +282,8 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     c.refresh_saved()
     row = c.days.index(today)
     cell = c.day_table.cellWidget(row, 1)
-    assert (cell.main.text(), cell.side.text()) == ("1 saved so far", "Today")
-    assert "of" not in cell.main.text() and "%" not in cell.side.text()
+    assert (cell.main.text(), cell.note.text()) == ("1 saved so far", "Today")
+    assert "of" not in cell.main.text() and "%" not in cell.note.text()
     button = c.day_table.cellWidget(row, 2).findChild(mw.QPushButton)
     assert button.text() == "Download all" and button.isEnabled()
     button.click()
@@ -293,22 +293,27 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     c.close()
 
 
-def test_a_day_whose_count_lags_behind_whats_saved_shows_no_total(make_window, monkeypatch):
+def test_recent_days_and_lagging_counts_show_no_total(make_window, monkeypatch):
     from subsentiment.gui import coverage
-    yesterday = coverage.today() - 86400
+    yesterday, older = coverage.today() - 86400, coverage.today() - 3 * 86400
 
-    def count(self, after, before):  # the archive's count for yesterday is still catching up
-        self._on_counts(self.subreddit, {d: (1 if d == yesterday else 9) for d in range(int(after), int(before), 86400)})
+    def count(self, after, before):  # 3 days ago the count is below what's saved; yesterday's is partial
+        self._on_counts(self.subreddit, {d: (1 if d == older else 9) for d in range(int(after), int(before), 86400)})
     monkeypatch.setattr(coverage.CoverageWindow, "_count", count)
     w = make_window()
-    for i in range(3):
-        w.store.save_post(Post(f"y{i}", "Python", "y", "", "a", None, None, None, yesterday + 60 + i, "u", ""), 0, "neutral")
+    for day in (yesterday, older):
+        for i in range(3):
+            w.store.save_post(Post(f"y{day}{i}", "Python", "y", "", "a", None, None, None, day + 60 + i, "u", ""),
+                              0, "neutral")
     w.store.commit()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     w.range.setCurrentIndex(w.range.findData("week"))
     w._show_coverage()
     c = w.coverage
     c.refresh_saved()
-    cell = c.day_table.cellWidget(c.days.index(yesterday), 1)
-    assert (cell.main.text(), cell.side.text()) == ("3 saved so far", "Still counting")
+    for day in (yesterday, older):  # yesterday's count (9) is above the 3 saved but still isn't shown
+        cell = c.day_table.cellWidget(c.days.index(day), 1)
+        assert (cell.main.text(), cell.note.text()) == ("3 saved so far", "Still counting")
+    cell = c.day_table.cellWidget(c.days.index(older + 86400), 1)
+    assert (cell.main.text(), cell.side.text()) == ("0 of 9", "0%")  # a settled day keeps its total
     c.close()

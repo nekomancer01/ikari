@@ -62,10 +62,16 @@ def today() -> int:
     return int(time.time() // DAY * DAY)
 
 
+COUNT_LAG_DAYS = 1  # days before today whose archive count is still filling in
+
+
 def no_total(day: int, saved: int, total: int | None, complete: bool) -> bool:
-    """True for a day whose archive count can't be shown: today (not over yet), or a recent day whose
-    count is still catching up and is below what's already saved."""
-    return day >= today() or (not complete and total is not None and total < saved)
+    """True for a day whose archive count can't be shown: today (not over yet), the day before (the
+    archive's daily counts lag by more than a day: on 19 Oct at 18:00 UTC, 18 Oct read about 55% of a
+    normal day while 17 Oct was settled), or any day whose count is below what's already saved."""
+    if day >= today() - COUNT_LAG_DAYS * DAY:
+        return True
+    return not complete and total is not None and total < saved
 
 
 def share_text(saved: int, total: int | None, complete: bool, noun: str) -> tuple[str, str, float | None, str]:
@@ -123,9 +129,8 @@ class Cell(QWidget):
 
     def __init__(self):
         super().__init__()
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 7, 12, 9)
-        lay.setSpacing(5)
+        self.lay = lay = QVBoxLayout(self)
+        self._fit(open_day=False)
         top = QHBoxLayout()
         top.setSpacing(8)
         self.main = QLabel()
@@ -139,20 +144,39 @@ class Cell(QWidget):
         keep.setRetainSizeWhenHidden(True)  # rows stay the same height with or without a bar
         self.bar.setSizePolicy(keep)
         lay.addWidget(self.bar)
+        # An open day has no bar, so its side text goes on its own line there: side by side,
+        # "1,234 saved so far" and "Still counting" don't fit the column at 150%.
+        self.note = label("", "muted")
+        self.note.setVisible(False)
+        lay.addWidget(self.note)
+
+    def _fit(self, open_day: bool) -> None:
+        # The bar keeps its room when hidden, so an open day trades the padding for its second line.
+        bar = self.bar.sizePolicy() if hasattr(self, "bar") else None
+        if bar is not None:
+            bar.setRetainSizeWhenHidden(not open_day)
+            self.bar.setSizePolicy(bar)
+        self.lay.setContentsMargins(*((8, 2, 12, 2) if open_day else (8, 7, 12, 9)))
+        self.lay.setSpacing(0 if open_day else 5)
 
     def set_open(self, saved: int, is_today: bool = True) -> None:
         """A day without a usable total: just what's saved so far, no share or estimate."""
         self.main.setText(f"{saved:,} saved so far")
-        self.side.setText("Today" if is_today else "Still counting")
+        self.side.setText("")
+        self.note.setText("Today" if is_today else "Still counting")
         self.bar.setVisible(False)  # an empty bar would read as 0%
+        self.note.setVisible(True)
+        self._fit(open_day=True)
         self.setToolTip("Today isn't over, so there's no total yet. Download all fetches everything "
                         "posted today so far." if is_today else
-                        "Arctic Shift's count for this day is still catching up (it's lower than what's "
-                        "already saved). Download all fetches everything posted that day.")
+                        "Arctic Shift's count for this day is still filling in, so there's no total yet. "
+                        "Download all fetches everything posted that day.")
 
     def set(self, saved: int, total: int | None, complete: bool, noun: str) -> None:
         main, side, share, tip = share_text(saved, total, complete, noun)
         self.bar.setVisible(True)
+        self.note.setVisible(False)
+        self._fit(open_day=False)
         self.main.setText(main)
         self.side.setText(side)
         self.bar.set(share, complete)
