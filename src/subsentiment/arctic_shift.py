@@ -322,17 +322,6 @@ class ArcticShiftClient:
         posts.sort(key=lambda p: p.created_utc)
         return posts
 
-    def fetch_newer(self, subreddit: str, after: float, skip: Collection[str] = (),
-                    limit: int = PAGE) -> list[Post]:
-        """Posts created after ``after``, oldest first, in one request (the live feed's poll).
-        A full page (``limit`` rows) means there may be more; call again from the newest one."""
-        subreddit = normalize_subreddit(subreddit)
-        if error := subreddit_error(subreddit):
-            raise FetchError(error)
-        page = self.get("/api/posts/search", {"subreddit": subreddit, "sort": "asc",
-                                              "after": int(after), "limit": limit})
-        return [_post(d) for d in page if d.get("id") and d["id"] not in skip and not _removed(d)]
-
     def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int]:
         """Posts from [lo, hi) and the end of the window actually searched: when the archive times
         out, the window is halved (down to MIN_WINDOW) and only its first part is searched."""
