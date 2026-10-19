@@ -1,7 +1,6 @@
 """One fetch job: pull posts (and optionally comments), score them, store them."""
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -75,12 +74,24 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
 
     # 2. New posts. An even sample skips everything already saved, so a repeat fetch adds new posts;
     #    top mode ranks everything, then keeps the ones that aren't saved yet.
+    # Each post is saved and announced the moment it is downloaded, so a UI can show it right away.
+    streamed: set[str] = set()
+
+    def save_streamed(batch: list[Post]) -> None:
+        for p in batch:
+            if p.id not in stored and p.id not in streamed:
+                store.save_post(p, *sentiment.score(p.text))
+                store.commit()
+                streamed.add(p.id)
+                saved()
+
     picked = client.fetch_posts(name, req.after, req.before, req.limit, req.query, top=req.top,
                                 skip=() if req.top else stored.keys(),
-                                progress=note, should_stop=should_stop)
+                                progress=note, should_stop=should_stop, on_posts=save_streamed)
     new = [p for p in picked if p.id not in stored]
     for p in new:
-        store.save_post(p, *sentiment.score(p.text))
+        if p.id not in streamed:
+            store.save_post(p, *sentiment.score(p.text))
     if req.everything and req.after is not None and not should_stop() and len(new) < req.limit:
         store.mark_complete("posts", name, str(int(req.after)))
     store.commit()
@@ -116,11 +127,11 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
             failed_in_row = 0
             for c in comments:
                 store.save_comment(c, *sentiment.score(c.body))
+                store.commit()
                 n_comments += 1
+                saved()
             store.mark_comments(p.id, ok=True, settled=p.score is not None)
             store.commit()
-            if comments:
-                saved()
         if todo:
             progress(len(todo), len(todo), "Done")
     return FetchResult(subreddit, len(new), n_comments, should_stop(), updated=len(updated),
@@ -182,37 +193,3 @@ def _comments_missing(r) -> bool:
 def _stored_post(r) -> Post:
     return Post(r["id"], r["subreddit"], r["title"] or "", r["selftext"] or "", r["author"] or "", r["score"],
                 r["upvote_ratio"], r["num_comments"], r["created_utc"] or 0.0, r["permalink"] or "", r["url"] or "")
-
-
-LIVE_LOOKBACK = 3 * 3600  # with nothing newer saved, a live feed starts this far back, not at the dawn of time
-LIVE_PAGE = 100
-
-
-@dataclass
-class LiveResult:
-    new: int  # posts saved by this poll
-    newest: float | None  # created time of the newest saved post, if any
-
-
-def poll_live(client: ArcticShiftClient, store: Store, subreddit: str,
-              now: float | None = None) -> LiveResult:
-    """One live-feed poll: save posts newer than the newest one already saved. Keeps reading while
-    the archive returns full pages, so a long gap is caught up in a few requests."""
-    name = normalize_subreddit(subreddit)
-    now = time.time() if now is None else now
-    saved_new = 0
-    for _ in range(5):
-        rows = store.posts_between(name, None, None)
-        newest = max((r["created_utc"] or 0.0 for r in rows), default=0.0)
-        after = max(newest, now - LIVE_LOOKBACK)
-        ids = {r["id"] for r in rows if (r["created_utc"] or 0.0) >= after - 60}
-        page = client.fetch_newer(name, after, skip=ids, limit=LIVE_PAGE)
-        for p in page:
-            store.save_post(p, *sentiment.score(p.text))
-        store.commit()
-        saved_new += len(page)
-        if len(page) < LIVE_PAGE - 10:
-            break
-    newest = store.db.execute("SELECT MAX(created_utc) FROM posts WHERE subreddit = ? COLLATE NOCASE",
-                              (name,)).fetchone()[0]
-    return LiveResult(saved_new, newest)
