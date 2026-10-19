@@ -56,18 +56,19 @@ def set_process_name() -> None:
 
 
 def prepare_window(window, full_size: bool = False) -> None:
-    """Before first show: unified title bar; with full_size, content runs under the title bar.
+    """Before first show. With full_size (vibrancy only): unified title bar, content under it.
 
-    full_size is only used with vibrancy, so the default window keeps the standard
-    title bar until the Qt 6.9 safe-area handling has been checked on a real Mac.
+    Without it the window keeps the standard title bar until the Qt 6.9 safe-area
+    handling has been checked on a real Mac. The unified title bar is part of the
+    vibrancy look only, because Qt makes the window translucent when it is enabled.
     """
-    if not IS_MACOS:
+    if not IS_MACOS or not full_size:
         return
     try:
         from PySide6.QtCore import Qt
         window.setUnifiedTitleAndToolBarOnMac(True)
         hints = [getattr(Qt.WindowType, n, None) for n in ("ExpandedClientAreaHint", "NoTitleBarBackgroundHint")]
-        if full_size and None not in hints:  # Qt 6.9+: layouts keep clear of the title bar through the safe-area margins
+        if None not in hints:  # Qt 6.9+: layouts keep clear of the title bar through the safe-area margins
             for hint in hints:
                 window.setWindowFlag(hint, True)
     except Exception:
