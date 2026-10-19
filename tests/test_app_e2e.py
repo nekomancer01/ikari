@@ -48,11 +48,16 @@ def env(tmp_path, monkeypatch):
     QSettings.setDefaultFormat(QSettings.Format.IniFormat)
     QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path / "cfg"))
     QSettings().setValue("updates/auto", False)
-    archive = FakeArchive(make_posts("Python", NOW) + make_posts("rust", NOW, per_day=(3,), seed=2))
+    archive = FakeArchive(make_posts("Python", NOW) + make_posts("rust", NOW, per_day=(3,), seed=2)
+                          + make_posts("AskReddit", NOW, days=3, per_day=(150,), seed=3),
+                          busy={"AskReddit"})
     monkeypatch.setattr(arctic_shift, "BASE_URL", archive.url)
-    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.05)  # 422/429 pauses, so error tests stay quick
-    monkeypatch.setattr(worker.LIMITER, "base", 0.0)
-    monkeypatch.setattr(worker.LIMITER, "interval", 0.0)
+    # Time runs ten times faster than in the app: requests every 0.04 s against a server allowing 30 a
+    # second, and pauses for timeouts and limits capped at 1.2 s (the app's MAX_WAIT is 120 s).
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 1.2)
+    monkeypatch.setattr(worker.LIMITER, "base", arctic_shift.BASE_INTERVAL / 10)
+    monkeypatch.setattr(worker.LIMITER, "interval", arctic_shift.BASE_INTERVAL / 10)
+    archive.rate = (30, 1.0)
     warnings = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a[2] if len(a) > 2 else a))
     windows = []
@@ -76,6 +81,7 @@ def env(tmp_path, monkeypatch):
     for w in windows:
         w.close()
     archive.close()
+    assert archive.violations() == []  # nothing the real API would refuse was sent
     QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
 
 
@@ -262,3 +268,41 @@ def test_a_big_download_reads_each_new_row_back_about_once(env, monkeypatch):
     s = env.store()
     saved = len(s.posts("python")) + len(s.comments("python"))
     assert saved > 60 and sum(read) < 4 * saved  # linear; it was about saved² / 2
+
+
+def test_a_busy_subreddit_that_times_out_still_fetches_with_narrower_queries(env):
+    w = env.window()
+    fetch(w, sub="askreddit", comments=False, limit=30, rng="day")
+    timeouts = [r for r in env.archive.rejected if r[2] == 422]
+    assert timeouts and not env.warnings  # it hit the archive's timeouts and worked around them
+    assert len(env.store().posts("askreddit")) >= 20
+
+
+def test_a_keyword_search_the_archive_cant_run_says_so_once(env):
+    w = env.window()
+    w.query.setText("black holes")
+    fetch(w, sub="askreddit", comments=False, limit=10, rng="day")
+    assert len(env.warnings) == 1 and "timed out" in env.warnings[0].lower()
+    assert w.fetch_btn.isEnabled()
+
+
+def test_a_fetch_at_the_apps_real_pace_never_trips_the_rate_limit(env, monkeypatch):
+    # The real limiter (a request every 0.4 s) against a server allowing 3 a second.
+    monkeypatch.setattr(worker.LIMITER, "base", arctic_shift.BASE_INTERVAL)
+    monkeypatch.setattr(worker.LIMITER, "interval", arctic_shift.BASE_INTERVAL)
+    env.archive.rate = (3, 1.0)
+    w = env.window()
+    fetch(w, comments=True, limit=4, rng="day")
+    assert [r for r in env.archive.rejected if r[2] == 429] == []
+    assert len(env.archive.paths()) >= 4
+
+
+def test_when_the_server_says_no_requests_are_left_the_app_waits_for_the_reset(env):
+    w = env.window()
+    env.archive.rate = (2, 1.0)  # far below the test pace
+    start = time.monotonic()
+    fetch(w, comments=True, limit=4, rng="day")
+    sent = len(env.archive.paths())
+    assert [r for r in env.archive.rejected if r[2] == 429] == []  # it waited instead of hitting the limit
+    assert time.monotonic() - start >= (sent - 2) / 2 * 0.9
+    assert not env.warnings and len(env.store().posts("python")) == 4
