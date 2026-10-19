@@ -204,8 +204,8 @@ Things to know about the archive:
   your own **From** and **To** dates. The range is cut into equal parts (up to four a day) and
   **Max posts** is shared equally between them, so a week with 70 posts gives about 10 a day instead
   of the 70 newest. Quiet parts hand their share to busier ones. Fetching the same range again adds
-  posts you don't have yet, rather than the same ones. To keep that quick, it reads only post ids
-  and dates while skipping the ones you have, then downloads just the new posts in batches.
+  posts you don't have yet, rather than the same ones. Each request reads up to 100 posts, so in a
+  quiet subreddit one request can fill several days' shares at once.
 - **Top posts are ranked by ikari, not the archive.** The archive can only search by date. With
   **Pick** set to **Top by score**, ikari reads a pool of posts from each day of the range and keeps
   the highest-scored. Only posts the archive has re-checked have scores (see below), so the newest

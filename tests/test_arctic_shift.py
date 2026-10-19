@@ -155,7 +155,8 @@ def test_posts_are_spread_evenly_across_the_days():
     url, params = c.session.calls[0]
     assert url == BASE_URL + "/api/posts/search"
     assert params["subreddit"] == "python" and params["sort"] == "asc" and params["limit"] <= 100
-    assert len(c.session.calls) == 28  # one small request per quarter-day, not thousands of posts
+    # A page of its own for each busy quarter of day one; then two pages hold the six quiet days.
+    assert len(c.session.calls) == 6
     assert c.session.headers["User-Agent"].startswith("ikari/")
 
 
@@ -174,22 +175,6 @@ def test_a_slice_pages_forward_when_saved_posts_fill_the_first_page():
     (got,) = [c.fetch_posts("python", after=T0, before=T0 + 3600, limit=1, skip=skip)]
     assert [p.id for p in got] == ["p150"]
     assert c.session.calls[1][1]["after"] == T0 + 100 + 99 - 1  # resumes a second before the last post seen
-
-
-def test_a_repeat_fetch_pages_past_saved_posts_with_light_pages_and_downloads_its_picks_by_id():
-    items = [at(T0 + 100 + i * 60, i) for i in range(400)]
-    c = archive(items)
-    first = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=20)
-    c.session.calls.clear()
-    second = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=20, skip={p.id for p in first})
-    assert len(second) == 20 and not {p.id for p in first} & {p.id for p in second}
-    searches = [q for url, q in c.session.calls if url.endswith("/api/posts/search")]
-    by_id = [q for url, q in c.session.calls if url.endswith("/api/posts/ids")]
-    assert searches and all(q["fields"] == "id,created_utc" for q in searches)  # never full pages
-    # One batch for all slices, plus one per round that tops up the quiet slices' share.
-    assert len(by_id) <= 4 and all(len(q["ids"].split(",")) <= 500 for q in by_id)
-    assert second[0].title and second[0].score is not None  # full posts, scores and all
-    assert [p.created_utc for p in second] == sorted(p.created_utc for p in second)
 
 
 def test_a_repeat_fetch_gets_the_same_posts_the_full_pages_would_have():
@@ -211,17 +196,31 @@ def test_a_repeat_fetch_replaces_removed_picks_with_the_next_posts():
     assert [p.id for p in posts] == ["p3"]
 
 
-def test_a_repeat_fetch_shows_its_posts_in_batches_as_they_arrive():
-    items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(24)]
-    clock = FakeClock()
-    c = ArcticShiftClient(session=ArchiveSession(items), limiter=RateLimiter(0.5, clock, clock.sleep))
+def test_a_quiet_subreddit_fills_many_slices_from_one_page():
+    items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(0, 24, 2)]  # 84 posts
+    c = archive(items)
+    posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28)
+    assert len(posts) == 28 and len(c.session.calls) == 1  # one page covers the whole week
+    per_day = [sum(1 for p in posts if T0 + d * DAY <= p.created_utc < T0 + (d + 1) * DAY) for d in range(7)]
+    assert per_day == [4] * 7
+
+
+def test_a_repeat_fetch_costs_no_more_requests_than_the_first():
+    items = [at(T0 + 100 + i * 300, i) for i in range(7 * 288)]  # a post every 5 minutes for a week
+    c = archive(items)
+    first = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28)
+    n_first = len(c.session.calls)
+    second = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28, skip={p.id for p in first})
+    assert len(second) == 28 and not {p.id for p in first} & {p.id for p in second}
+    assert n_first < 28 and len(c.session.calls) - n_first <= n_first  # fewer than one page per slice
+    assert all(u.endswith("/api/posts/search") for u, _ in c.session.calls)  # no second download by id
+
+
+def test_posts_show_as_each_page_arrives():
+    items = [at(T0 + d * DAY + 60 * k, d * 1000 + k) for d in range(4) for k in range(300)]
     batches = []
-    posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28, skip={"p0"},
-                          on_posts=batches.append)
-    assert len(posts) == 28 and sum(map(len, batches)) == 28
-    assert len(batches) >= 4  # several downloads while it runs, not one at the end
-    by_id = [q for url, q in c.session.calls if url.endswith("/api/posts/ids")]
-    assert len(by_id) == len(batches) < 28 / 2  # still far fewer than one per slice
+    archive(items).fetch_posts("python", after=T0, before=T0 + 4 * DAY, limit=8, on_posts=batches.append)
+    assert len(batches) >= 4 and sum(map(len, batches)) == 8
 
 
 def test_quiet_slices_hand_their_share_to_busy_ones():
@@ -447,7 +446,7 @@ def test_a_timing_out_window_is_narrowed_and_the_rest_still_read():
     posts = c.fetch_posts("python", after=T0, before=T0 + 6 * 3600, limit=30)  # four 90-minute slices
     assert [p.id for p in posts] == [f"p{i}" for i in range(30)]
     widths = {params["before"] - params["after"] for _, params in session.calls}
-    assert max(widths) == 5400 and min(widths) <= 1800  # gave up on 90 minutes, read 22-minute windows
+    assert max(widths) == 6 * 3600 + 1 and min(widths) <= 1800  # gave up on the whole range, read narrower windows
 
 
 def test_other_errors_are_reported():
