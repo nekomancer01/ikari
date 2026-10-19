@@ -35,6 +35,7 @@ SELECTABLE = {"author", "author_fullname", "author_flair_text", "created_utc", "
               "num_comments", "over_18", "post_hint", "selftext", "spoiler", "title", "url"}
 BUSY_PAGE = 15  # a busy subreddit times out on a window holding more posts than this
 BUSY_AGG_DAYS = 7
+CLOCK_SLACK = 0.03
 SLOW_DOWN = (422, {"error": "Timeout. Maybe slow down a bit"})
 
 
@@ -116,7 +117,7 @@ def _date(q: dict, key: str) -> float | None:
 class FakeArchive:
     def __init__(self, posts: list[dict], rate: tuple[int, float] = (60, 1.0), busy=()):
         self.posts = posts
-        self.rate, self.window_start, self.used = rate, time.monotonic(), 0
+        self.rate, self.window_start, self.used = rate, time.perf_counter(), 0
         self.busy = {b.lower() for b in busy}
         self.rejected: list[tuple[str, dict, int, str]] = []  # every 4xx sent: path, params, status, error
         self.requests: list[tuple[str, dict]] = []
@@ -184,8 +185,10 @@ class FakeArchive:
     def _spend(self) -> dict:
         """Count a request against the rate limit; the headers to send with its answer."""
         budget, window = self.rate
-        now = time.monotonic()
-        if now - self.window_start >= window:
+        now = time.perf_counter()
+        # A request up to CLOCK_SLACK early still counts as the next window: Windows' time.monotonic,
+        # which the app's limiter waits by, only ticks every ~16 ms on Python 3.12.
+        if now - self.window_start >= window - CLOCK_SLACK:
             self.window_start, self.used = now, 0
         self.used += 1
         reset = max(0.0, window - (now - self.window_start))
