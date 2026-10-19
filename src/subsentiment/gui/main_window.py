@@ -1,49 +1,100 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QSettings, QSortFilterProxyModel, Qt, QThread, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
+from datetime import datetime
+
+from PySide6.QtCore import QEvent, QRectF, QSettings, QSortFilterProxyModel, Qt, QThread, QUrl
+from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QKeySequence, QPainter
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame, QGridLayout,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter, QTableView,
-    QTabWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QSpinBox, QStackedWidget, QTableView, QTabBar,
+    QVBoxLayout, QWidget,
 )
 
 from subsentiment import collect
-from subsentiment.gui import settings_dialog
-from subsentiment.gui.charts import DistributionChart, TimelineChart
+from subsentiment.gui import settings_dialog, theme
+from subsentiment.gui.charts import DistributionChart, TimelineChart, palette
 from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, RowsModel
+from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.worker import FetchWorker
 from subsentiment.reddit import LISTING_SORTS, SEARCH_SORTS, TIME_FILTERS
 from subsentiment.store import Store, daily_means, summarize
 
 
-class StatTile(QFrame):
-    def __init__(self, caption: str):
+def panel(kind: str = "true", margins: int = 18, spacing: int = 12) -> tuple[QFrame, QVBoxLayout]:
+    """A rounded panel: kind "true" is glass, "tile" a brighter glass card, "solid" a near-opaque data surface."""
+    frame = mark(QFrame(), "glass", kind)
+    lay = QVBoxLayout(frame)
+    lay.setContentsMargins(margins, margins, margins, margins)
+    lay.setSpacing(spacing)
+    return frame, lay
+
+
+def label(text: str, role: str) -> QLabel:
+    return mark(QLabel(text), "role", role)
+
+
+def section(text: str) -> QLabel:
+    return label(text.upper(), "section")
+
+
+class Meter(QWidget):
+    """Thin rounded bar showing a share from 0 to 1."""
+
+    def __init__(self, color_key: str):
         super().__init__()
-        self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.value = QLabel("–")
-        f = self.value.font()
-        f.setPointSizeF(f.pointSizeF() * 1.8)
-        f.setBold(True)
-        self.value.setFont(f)
-        cap = QLabel(caption)
-        cap.setEnabled(False)  # secondary ink
+        self.color_key = color_key
+        self.share = 0.0
+        self.setFixedHeight(6)
+
+    def set_share(self, share: float) -> None:
+        self.share = max(0.0, min(1.0, share))
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        r = QRectF(self.rect())
+        track = QColor(*theme.tokens()["edge"][:3])
+        track.setAlpha(40)
+        p.setBrush(track)
+        p.drawRoundedRect(r, 3, 3)
+        if self.share > 0:
+            p.setBrush(QColor(palette()[self.color_key]))
+            p.drawRoundedRect(QRectF(r.x(), r.y(), max(r.height(), r.width() * self.share), r.height()), 3, 3)
+
+
+class StatTile(QFrame):
+    def __init__(self, caption: str, meter: str | None = None):
+        super().__init__()
+        mark(self, "glass", "tile")
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setSpacing(4)
+        self.value = label("–", "value")
+        lay.addWidget(label(caption.upper(), "section"))
         lay.addWidget(self.value)
-        lay.addWidget(cap)
+        self.meter = Meter(meter) if meter else None
+        if self.meter:
+            lay.addSpacing(4)
+            lay.addWidget(self.meter)
+        else:
+            lay.addSpacing(10)
 
-    def set(self, text: str) -> None:
+    def set(self, text: str, share: float | None = None) -> None:
         self.value.setText(text)
+        if self.meter is not None:
+            self.meter.set_share(share or 0.0)
 
 
-class TableTab(QWidget):
-    """Filterable, sortable table; double-click opens the item on Reddit."""
+class TablePage(QWidget):
+    """Filterable, sortable table on a solid panel; double-click opens the item on Reddit."""
 
     def __init__(self, columns, stretch_col: int):
         super().__init__()
         self.model = RowsModel(columns)
-        self._all_rows_unfiltered: list = []
+        self._all_rows: list = []
         self.proxy = QSortFilterProxyModel()
         self.proxy.setSourceModel(self.model)
         self.proxy.setSortRole(SORT_ROLE)
@@ -57,7 +108,7 @@ class TableTab(QWidget):
         self.label_filter = QComboBox()
         self.label_filter.addItems(["All labels", "Positive", "Neutral", "Negative"])
         self.label_filter.currentTextChanged.connect(self._apply_label_filter)
-        self.count = QLabel()
+        self.count = label("", "muted")
 
         self.view = QTableView()
         self.view.setModel(self.proxy)
@@ -66,37 +117,46 @@ class TableTab(QWidget):
         self.view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.view.setAlternatingRowColors(True)
+        self.view.setShowGrid(False)
+        self.view.setMouseTracking(True)
         self.view.verticalHeader().hide()
+        self.view.verticalHeader().setDefaultSectionSize(34)
         self.view.setWordWrap(False)
+        self.view.setFrameShape(QFrame.Shape.NoFrame)
         header = self.view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(stretch_col, QHeaderView.ResizeMode.Stretch)
+        header.setHighlightSections(False)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.view.doubleClicked.connect(self._open)
 
+        card, inner = panel("solid", margins=14, spacing=10)
         top = QHBoxLayout()
+        top.setSpacing(10)
         top.addWidget(self.filter, 1)
         top.addWidget(self.label_filter)
         top.addWidget(self.count)
+        inner.addLayout(top)
+        inner.addWidget(self.view)
         lay = QVBoxLayout(self)
-        lay.addLayout(top)
-        lay.addWidget(self.view)
-        self.proxy.rowsInserted.connect(self._update_count)
-        self.proxy.modelReset.connect(self._update_count)
-        self.proxy.layoutChanged.connect(self._update_count)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(card)
+        for sig in (self.proxy.rowsInserted, self.proxy.rowsRemoved, self.proxy.modelReset, self.proxy.layoutChanged):
+            sig.connect(self._update_count)
+
+    def load(self, rows) -> None:
+        self._all_rows = rows
+        self._apply_label_filter(self.label_filter.currentText())
 
     def _apply_label_filter(self, text: str) -> None:
-        rows = self._all_rows_unfiltered
+        rows = self._all_rows
         if text != "All labels":
             rows = [r for r in rows if r["label"] == text.lower()]
         self.model.set_rows(rows)
         self._update_count()
 
-    def load(self, rows) -> None:
-        self._all_rows_unfiltered = rows
-        self._apply_label_filter(self.label_filter.currentText())
-
     def _update_count(self, *args) -> None:
-        self.count.setText(f"{self.proxy.rowCount()} rows")
+        self.count.setText(f"{self.proxy.rowCount():,} rows")
 
     def _open(self, index) -> None:
         row = self.model.row_at(self.proxy.mapToSource(index).row())
@@ -107,22 +167,26 @@ class MainWindow(QMainWindow):
     def __init__(self, db_path: str):
         super().__init__()
         self.setWindowTitle("Subreddit Sentiment")
-        self.resize(1280, 820)
+        self.resize(1320, 860)
         self.db_path = db_path
         self.store = Store(db_path)
         self.settings = QSettings()
         self.thread: QThread | None = None
         self.worker: FetchWorker | None = None
         self.current: str | None = None
+        self.posts: list = []
+        self.comments: list = []
 
         self._build_menu()
-        splitter = QSplitter()
-        splitter.addWidget(self._build_controls())
-        splitter.addWidget(self._build_tabs())
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([320, 960])
-        self.setCentralWidget(splitter)
+        backdrop = QWidget()  # transparent: the window paints the backdrop behind menus too
+        root = QHBoxLayout(backdrop)
+        root.setContentsMargins(18, 8, 18, 12)
+        root.setSpacing(18)
+        root.addWidget(self._build_sidebar())
+        root.addWidget(self._build_content(), 1)
+        self.setCentralWidget(backdrop)
         self.statusBar().showMessage(self._mode_text())
+        QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _: self._apply_theme())
         self._refresh_datasets()
 
     # -- layout ---------------------------------------------------------------
@@ -138,13 +202,36 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(QAction("Quit", self, shortcut=QKeySequence.StandardKey.Quit, triggered=self.close))
 
-    def _build_controls(self) -> QWidget:
-        fetch = QGroupBox("Fetch")
+        view = self.menuBar().addMenu("&View")
+        group = QActionGroup(self)
+        current = self.settings.value("ui/theme", "system", str)
+        for key, text in (("system", "Match system theme"), ("light", "Light"), ("dark", "Dark")):
+            act = QAction(text, self, checkable=True, checked=key == current)
+            act.triggered.connect(lambda _=False, k=key: self._set_theme(k))
+            group.addAction(act)
+            view.addAction(act)
+        view.addSeparator()
+        self.reduce_act = QAction("Reduce transparency", self, checkable=True,
+                                  checked=self.settings.value("ui/reduce_transparency", False, bool))
+        self.reduce_act.toggled.connect(self._set_reduce)
+        view.addAction(self.reduce_act)
+
+    def _build_sidebar(self) -> QWidget:
+        side, lay = panel("true", margins=20, spacing=14)
+        side.setFixedWidth(318)
+
+        brand = QVBoxLayout()
+        brand.setSpacing(2)
+        brand.addWidget(label("Subreddit Sentiment", "title"))
+        brand.addWidget(label("Gather posts and read the mood", "subtitle"))
+        lay.addLayout(brand)
+        lay.addSpacing(6)
+
         self.subreddit = QLineEdit()
-        self.subreddit.setPlaceholderText("e.g. python")
+        self.subreddit.setPlaceholderText("python")
         self.subreddit.returnPressed.connect(self._start_fetch)
         self.query = QLineEdit()
-        self.query.setPlaceholderText("optional: search within subreddit")
+        self.query.setPlaceholderText("Optional keywords")
         self.query.textChanged.connect(self._update_sort_options)
         self.sort = QComboBox()
         self.sort.currentTextChanged.connect(self._update_time_enabled)
@@ -162,103 +249,153 @@ class MainWindow(QMainWindow):
         self.include_comments.toggled.connect(self.comments_per_post.setEnabled)
         self._update_sort_options()
 
+        lay.addWidget(section("Fetch"))
         form = QFormLayout()
-        form.addRow("Subreddit  r/", self.subreddit)
-        form.addRow("Search", self.query)
-        form.addRow("Sort", self.sort)
-        form.addRow("Time range", self.time_filter)
-        form.addRow("Max posts", self.limit)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form.addRow(label("Subreddit", "muted"), self.subreddit)
+        form.addRow(label("Search", "muted"), self.query)
+        form.addRow(label("Sort", "muted"), self.sort)
+        form.addRow(label("Time range", "muted"), self.time_filter)
+        form.addRow(label("Max posts", "muted"), self.limit)
         form.addRow(self.include_comments)
-        form.addRow("Comments / post", self.comments_per_post)
+        form.addRow(label("Per post", "muted"), self.comments_per_post)
+        lay.addLayout(form)
 
-        self.fetch_btn = QPushButton("Fetch && analyse")
+        self.fetch_btn = mark(QPushButton("Fetch and analyse"), "primary", True)
         self.fetch_btn.setDefault(True)
+        self.fetch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.fetch_btn.clicked.connect(self._start_fetch)
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop_fetch)
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        self.progress_msg = QLabel()
-        self.progress_msg.setWordWrap(True)
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
         buttons.addWidget(self.fetch_btn, 1)
         buttons.addWidget(self.stop_btn)
-        fl = QVBoxLayout(fetch)
-        fl.addLayout(form)
-        fl.addLayout(buttons)
-        fl.addWidget(self.progress)
-        fl.addWidget(self.progress_msg)
+        lay.addLayout(buttons)
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        self.progress_msg = label("", "muted")
+        self.progress_msg.setWordWrap(True)
+        lay.addWidget(self.progress)
+        lay.addWidget(self.progress_msg)
 
-        data = QGroupBox("Saved data")
+        lay.addSpacing(4)
+        lay.addWidget(section("Saved data"))
         self.datasets = QListWidget()
-        self.datasets.currentTextChanged.connect(self._show_dataset)
-        self.delete_btn = QPushButton("Delete selected")
+        self.datasets.setFrameShape(QFrame.Shape.NoFrame)
+        self.datasets.currentItemChanged.connect(
+            lambda item, _: self._show_dataset(item.data(Qt.ItemDataRole.UserRole) if item else ""))
+        lay.addWidget(self.datasets, 1)
+        self.delete_btn = mark(QPushButton("Delete selected"), "flat", True)
         self.delete_btn.clicked.connect(self._delete_dataset)
-        dl = QVBoxLayout(data)
-        dl.addWidget(self.datasets)
-        dl.addWidget(self.delete_btn)
+        lay.addWidget(self.delete_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        return side
 
-        panel = QWidget()
-        lay = QVBoxLayout(panel)
-        lay.addWidget(fetch)
-        lay.addWidget(data, 1)
-        return panel
+    def _build_content(self) -> QWidget:
+        content = QWidget()
+        lay = QVBoxLayout(content)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(14)
 
-    def _build_tabs(self) -> QWidget:
-        self.tabs = QTabWidget()
+        self.heading = label("No data yet", "heading")
+        self.subheading = label("Enter a subreddit on the left and press Fetch and analyse.", "subtitle")
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
+        titles.addWidget(self.heading)
+        titles.addWidget(self.subheading)
 
-        overview = QWidget()
+        self.tabbar = QTabBar()
+        self.tabbar.setDrawBase(False)
+        self.tabbar.setExpanding(False)
+        for t in ("Overview", "Posts", "Comments"):
+            self.tabbar.addTab(t)
         self.scope = QComboBox()
         self.scope.addItems(["Posts and comments", "Posts only", "Comments only"])
         self.scope.currentTextChanged.connect(lambda _: self._render_overview())
-        self.heading = QLabel("No data yet. Enter a subreddit and press Fetch.")
-        f = self.heading.font()
-        f.setPointSizeF(f.pointSizeF() * 1.3)
-        f.setBold(True)
-        self.heading.setFont(f)
-        top = QHBoxLayout()
-        top.addWidget(self.heading, 1)
-        top.addWidget(QLabel("Include:"))
-        top.addWidget(self.scope)
+        header = QHBoxLayout()
+        header.addLayout(titles, 1)
+        header.addWidget(self.tabbar, 0, Qt.AlignmentFlag.AlignBottom)
+        lay.addLayout(header)
 
-        self.tiles = {k: StatTile(c) for k, c in [
-            ("count", "items analysed"), ("mean", "mean sentiment (−1 to +1)"),
-            ("positive", "positive"), ("negative", "negative")]}
+        self.pages = QStackedWidget()
+        self.tabbar.currentChanged.connect(self.pages.setCurrentIndex)
+        self.pages.addWidget(self._build_overview())
+        self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
+        self.comments_tab = TablePage(COMMENT_COLUMNS, stretch_col=2)
+        self.pages.addWidget(self.posts_tab)
+        self.pages.addWidget(self.comments_tab)
+        lay.addWidget(self.pages, 1)
+        return content
+
+    def _build_overview(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(14)
+
+        self.tiles = {
+            "count": StatTile("Items analysed"),
+            "mean": StatTile("Mean sentiment"),
+            "positive": StatTile("Positive", meter="positive"),
+            "negative": StatTile("Negative", meter="negative"),
+        }
         tiles = QHBoxLayout()
+        tiles.setSpacing(14)
         for t in self.tiles.values():
             tiles.addWidget(t)
+        lay.addLayout(tiles)
 
         self.distribution = DistributionChart()
         self.timeline = TimelineChart()
         charts = QHBoxLayout()
-        charts.addWidget(self.distribution, 2)
-        charts.addWidget(self.timeline, 3)
+        charts.setSpacing(14)
+        for chart, stretch in ((self.distribution, 2), (self.timeline, 3)):
+            card, inner = panel("true", margins=10)
+            inner.addWidget(chart)
+            charts.addWidget(card, stretch)
+        lay.addLayout(charts, 3)
+
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(section("Strongest posts and comments"), 1)
+        scope_row.addWidget(label("Include", "muted"))
+        scope_row.addWidget(self.scope)
+        lay.addLayout(scope_row)
 
         self.most_positive = QListWidget()
         self.most_negative = QListWidget()
-        for lw in (self.most_positive, self.most_negative):
-            lw.itemDoubleClicked.connect(lambda item: QDesktopServices.openUrl(QUrl(item.data(Qt.ItemDataRole.UserRole))))
-        extremes = QGridLayout()
-        extremes.addWidget(QLabel("<b>Most positive</b>"), 0, 0)
-        extremes.addWidget(QLabel("<b>Most negative</b>"), 0, 1)
-        extremes.addWidget(self.most_positive, 1, 0)
-        extremes.addWidget(self.most_negative, 1, 1)
+        extremes = QHBoxLayout()
+        extremes.setSpacing(14)
+        for title, lw in (("Most positive", self.most_positive), ("Most negative", self.most_negative)):
+            lw.setFrameShape(QFrame.Shape.NoFrame)
+            lw.itemDoubleClicked.connect(
+                lambda item: QDesktopServices.openUrl(QUrl(item.data(Qt.ItemDataRole.UserRole))))
+            card, inner = panel("solid", margins=14, spacing=6)
+            inner.addWidget(label(title, "muted"))
+            inner.addWidget(lw)
+            extremes.addWidget(card)
+        lay.addLayout(extremes, 2)
+        return page
 
-        ol = QVBoxLayout(overview)
-        ol.addLayout(top)
-        ol.addLayout(tiles)
-        ol.addLayout(charts, 3)
-        ol.addLayout(extremes, 2)
+    # -- theme ----------------------------------------------------------------
 
-        self.posts_tab = TableTab(POST_COLUMNS, stretch_col=2)
-        self.comments_tab = TableTab(COMMENT_COLUMNS, stretch_col=2)
-        self.tabs.addTab(overview, "Overview")
-        self.tabs.addTab(self.posts_tab, "Posts")
-        self.tabs.addTab(self.comments_tab, "Comments")
-        return self.tabs
+    def _set_theme(self, key: str) -> None:
+        self.settings.setValue("ui/theme", key)
+        self._apply_theme()
 
-    # -- control state ------------------------------------------------------
+    def _set_reduce(self, on: bool) -> None:
+        self.settings.setValue("ui/reduce_transparency", on)
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        theme.apply(QApplication.instance(), self.settings.value("ui/theme", "system", str),
+                    self.settings.value("ui/reduce_transparency", False, bool))
+        self.update()
+        self._show_dataset(self.current or "")  # re-pick chart and swatch colors
+
+    # -- control state --------------------------------------------------------
 
     def _update_sort_options(self) -> None:
         options = SEARCH_SORTS if self.query.text().strip() else LISTING_SORTS
@@ -278,7 +415,7 @@ class MainWindow(QMainWindow):
     def _mode_text(self) -> str:
         creds = settings_dialog.load(self.settings)
         if creds["client_id"] and creds["client_secret"]:
-            return "Using Reddit API credentials."
+            return "Connected with Reddit API credentials."
         return "Anonymous mode (slow). Add API credentials under File → Reddit API settings for faster, reliable fetching."
 
     def _set_busy(self, busy: bool) -> None:
@@ -363,11 +500,13 @@ class MainWindow(QMainWindow):
         self.datasets.blockSignals(True)
         self.datasets.clear()
         for n in names:
-            self.datasets.addItem(n)
+            item = QListWidgetItem(f"r/{n}")
+            item.setData(Qt.ItemDataRole.UserRole, n)
+            self.datasets.addItem(item)
         self.datasets.blockSignals(False)
         match = next((i for i, n in enumerate(names) if select and n.lower() == select.lower()), None)
         if match is not None:
-            self.datasets.setCurrentRow(match)  # emits currentTextChanged -> _show_dataset
+            self.datasets.setCurrentRow(match)  # emits currentItemChanged -> _show_dataset
         else:
             self._show_dataset("")
 
@@ -380,25 +519,29 @@ class MainWindow(QMainWindow):
         self.export_posts.setEnabled(bool(self.posts))
         self.export_comments.setEnabled(bool(self.comments))
         self.delete_btn.setEnabled(bool(name))
-        self.tabs.setTabText(1, f"Posts ({len(self.posts)})")
-        self.tabs.setTabText(2, f"Comments ({len(self.comments)})")
+        self.tabbar.setTabText(1, f"Posts  {len(self.posts):,}")
+        self.tabbar.setTabText(2, f"Comments  {len(self.comments):,}")
+        if self.current:
+            self.heading.setText(f"r/{self.current}")
+            fetched = max((r["fetched_at"] for r in self.posts), default=None)
+            when = datetime.fromtimestamp(fetched).strftime("%d %b %Y, %H:%M") if fetched else "never"
+            self.subheading.setText(f"{len(self.posts):,} posts and {len(self.comments):,} comments · last fetched {when}")
+        else:
+            self.heading.setText("No data yet")
+            self.subheading.setText("Enter a subreddit on the left and press Fetch and analyse.")
         self._render_overview()
 
     def _render_overview(self) -> None:
-        if not self.current:
-            self.heading.setText("No data yet. Enter a subreddit and press Fetch.")
-            rows = []
-        else:
-            self.heading.setText(f"r/{self.current}")
-            scope = self.scope.currentText()
-            rows = (list(self.posts) if scope != "Comments only" else []) + \
-                   (list(self.comments) if scope != "Posts only" else [])
+        scope = self.scope.currentText()
+        rows = (list(self.posts) if scope != "Comments only" else []) + \
+               (list(self.comments) if scope != "Posts only" else [])
         s = summarize(rows)
         n = s["count"]
+        pos, neg = (s["counts"]["positive"] / n, s["counts"]["negative"] / n) if n else (0.0, 0.0)
         self.tiles["count"].set(f"{n:,}")
         self.tiles["mean"].set(f"{s['mean']:+.3f}" if n else "–")
-        self.tiles["positive"].set(f"{100 * s['counts']['positive'] / n:.0f}%" if n else "–")
-        self.tiles["negative"].set(f"{100 * s['counts']['negative'] / n:.0f}%" if n else "–")
+        self.tiles["positive"].set(f"{100 * pos:.0f}%" if n else "–", pos)
+        self.tiles["negative"].set(f"{100 * neg:.0f}%" if n else "–", neg)
         self.distribution.set_counts(s["counts"])
         self.timeline.set_points(daily_means(rows))
 
@@ -412,7 +555,7 @@ class MainWindow(QMainWindow):
         for r in rows:
             text = r["title"] if "title" in r.keys() else r["body"]
             text = " ".join((text or "").split())
-            item = QListWidgetItem(f"{r['sentiment']:+.2f}   {text[:140]}")
+            item = QListWidgetItem(f"{r['sentiment']:+.2f}    {text[:140]}")
             item.setToolTip(text[:1000])
             item.setData(Qt.ItemDataRole.UserRole, r["permalink"])
             widget.addItem(item)
@@ -439,10 +582,8 @@ class MainWindow(QMainWindow):
         if settings_dialog.SettingsDialog(self.settings, self).exec():
             self.statusBar().showMessage(self._mode_text())
 
-    def changeEvent(self, event) -> None:
-        super().changeEvent(event)
-        if event.type() == QEvent.Type.PaletteChange and hasattr(self, "posts"):
-            self._show_dataset(self.current or "")  # re-pick chart and swatch colors for the new theme
+    def paintEvent(self, event) -> None:
+        paint_backdrop(self)
 
     def closeEvent(self, event) -> None:
         if self.worker:

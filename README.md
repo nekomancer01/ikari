@@ -13,6 +13,8 @@ sentiment, and lets you explore and export the results.
 - Overview tab: summary numbers, sentiment distribution, mean sentiment per day, and the most
   positive/negative items.
 - Posts and Comments tabs: sortable, filterable tables. Double-click a row to open it on Reddit.
+- Glass interface: translucent panels over a soft gradient, light and dark themes (View menu, or
+  follow the system), and a **Reduce transparency** option that makes every panel opaque.
 - Everything is saved to a local SQLite database, so earlier fetches stay available under
   "Saved data". Fetching again updates existing rows. File → Export writes CSV.
 
@@ -34,6 +36,17 @@ client id and secret under **File → Reddit API settings**. The app uses app-on
 Reddit password) and can make about 100 requests a minute. Note that the secret is stored
 unencrypted in Qt's settings file.
 
+## Design notes
+
+- Type: [Manrope](https://fonts.google.com/specimen/Manrope) for the interface and
+  [Sora](https://fonts.google.com/specimen/Sora) for headings and big numbers. Both are SIL Open Font
+  License fonts, bundled in `src/subsentiment/gui/assets/` as static weights cut from the variable
+  fonts (Qt's variable-font weight matching is unreliable). Tabular figures are on so numbers line up.
+- Glass is used for the sidebar, stat tiles and chart cards. Tables and lists sit on near-solid
+  panels so dense text stays readable, and glass is never stacked on glass.
+- Chart colors: blue for positive, red for negative, gray for neutral, checked for color-blind
+  separation. Bars are always labelled, so color is never the only cue.
+
 ## Development
 
 ```bash
@@ -49,3 +62,4 @@ Layout:
 | `src/subsentiment/store.py` | SQLite storage, CSV export, summary helpers |
 | `src/subsentiment/collect.py` | One fetch job: fetch → score → store |
 | `src/subsentiment/gui/` | Qt main window, charts, table models, background worker, settings |
+| `src/subsentiment/gui/theme.py` | Glass theme: color tokens, stylesheet, fonts, backdrop |

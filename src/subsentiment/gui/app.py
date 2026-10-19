@@ -3,9 +3,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths
+from PySide6.QtCore import QSettings, QStandardPaths
 from PySide6.QtWidgets import QApplication
 
+from subsentiment.gui import theme
 from subsentiment.gui.main_window import MainWindow
 
 
@@ -18,6 +19,10 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(argv if argv is not None else sys.argv)
     app.setOrganizationName("subsentiment")
     app.setApplicationName("Subreddit Sentiment")
+    settings = QSettings()
+    theme.load_fonts(app)
+    theme.apply(app, settings.value("ui/theme", "system", str),
+                settings.value("ui/reduce_transparency", False, bool))
     window = MainWindow(default_db_path())
     window.show()
     return app.exec()

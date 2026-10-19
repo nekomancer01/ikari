@@ -10,6 +10,7 @@ from PySide6.QtGui import QColor, QIcon, QPixmap
 from subsentiment.gui.charts import palette
 
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1
+NUMERIC = ("sentiment", "score", "num_comments")
 
 
 def _fmt_time(ts: float) -> str:
@@ -71,8 +72,12 @@ class RowsModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.columns)
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
-        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+        if orientation != Qt.Orientation.Horizontal:
+            return None
+        if role == Qt.ItemDataRole.DisplayRole:
             return self.columns[section][0]
+        if role == Qt.ItemDataRole.TextAlignmentRole and self.columns[section][1] in NUMERIC:
+            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return None
 
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
@@ -89,7 +94,7 @@ class RowsModel(QAbstractTableModel):
             return self._icons.get(value)
         if role == Qt.ItemDataRole.ToolTipRole and key in ("title", "body"):
             return (row["title"] + "\n\n" + (row["selftext"] or "")) if key == "title" else row["body"]
-        if role == Qt.ItemDataRole.TextAlignmentRole and key in ("sentiment", "score", "num_comments"):
+        if role == Qt.ItemDataRole.TextAlignmentRole and key in NUMERIC:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return None
 

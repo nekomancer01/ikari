@@ -14,8 +14,10 @@ from PySide6.QtCharts import (
     QScatterSeries, QStackedBarSeries, QValueAxis,
 )
 from PySide6.QtCore import QDateTime, QMargins, QPointF, Qt
-from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QPainter, QPen
+from PySide6.QtGui import QColor, QCursor, QPainter, QPen
 from PySide6.QtWidgets import QToolTip
+
+from subsentiment.gui import theme
 
 LIGHT = {
     "surface": "#fcfcfb", "text": "#0b0b0b", "muted": "#52514e", "grid": "#e4e3df",
@@ -27,22 +29,28 @@ DARK = {
 }
 
 
+# Approximate color of the glass card behind the charts, for the dots' surface ring.
+CARD = {"light": "#f3f5fc", "dark": "#1b1f2e"}
+
+
 def palette() -> dict:
-    # Follow the window colors actually in use (OS theme or a custom style).
-    return DARK if QGuiApplication.palette().window().color().lightness() < 128 else LIGHT
+    """Validated series colors for the current theme, with text and grid from the theme."""
+    t = theme.tokens()
+    mode = theme.mode()
+    grid = QColor(*t["edge"][:3])
+    grid.setAlpha(min(255, t["edge"][3] * 2))
+    return dict(DARK if mode == "dark" else LIGHT, surface=CARD[mode], text=t["text"], muted=t["muted"],
+                grid=grid.name(QColor.NameFormat.HexArgb))
 
 
 def _base_chart(title: str, colors: dict) -> QChart:
     chart = QChart()
     chart.setTitle(title)
-    chart.setBackgroundBrush(QColor(colors["surface"]))
-    chart.setBackgroundRoundness(6)
+    chart.setBackgroundVisible(False)  # the glass card behind shows through
+    chart.setPlotAreaBackgroundVisible(False)
     chart.setTitleBrush(QColor(colors["text"]))
-    f = QFont()
-    f.setPointSizeF(f.pointSizeF() * 1.1)
-    f.setBold(True)
-    chart.setTitleFont(f)
-    chart.setMargins(QMargins(8, 8, 8, 8))
+    chart.setTitleFont(theme.display_font(11.5, 600))
+    chart.setMargins(QMargins(4, 4, 4, 4))
     chart.legend().hide()
     chart.setAnimationOptions(QChart.AnimationOption.NoAnimation)
     return chart
@@ -63,6 +71,8 @@ class DistributionChart(QChartView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setStyleSheet("background: transparent; border: none;")
+        self.setBackgroundBrush(Qt.GlobalColor.transparent)
         self.setMinimumHeight(260)
         self.set_counts({"negative": 0, "neutral": 0, "positive": 0})
 
@@ -118,6 +128,8 @@ class TimelineChart(QChartView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setStyleSheet("background: transparent; border: none;")
+        self.setBackgroundBrush(Qt.GlobalColor.transparent)
         self.setMinimumHeight(260)
         self.set_points([])
 
