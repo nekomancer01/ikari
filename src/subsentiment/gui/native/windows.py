@@ -17,6 +17,7 @@ import sys
 IS_WINDOWS = sys.platform == "win32"
 
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+DWMWA_USE_IMMERSIVE_DARK_MODE_PRE_20H1 = 19  # Windows 10 1809 to 1909 know only this id
 DWMWA_BORDER_COLOR = 34
 DWMWA_CAPTION_COLOR = 35
 DWMWA_TEXT_COLOR = 36
@@ -67,7 +68,9 @@ def style_title_bar(hwnd: int, dark: bool, caption: str | None = None, text: str
     if not IS_WINDOWS:
         return
     try:
-        _set_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 1 if dark else 0)
+        flag = 1 if dark else 0
+        if not _set_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, flag):
+            _set_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_PRE_20H1, flag)
         if windows_build() >= 22000:
             _set_attr(hwnd, DWMWA_CAPTION_COLOR, _colorref(caption) if caption else DWMWA_COLOR_DEFAULT)
             _set_attr(hwnd, DWMWA_TEXT_COLOR, _colorref(text) if text else DWMWA_COLOR_DEFAULT)

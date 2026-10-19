@@ -65,14 +65,14 @@ class Comment:
 def _post_from(d: dict) -> Post:
     return Post(
         id=d["id"],
-        subreddit=d.get("subreddit", ""),
-        title=d.get("title", ""),
-        selftext=d.get("selftext", "") or "",
-        author=d.get("author", "[deleted]"),
-        score=int(d.get("score", 0)),
-        upvote_ratio=float(d.get("upvote_ratio", 0.0) or 0.0),
-        num_comments=int(d.get("num_comments", 0)),
-        created_utc=float(d.get("created_utc", 0)),
+        subreddit=d.get("subreddit") or "",
+        title=d.get("title") or "",
+        selftext=d.get("selftext") or "",
+        author=d.get("author") or "[deleted]",  # null for deleted accounts
+        score=int(d.get("score") or 0),
+        upvote_ratio=float(d.get("upvote_ratio") or 0.0),
+        num_comments=int(d.get("num_comments") or 0),
+        created_utc=float(d.get("created_utc") or 0),
         permalink="https://www.reddit.com" + d.get("permalink", ""),
         url=d.get("url", ""),
     )
@@ -84,17 +84,17 @@ def flatten_comments(children: list, post_id: str, subreddit: str, depth: int = 
         if child.get("kind") != "t1":
             continue
         d = child["data"]
-        body = d.get("body", "")
+        body = d.get("body") or ""
         if body not in ("[deleted]", "[removed]"):
             yield Comment(
                 id=d["id"],
                 post_id=post_id,
                 subreddit=subreddit,
                 parent_id=d.get("parent_id", ""),
-                author=d.get("author", "[deleted]"),
+                author=d.get("author") or "[deleted]",
                 body=body,
-                score=int(d.get("score", 0)),
-                created_utc=float(d.get("created_utc", 0)),
+                score=int(d.get("score") or 0),
+                created_utc=float(d.get("created_utc") or 0),
                 depth=depth,
                 permalink="https://www.reddit.com" + d.get("permalink", ""),
             )
@@ -171,7 +171,11 @@ class RedditClient:
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code == 429:
-                retry = float(resp.headers.get("Retry-After") or 0) or 10.0 * (attempt + 1)
+                try:
+                    retry = float(resp.headers.get("Retry-After") or 0)
+                except ValueError:  # an HTTP date instead of seconds
+                    retry = 0.0
+                retry = retry or 10.0 * (attempt + 1)
                 self._sleep(min(retry, 60.0))
                 continue
             if resp.status_code == 401 and self.authenticated:

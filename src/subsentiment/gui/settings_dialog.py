@@ -23,6 +23,11 @@ def _keyring():
 
 
 def _get_secret(settings: QSettings, client_id: str) -> str:
+    # A plaintext value means the keychain write failed (or predates it) and is newer than any keychain entry:
+    # saving to the keychain removes the plaintext copy.
+    plain = settings.value("reddit/client_secret", "", str)
+    if plain:
+        return plain
     kr = _keyring()
     if kr and client_id:
         try:
@@ -31,7 +36,7 @@ def _get_secret(settings: QSettings, client_id: str) -> str:
                 return secret
         except Exception:
             pass
-    return settings.value("reddit/client_secret", "", str)
+    return ""
 
 
 def _set_secret(settings: QSettings, client_id: str, secret: str) -> bool:
