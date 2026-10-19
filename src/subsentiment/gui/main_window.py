@@ -591,7 +591,7 @@ class MainWindow(QMainWindow):
         comments_row = QWidget()
         row = QHBoxLayout(comments_row)
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(10)
+        row.setSpacing(6)  # Windows' wider text needs the "50 per post" box this little bit wider
         row.addWidget(self.include_comments)
         row.addWidget(self.comments_per_post, 1)
         self._restore_fetch_settings()
