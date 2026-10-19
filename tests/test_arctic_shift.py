@@ -109,11 +109,23 @@ class ArchiveSession(FakeSession):
         self.calls.append((url, dict(params)))
         if url.endswith("/api/posts/ids"):
             ids = params["ids"].split(",")
-            return ok([d for d in self.items if d["id"] in ids])
+            if len(ids) > 500:  # the API's own bounds
+                return FakeResponse(400, {"error": "too many ids"})
+            return ok(self._fields([d for d in self.items if d["id"] in ids], params))
         hits = [d for d in self.items if params["after"] < d["created_utc"] < params["before"]]
         limit = params["limit"]
+        if limit != "auto" and not 1 <= limit <= 100:
+            return FakeResponse(400, {"error": "limit must be between 1 and 100"})
         n = self.page_cap if limit == "auto" else limit
-        return ok(hits[:n])
+        return ok(self._fields(hits[:n], params))
+
+    @staticmethod
+    def _fields(items, params):
+        """Like the API, ``fields`` keeps only the named fields, and drops _meta with the rest."""
+        if "fields" not in params:
+            return items
+        keep = params["fields"].split(",")
+        return [{k: d[k] for k in keep if k in d} for d in items]
 
 
 def archive(items, **kw):
@@ -387,7 +399,7 @@ def test_a_timing_out_window_is_narrowed_and_the_rest_still_read():
     posts = c.fetch_posts("python", after=T0, before=T0 + 6 * 3600, limit=30)  # four 90-minute slices
     assert [p.id for p in posts] == [f"p{i}" for i in range(30)]
     widths = {params["before"] - params["after"] for _, params in session.calls}
-    assert max(widths) == 5400 and min(widths) <= 1800  # gave up on 90 minutes, read 22-minute windows
+    assert max(widths) == 5401 and min(widths) <= 1800  # gave up on 90 minutes (from a second early), read narrower windows
 
 
 def test_other_errors_are_reported():
@@ -448,3 +460,37 @@ def test_all_comments_ask_for_the_whole_thread_and_say_whether_it_is_complete():
     small = Post("p1", "Python", "t", "", "a", 10, 0.9, 0, 1.0, "u", "")  # asks for at least a page
     full = [node(comment(f"c{i}", "t3_p1", i)) for i in range(100)]
     assert client([ok(full)]).fetch_all_comments(small)[1] is False  # a full page may have been cut short
+
+
+class BusyArchive(ArchiveSession):
+    """Times out on any page bigger than ``max_limit``, so the client retries with smaller pages."""
+
+    def __init__(self, items, max_limit):
+        super().__init__(items)
+        self.max_limit = max_limit
+
+    def get(self, url, params=None, timeout=None):
+        if url.endswith("/api/posts/search") and params["limit"] > self.max_limit:
+            self.calls.append((url, dict(params)))
+            return FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
+        return super().get(url, params, timeout)
+
+
+def test_a_page_shrunk_after_a_timeout_doesnt_end_the_slice_early():
+    # Every slice starts with 100 saved posts, so finding new ones needs full pages, which time out.
+    items = [at(T0 + d * DAY + 60 * k, d * 1000 + k) for d in range(7) for k in range(300)]
+    skip = {d["id"] for d in items if int(d["id"][1:]) % 1000 < 100}
+    clock = FakeClock()
+    c = ArcticShiftClient(session=BusyArchive(items, max_limit=50), limiter=RateLimiter(0.0, clock, clock.sleep))
+    posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28, skip=skip)
+    assert len(posts) == 28 and not skip & {p.id for p in posts}
+    per_day = [sum(1 for p in posts if T0 + d * DAY <= p.created_utc < T0 + (d + 1) * DAY) for d in range(7)]
+    assert per_day == [4] * 7
+    timeouts = [p for _, p in c.session.calls if p["limit"] > 50]
+    assert len(timeouts) == 1  # the smaller page that worked is kept, not retried at full size each time
+
+
+def test_a_post_right_on_a_slice_edge_is_found():
+    items = [at(T0 + 6 * 3600, 1), at(T0 + 6 * 3600 + 5, 2)]  # the first sits exactly where slice two starts
+    posts = archive(items).fetch_posts("python", after=T0, before=T0 + DAY, limit=4)
+    assert [p.id for p in posts] == ["p1", "p2"]

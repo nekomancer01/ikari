@@ -190,6 +190,7 @@ class ArcticShiftClient:
         self.session = session or requests.Session()
         self.session.headers["User-Agent"] = USER_AGENT
         self.limiter = limiter or RateLimiter()
+        self._page_cap = PAGE  # largest page the archive has answered without timing out in this fetch
 
     # -- HTTP ---------------------------------------------------------------
 
@@ -278,6 +279,7 @@ class ArcticShiftClient:
         if query:
             base["query"] = query
         skip = set(skip)
+        self._page_cap = PAGE
 
         n = slot_count(after, before, limit, top)
         windows = slices(after, before, n)
@@ -329,12 +331,14 @@ class ArcticShiftClient:
             on_posts(posts)
         return posts
 
-    def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int]:
-        """Posts from [lo, hi) and the end of the window actually searched: when the archive times
-        out, the window is halved (down to MIN_WINDOW) and only its first part is searched."""
+    def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int, int]:
+        """Posts from [lo, hi), the end of the window actually searched, and the page size actually
+        asked for: when the archive times out, the page is made smaller, then the window is halved
+        (down to MIN_WINDOW) and only its first part is searched."""
         while True:
             try:
-                return self.get("/api/posts/search", dict(base, after=lo, before=hi, limit=size)), hi
+                page = self.get("/api/posts/search", dict(base, after=lo, before=hi, limit=size))
+                return page, hi, self.last_params.get("limit", size)
             except QueryTimeout:
                 if hi - lo <= MIN_WINDOW:
                     raise
@@ -346,11 +350,15 @@ class ArcticShiftClient:
         reading from, and whether the slice may hold more."""
         out: list[Post] = []
         seen: set[str] = set()
-        cursor = lo
+        cursor = lo - 1  # `after` is exclusive; this way a post right on the slice's start isn't lost
         for _ in range(SLOT_PAGES):
-            # A few spare for removed posts; a full page when saved posts may need skipping.
-            size = PAGE if skip else min(PAGE, want - len(out) + 5)
-            page, end = self._page(base, cursor, hi, size)
+            # A few spare for removed posts; a full page when saved posts may need skipping. Once the
+            # archive has timed out on a big page, this fetch keeps to the smaller size that worked.
+            size = min(self._page_cap, PAGE if skip else want - len(out) + 5)
+            page, end, sent = self._page(base, cursor, hi, size)
+            if sent < size:
+                self._page_cap = sent
+            size = sent  # a page shrunk after a timeout is full at this size, not at the size asked for
             new = [d for d in page if d.get("id") and d["id"] not in seen]
             fresh: list[Post] = []
             for d in new:

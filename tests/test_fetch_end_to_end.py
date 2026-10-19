@@ -38,18 +38,30 @@ def server(monkeypatch):
             q = {k: v[0] for k, v in parse_qs(url.query).items()}
             seen.append((url.path, q))
             time.sleep(0.05)
+            status, data = 200, []
             if url.path == "/api/posts/search":
-                lo, hi = float(q.get("after", 0)), float(q.get("before", 1e12))
-                data = [p for p in POSTS if lo < p["created_utc"] < hi][: int(q.get("limit", 100))]
+                limit = int(q.get("limit", 25))
+                if not 1 <= limit <= 100:  # the API's own bounds
+                    status = 400
+                else:
+                    lo, hi = float(q.get("after", 0)), float(q.get("before", 1e12))
+                    data = [p for p in POSTS if lo < p["created_utc"] < hi][:limit]
+            elif url.path == "/api/posts/ids":
+                ids = q["ids"].split(",")
+                if len(ids) > 500:
+                    status = 400
+                else:
+                    data = [p for p in POSTS if p["id"] in ids]
             elif url.path == "/api/comments/tree":
                 pid = q["link_id"]
                 data = [{"kind": "t1", "data": {"id": f"c{pid}{j}", "body": f"lovely {j}", "author": "b",
                          "created_utc": T0 + 10, "parent_id": "t3_" + pid, "score": 1, "retrieved_on": T0 + 20,
                          "replies": ""}} for j in range(3)]
-            else:
-                data = []
-            body = json.dumps({"data": data}).encode()
-            self.send_response(200)
+            if "fields" in q:  # like the API: only the named fields, and no _meta
+                keep = q["fields"].split(",")
+                data = [{k: d[k] for k in keep if k in d} for d in data]
+            body = json.dumps({"data": data} if status == 200 else {"error": "bad request"}).encode()
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
