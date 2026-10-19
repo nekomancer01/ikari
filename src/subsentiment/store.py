@@ -61,6 +61,15 @@ class Store:
                   c.created_utc, c.depth, c.permalink, sentiment, label, time.time())
         self.db.execute(f"INSERT OR REPLACE INTO comments VALUES ({','.join('?' * len(values))})", values)
 
+    def posts_between(self, subreddit: str, after: float | None = None,
+                      before: float | None = None) -> list[sqlite3.Row]:
+        """Stored posts created in [after, before), each with a has_comments flag."""
+        return self.db.execute(
+            "SELECT p.*, EXISTS(SELECT 1 FROM comments c WHERE c.post_id = p.id) AS has_comments "
+            "FROM posts p WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ?",
+            (subreddit, after if after is not None else float("-inf"),
+             before if before is not None else float("inf"))).fetchall()
+
     def commit(self) -> None:
         self.db.commit()
 

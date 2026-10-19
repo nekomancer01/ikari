@@ -1,7 +1,9 @@
 import pytest
 import requests
 
-from subsentiment.arctic_shift import BASE_URL, SETTLE_SECONDS, ArcticShiftClient, RateLimiter
+from subsentiment.arctic_shift import (
+    BASE_URL, SETTLE_SECONDS, ArcticShiftClient, RateLimiter, quotas, slices, slot_count,
+)
 from subsentiment.reddit import FetchError, Post
 
 NOW = 1_792_000_000
@@ -86,59 +88,138 @@ def a_post():
 
 # -- posts -------------------------------------------------------------------
 
-def test_posts_search_the_date_range_newest_first():
-    c = client([ok([post(1), post(2)]), ok([post(2)])])
-    posts = c.fetch_posts("r/Python", after=NOW - 86400, before=NOW, limit=10)
-    assert [p.id for p in posts] == ["p1", "p2"]
+DAY = 86400
+T0 = NOW - 7 * DAY
+
+
+def at(t, i, **kw):
+    """A settled post created at time t."""
+    return post(i, created_utc=t, retrieved_on=t + 20, _meta={"retrieved_2nd_on": t + SETTLE_SECONDS}, **kw)
+
+
+class ArchiveSession(FakeSession):
+    """Answers /api/posts/search from a list of posts, honouring after/before/sort/limit like the API."""
+
+    def __init__(self, items, page_cap=100):
+        super().__init__([])
+        self.items = sorted(items, key=lambda d: d["created_utc"])
+        self.page_cap = page_cap
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append((url, dict(params)))
+        if url.endswith("/api/posts/ids"):
+            ids = params["ids"].split(",")
+            return ok([d for d in self.items if d["id"] in ids])
+        hits = [d for d in self.items if params["after"] < d["created_utc"] < params["before"]]
+        limit = params["limit"]
+        n = self.page_cap if limit == "auto" else limit
+        return ok(hits[:n])
+
+
+def archive(items, **kw):
+    clock = FakeClock()
+    return ArcticShiftClient(session=ArchiveSession(items, **kw), limiter=RateLimiter(0.0, clock, clock.sleep))
+
+
+def test_slices_and_quotas_split_evenly():
+    assert slices(0, 100, 4) == [(0, 25), (25, 50), (50, 75), (75, 100)]
+    assert quotas(10, 4) == [2, 3, 2, 3] and sum(quotas(1000, 7)) == 1000
+    assert slot_count(0, 7 * DAY, 100, top=False) == 28  # four parts a day
+    assert slot_count(0, 365 * DAY, 100, top=False) == 100  # never more parts than posts
+    assert slot_count(0, 365 * DAY, 1000, top=False) == 365  # about one a day for long ranges
+    assert slot_count(0, 7 * DAY, 100, top=True) == 7
+
+
+def test_posts_are_spread_evenly_across_the_days():
+    # A busy first day and quiet later days: newest-first paging would only ever see day one.
+    items = [at(T0 + 60 + i * 43, i) for i in range(2000)]  # a post every 43 s on day one
+    items += [at(T0 + d * DAY + 3600 * h, 10_000 + d * 100 + h) for d in range(1, 7) for h in range(24)]
+    c = archive(items)
+    posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=70)
+    assert len(posts) == 70
+    per_day = [sum(1 for p in posts if T0 + d * DAY <= p.created_utc < T0 + (d + 1) * DAY) for d in range(7)]
+    assert per_day == [10] * 7
+    assert [p.created_utc for p in posts] == sorted(p.created_utc for p in posts)
     url, params = c.session.calls[0]
     assert url == BASE_URL + "/api/posts/search"
-    assert params == {"subreddit": "Python", "sort": "desc", "limit": 100, "after": NOW - 86400, "before": NOW}
-    assert posts[0].permalink == "https://www.reddit.com/r/Python/comments/p1/post_1/"
+    assert params["subreddit"] == "python" and params["sort"] == "asc" and params["limit"] <= 100
+    assert len(c.session.calls) == 28  # one small request per quarter-day, not thousands of posts
     assert c.session.headers["User-Agent"].startswith("ikari/")
 
 
-def test_open_ended_range_sends_no_before():
-    c = client([ok([])])
-    c.fetch_posts("python", after=NOW - 60)
-    assert "before" not in c.session.calls[0][1]
+def test_saved_posts_are_skipped_so_a_repeat_fetch_brings_new_ones():
+    items = [at(T0 + 100 + i * 60, i) for i in range(200)]
+    c = archive(items)
+    first = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=20)
+    second = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=20, skip={p.id for p in first})
+    assert len(second) == 20 and not {p.id for p in first} & {p.id for p in second}
 
 
-def test_pagination_moves_before_back_and_drops_repeats():
-    first = [post(i) for i in range(100)]
-    second = [post(99)] + [post(i) for i in range(100, 130)]
-    c = client([ok(first), ok(second), ok([post(129)])])
-    posts = c.fetch_posts("python", limit=500)
-    assert len(posts) == 130 and len({p.id for p in posts}) == 130
-    assert c.session.calls[1][1]["before"] == NOW - 990 + 1
-    assert c.session.calls[2][1]["before"] == NOW - 1290 + 1
+def test_a_slice_pages_forward_when_saved_posts_fill_the_first_page():
+    items = [at(T0 + 100 + i, i) for i in range(300)]
+    c = archive(items)
+    skip = {f"p{i}" for i in range(150)}
+    (got,) = [c.fetch_posts("python", after=T0, before=T0 + 3600, limit=1, skip=skip)]
+    assert [p.id for p in got] == ["p150"]
+    assert c.session.calls[1][1]["after"] == T0 + 100 + 99 - 1  # resumes a second before the last post seen
 
 
-def test_limit_is_honoured_without_extra_requests():
-    c = client([ok([post(i) for i in range(100)])])
-    assert len(c.fetch_posts("python", limit=30)) == 30
-    assert len(c.session.calls) == 1
+def test_quiet_slices_hand_their_share_to_busy_ones():
+    items = [at(T0 + 100 + i * 60, i) for i in range(200)]  # all within the first 6 hours
+    posts = archive(items).fetch_posts("python", after=T0, before=T0 + DAY, limit=20)
+    assert [p.id for p in posts] == [f"p{i}" for i in range(20)]
+
+
+def test_top_mode_ranks_settled_scores_within_each_day():
+    items = [at(T0 + d * DAY + 600 * k, d * 100 + k, score=(k * 37) % 101) for d in range(3) for k in range(100)]
+    c = archive(items, page_cap=1000)
+    posts = c.fetch_posts("python", after=T0, before=T0 + 3 * DAY, limit=6, top=True)
+    assert len(posts) == 6
+    for d in range(3):
+        day = sorted((x for x in items if T0 + d * DAY <= x["created_utc"] < T0 + (d + 1) * DAY),
+                     key=lambda x: x["score"], reverse=True)
+        assert {p.id for p in posts if T0 + d * DAY <= p.created_utc < T0 + (d + 1) * DAY} == \
+            {x["id"] for x in day[:2]}
+    assert {params["limit"] for _, params in c.session.calls} == {"auto"}
+
+
+def test_top_mode_puts_unscored_posts_last():
+    items = [at(T0 + 10, 1, score=5), post(2, settled=False, created_utc=T0 + 20, retrieved_on=T0 + 30, score=1)]
+    posts = archive(items).fetch_posts("python", after=T0, before=T0 + DAY, limit=1, top=True)
+    assert [p.id for p in posts] == ["p1"]
 
 
 def test_settled_posts_keep_their_numbers_fresh_ones_are_unknown():
     fresh = post(1, settled=False, score=1, num_comments=1)
     late = post(2, settled=False, retrieved_on=NOW + SETTLE_SECONDS)  # first archived after it settled
-    c = client([ok([fresh, late, post(3)]), ok([])])
-    p1, p2, p3 = c.fetch_posts("python")
-    assert (p1.score, p1.num_comments, p1.upvote_ratio) == (None, None, None)
-    assert (p2.score, p2.num_comments) == (42, 3)
-    assert (p3.score, p3.num_comments, p3.upvote_ratio) == (43, 3, 0.9)
+    c = archive([fresh, late, post(3)])
+    by_id = {p.id: p for p in c.fetch_posts("python", after=NOW - DAY, before=NOW + 1)}
+    assert (by_id["p1"].score, by_id["p1"].num_comments, by_id["p1"].upvote_ratio) == (None, None, None)
+    assert (by_id["p2"].score, by_id["p2"].num_comments) == (42, 3)
+    assert (by_id["p3"].score, by_id["p3"].num_comments, by_id["p3"].upvote_ratio) == (43, 3, 0.9)
+    assert by_id["p3"].permalink == "https://www.reddit.com/r/Python/comments/p3/post_3/"
 
 
 def test_query_is_passed_through():
-    c = client([ok([])])
-    c.fetch_posts("python", query="asyncio")
+    c = archive([])
+    c.fetch_posts("python", after=T0, before=T0 + DAY, query="asyncio")
     assert c.session.calls[0][1]["query"] == "asyncio"
 
 
 def test_removed_posts_are_skipped_and_removed_bodies_blanked():
-    c = client([ok([post(1, removed_by_category="moderator"), post(2, selftext="[removed]")]), ok([])])
-    posts = c.fetch_posts("python")
+    items = [post(1, removed_by_category="moderator"), post(2, selftext="[removed]"),
+             post(3, _meta={"retrieved_2nd_on": NOW, "removal_type": "moderator", "was_deleted_later": True})]
+    posts = archive(items).fetch_posts("python", after=NOW - DAY, before=NOW + 1)
     assert [p.id for p in posts] == ["p2"] and posts[0].selftext == ""
+
+
+def test_posts_by_id_are_fetched_in_batches_of_500():
+    items = [at(T0 + i, i) for i in range(1200)]
+    c = archive(items)
+    got = c.fetch_posts_by_ids([f"p{i}" for i in range(1200)] + ["p1"])
+    assert len(got) == 1200
+    assert [len(params["ids"].split(",")) for _, params in c.session.calls] == [500, 500, 200]
+    assert all(url == BASE_URL + "/api/posts/ids" for url, _ in c.session.calls)
 
 
 @pytest.mark.parametrize("name, message", [("  r/ ", "Enter a subreddit"), ("not a sub", "isn't a valid")])
@@ -157,93 +238,129 @@ def test_should_stop_ends_early():
 
 # -- comments ----------------------------------------------------------------
 
-def test_comments_use_the_post_id_and_rank_by_score():
-    c = client([ok([
-        comment("c1", "t3_p1", 1, score=2),
-        comment("c2", "t1_c1", 2, score=9),
-        comment("c3", "t1_c2", 3, body="[deleted]"),
-        comment("c4", "t1_c3", 4, score=1),
-        comment("c5", "t1_zz", 5, score=0),  # parent not in the archive
-        comment("c6", "t3_p1", 6, settled=False),
-    ]), ok([])])
+def node(d, replies=()):
+    return {"kind": "t1", "data": dict(d, replies={"kind": "Listing", "data": {"children": list(replies)}}
+                                       if replies else "")}
+
+
+def test_comments_come_from_the_tree_in_one_request_ranked_by_score():
+    tree = [
+        node(comment("c1", "t3_p1", 1, score=2, depth=0), [
+            node(comment("c2", "t1_c1", 2, score=9, depth=1), [
+                node(comment("c3", "t1_c2", 3, body="[deleted]", depth=2), [
+                    node(comment("c4", "t1_c3", 4, score=1, depth=3))])])]),
+        node(comment("c6", "t3_p1", 6, settled=False, depth=0)),
+        {"kind": "more", "data": {"count": 15, "children": ["x", "y"], "depth": 0}},
+    ]
+    c = client([ok(tree)])
     comments = c.fetch_comments(a_post(), limit=50)
-    assert [x.id for x in comments] == ["c2", "c1", "c4", "c5", "c6"]  # unscored last
-    assert {x.id: x.depth for x in comments} == {"c1": 0, "c2": 1, "c4": 3, "c5": 1, "c6": 0}
+    assert [x.id for x in comments] == ["c2", "c1", "c4", "c6"]  # unscored last
+    assert {x.id: x.depth for x in comments} == {"c1": 0, "c2": 1, "c4": 3, "c6": 0}
     assert comments[-1].score is None
     url, params = c.session.calls[0]
-    assert url == BASE_URL + "/api/comments/search"
-    assert params == {"link_id": "p1", "sort": "asc", "limit": 100}
+    assert url == BASE_URL + "/api/comments/tree"
+    assert params == {"link_id": "p1", "limit": 100}
+    assert len(c.session.calls) == 1
     assert comments[0].permalink == "https://www.reddit.com/r/Python/comments/p1/x/c2/"
 
 
-def test_comment_depth_from_the_archive_wins():
-    c = client([ok([comment("c1", "t1_gone", 1, depth=4)]), ok([])])
-    assert c.fetch_comments(a_post())[0].depth == 4
+def test_depth_is_worked_out_when_the_archive_leaves_it_out():
+    tree = [node(comment("c1", "t3_p1", 1), [node(comment("c2", "t1_c1", 2))])]
+    assert {x.id: x.depth for x in client([ok(tree)]).fetch_comments(a_post())} == {"c1": 0, "c2": 1}
 
 
-def test_comments_paginate_forward():
-    first = [comment(f"c{i}", "t3_p1", i) for i in range(100)]
-    c = client([ok(first), ok([comment("c99", "t3_p1", 99), comment("c100", "t3_p1", 100)]), ok([])])
-    comments = c.fetch_comments(a_post(), limit=500)
-    assert len(comments) == 101
-    assert c.session.calls[1][1]["after"] == 98
+def test_big_threads_ask_for_a_bigger_tree_and_keep_the_top_ones():
+    p = Post("p1", "Python", "t", "", "a", 10, 0.9, 5000, 1.0, "u", "")
+    tree = [node(comment(f"c{i}", "t3_p1", i, score=i, depth=0)) for i in range(30)]
+    c = client([ok(tree)])
+    got = c.fetch_comments(p, limit=5)
+    assert c.session.calls[0][1]["limit"] == 1000
+    assert [x.id for x in got] == ["c29", "c28", "c27", "c26", "c25"]
 
 
 # -- rate limiting and retries -------------------------------------------------
 
-def test_requests_are_spaced_one_second_apart():
+SEARCH = ("/api/posts/search", {"subreddit": "Python", "limit": 100})
+
+
+def test_requests_are_spaced_one_second_apart_across_posts_and_comments():
     c = client([ok([post(1)]), ok([]), ok([])])
-    c.fetch_posts("python")
+    c.get(*SEARCH)
+    c.fetch_posts_by_ids(["p1"])
     c.fetch_comments(a_post())
     assert c.clock.sleeps == [1.0, 1.0]  # three requests, the first goes out at once
 
 
 def test_429_waits_for_the_reset_header_then_succeeds():
-    c = client([FakeResponse(429, {"error": "slow down"}, {"X-RateLimit-Reset": "7"}), ok([post(1)]), ok([])])
-    assert len(c.fetch_posts("python")) == 1
+    c = client([FakeResponse(429, {"error": "slow down"}, {"X-RateLimit-Reset": "7"}), ok([post(1)])])
+    assert len(c.get(*SEARCH)) == 1
     assert 7.0 in c.clock.sleeps
 
 
-def test_429_without_a_header_backs_off_exponentially():
-    c = client([FakeResponse(429), FakeResponse(429), ok([])])
-    c.fetch_posts("python")
+def test_429_with_a_reset_time_waits_until_then():
+    c = client([FakeResponse(429, headers={"X-RateLimit-Reset-At": "5025"}), ok([])])
+    c.limiter._wall = lambda: 5000.0
+    c.get(*SEARCH)
+    assert c.clock.sleeps == [25.0]
+
+
+def test_429_without_a_header_backs_off_and_slows_later_requests():
+    c = client([FakeResponse(429), FakeResponse(429), ok([]), ok([])])
+    c.get(*SEARCH)
     assert c.clock.sleeps == [5.0, 10.0]
+    assert c.limiter.interval == 4.0 * 0.9  # doubled twice, eased once by the success
+    c.get(*SEARCH)
+    assert c.clock.sleeps[-1] == 4.0  # the next request waits 4 s instead of 1
+
+
+def test_long_waits_are_announced():
+    c = client([FakeResponse(429, headers={"X-RateLimit-Reset": "30"}), ok([])])
+    told = []
+    c.limiter.on_wait = lambda secs, why: told.append((round(secs), why))
+    c.get(*SEARCH)
+    assert told == [(30, "Arctic Shift asked ikari to slow down")]
 
 
 def test_running_out_of_requests_pauses_before_the_next_one():
     c = client([ok([post(1)], {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "30"}), ok([])])
-    c.fetch_posts("python")
+    c.get(*SEARCH)
+    c.get(*SEARCH)
     assert c.clock.sleeps == [30.0]
 
 
 def test_waits_are_capped():
     c = client([FakeResponse(429, headers={"X-RateLimit-Reset": "9999"}), ok([])])
-    c.fetch_posts("python")
+    c.get(*SEARCH)
     assert c.clock.sleeps == [120.0]
 
 
 def test_server_and_network_errors_retry_then_give_up():
     c = client([FakeResponse(503), requests.ConnectionError("reset"), FakeResponse(502), FakeResponse(500),
-                FakeResponse(503)])
+                FakeResponse(503), FakeResponse(503), FakeResponse(504), FakeResponse(503)])
     with pytest.raises(FetchError, match="busy"):
-        c.fetch_posts("python")
-    assert len(c.session.calls) == 5
+        c.get(*SEARCH)
+    assert len(c.session.calls) == 8
 
 
 def test_network_error_on_the_last_attempt_is_raised():
-    c = client([requests.Timeout("slow")] * 5)
+    c = client([requests.Timeout("slow")] * 8)
     with pytest.raises(requests.Timeout):
-        c.fetch_posts("python")
+        c.get(*SEARCH)
 
 
-def test_query_timeout_retries_with_smaller_pages():
-    c = client([FakeResponse(200, {"data": None, "error": "Query timed out"}), ok([post(1)]), ok([])])
-    c.fetch_posts("python")
-    assert [params["limit"] for _, params in c.session.calls] == [100, 50, 100]
+def test_query_timeout_retries_with_smaller_pages_then_waits():
+    timeout = FakeResponse(200, {"data": None, "error": "Query timed out"})
+    c = client([timeout, timeout, ok([post(1)])])
+    c.get("/api/posts/search", {"limit": "auto"})
+    assert [params["limit"] for _, params in c.session.calls] == ["auto", 100, 50]
+    c = client([timeout] * 4 + [ok([])])
+    c.get("/api/posts/search", {"limit": 20})
+    assert [params["limit"] for _, params in c.session.calls] == [20, 10, 10, 10, 10]
+    assert c.clock.sleeps == [1.0, 10.0, 20.0, 40.0]  # at the smallest page it backs off instead
 
 
 def test_other_errors_are_reported():
     with pytest.raises(FetchError, match="HTTP 400: bad param"):
-        client([FakeResponse(400, {"error": "bad param"})]).fetch_posts("python")
+        client([FakeResponse(400, {"error": "bad param"})]).get(*SEARCH)
     with pytest.raises(FetchError, match="^Arctic Shift: unknown field$"):
-        client([FakeResponse(200, {"data": None, "error": "unknown field"})]).fetch_posts("python")
+        client([FakeResponse(200, {"data": None, "error": "unknown field"})]).get(*SEARCH)

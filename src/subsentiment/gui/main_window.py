@@ -30,11 +30,19 @@ RANGES = {"day": ("Past 24 hours", 1), "week": ("Past week", 7), "month": ("Past
           "quarter": ("Past 3 months", 91), "year": ("Past year", 365), "custom": ("Custom dates", None)}
 
 # Last-used fetch form, restored at startup. Keys live under "fetch/" in QSettings.
-FETCH_DEFAULTS = {"subreddit": "", "query": "", "range": "week", "from": "", "to": "", "limit": 100,
-                  "include_comments": True, "comments_per_post": 50}
+FETCH_DEFAULTS = {"subreddit": "", "query": "", "range": "week", "from": "", "to": "", "pick": "spread",
+                  "limit": 100, "include_comments": True, "comments_per_post": 50}
+
+PICKS = {"spread": ("Spread across days",
+                    "An equal share of posts from each part of the range. Fetching again adds posts you "
+                    "don't have yet."),
+         "top": ("Top by score",
+                 "The highest-scored posts from each part of the range. Scores only exist once the archive "
+                 "re-checks a post (usually 36 hours after posting, sometimes up to a week), so the newest "
+                 "posts can't be ranked yet.")}
 
 STATUS_TEXT = ("Posts and comments come from the free Arctic Shift archive of Reddit. Scores and comment "
-               "counts appear about 36 hours after posting.")
+               "counts appear once the archive re-checks a post, usually 36 hours after posting.")
 
 
 def range_bounds(key: str, start: QDate, end: QDate, now: datetime | None = None) -> tuple[float, float | None]:
@@ -84,6 +92,29 @@ def human_size(n: int) -> str:
             return f"{n:,.0f}\u00a0{unit}" if unit == "bytes" else f"{n:,.1f}\u00a0{unit}"
         n /= 1024
     return ""
+
+
+def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
+    """What a finished fetch did, for the line under the progress bar."""
+    if not (result.posts or result.updated or result.already):
+        if result.stopped:
+            return "Stopped before any posts were fetched."
+        matching = f" matching \u201c{req.query}\u201d" if req.query else ""
+        return f"No new posts found in r/{result.subreddit}{matching} in this date range."
+    parts = [f"Added {plural(result.posts, 'new post')}"
+             + (f" and {plural(result.comments, 'comment')}" if req.include_comments else "")
+             + f" from r/{result.subreddit}."]
+    if result.updated:
+        parts.append(f"Updated scores on {plural(result.updated, 'saved post')}.")
+    if result.already:
+        parts.append(f"{plural(result.already, 'top post')} {'was' if result.already == 1 else 'were'} "
+                     "already saved.")
+    if result.comment_errors:
+        parts.append(f"Comments couldn't be fetched for {plural(result.comment_errors, 'post')}; "
+                     "fetch again later to fill them in.")
+    if result.stopped:
+        parts.append("Stopped early.")
+    return " ".join(parts)
 
 
 def plural(n: int, noun: str) -> str:
@@ -380,6 +411,12 @@ class MainWindow(QMainWindow):
         self.date_to = date_edit()
         for edit in (self.date_from, self.date_to):
             edit.userDateChanged.connect(self._on_date_edited)
+        self.pick = QComboBox()
+        for i, (key, (text, tip)) in enumerate(PICKS.items()):
+            self.pick.addItem(text, key)
+            self.pick.setItemData(i, tip, Qt.ItemDataRole.ToolTipRole)
+        self.pick.currentIndexChanged.connect(
+            lambda _: self.pick.setToolTip(PICKS[self.pick.currentData()][1]))
         self.limit = spin_box(1, 1000, 25, FETCH_DEFAULTS["limit"])
         self.include_comments = QCheckBox("Fetch")
         self.comments_per_post = spin_box(1, 500, 10, FETCH_DEFAULTS["comments_per_post"], " per post")
@@ -403,6 +440,7 @@ class MainWindow(QMainWindow):
         form.addRow(label("Posted", "muted"), self.range)
         form.addRow(label("From", "muted"), self.date_from)
         form.addRow(label("To", "muted"), self.date_to)
+        form.addRow(label("Pick", "muted"), self.pick)
         form.addRow(label("Max posts", "muted"), self.limit)
         form.addRow(label("Comments", "muted"), comments_row)
         lay.addLayout(form)
@@ -617,6 +655,8 @@ class MainWindow(QMainWindow):
                     edit.blockSignals(True)
                     edit.setDate(date)
                     edit.blockSignals(False)
+        self.pick.setCurrentIndex(max(self.pick.findData(v["pick"]), 0))
+        self.pick.setToolTip(PICKS[self.pick.currentData()][1])
         self.limit.setValue(v["limit"])
         self.include_comments.setChecked(v["include_comments"])
         self.comments_per_post.setValue(v["comments_per_post"])
@@ -627,6 +667,7 @@ class MainWindow(QMainWindow):
                      "range": self.range.currentData(),
                      "from": self.date_from.date().toString(Qt.DateFormat.ISODate),
                      "to": self.date_to.date().toString(Qt.DateFormat.ISODate),
+                     "pick": self.pick.currentData(),
                      "limit": self.limit.value(), "include_comments": self.include_comments.isChecked(),
                      "comments_per_post": self.comments_per_post.value()}.items():
             self.settings.setValue(f"fetch/{k}", v)
@@ -638,8 +679,8 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(busy)
         if busy:
             self.progress.setRange(0, 0)
-        for w in (self.subreddit, self.query, self.range, self.date_from, self.date_to, self.limit,
-                  self.include_comments):
+        for w in (self.subreddit, self.query, self.range, self.date_from, self.date_to, self.pick,
+                  self.limit, self.include_comments):
             w.setEnabled(not busy)
         self._update_comments_enabled()
         self._update_delete_enabled()  # don't delete rows the fetch thread is writing
@@ -669,7 +710,7 @@ class MainWindow(QMainWindow):
         req = collect.FetchRequest(
             subreddit=name, after=after, before=before, limit=self.limit.value(), query=self.query.text().strip(),
             include_comments=self.include_comments.isChecked(),
-            comments_per_post=self.comments_per_post.value())
+            comments_per_post=self.comments_per_post.value(), top=self.pick.currentData() == "top")
         self.request = req
         self.thread = QThread(self)
         self.worker = FetchWorker(req, self.db_path)
@@ -698,17 +739,9 @@ class MainWindow(QMainWindow):
         self.progress_msg.setText(msg)
 
     def _on_finished(self, result: collect.FetchResult) -> None:
-        if result.posts == 0:
-            if result.stopped:
-                self.progress_msg.setText("Stopped before any posts were fetched.")
-            else:
-                matching = f" matching \u201c{self.request.query}\u201d" if self.request.query else ""
-                self.progress_msg.setText(f"No posts found in r/{result.subreddit}{matching} in this date range.")
-            return
-        extra = f" and {result.comments:,} comments" if self.request.include_comments else ""
-        stopped = " (stopped early)" if result.stopped else ""
-        self.progress_msg.setText(f"Analysed {result.posts:,} posts{extra} from r/{result.subreddit}{stopped}.")
-        self._refresh_datasets(select=result.subreddit)
+        self.progress_msg.setText(finish_text(result, self.request))
+        if result.posts or result.updated or result.comments:
+            self._refresh_datasets(select=result.subreddit)
 
     def _on_failed(self, message: str) -> None:
         self._refresh_datasets(select=self.request.subreddit)  # show anything stored before the error
