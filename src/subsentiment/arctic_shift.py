@@ -329,6 +329,7 @@ class ArcticShiftClient:
         picked: list[list[Post]] = [[] for _ in windows]
         reads = [0] * len(windows)
         span: list[int | None] = [None]  # once the archive times out on a long window, later reads stay this short
+        page_size = [PAGE]  # ...and once it times out on a big page, later pages stay this small
 
         def read(i: int) -> None:
             """One page from where slice i got to; marks every slice it covers as read that far."""
@@ -336,7 +337,8 @@ class ArcticShiftClient:
             # `after` is exclusive, so ask from a second earlier; posts already seen are dropped.
             lo = known[i] - 1
             hi = end if span[0] is None else min(end, lo + span[0])
-            page, searched = self._page(base, lo, hi, PAGE)
+            page, searched, size = self._page(base, lo, hi, page_size[0])
+            page_size[0] = size
             if searched < hi:
                 span[0] = searched - lo
             new = [d for d in page if d.get("id") and d["id"] not in seen]
@@ -345,7 +347,7 @@ class ArcticShiftClient:
                 j = bisect.bisect_right(starts, _number(d.get("created_utc"), 0)) - 1
                 if j >= 0 and d["id"] not in skip and not _removed(d):
                     usable[j].append(d)
-            if len(page) < PAGE:
+            if len(page) < size:  # not `PAGE`: after a timeout the page asked for may have been smaller
                 reached = searched  # all of [known[i], searched) is in
             elif new:
                 # A full page: posts sharing its last second may continue on the next one.
@@ -399,12 +401,14 @@ class ArcticShiftClient:
         posts.sort(key=lambda p: p.created_utc)
         return posts
 
-    def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int]:
-        """Posts from [lo, hi) and the end of the window actually searched: when the archive times
-        out, the window is halved (down to MIN_WINDOW) and only its first part is searched."""
+    def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int, int]:
+        """Posts from [lo, hi), the end of the window actually searched, and the page size actually
+        asked for: when the archive times out, the page is made smaller, then the window is halved
+        (down to MIN_WINDOW) and only its first part is searched."""
         while True:
             try:
-                return self.get("/api/posts/search", dict(base, after=lo, before=hi, limit=size)), hi
+                page = self.get("/api/posts/search", dict(base, after=lo, before=hi, limit=size))
+                return page, hi, self.last_params.get("limit", size)
             except QueryTimeout:
                 if hi - lo <= MIN_WINDOW:
                     raise

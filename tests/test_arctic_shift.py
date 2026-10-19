@@ -517,3 +517,28 @@ def test_a_window_narrowed_after_a_timeout_stays_narrow():
     c.fetch_posts("python", after=T0, before=T0 + 6 * 3600, limit=30)
     wide = [p for _, p in session.calls if p["before"] - p["after"] > 1800]
     assert len(wide) <= 3 * 4  # only the first read tries the long windows
+
+
+class BusyArchive(ArchiveSession):
+    """Times out on any page bigger than ``max_limit``, so the client retries with smaller pages."""
+
+    def __init__(self, items, max_limit):
+        super().__init__(items)
+        self.max_limit = max_limit
+
+    def get(self, url, params=None, timeout=None):
+        if url.endswith("/api/posts/search") and params["limit"] > self.max_limit:
+            self.calls.append((url, dict(params)))
+            return FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
+        return super().get(url, params, timeout)
+
+
+def test_a_page_shrunk_after_a_timeout_isnt_taken_for_the_end_of_the_range():
+    items = [at(T0 + 100 + i * 120, i) for i in range(7 * 720)]  # a post every 2 minutes for a week
+    clock = FakeClock()
+    c = ArcticShiftClient(session=BusyArchive(items, max_limit=50), limiter=RateLimiter(0.0, clock, clock.sleep))
+    posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28)
+    per_day = [sum(1 for p in posts if T0 + d * DAY <= p.created_utc < T0 + (d + 1) * DAY) for d in range(7)]
+    assert per_day == [4] * 7
+    timeouts = [p for _, p in c.session.calls if p["limit"] > 50]
+    assert len(timeouts) == 1  # the smaller page that worked is kept, not retried at full size each time
