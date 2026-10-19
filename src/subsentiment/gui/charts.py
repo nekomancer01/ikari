@@ -14,8 +14,10 @@ from PySide6.QtCharts import (
     QScatterSeries, QStackedBarSeries, QValueAxis,
 )
 from PySide6.QtCore import QMargins, QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QApplication, QGraphicsPathItem, QGraphicsSimpleTextItem, QToolTip
+from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QLinearGradient, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import (
+    QApplication, QGraphicsDropShadowEffect, QGraphicsPathItem, QGraphicsSimpleTextItem, QToolTip,
+)
 
 from subsentiment.gui import theme
 
@@ -132,8 +134,13 @@ class DistributionChart(QChartView):
         self._bars = []
         for i, cat in enumerate(self.CATEGORIES):
             bar = QGraphicsPathItem(chart)
-            bar.setBrush(QColor(colors[cat]))
+            bar.setData(0, colors[cat])  # base color; the shaded brush is built per size in _place_labels
             bar.setPen(QPen(Qt.PenStyle.NoPen))
+            shadow = QGraphicsDropShadowEffect()
+            shadow.setBlurRadius(14)
+            shadow.setOffset(2, 3)
+            shadow.setColor(QColor(0, 0, 0, 110 if theme.mode() == "dark" else 45))
+            bar.setGraphicsEffect(shadow)
             bar.setAcceptHoverEvents(False)  # hover goes to the series' own bar underneath
             bar.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self._bars.append((bar, i, float(counts.get(cat, 0))))
@@ -165,7 +172,9 @@ class DistributionChart(QChartView):
         for bar, i, value in self._bars:
             top_left = chart.mapToPosition(QPointF(i - half, value), self._series)
             base_right = chart.mapToPosition(QPointF(i + half, 0), self._series)
-            bar.setPath(_rounded_bar(QRectF(top_left, base_right).normalized()))
+            rect = QRectF(top_left, base_right).normalized()
+            bar.setPath(_rounded_bar(rect))
+            bar.setBrush(_shaded(QColor(bar.data(0)), rect))
         for count, share, i, value in self._labels:
             top = chart.mapToPosition(QPointF(i, value), self._series)
             c, sh = count.boundingRect(), share.boundingRect()
@@ -193,6 +202,17 @@ def _rounded_bar(r: QRectF) -> QPainterPath:
     path.lineTo(r.right(), r.bottom())
     path.closeSubpath()
     return path
+
+
+def _shaded(base: QColor, r: QRectF) -> QBrush:
+    """Light from the upper left: a soft cylinder shade across the bar. The middle of
+    the bar keeps the validated palette color, so the category still reads by hue."""
+    g = QLinearGradient(r.topLeft(), r.topRight())
+    g.setColorAt(0.0, base.lighter(122))
+    g.setColorAt(0.3, base.lighter(108))
+    g.setColorAt(0.55, base)
+    g.setColorAt(1.0, base.darker(118))
+    return QBrush(g)
 
 
 # Symmetric y ranges for the timeline: the smallest that fits the data, so day-to-day
