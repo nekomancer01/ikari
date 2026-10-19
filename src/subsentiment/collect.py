@@ -100,15 +100,13 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     subreddit = first.subreddit if first else name  # canonical capitalisation from Reddit
 
     # 3. Comments: for new posts, for saved ones whose scores just settled (their comment scores have
-    #    too), for saved posts this fetch picked again that never got theirs, and for saved posts whose
-    #    comments failed last time. Saved posts that were never asked about (a day downloaded without
-    #    comments) are left alone: a fetch doesn't quietly fill in comments for posts it didn't pick.
+    #    too), and for saved posts whose comments were never fetched or failed last time. A post whose
+    #    comments came back fine, even if there were none, isn't asked about again.
     n_comments = errors = 0
     if req.include_comments and not should_stop():
         refreshed = {p.id for p in updated}
-        repicked = {p.id for p in picked} - {p.id for p in new}
-        todo = new + updated + [_stored_post(r) for pid, r in stored.items() if pid not in refreshed and (
-            r["comments_ok"] == 0 or (pid in repicked and _comments_missing(r)))]
+        todo = new + updated + [_stored_post(r) for pid, r in stored.items()
+                                if pid not in refreshed and _comments_missing(r)]
         todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up
         failed_in_row = 0
         for i, p in enumerate(todo, 1):
@@ -124,9 +122,6 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
                 failed_in_row += 1
                 if failed_in_row >= GIVE_UP_AFTER:  # the archive is struggling; don't hammer it
                     errors += len(todo) - i
-                    for skipped in todo[i:]:  # marked failed, so the next fetch retries them
-                        store.mark_comments(skipped.id, ok=False, settled=False)
-                    store.commit()
                     break
                 continue
             failed_in_row = 0

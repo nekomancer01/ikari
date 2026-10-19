@@ -176,32 +176,6 @@ def test_downloading_a_whole_day_marks_it_complete_only_when_the_archive_ran_out
     assert s2.complete_keys("posts", "python") == set()  # it may have had more than the 2 asked for
 
 
-def test_a_fetch_leaves_saved_posts_it_didnt_pick_alone(tmp_path):
-    # A day downloaded without comments, then an ordinary fetch over the same range: only the posts the
-    # fetch picked get comments, not every saved post that never had any.
-    s = store_with(tmp_path, [mk(i) for i in range(1, 6)])
-    c = FakeClient(posts=[mk(6), mk(7)])
-    result = collect.run(c, s, collect.FetchRequest("python"))
-    assert sorted(call[1] for call in c.calls if call[0] == "comments") == ["p6", "p7"]
-    assert result.comments == 2
-
-
-def test_top_mode_fills_in_comments_for_saved_posts_it_picks_again(tmp_path):
-    s = store_with(tmp_path, [mk(1), mk(2)])
-    c = FakeClient(posts=[mk(1)])
-    collect.run(c, s, collect.FetchRequest("python", top=True))
-    assert [call[1] for call in c.calls if call[0] == "comments"] == ["p1"]
-
-
-def test_comments_skipped_after_giving_up_are_retried_but_nothing_else(tmp_path):
-    s = store_with(tmp_path, [mk(100)])  # saved earlier without comments; never part of these fetches
-    posts = [mk(i) for i in range(8)]
-    collect.run(FakeClient(posts=posts, failing={p.id for p in posts}), s, collect.FetchRequest("python"))
-    c = FakeClient(posts=posts)
-    collect.run(c, s, collect.FetchRequest("python"))
-    assert sorted(call[1] for call in c.calls if call[0] == "comments") == sorted(p.id for p in posts)
-
-
 def test_each_post_and_comment_is_saved_and_announced_as_it_arrives(tmp_path):
     s = store_with(tmp_path, [])
     counts = []
