@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+train = ["scikit-learn>=1.4", "scipy", "numpy"]
 
 [project.gui-scripts]
 subsentiment = "subsentiment.gui.app:main"
@@ -30,3 +31,4 @@ testpaths = ["tests"]
 
 [tool.setuptools.package-data]
 "subsentiment.gui" = ["assets/*"]
+"subsentiment.data" = ["*.json.gz"]

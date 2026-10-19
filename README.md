@@ -7,9 +7,12 @@ sentiment, and lets you explore and export the results.
 
 - Fetch from any subreddit by sort (hot/new/top/rising/controversial) and time range, or search within it.
 - Optionally fetch comments for each post (full reply trees, "load more" stubs skipped).
-- Sentiment scoring with [VADER](https://github.com/cjhutto/vaderSentiment), which is tuned for
-  social-media text. Quoted text, code blocks and URLs are stripped before scoring. Labels use the
-  standard cut-offs: compound ≥ 0.05 is positive, ≤ −0.05 negative, otherwise neutral.
+- Sentiment scoring with a small bundled offline classifier (TF-IDF plus
+  [VADER](https://github.com/cjhutto/vaderSentiment) features, trained on GoEmotions Reddit
+  comments with `tools/train_model.py`). It is built for accurate totals over many comments, not
+  for every single one: on the GoEmotions test split it gets 73% of labels right (plain VADER: 65%)
+  and its overall positive/neutral/negative split is off by 4 points (VADER: 14). Quoted text, code
+  blocks and URLs are stripped before scoring. Plain VADER is the fallback if the model is missing.
 - Overview tab: summary numbers, sentiment distribution, mean sentiment per day, and the most
   positive/negative items.
 - Posts and Comments tabs: sortable, filterable tables. Double-click a row to open it on Reddit.
@@ -90,7 +93,7 @@ Layout:
 | Path | Purpose |
 |---|---|
 | `src/subsentiment/reddit.py` | Reddit client: anonymous or OAuth, pagination, rate limiting, comment trees |
-| `src/subsentiment/sentiment.py` | Text cleanup + VADER scoring |
+| `src/subsentiment/sentiment.py` | Text cleanup + scoring (bundled model, VADER fallback) |
 | `src/subsentiment/store.py` | SQLite storage, CSV export, summary helpers |
 | `src/subsentiment/collect.py` | One fetch job: fetch → score → store |
 | `src/subsentiment/gui/` | Qt main window, charts, table models, background worker, settings |
