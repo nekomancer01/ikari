@@ -1,0 +1,55 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" pyinstaller
+
+      - name: Test
+        run: pytest -q
+
+      - name: Build app
+        run: pyinstaller packaging/subsentiment.spec --noconfirm
+
+      - name: Check the app starts
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\SubredditSentiment\SubredditSentiment.exe -PassThru
+          Start-Sleep -Seconds 15
+          if ($p.HasExited) { throw "App exited early with code $($p.ExitCode)" }
+          Stop-Process -Id $p.Id
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc packaging\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+
+      - name: Zip portable build
+        shell: pwsh
+        run: Compress-Archive -Path dist\SubredditSentiment -DestinationPath dist\SubredditSentiment-windows-portable.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SubredditSentiment-windows
+          path: |
+            dist/SubredditSentiment-windows-portable.zip
+            dist/SubredditSentiment-Setup-*.exe

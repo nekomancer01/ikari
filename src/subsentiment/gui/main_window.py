@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 
 from PySide6.QtCore import QEvent, QRectF, QSettings, QSortFilterProxyModel, Qt, QThread, QUrl
-from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QKeySequence, QPainter
+from PySide6.QtGui import (
+    QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPainter,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
@@ -12,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from subsentiment import collect
-from subsentiment.gui import settings_dialog, theme
+from subsentiment.gui import settings_dialog, theme, win_native
 from subsentiment.gui.charts import DistributionChart, TimelineChart, palette
 from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, RowsModel
 from subsentiment.gui.theme import mark, paint_backdrop
@@ -176,6 +178,13 @@ class MainWindow(QMainWindow):
         self.current: str | None = None
         self.posts: list = []
         self.comments: list = []
+        self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
+        # Windows 11 Mica/Acrylic needs a translucent window from the start, so it applies on next launch.
+        backdrop = self.settings.value("ui/backdrop", "gradient", str)
+        self._native_backdrop = backdrop if win_native.backdrop_supported() and backdrop in win_native.BACKDROPS else None
+        if self._native_backdrop:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._shown = False
 
         self._build_menu()
         backdrop = QWidget()  # transparent: the window paints the backdrop behind menus too
@@ -215,6 +224,19 @@ class MainWindow(QMainWindow):
                                   checked=self.settings.value("ui/reduce_transparency", False, bool))
         self.reduce_act.toggled.connect(self._set_reduce)
         view.addAction(self.reduce_act)
+
+        bg_menu = view.addMenu("Window background")
+        bg_group = QActionGroup(self)
+        current_bg = self.settings.value("ui/backdrop", "gradient", str)
+        for key, text in (("gradient", "Gradient"), ("mica", "Windows Mica"), ("acrylic", "Windows Acrylic (most glassy)")):
+            act = QAction(text, self, checkable=True, checked=key == current_bg)
+            if key != "gradient" and not win_native.backdrop_supported():
+                act.setEnabled(False)
+                act.setToolTip("Needs Windows 11 version 22H2 or later")
+            act.triggered.connect(lambda _=False, k=key: self._set_backdrop(k))
+            bg_group.addAction(act)
+            bg_menu.addAction(act)
+        bg_menu.setToolTipsVisible(True)
 
     def _build_sidebar(self) -> QWidget:
         side, lay = panel("true", margins=20, spacing=14)
@@ -389,10 +411,34 @@ class MainWindow(QMainWindow):
         self.settings.setValue("ui/reduce_transparency", on)
         self._apply_theme()
 
+    def _set_backdrop(self, key: str) -> None:
+        self.settings.setValue("ui/backdrop", key)
+        self.statusBar().showMessage("Restart the app to change the window background.", 10000)
+
+    def _style_native_frame(self) -> None:
+        hwnd = int(self.winId())
+        t = theme.tokens()
+        dark = theme.mode() == "dark"
+        if self._native_backdrop:
+            win_native.style_title_bar(hwnd, dark)
+        else:
+            win_native.style_title_bar(hwnd, dark, caption=t["bg0"], text=t["text"])
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._shown:
+            self._shown = True
+            if self._native_backdrop and not win_native.apply_backdrop(int(self.winId()), self._native_backdrop):
+                # Material refused: fall back to the painted gradient (opaque paint covers the translucency).
+                self._native_backdrop = None
+                self.update()
+            self._style_native_frame()
+
     def _apply_theme(self) -> None:
         theme.apply(QApplication.instance(), self.settings.value("ui/theme", "system", str),
                     self.settings.value("ui/reduce_transparency", False, bool))
         self.update()
+        self._style_native_frame()
         self._show_dataset(self.current or "")  # re-pick chart and swatch colors
 
     # -- control state --------------------------------------------------------
@@ -583,7 +629,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(self._mode_text())
 
     def paintEvent(self, event) -> None:
-        paint_backdrop(self)
+        paint_backdrop(self, over_native=self._native_backdrop is not None)
 
     def closeEvent(self, event) -> None:
         if self.worker:

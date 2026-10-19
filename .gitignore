@@ -5,3 +5,7 @@ __pycache__/
 *.db-wal
 *.db-shm
 *.csv
+
+build/
+dist/
+.venv-build/

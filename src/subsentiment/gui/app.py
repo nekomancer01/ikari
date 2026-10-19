@@ -6,7 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, QStandardPaths
 from PySide6.QtWidgets import QApplication
 
-from subsentiment.gui import theme
+from subsentiment.gui import theme, win_native
 from subsentiment.gui.main_window import MainWindow
 
 
@@ -16,6 +16,7 @@ def default_db_path() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    win_native.set_app_user_model_id()  # before any window, so the taskbar uses our icon
     app = QApplication(argv if argv is not None else sys.argv)
     app.setOrganizationName("subsentiment")
     app.setApplicationName("Subreddit Sentiment")

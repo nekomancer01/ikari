@@ -9,7 +9,8 @@ description = "Desktop app to gather subreddit posts/comments and analyse their 
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "PySide6>=6.6",
+    "PySide6>=6.7",
+    "keyring>=24",
     "requests>=2.31",
     "vaderSentiment>=3.3.2",
 ]

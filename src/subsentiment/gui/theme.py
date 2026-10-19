@@ -13,6 +13,7 @@ numbers line up in columns.
 """
 from __future__ import annotations
 
+import sys
 import tempfile
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from PySide6.QtGui import (
     QColor, QFont, QFontDatabase, QGuiApplication, QLinearGradient, QPainter, QPalette,
     QRadialGradient,
 )
-from PySide6.QtWidgets import QApplication, QGraphicsDropShadowEffect, QWidget
+from PySide6.QtWidgets import QApplication, QWidget
 
 ASSETS = Path(__file__).parent / "assets"
 
@@ -101,7 +102,8 @@ def load_fonts(app: QApplication) -> None:
     font.setFamilies(UI_FAMILIES)
     font.setPointSizeF(10)
     font.setWeight(QFont.Weight.Medium)  # Manrope's regular is light on translucent fills
-    font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+    if sys.platform != "win32":  # Windows text is crisper with its default (DirectWrite) hinting
+        font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
     font.setFeature(QFont.Tag("tnum"), 1)
     app.setFont(font)
 
@@ -110,7 +112,8 @@ def _icons(t: dict) -> Path:
     """Write the small SVG glyphs the stylesheet needs, colored for this theme."""
     global _icon_dir
     if _icon_dir is None:
-        _icon_dir = Path(tempfile.mkdtemp(prefix="subsentiment-icons-"))
+        _icon_dir = Path(tempfile.gettempdir()) / "subsentiment-icons"
+        _icon_dir.mkdir(exist_ok=True)
     chevron = ('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12">'
                '<path d="M{d}" fill="none" stroke="{c}" stroke-width="1.6" stroke-linecap="round" '
                'stroke-linejoin="round"/></svg>')
@@ -125,7 +128,7 @@ def _icons(t: dict) -> Path:
 
 
 def stylesheet(t: dict) -> str:
-    icons = _icons(t).as_posix()
+    icons = _icons(t).as_posix()  # forward slashes; urls are quoted below for paths with spaces
     glass, strong, soft = _rgba(t["glass"]), _rgba(t["glass_strong"]), _rgba(t["glass_soft"])
     solid = _rgba(t["solid"])
     display = f'"{DISPLAY_FAMILY}"'
@@ -171,7 +174,7 @@ QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QComboBox:on {{ border: 1px so
 QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{ color: {t['faint']}; background: {soft}; }}
 QLineEdit[placeholderText] {{ }}
 QComboBox::drop-down {{ border: none; width: 26px; }}
-QComboBox::down-arrow {{ image: url({icons}/{_mode}-down.svg); width: 12px; height: 12px; }}
+QComboBox::down-arrow {{ image: url("{icons}/{_mode}-down.svg"); width: 12px; height: 12px; }}
 QComboBox QAbstractItemView {{
     background: {t['menu']}; border: 1px solid {edge}; border-radius: 10px; padding: 4px;
     selection-background-color: {sel}; selection-color: {t['text']}; outline: 0;
@@ -180,13 +183,13 @@ QSpinBox {{ padding-right: 24px; }}
 QSpinBox::up-button, QSpinBox::down-button {{ border: none; width: 22px; background: transparent; subcontrol-origin: border; }}
 QSpinBox::up-button {{ subcontrol-position: top right; margin: 3px 4px 0 0; }}
 QSpinBox::down-button {{ subcontrol-position: bottom right; margin: 0 4px 3px 0; }}
-QSpinBox::up-arrow {{ image: url({icons}/{_mode}-up.svg); width: 10px; height: 10px; }}
-QSpinBox::down-arrow {{ image: url({icons}/{_mode}-down.svg); width: 10px; height: 10px; }}
+QSpinBox::up-arrow {{ image: url("{icons}/{_mode}-up.svg"); width: 10px; height: 10px; }}
+QSpinBox::down-arrow {{ image: url("{icons}/{_mode}-down.svg"); width: 10px; height: 10px; }}
 
 QCheckBox {{ spacing: 8px; background: transparent; }}
 QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 5px; border: 1px solid {t['faint']}; background: {strong}; }}
 QCheckBox::indicator:hover {{ border-color: {t['accent']}; }}
-QCheckBox::indicator:checked {{ background: {t['accent']}; border-color: {t['accent']}; image: url({icons}/{_mode}-check.svg); }}
+QCheckBox::indicator:checked {{ background: {t['accent']}; border-color: {t['accent']}; image: url("{icons}/{_mode}-check.svg"); }}
 QCheckBox:disabled {{ color: {t['faint']}; }}
 
 /* Buttons */
@@ -239,8 +242,8 @@ QHeaderView::section {{
     padding: 8px; font-weight: 600; font-size: 8.5pt;
 }}
 QHeaderView::section:hover {{ color: {t['text']}; }}
-QHeaderView::up-arrow {{ image: url({icons}/{_mode}-up.svg); width: 10px; height: 10px; subcontrol-position: center right; padding-right: 6px; }}
-QHeaderView::down-arrow {{ image: url({icons}/{_mode}-down.svg); width: 10px; height: 10px; subcontrol-position: center right; padding-right: 6px; }}
+QHeaderView::up-arrow {{ image: url("{icons}/{_mode}-up.svg"); width: 10px; height: 10px; subcontrol-position: center right; padding-right: 6px; }}
+QHeaderView::down-arrow {{ image: url("{icons}/{_mode}-down.svg"); width: 10px; height: 10px; subcontrol-position: center right; padding-right: 6px; }}
 QTableCornerButton::section {{ background: transparent; border: none; }}
 
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 4px 2px; }}
@@ -295,31 +298,33 @@ def mark(widget: QWidget, prop: str, value) -> QWidget:
     return widget
 
 
-def add_shadow(widget: QWidget, blur: int = 36, dy: int = 10) -> None:
-    effect = QGraphicsDropShadowEffect(widget)
-    effect.setBlurRadius(blur)
-    effect.setOffset(0, dy)
-    effect.setColor(QColor(*tokens()["shadow"]))
-    widget.setGraphicsEffect(effect)
+def paint_backdrop(widget: QWidget, over_native: bool = False) -> None:
+    """Window background: a diagonal gradient with a few large, soft color glows.
 
-
-def paint_backdrop(widget: QWidget) -> None:
-    """Window background: a diagonal gradient with a few large, soft color glows."""
+    over_native: a Windows Mica/Acrylic material is behind the window, so only
+    lay a thin tint over it (enough to keep text contrast) and fainter glows.
+    """
     t = tokens()
     p = QPainter(widget)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     r = QRectF(widget.rect())
     base = QLinearGradient(r.topLeft(), r.bottomRight())
-    base.setColorAt(0, QColor(t["bg0"]))
-    base.setColorAt(1, QColor(t["bg1"]))
+    c0, c1 = QColor(t["bg0"]), QColor(t["bg1"])
+    if over_native:
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        c0.setAlpha(150 if _mode == "dark" else 120)
+        c1.setAlpha(150 if _mode == "dark" else 120)
+    base.setColorAt(0, c0)
+    base.setColorAt(1, c1)
     p.fillRect(r, base)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
     w, h = r.width(), r.height()
     spots = [(0.12, 0.08, 0.55), (0.92, 0.18, 0.5), (0.62, 1.0, 0.6)]
     for (fx, fy, fr), (hex_color, alpha) in zip(spots, t["blobs"]):
         radius = max(w, h) * fr
         g = QRadialGradient(QPointF(w * fx, h * fy), radius)
         c = QColor(hex_color)
-        c.setAlpha(alpha)
+        c.setAlpha(alpha // 2 if over_native else alpha)
         g.setColorAt(0, c)
         c.setAlpha(0)
         g.setColorAt(1, c)
