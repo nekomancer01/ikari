@@ -54,8 +54,13 @@ a = Analysis(
     pathex=[],
     datas=datas,
     hiddenimports=hiddenimports,
-    # Qt modules the app never uses; keeps the download smaller.
-    excludes=["tkinter", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.Qt3DCore",
+    # Dev/test/training-only packages must never ship: the app runs on the bundled model in
+    # subsentiment/data. Excluded by name so a dev install (pytest, scikit-learn, ...) in the
+    # build environment can't leak into the package. tools/ and tests/ sit outside src/ and are
+    # never collected; "tools"/"tests" here guards against a stray top-level import path.
+    # Qt modules the app never uses are excluded too; keeps the download smaller.
+    excludes=["pytest", "_pytest", "sklearn", "scipy", "numpy", "setuptools", "pkg_resources",
+              "tools", "tests", "tkinter", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.Qt3DCore",
               "PySide6.QtQuick", "PySide6.QtQml", "PySide6.QtMultimedia", "PySide6.QtPdf"],
     noarchive=False,
 )

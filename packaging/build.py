@@ -51,6 +51,15 @@ def pyinstaller() -> None:
         "--distpath", DIST, "--workpath", BUILD)
 
 
+def check_no_dev_files() -> None:
+    """Fail the build if test/training tooling ended up in the app folder."""
+    banned = {"pytest", "_pytest", "sklearn", "scipy", "numpy", "tools", "tests"}
+    root = DIST / "ikari.app" if sys.platform == "darwin" else DIST / "ikari"
+    found = sorted({p.name for p in root.rglob("*") if p.name in banned})
+    if found:
+        raise SystemExit(f"dev-only files in the package: {', '.join(found)}")
+
+
 def build_windows(v: str) -> None:
     app = DIST / "ikari"
     zip_base = DIST / f"ikari-{v}-windows-x64"
@@ -140,6 +149,7 @@ def main() -> int:
     v = version()
     print(f"Building ikari {v} for {sys.platform}", flush=True)
     pyinstaller()
+    check_no_dev_files()
     if sys.platform == "win32":
         build_windows(v)
     elif sys.platform == "darwin":
