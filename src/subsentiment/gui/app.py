@@ -28,6 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName(STORAGE_APP)  # drives storage paths only; the visible name is the display name
     app.setApplicationDisplayName("ikari")
     settings = QSettings()
+    settings.remove("reddit")  # Reddit API credentials from versions that supported the official API
     theme.load_fonts(app)
     requested = settings.value("ui/theme", "system", str)
     native.set_appearance(requested)

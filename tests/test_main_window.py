@@ -1,11 +1,12 @@
 """The fetch form and saved-data list survive a restart; the delete actions clear the store."""
 import os
+from datetime import datetime, timedelta
 
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings  # noqa: E402
+from PySide6.QtCore import QDate, QSettings  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from subsentiment.gui import main_window as mw  # noqa: E402
@@ -22,7 +23,6 @@ def make_window(tmp_path, monkeypatch):
     QSettings.setDefaultFormat(QSettings.Format.IniFormat)
     QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path / "cfg"))
     QSettings().setValue("updates/auto", False)
-    monkeypatch.setattr(mw.settings_dialog, "load", lambda s: {"client_id": "", "client_secret": ""})
     db = tmp_path / "w.db"
     s = Store(db)
     for i, sub in enumerate(("Python", "rust")):
@@ -45,10 +45,10 @@ def test_fetch_form_and_viewed_dataset_are_restored(make_window):
     w = make_window()
     w.subreddit.setText("r/AskScience")
     w.query.setText("black holes")
-    w.sort.setCurrentIndex(w.sort.findData("top"))
-    w.time_filter.setCurrentIndex(w.time_filter.findData("year"))
+    w.date_from.setDate(QDate(2026, 3, 1))  # editing a date switches to a custom range
+    w.date_to.setDate(QDate(2026, 3, 31))
     w.limit.setValue(250)
-    w.include_comments.setChecked(True)
+    w.include_comments.setChecked(False)
     w.comments_per_post.setValue(20)
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     w.tabbar.setCurrentIndex(1)
@@ -56,23 +56,41 @@ def test_fetch_form_and_viewed_dataset_are_restored(make_window):
 
     again = make_window()
     assert again.subreddit.text() == "r/AskScience" and again.query.text() == "black holes"
-    assert again.sort.currentData() == "top" and again.time_filter.currentData() == "year"
-    assert (again.limit.value(), again.include_comments.isChecked(), again.comments_per_post.value()) == (250, True, 20)
-    assert again.comments_per_post.isEnabled()
+    assert again.range.currentData() == "custom"
+    assert (again.date_from.date(), again.date_to.date()) == (QDate(2026, 3, 1), QDate(2026, 3, 31))
+    assert (again.limit.value(), again.include_comments.isChecked(), again.comments_per_post.value()) == (250, False, 20)
+    assert not again.comments_per_post.isEnabled()
     assert again.current == "Python" and again.tabbar.currentIndex() == 1
 
 
-def test_sort_options_follow_search_and_time_range_only_where_it_applies(make_window):
+def test_comments_are_fetched_by_default_and_presets_fill_the_dates(make_window):
     w = make_window()
-    assert [w.sort.itemData(i) for i in range(w.sort.count())] == list(mw.LISTING_SORTS)
-    w.sort.setCurrentIndex(w.sort.findData("rising"))
-    assert not w.time_filter.isEnabled()
-    w.query.setText("q")
-    assert w.sort.currentData() == "relevance" and w.time_filter.isEnabled()
-    w.query.setText("")
-    assert w.sort.currentData() == "hot" and not w.time_filter.isEnabled()
-    w.sort.setCurrentIndex(w.sort.findData("top"))
-    assert w.time_filter.isEnabled()
+    assert w.include_comments.isChecked() and w.range.currentData() == "week"
+    today = QDate.currentDate()
+    assert (w.date_from.date(), w.date_to.date()) == (today.addDays(-7), today)
+    w.range.setCurrentIndex(w.range.findData("month"))
+    assert w.date_from.date() == today.addDays(-30) and w.range.currentData() == "month"
+
+
+def test_range_bounds():
+    now = datetime(2026, 10, 19, 12, 0)
+    assert mw.range_bounds("day", QDate(), QDate(), now) == ((now - timedelta(days=1)).timestamp(), None)
+    after, before = mw.range_bounds("custom", QDate(2026, 3, 31), QDate(2026, 3, 1), now)  # reversed is fine
+    assert after == datetime(2026, 3, 1).timestamp() and before == datetime(2026, 4, 1).timestamp()
+
+
+def test_fetch_builds_a_date_range_request(make_window, monkeypatch):
+    sent = []
+    monkeypatch.setattr(mw, "FetchWorker", lambda req, db: sent.append(req) or (_ for _ in ()).throw(RuntimeError))
+    w = make_window()
+    w.subreddit.setText("python")
+    w.date_from.setDate(QDate(2026, 3, 1))
+    w.date_to.setDate(QDate(2026, 3, 2))
+    with pytest.raises(RuntimeError):
+        w._start_fetch()
+    (req,) = sent
+    assert (req.after, req.before) == (datetime(2026, 3, 1).timestamp(), datetime(2026, 3, 3).timestamp())
+    assert req.include_comments
 
 
 def test_invalid_subreddit_is_explained_without_starting_a_fetch(make_window):

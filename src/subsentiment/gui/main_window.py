@@ -1,50 +1,70 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from PySide6.QtCore import QEvent, QRectF, QSettings, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl
+from PySide6.QtCore import QDate, QEvent, QRectF, QSettings, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import (
-    QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPainter,
+    QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence,
+    QPainter,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QSpinBox, QStackedWidget, QTableView, QTabBar,
     QVBoxLayout, QWidget,
 )
 
 from subsentiment import __version__, collect
-from subsentiment.gui import native, settings_dialog, theme
+from subsentiment.gui import native, theme
 from subsentiment.gui.charts import DistributionChart, TimelineChart, palette
 from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, RowsModel
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.worker import FetchWorker
-from subsentiment.reddit import LISTING_SORTS, SEARCH_SORTS, TIME_FILTERS, normalize_subreddit, subreddit_error
+from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, daily_means, summarize
 
 
-# Reddit's API keys stay the stored values; these are only what the controls show.
-SORT_LABELS = {"hot": "Hot", "new": "New", "top": "Top", "rising": "Rising", "controversial": "Controversial",
-               "relevance": "Relevance", "comments": "Most comments"}
-TIME_LABELS = {"hour": "Past hour", "day": "Past 24 hours", "week": "Past week", "month": "Past month",
-               "year": "Past year", "all": "All time"}
-TIMED_SORTS = ("top", "controversial")  # listing sorts that take a time range; searches always do
+# Date ranges the fetch form offers: key -> (label, days back from now). "custom" uses the From/To dates.
+RANGES = {"day": ("Past 24 hours", 1), "week": ("Past week", 7), "month": ("Past 30 days", 30),
+          "quarter": ("Past 3 months", 91), "year": ("Past year", 365), "custom": ("Custom dates", None)}
 
 # Last-used fetch form, restored at startup. Keys live under "fetch/" in QSettings.
-FETCH_DEFAULTS = {"subreddit": "", "query": "", "sort": "hot", "time_filter": "week", "limit": 100,
-                  "include_comments": False, "comments_per_post": 50}
+FETCH_DEFAULTS = {"subreddit": "", "query": "", "range": "week", "from": "", "to": "", "limit": 100,
+                  "include_comments": True, "comments_per_post": 50}
+
+STATUS_TEXT = ("Posts and comments come from the free Arctic Shift archive of Reddit. Scores and comment "
+               "counts appear about 36 hours after posting.")
 
 
-def fill_combo(combo: QComboBox, keys, labels: dict, keep: str | None = None) -> None:
-    """Show labels for keys (stored as item data), keeping keep selected when it's still offered."""
-    combo.blockSignals(True)
-    combo.clear()
-    for k in keys:
-        combo.addItem(labels.get(k, k), k)
-    i = combo.findData(keep)
-    combo.setCurrentIndex(max(i, 0))
-    combo.blockSignals(False)
+def range_bounds(key: str, start: QDate, end: QDate, now: datetime | None = None) -> tuple[float, float | None]:
+    """(after, before) in epoch seconds for a range key; before is None for "up to now"."""
+    now = now or datetime.now()
+    days = RANGES[key][1]
+    if days is not None:
+        return (now - timedelta(days=days)).timestamp(), None
+    lo, hi = sorted((start, end))
+    first = datetime(lo.year(), lo.month(), lo.day())
+    last = datetime(hi.year(), hi.month(), hi.day()) + timedelta(days=1)  # "to" includes that whole day
+    return first.timestamp(), last.timestamp()
+
+
+def header_font(base: QFont) -> QFont:
+    """The table-header font the stylesheet draws with (8.5pt semibold)."""
+    font = QFont(base)
+    font.setPointSizeF(8.5)
+    font.setWeight(QFont.Weight.DemiBold)
+    return font
+
+
+def date_edit() -> QDateEdit:
+    edit = QDateEdit()
+    edit.setCalendarPopup(True)
+    edit.setDisplayFormat("d MMM yyyy")
+    edit.setMinimumDate(QDate(2005, 6, 1))  # Reddit's first month
+    edit.setMaximumDate(QDate.currentDate())
+    edit.setMinimumWidth(110)  # its size hint is wide enough to squeeze the form's labels
+    return edit
 
 
 def spin_box(lo: int, hi: int, step: int, value: int, suffix: str = "") -> QSpinBox:
@@ -61,9 +81,13 @@ def spin_box(lo: int, hi: int, step: int, value: int, suffix: str = "") -> QSpin
 def human_size(n: int) -> str:
     for unit in ("bytes", "KB", "MB"):
         if n < 1024 or unit == "MB":
-            return f"{n:,.0f} {unit}" if unit == "bytes" else f"{n:,.1f} {unit}"
+            return f"{n:,.0f}\u00a0{unit}" if unit == "bytes" else f"{n:,.1f}\u00a0{unit}"
         n /= 1024
     return ""
+
+
+def plural(n: int, noun: str) -> str:
+    return f"{n:,}\u00a0{noun}{'' if n == 1 else 's'}"  # no-break space keeps a number with its noun
 
 
 def when_text(ts: float | None) -> str:
@@ -99,12 +123,6 @@ class Meter(QWidget):
     def set_share(self, share: float) -> None:
         self.share = max(0.0, min(1.0, share))
         self.update()
-
-    def _show_about(self) -> None:
-        QMessageBox.about(self, "About ikari", (
-            f"<h3>ikari {__version__}</h3>"
-            "<p>Gather subreddit posts and comments and score their sentiment with VADER.</p>"
-            "<p>Fonts: Manrope and Sora, both under the SIL Open Font License 1.1.</p>"))
 
     def paintEvent(self, event) -> None:
         p = QPainter(self)
@@ -178,8 +196,9 @@ class TablePage(QWidget):
         self.view.verticalHeader().setDefaultSectionSize(34)
         self.view.setWordWrap(False)
         self.view.setFrameShape(QFrame.Shape.NoFrame)
+        self.stretch_col = stretch_col
         header = self.view.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(stretch_col, QHeaderView.ResizeMode.Stretch)
         header.setHighlightSections(False)
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -208,8 +227,23 @@ class TablePage(QWidget):
         if text != "All labels":
             rows = [r for r in rows if r["label"] == text.lower()]
         self.model.set_rows(rows)
+        self._fit_columns()
         self._update_count()
 
+    def _fit_columns(self) -> None:
+        """Size each column to its values and its full header title, leaving the rest to the text column.
+
+        Qt's own sizing leaves out room for the sort arrow, so a sorted column's title got cut short."""
+        header = self.view.horizontalHeader()
+        font = header_font(self.view.font())
+        header.setFont(font)  # Qt elides header titles using the widget's font, not the stylesheet's
+        metrics = QFontMetrics(font)
+        for col in range(self.model.columnCount()):
+            if col == self.stretch_col:
+                continue
+            title = self.model.headerData(col, Qt.Orientation.Horizontal)
+            header.resizeSection(col, max(self.view.sizeHintForColumn(col),
+                                          metrics.horizontalAdvance(title) + 16 + 24 + 8))  # padding, arrow, slack
     def _update_count(self, *args) -> None:
         self.count.setText(f"{self.proxy.rowCount():,} rows")
 
@@ -248,7 +282,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_content(), 1)
         self.setCentralWidget(backdrop)
         # Permanent, so temporary messages (exports, restarts) don't wipe the access-mode note.
-        self.mode_label = label(self._mode_text(), "status")
+        self.mode_label = label(STATUS_TEXT, "status")
         self.statusBar().addPermanentWidget(self.mode_label)
         QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _: self._apply_theme())
         self._refresh_datasets(select=self.settings.value("ui/last_dataset", "", str))
@@ -271,10 +305,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.delete_act)
         file_menu.addAction(self.delete_all_act)
         file_menu.addSeparator()
-        # On macOS Qt moves the Preferences, Quit and About roles into the application menu.
-        file_menu.addAction(QAction("Reddit API settings…", self, shortcut=QKeySequence.StandardKey.Preferences,
-                                    menuRole=QAction.MenuRole.PreferencesRole, triggered=self._open_settings))
-        file_menu.addSeparator()
+        # On macOS Qt moves the Quit and About roles into the application menu.
         file_menu.addAction(QAction("Quit", self, shortcut=QKeySequence.StandardKey.Quit,
                                     menuRole=QAction.MenuRole.QuitRole, triggered=self.close))
 
@@ -337,15 +368,18 @@ class MainWindow(QMainWindow):
         self.query.setPlaceholderText("Optional keywords")
         self.query.setClearButtonEnabled(True)
         self.query.returnPressed.connect(self._start_fetch)
-        self.query.textChanged.connect(self._update_sort_options)
-        self.sort = QComboBox()
-        self.sort.currentIndexChanged.connect(self._update_time_enabled)
-        self.time_filter = QComboBox()
-        fill_combo(self.time_filter, TIME_FILTERS, TIME_LABELS, keep=FETCH_DEFAULTS["time_filter"])
-        self.time_label = label("Time range", "muted")
+        self.range = QComboBox()
+        for key, (text, _) in RANGES.items():
+            self.range.addItem(text, key)
+        self.range.currentIndexChanged.connect(self._on_range_changed)
+        self.date_from = date_edit()
+        self.date_to = date_edit()
+        for edit in (self.date_from, self.date_to):
+            edit.userDateChanged.connect(self._on_date_edited)
         self.limit = spin_box(1, 1000, 25, FETCH_DEFAULTS["limit"])
         self.include_comments = QCheckBox("Fetch")
         self.comments_per_post = spin_box(1, 500, 10, FETCH_DEFAULTS["comments_per_post"], " per post")
+        self.comments_per_post.setMinimumWidth(100)  # its size hint would squeeze the form's labels
         self.include_comments.toggled.connect(lambda _: self._update_comments_enabled())
         comments_row = QWidget()
         row = QHBoxLayout(comments_row)
@@ -353,7 +387,6 @@ class MainWindow(QMainWindow):
         row.setSpacing(10)
         row.addWidget(self.include_comments)
         row.addWidget(self.comments_per_post, 1)
-        self._search_mode: bool | None = None
         self._restore_fetch_settings()
 
         lay.addWidget(section("Fetch"))
@@ -363,8 +396,9 @@ class MainWindow(QMainWindow):
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         form.addRow(label("Subreddit", "muted"), self.subreddit)
         form.addRow(label("Search", "muted"), self.query)
-        form.addRow(label("Sort", "muted"), self.sort)
-        form.addRow(self.time_label, self.time_filter)
+        form.addRow(label("Posted", "muted"), self.range)
+        form.addRow(label("From", "muted"), self.date_from)
+        form.addRow(label("To", "muted"), self.date_to)
         form.addRow(label("Max posts", "muted"), self.limit)
         form.addRow(label("Comments", "muted"), comments_row)
         lay.addLayout(form)
@@ -542,31 +576,22 @@ class MainWindow(QMainWindow):
 
     # -- control state --------------------------------------------------------
 
-    def _sort_keys(self) -> tuple[str, ...]:
-        """Sorts the current fetch can use: Reddit's search endpoint takes a different set than listings."""
-        return SEARCH_SORTS if self._search_mode else LISTING_SORTS
+    def _on_range_changed(self) -> None:
+        """A preset fills in the dates it covers, so the From and To boxes always show the range."""
+        days = RANGES[self.range.currentData()][1]
+        if days is not None:
+            today = QDate.currentDate()
+            for edit, date in ((self.date_from, today.addDays(-days)), (self.date_to, today)):
+                edit.blockSignals(True)
+                edit.setMaximumDate(today)
+                edit.setDate(date)
+                edit.blockSignals(False)
 
-    def _time_applies(self) -> bool:
-        return bool(self._search_mode) or self.sort.currentData() in TIMED_SORTS
-
-    def _update_sort_options(self) -> None:
-        searching = bool(self.query.text().strip())
-        if searching == self._search_mode:
-            return  # only rebuild when switching between listing and search, not on every keystroke
-        self._search_mode = searching
-        keep = self.sort.currentData()
-        if keep not in self._sort_keys():
-            keep = "relevance" if searching else "hot"
-        fill_combo(self.sort, self._sort_keys(), SORT_LABELS, keep=keep)
-        self._update_time_enabled()
-
-    def _update_time_enabled(self) -> None:
-        on = self.thread is None and self._time_applies()
-        self.time_filter.setEnabled(on)
-        self.time_label.setEnabled(on)
-        tip = "" if self._time_applies() else "Only used by Top and Controversial, and by searches."
-        self.time_filter.setToolTip(tip)
-        self.time_label.setToolTip(tip)
+    def _on_date_edited(self) -> None:
+        """Typing or picking a date means a custom range."""
+        self.range.blockSignals(True)
+        self.range.setCurrentIndex(self.range.findData("custom"))
+        self.range.blockSignals(False)
 
     def _update_comments_enabled(self) -> None:
         self.comments_per_post.setEnabled(self.thread is None and self.include_comments.isChecked())
@@ -575,31 +600,28 @@ class MainWindow(QMainWindow):
         v = {k: self.settings.value(f"fetch/{k}", d, type(d)) for k, d in FETCH_DEFAULTS.items()}
         self.subreddit.setText(v["subreddit"])
         self.query.setText(v["query"])
-        self._update_sort_options()
-        if self.sort.findData(v["sort"]) >= 0:
-            self.sort.setCurrentIndex(self.sort.findData(v["sort"]))
-        if self.time_filter.findData(v["time_filter"]) >= 0:
-            self.time_filter.setCurrentIndex(self.time_filter.findData(v["time_filter"]))
+        self.range.setCurrentIndex(max(self.range.findData(v["range"]), 0))
+        self._on_range_changed()
+        if self.range.currentData() == "custom":
+            for edit, text in ((self.date_from, v["from"]), (self.date_to, v["to"])):
+                date = QDate.fromString(text, Qt.DateFormat.ISODate)
+                if date.isValid():
+                    edit.blockSignals(True)
+                    edit.setDate(date)
+                    edit.blockSignals(False)
         self.limit.setValue(v["limit"])
         self.include_comments.setChecked(v["include_comments"])
         self.comments_per_post.setValue(v["comments_per_post"])
-        self._update_time_enabled()
         self._update_comments_enabled()
 
     def _save_fetch_settings(self) -> None:
         for k, v in {"subreddit": self.subreddit.text().strip(), "query": self.query.text().strip(),
-                     "sort": self.sort.currentData(), "time_filter": self.time_filter.currentData(),
+                     "range": self.range.currentData(),
+                     "from": self.date_from.date().toString(Qt.DateFormat.ISODate),
+                     "to": self.date_to.date().toString(Qt.DateFormat.ISODate),
                      "limit": self.limit.value(), "include_comments": self.include_comments.isChecked(),
                      "comments_per_post": self.comments_per_post.value()}.items():
             self.settings.setValue(f"fetch/{k}", v)
-
-    def _mode_text(self) -> str:
-        creds = settings_dialog.load(self.settings)
-        if creds["client_id"] and creds["client_secret"]:
-            return "Connected with Reddit API credentials."
-        where = "ikari → Settings" if native.platform_name() == "macos" else "File → Reddit API settings"
-        return (f"Using the Arctic Shift archive (free, no account). Newest posts first; scores settle "
-                f"after about a day. Approved Reddit API keys can be added under {where}.")
 
     def _set_busy(self, busy: bool) -> None:
         # Called after self.thread is set (busy) or cleared (idle); the update helpers read it.
@@ -608,9 +630,9 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(busy)
         if busy:
             self.progress.setRange(0, 0)
-        for w in (self.subreddit, self.query, self.sort, self.limit, self.include_comments):
+        for w in (self.subreddit, self.query, self.range, self.date_from, self.date_to, self.limit,
+                  self.include_comments):
             w.setEnabled(not busy)
-        self._update_time_enabled()
         self._update_comments_enabled()
         self._update_delete_enabled()  # don't delete rows the fetch thread is writing
 
@@ -634,14 +656,15 @@ class MainWindow(QMainWindow):
             return
         self.subreddit.setText(name)
         self._save_fetch_settings()
+        self._on_range_changed()  # a preset counts back from now, not from when the app started
+        after, before = range_bounds(self.range.currentData(), self.date_from.date(), self.date_to.date())
         req = collect.FetchRequest(
-            subreddit=name, sort=self.sort.currentData(), time_filter=self.time_filter.currentData(),
-            limit=self.limit.value(), query=self.query.text().strip(),
+            subreddit=name, after=after, before=before, limit=self.limit.value(), query=self.query.text().strip(),
             include_comments=self.include_comments.isChecked(),
             comments_per_post=self.comments_per_post.value())
         self.request = req
         self.thread = QThread(self)
-        self.worker = FetchWorker(settings_dialog.load(self.settings), req, self.db_path)
+        self.worker = FetchWorker(req, self.db_path)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self._on_progress)
@@ -651,7 +674,7 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.thread.quit)
         self.thread.finished.connect(self._on_thread_done)
         self._set_busy(True)
-        self.progress_msg.setText(f"Contacting Reddit for r/{name}…")
+        self.progress_msg.setText(f"Contacting Arctic Shift for r/{name}…")
         self.thread.start()
 
     def _stop_fetch(self) -> None:
@@ -672,7 +695,7 @@ class MainWindow(QMainWindow):
                 self.progress_msg.setText("Stopped before any posts were fetched.")
             else:
                 matching = f" matching \u201c{self.request.query}\u201d" if self.request.query else ""
-                self.progress_msg.setText(f"No posts found in r/{result.subreddit}{matching}.")
+                self.progress_msg.setText(f"No posts found in r/{result.subreddit}{matching} in this date range.")
             return
         extra = f" and {result.comments:,} comments" if self.request.include_comments else ""
         stopped = " (stopped early)" if result.stopped else ""
@@ -715,7 +738,7 @@ class MainWindow(QMainWindow):
         self._on_dataset_selected(self.datasets.currentItem())  # reload even when the selection is unchanged
         posts, comments = sum(d["posts"] for d in sets), sum(d["comments"] for d in sets)
         self.storage_info.setText(
-            f"{len(sets)} subreddit{'s' if len(sets) != 1 else ''}, {posts:,} posts, {comments:,} comments · "
+            f"{plural(len(sets), 'subreddit')}, {plural(posts, 'post')}, {plural(comments, 'comment')} · "
             f"{human_size(self.store.size_bytes())} on this computer" if sets
             else "Nothing saved yet. Fetched data is kept on this computer between sessions.")
         self._update_delete_enabled()
@@ -740,7 +763,7 @@ class MainWindow(QMainWindow):
         if self.current:
             self.heading.setText(f"r/{self.current}")
             fetched = max((r["fetched_at"] for r in self.posts), default=None)
-            self.subheading.setText(f"{len(self.posts):,} posts and {len(self.comments):,} comments · "
+            self.subheading.setText(f"{plural(len(self.posts), 'post')} and {plural(len(self.comments), 'comment')} · "
                                     f"last fetched {when_text(fetched)}")
         else:
             self.heading.setText("No data yet")
@@ -810,10 +833,6 @@ class MainWindow(QMainWindow):
         if path:
             n = self.store.export_csv(self.current, kind, path)
             self.statusBar().showMessage(f"Exported {n} {kind} to {path}", 8000)
-
-    def _open_settings(self) -> None:
-        if settings_dialog.SettingsDialog(self.settings, self).exec():
-            self.mode_label.setText(self._mode_text())
 
     def _show_about(self) -> None:
         QMessageBox.about(self, "About ikari", (
