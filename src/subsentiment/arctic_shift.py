@@ -328,12 +328,17 @@ class ArcticShiftClient:
         known = [lo for lo, _ in windows]
         picked: list[list[Post]] = [[] for _ in windows]
         reads = [0] * len(windows)
+        span: list[int | None] = [None]  # once the archive times out on a long window, later reads stay this short
 
         def read(i: int) -> None:
             """One page from where slice i got to; marks every slice it covers as read that far."""
             reads[i] += 1
             # `after` is exclusive, so ask from a second earlier; posts already seen are dropped.
-            page, searched = self._page(base, known[i] - 1, end, PAGE)
+            lo = known[i] - 1
+            hi = end if span[0] is None else min(end, lo + span[0])
+            page, searched = self._page(base, lo, hi, PAGE)
+            if searched < hi:
+                span[0] = searched - lo
             new = [d for d in page if d.get("id") and d["id"] not in seen]
             for d in new:
                 seen.add(d["id"])

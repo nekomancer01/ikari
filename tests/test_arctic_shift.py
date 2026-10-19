@@ -507,3 +507,13 @@ def test_all_comments_ask_for_the_whole_thread_and_say_whether_it_is_complete():
     small = Post("p1", "Python", "t", "", "a", 10, 0.9, 0, 1.0, "u", "")  # asks for at least a page
     full = [node(comment(f"c{i}", "t3_p1", i)) for i in range(100)]
     assert client([ok(full)]).fetch_all_comments(small)[1] is False  # a full page may have been cut short
+
+
+def test_a_window_narrowed_after_a_timeout_stays_narrow():
+    items = [at(T0 + 100 + i * 600, i) for i in range(30)]
+    session = SlowArchive(items, max_window=1800)
+    clock = FakeClock()
+    c = ArcticShiftClient(session=session, limiter=RateLimiter(0.0, clock, clock.sleep))
+    c.fetch_posts("python", after=T0, before=T0 + 6 * 3600, limit=30)
+    wide = [p for _, p in session.calls if p["before"] - p["after"] > 1800]
+    assert len(wide) <= 3 * 4  # only the first read tries the long windows
