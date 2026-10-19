@@ -46,6 +46,8 @@ TOP_PAGES = 4  # pages pulled per slice in top mode
 # fetches the winners in full by id. Removed posts only show up in the full copy, so a few spares are kept.
 TOP_FIELDS = "id,created_utc,score,num_comments"
 TOP_SPARE = 0.25
+LIGHT_FIELDS = "id,created_utc"  # all a repeat fetch needs to page past posts it already has
+HYDRATE_EVERY = 1.5  # seconds; a repeat fetch downloads its picks in batches this often, so they still show as they come
 SLOT_PAGES = 10
 TIMEOUT_TRIES = 3  # query timeouts on one request before the caller is asked to narrow it
 MIN_WINDOW = 600  # seconds; a timing-out window is halved down to this
@@ -285,6 +287,16 @@ class ArcticShiftClient:
         spare: list[list[Post]] = [[] for _ in windows]  # top mode: ranked candidates not picked yet
         more = [True] * len(windows)  # the slice may hold posts we haven't read
         cursors = [lo for lo, _ in windows]
+        # A repeat fetch pages past saved posts with light pages (ids and times only) and downloads its
+        # picks by id in batches: slices waiting for that download are kept here as (slice, picks, quota).
+        pending: list[tuple[int, list[dict], int]] = []
+        flushed = self.limiter._clock()
+
+        def flush() -> None:
+            nonlocal flushed
+            self._fill(pending, picked, cursors, more, should_stop, on_posts)
+            flushed = self.limiter._clock()
+
         what = "Ranking" if top else "Collecting"
         for i, ((lo, hi), want) in enumerate(zip(windows, quotas(limit, len(windows)))):
             if should_stop and should_stop():
@@ -293,12 +305,19 @@ class ArcticShiftClient:
                 ranked = sorted(self._top_pool(base, lo, hi, should_stop), key=_light_rank, reverse=True)
                 picked[i], spare[i] = ranked[:want], ranked[want:]
                 more[i] = False
+            elif skip:
+                light, cursors[i], more[i] = self._earliest_ids(base, lo, hi, want, skip, should_stop)
+                pending.append((i, light, want))
+                if (sum(len(c) for _, c, _ in pending) >= IDS_BATCH
+                        or self.limiter._clock() - flushed >= HYDRATE_EVERY):
+                    flush()
             else:
                 picked[i], cursors[i], more[i] = self._earliest(base, lo, hi, want, skip, should_stop,
                                                                 on_posts)
             if progress:
                 got = sum(map(len, picked))
                 progress(f"{what} posts from r/{subreddit}: part {i + 1} of {len(windows)}, {got:,} so far")
+        flush()
 
         # Quiet slices (night hours, a slow week) leave the total short. Share what's missing among the
         # slices that had more to give, a few rounds at most.
@@ -316,11 +335,17 @@ class ArcticShiftClient:
                 if top:
                     picked[i] += spare[i][:want]
                     spare[i] = spare[i][want:]
+                elif skip:
+                    have = skip | {p.id for p in picked[i]}
+                    light, cursors[i], more[i] = self._earliest_ids(base, cursors[i], windows[i][1], want, have,
+                                                                    should_stop)
+                    pending.append((i, light, want))
                 else:
                     have = skip | {p.id for p in picked[i]}
                     extra, cursors[i], more[i] = self._earliest(base, cursors[i], windows[i][1], want, have,
                                                                 should_stop, on_posts)
                     picked[i] += extra
+            flush()
         if top:
             picked = self._hydrate(picked, spare, should_stop)
         posts = [p for group in picked for p in group]
@@ -372,6 +397,57 @@ class ArcticShiftClient:
             # aren't lost; `seen` drops the repeats.
             cursor = int(max(_number(d.get("created_utc"), 0) for d in page)) - 1
         return out, cursor, True
+
+    def _earliest_ids(self, base, lo, hi, want, skip, should_stop) -> tuple[list[dict], int, bool]:
+        """Light copies (LIGHT_FIELDS) of the first ``want`` posts in [lo, hi) that aren't in ``skip``,
+        plus a few spares for posts that turn out to be removed, where to carry on reading from, and
+        whether the slice may hold more. Paging past saved posts like this is far cheaper for the
+        archive than pulling full posts only to throw most of them away."""
+        light = dict(base, fields=LIGHT_FIELDS)
+        need = want + math.ceil(want * TOP_SPARE)
+        out: list[dict] = []
+        seen: set[str] = set()
+        cursor = lo
+        for _ in range(SLOT_PAGES):
+            page, end = self._page(light, cursor, hi, PAGE)
+            new = [d for d in page if d.get("id") and d["id"] not in seen]
+            for d in new:
+                seen.add(d["id"])
+                if d["id"] not in skip and len(out) < need:
+                    out.append(d)
+                    cursor = max(cursor, int(_number(d.get("created_utc"), 0)) - 1)
+            if len(out) >= need or (should_stop and should_stop()):
+                return out, cursor, True
+            if end < hi and (len(page) < PAGE or not new):  # only part of the window was searched
+                cursor = end - 1
+                continue
+            if len(page) < PAGE or not new:
+                return out, cursor, False
+            cursor = int(max(_number(d.get("created_utc"), 0) for d in page)) - 1
+        return out, cursor, True
+
+    def _fill(self, pending, picked, cursors, more, should_stop, on_posts) -> None:
+        """Download the pending slices' picks in one batch by id and add up to each slice's quota to
+        ``picked``, skipping removed posts. A slice with picks left over resumes reading at the first
+        of them, so they're found again if it's asked for more."""
+        if not pending:
+            return
+        full = {p.id: p for p in self.fetch_posts_by_ids([d["id"] for _, light, _ in pending for d in light],
+                                                         should_stop)}
+        fresh: list[Post] = []
+        for i, light, want in pending:
+            used: list[Post] = []
+            for d in light:
+                if len(used) >= want:
+                    cursors[i], more[i] = int(_number(d.get("created_utc"), 0)) - 1, True
+                    break
+                if d["id"] in full:
+                    used.append(full[d["id"]])
+            picked[i] += used
+            fresh += used
+        pending.clear()
+        if fresh and on_posts:
+            on_posts(sorted(fresh, key=lambda p: p.created_utc))
 
     def _top_pool(self, base, lo, hi, should_stop) -> list[dict]:
         """Light candidates (TOP_FIELDS only) for the top posts of [lo, hi): a page from each of
