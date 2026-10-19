@@ -173,6 +173,33 @@ def test_rows_added_during_a_fetch_are_appended_and_fade_in():
     assert [r["id"] for r in m.rows] == ["p3"]
 
 
+def test_append_rows_shows_each_new_row_fading_in_and_skips_ones_already_shown():
+    from subsentiment.gui.models import POST_COLUMNS, RowsModel
+    now = [0.0]
+    m = RowsModel(POST_COLUMNS, clock=lambda: now[0])
+    row = lambda i: {"id": f"p{i}", "sentiment": 0.1, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
+                     "score": 1, "num_comments": 1, "author": "a", "created_utc": 0.0}
+    m.set_rows([row(1)])
+    assert m.append_rows([row(1), row(2)]) == 1 and m.append_rows([row(2)]) == 0
+    fg = mw.Qt.ItemDataRole.ForegroundRole
+    assert m.data(m.index(0, 0), fg) is None and m.data(m.index(1, 0), fg).alphaF() < 0.3
+
+
+def test_rows_saved_by_a_running_fetch_are_dripped_into_the_tables(make_window):
+    w = make_window()
+    w.thread = object()  # a fetch is "running"
+    w.request = mw.collect.FetchRequest("Python")
+    w._since = 0.0
+    w._show_dataset("Python")
+    before = len(w.posts)
+    row = lambda i: {"id": f"new{i}", "sentiment": 0.1, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
+                     "score": None, "num_comments": None, "author": "a", "created_utc": 1.0, "fetched_at": 1.0}
+    w.posts_tab.add_rows([row(1), row(2)])
+    assert len(w.posts) == before + 2 and w.posts_tab.model.rowCount() == before + 2
+    assert w.posts_tab.add_rows([row(2)]) == 0
+    w.thread = None
+
+
 def test_coverage_window_lists_days_and_downloads_through_the_fetch_job(make_window, monkeypatch):
     from subsentiment.gui import coverage
 

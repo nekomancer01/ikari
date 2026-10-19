@@ -83,3 +83,15 @@ def test_coverage_counts_per_day_and_complete_marks_are_cleared_with_the_data(tm
     assert s.complete_keys("posts", "python") == set() and s.complete_keys("comments", "rust") == {"r1"}
     s.delete_all()
     assert s.complete_keys("comments", "rust") == set()
+
+
+def test_posts_and_comments_since_return_only_what_a_fetch_just_saved(tmp_path):
+    import time
+    s = Store(tmp_path / "x.db")
+    p = Post("a", "Python", "t", "", "u", 1, None, 1, 1.0, "p", "")
+    s.save_post(p, 0.0, "neutral")
+    cut = time.time() + 0.01
+    time.sleep(0.02)
+    s.save_post(Post("b", "Python", "t", "", "u", 1, None, 1, 2.0, "p", ""), 0.0, "neutral")
+    assert [r["id"] for r in s.posts_since("python", cut)] == ["b"]
+    assert s.comments_since("python", cut) == []

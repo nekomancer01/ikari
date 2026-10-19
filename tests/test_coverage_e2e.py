@@ -38,9 +38,12 @@ class FakeArchive:
         return {d: 10 for d in range(int(after // DAY * DAY), int(before), DAY)}
 
     def fetch_posts(self, subreddit, after, before, limit, query="", top=False, skip=(), progress=None,
-                    should_stop=None):
+                    should_stop=None, on_posts=None):
         FakeArchive.calls.append(("posts", subreddit, after, before))
-        return [p for p in self.archive.get(subreddit, []) if after <= p.created_utc < before and p.id not in skip]
+        posts = [p for p in self.archive.get(subreddit, []) if after <= p.created_utc < before and p.id not in skip]
+        if on_posts:
+            on_posts(posts)
+        return posts
 
     def fetch_posts_by_ids(self, ids, should_stop=None):
         FakeArchive.calls.append(("ids", list(ids)))
@@ -74,6 +77,8 @@ def window(tmp_path, monkeypatch):
     s.close()
     FakeArchive.calls = []
     monkeypatch.setattr(worker, "ArcticShiftClient", FakeArchive)
+    # A failed fetch would open a modal box and hang the test; fail fast instead.
+    monkeypatch.setattr(mw.QMessageBox, "warning", lambda *a: pytest.fail(f"fetch failed: {a[-1]}"))
     w = mw.MainWindow(str(db))
     w.range.setCurrentIndex(w.range.findData("week"))
     w.show()

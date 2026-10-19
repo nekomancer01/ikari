@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import (
@@ -22,7 +23,7 @@ from subsentiment.gui.charts import DistributionChart, TimelineChart, palette
 from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, RowsModel
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
-from subsentiment.gui.worker import FetchWorker, LiveWorker
+from subsentiment.gui.worker import FetchWorker
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, daily_means, summarize
 
@@ -133,15 +134,6 @@ def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
     if result.stopped:
         parts.append("Stopped early.")
     return " ".join(parts)
-
-
-def age_text(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    if seconds < 90:
-        return "under a minute" if seconds < 60 else "1 minute"
-    if seconds < 5400:
-        return f"{round(seconds / 60)} minutes"
-    return f"{seconds / 3600:.1f} hours" if seconds < 172800 else f"{seconds // 86400} days"
 
 
 def plural(n: int, noun: str) -> str:
@@ -280,6 +272,17 @@ class TablePage(QWidget):
         self._all_rows = rows
         self._apply_label_filter(self.label_filter.currentText(), animate)
 
+    def add_rows(self, rows) -> int:
+        """Append rows a running fetch has just saved; they fade in. Returns how many were new."""
+        have = {r["id"] for r in self._all_rows}
+        new = [r for r in rows if r["id"] not in have]
+        label = self.label_filter.currentText()
+        self._all_rows.extend(new)
+        shown = new if label == "All labels" else [r for r in new if r["label"] == label.lower()]
+        self.model.append_rows(shown)
+        self._update_count()
+        return len(new)
+
     def _apply_label_filter(self, text: str, animate: bool = False) -> None:
         rows = self._all_rows
         if text != "All labels":
@@ -328,10 +331,12 @@ class MainWindow(QMainWindow):
         self._live.setSingleShot(True)
         self._live.setInterval(1000)
         self._live.timeout.connect(self._live_refresh)
-        self.live_thread: QThread | None = None
-        self.live_worker: LiveWorker | None = None
-        self.live_name: str | None = None
-        self._live_seen = 0
+        self._drip = QTimer(self)  # releases fetched rows into the tables a few at a time, so each is seen
+        self._drip.setInterval(40)
+        self._drip.timeout.connect(self._release_rows)
+        self._queued: dict[str, list] = {"posts": [], "comments": []}
+        self._queued_ids: set[str] = set()
+        self._since = 0.0  # rows saved since this moment belong to the running fetch
         self.posts: list = []
         self.comments: list = []
         self.coverage = None  # the Download coverage window, once opened
@@ -517,15 +522,6 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self.fetch_btn, 1)
         buttons.addWidget(self.stop_btn)
         lay.addLayout(buttons)
-        self.live_btn = QPushButton("Live feed")
-        self.live_btn.setCheckable(True)
-        self.live_btn.setToolTip("Keep checking Arctic Shift for new posts in this subreddit and add them as they appear")
-        self.live_btn.toggled.connect(self._toggle_live)
-        lay.addWidget(self.live_btn)
-        self.live_msg = label("", "muted")
-        self.live_msg.setWordWrap(True)
-        self.live_msg.setVisible(False)
-        lay.addWidget(self.live_msg)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         self.progress_msg = label("", "muted")
@@ -752,8 +748,7 @@ class MainWindow(QMainWindow):
 
     def _set_busy(self, busy: bool) -> None:
         # Called after self.thread is set (busy) or cleared (idle); the update helpers read it.
-        self.fetch_btn.setEnabled(not busy and self.live_thread is None)
-        self.live_btn.setEnabled(not busy)
+        self.fetch_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
         self.progress.setVisible(busy)
         if busy:
@@ -776,7 +771,7 @@ class MainWindow(QMainWindow):
     # -- fetching -------------------------------------------------------------
 
     def _start_fetch(self) -> None:
-        if self.thread is not None or self.live_thread is not None:
+        if self.thread is not None:
             return
         name = normalize_subreddit(self.subreddit.text())
         if error := subreddit_error(name):
@@ -803,6 +798,8 @@ class MainWindow(QMainWindow):
 
     def _launch(self, req: collect.FetchRequest, message: str) -> None:
         self.request = req
+        self._since = time.time() - 1.0
+        self._flush_rows()
         self.thread = QThread(self)
         self.worker = FetchWorker(req, self.db_path)
         self.worker.moveToThread(self.thread)
@@ -817,84 +814,6 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         self.progress_msg.setText(message)
         self.thread.start()
-
-    # -- live feed ------------------------------------------------------------
-
-    def _toggle_live(self, on: bool) -> None:
-        if on:
-            self._start_live()
-        else:
-            self._stop_live()
-
-    def _start_live(self) -> None:
-        name = normalize_subreddit(self.subreddit.text())
-        if error := subreddit_error(name):
-            self.progress_msg.setText(error)
-            self.live_btn.blockSignals(True)
-            self.live_btn.setChecked(False)
-            self.live_btn.blockSignals(False)
-            self.subreddit.setFocus()
-            return
-        self.subreddit.setText(name)
-        self.live_name = name
-        self._live_seen = 0
-        self.live_thread = QThread(self)
-        self.live_worker = LiveWorker(name, self.db_path)
-        w = self.live_worker
-        w.moveToThread(self.live_thread)
-        self.live_thread.started.connect(w.run)
-        w.status.connect(self._set_live_msg)
-        w.polled.connect(self._on_live_polled)
-        w.saved.connect(self._on_live_saved)
-        w.failed.connect(lambda m: QMessageBox.warning(self, "Live feed stopped", m))
-        w.finished.connect(self.live_thread.quit)
-        self.live_thread.finished.connect(self._on_live_done)
-        for widget in (self.subreddit, self.fetch_btn):
-            widget.setEnabled(False)
-        self.live_msg.setVisible(True)
-        self._set_live_msg(f"Live: checking r/{name} for new posts…")
-        self.live_thread.start()
-
-    def _stop_live(self) -> None:
-        if self.live_worker:
-            self.live_worker.stop()
-            self.live_btn.setEnabled(False)
-            self._set_live_msg("Stopping the live feed…")
-
-    def _on_live_done(self) -> None:
-        self.live_thread.deleteLater()
-        self.live_worker.deleteLater()
-        self.live_thread = self.live_worker = None
-        self.subreddit.setEnabled(True)
-        self.fetch_btn.setEnabled(self.thread is None)
-        self.live_btn.setEnabled(self.thread is None)
-        self.live_btn.blockSignals(True)
-        self.live_btn.setChecked(False)
-        self.live_btn.blockSignals(False)
-        self.live_msg.setVisible(False)
-
-    def _set_live_msg(self, text: str) -> None:
-        self.live_msg.setText(text)
-
-    def _on_live_polled(self, result) -> None:
-        stamp = datetime.now().strftime("%H:%M:%S")
-        newest = (f" Newest post is {age_text(datetime.now().timestamp() - result.newest)} old."
-                  if result.newest else "")
-        self._set_live_msg(
-            f"Live: r/{self.live_name}, {plural(self._live_seen + result.new, 'new post')} this session. "
-            f"Checked {stamp}.{newest} Arctic Shift archives posts a little after Reddit, so the feed "
-            "can trail by a few minutes.")
-
-    def _on_live_saved(self, new: int, newest) -> None:
-        self._live_seen += new
-        name = self.live_name or ""
-        showing = self.current is None or self.current.lower() == name.lower()
-        self._refresh_datasets(select=None if self.current else name, reload=False)
-        if showing:
-            item = self.datasets.currentItem()
-            shown = item.data(Qt.ItemDataRole.UserRole) if item else None
-            if shown and shown.lower() == name.lower():
-                self._show_dataset(shown, animate=self.current is not None)
 
     def _stop_fetch(self) -> None:
         if self.worker:
@@ -911,21 +830,71 @@ class MainWindow(QMainWindow):
             self.coverage.set_progress(done, total, msg)
 
     def _on_saved(self) -> None:
-        # Rows arrive in bursts; redraw at most about once a second so big fetches stay smooth.
+        # A row was committed: queue it for the tables right away, and refresh the sidebar list and
+        # overview charts at most about once a second so big fetches stay smooth.
+        self._queue_new_rows()
         if not self._live.isActive():
             self._live.start()
+
+    def _showing_fetch(self) -> bool:
+        return bool(self.request and self.current and self.current.lower() == self.request.subreddit.lower())
+
+    def _queue_new_rows(self) -> None:
+        if self.thread is None or not self._showing_fetch():
+            return
+        name = self.current
+        for kind, rows in (("posts", self.store.posts_since(name, self._since)),
+                           ("comments", self.store.comments_since(name, self._since))):
+            for r in rows:
+                if r["id"] not in self._queued_ids:
+                    self._queued_ids.add(r["id"])
+                    self._queued[kind].append(r)
+        if any(self._queued.values()):
+            self._drip.start()
+
+    def _release_rows(self) -> None:
+        """Show the next few queued rows; a long backlog is released faster so it never lags far behind."""
+        for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
+            queue = self._queued[kind]
+            batch, self._queued[kind] = queue[:max(1, len(queue) // 25)], queue[max(1, len(queue) // 25):]
+            if batch:
+                tab.add_rows(batch)
+        if not any(self._queued.values()):
+            self._drip.stop()
+        self._update_dataset_labels()
+
+    def _flush_rows(self) -> None:
+        self._drip.stop()
+        for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
+            if self._queued[kind]:
+                tab.add_rows(self._queued[kind])
+            self._queued[kind] = []
+        self._queued_ids.clear()
+
+    def _update_dataset_labels(self) -> None:
+        self.tabbar.setTabText(1, f"Posts  {len(self.posts):,}")
+        self.tabbar.setTabText(2, f"Comments  {len(self.comments):,}")
+        self.export_posts.setEnabled(bool(self.posts))
+        self.export_comments.setEnabled(bool(self.comments))
+        fetched = max((r["fetched_at"] for r in self.posts), default=None)
+        self.subheading.setText(f"{plural(len(self.posts), 'post')} and {plural(len(self.comments), 'comment')} · "
+                                f"last fetched {when_text(fetched)}")
 
     def _live_refresh(self) -> None:
         if self.thread is None or self.request is None:
             return
         target = self.request.subreddit.lower()
-        showing = self.current is None or self.current.lower() == target
-        self._refresh_datasets(select=None if self.current else self.request.subreddit, reload=False)
-        if showing:
+        if self._showing_fetch():
+            self._refresh_datasets(reload=False)
+            self._render_overview()
+        elif self.current is None:  # the first rows of a new subreddit: open it
+            self._refresh_datasets(select=self.request.subreddit, reload=False)
             item = self.datasets.currentItem()
             name = item.data(Qt.ItemDataRole.UserRole) if item else None
             if name and name.lower() == target:
-                self._show_dataset(name, animate=self.current is not None)
+                self._show_dataset(name)
+        else:
+            self._refresh_datasets(reload=False)
         if self.coverage is not None:
             self.coverage.refresh_saved()
 
@@ -934,6 +903,7 @@ class MainWindow(QMainWindow):
         if self.coverage is not None:
             self.coverage.set_progress(0, 0, self.progress_msg.text())
         self._live.stop()
+        self._flush_rows()
         if self.current and self.current.lower() == result.subreddit.lower():
             self._refresh_datasets(reload=False)
             self._show_dataset(self.current, animate=True)  # keeps the tables where they are
@@ -941,6 +911,8 @@ class MainWindow(QMainWindow):
             self._refresh_datasets(select=result.subreddit)
 
     def _on_failed(self, message: str) -> None:
+        self._live.stop()
+        self._flush_rows()
         self._refresh_datasets(select=self.request.subreddit)  # show anything stored before the error
         kept = self.current and self.current.lower() == self.request.subreddit.lower()
         self.progress_msg.setText("Fetch failed. What was fetched before the error is saved." if kept
@@ -1115,10 +1087,6 @@ class MainWindow(QMainWindow):
         self._save_fetch_settings()
         if self.coverage is not None:
             self.coverage.close()
-        if self.live_worker:
-            self.live_worker.stop()
-            self.live_thread.quit()
-            self.live_thread.wait(3000)
         if self.worker:
             self.worker.stop()
             self.thread.quit()
