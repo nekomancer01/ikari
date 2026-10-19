@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PySide6.QtCore import QEvent, QRectF, QSettings, QSortFilterProxyModel, Qt, QThread, QUrl
+from PySide6.QtCore import QEvent, QRectF, QSettings, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPainter,
 )
@@ -18,6 +18,7 @@ from subsentiment.gui import native, settings_dialog, theme
 from subsentiment.gui.charts import DistributionChart, TimelineChart, palette
 from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, RowsModel
 from subsentiment.gui.theme import mark, paint_backdrop
+from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.worker import FetchWorker
 from subsentiment.reddit import LISTING_SORTS, SEARCH_SORTS, TIME_FILTERS
 from subsentiment.store import Store, daily_means, summarize
@@ -179,6 +180,7 @@ class MainWindow(QMainWindow):
         self.db_path = db_path
         self.store = Store(db_path)
         self.settings = QSettings()
+        self.updates = UpdateFlow(self, self.settings)
         self.thread: QThread | None = None
         self.worker: FetchWorker | None = None
         self.current: str | None = None
@@ -201,6 +203,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(self._mode_text())
         QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _: self._apply_theme())
         self._refresh_datasets()
+        if self.settings.value("updates/auto", True, bool):
+            QTimer.singleShot(3000, lambda: self.updates.check(silent=True))
 
     # -- layout ---------------------------------------------------------------
 
@@ -252,6 +256,11 @@ class MainWindow(QMainWindow):
         help_menu = self.menuBar().addMenu("&Help")
         help_menu.addAction(QAction("About Subreddit Sentiment", self, menuRole=QAction.MenuRole.AboutRole,
                                     triggered=self._show_about))
+        help_menu.addAction(QAction("Check for updates…", self, triggered=lambda: self.updates.check()))
+        auto = QAction("Check for updates at startup", self, checkable=True,
+                       checked=self.settings.value("updates/auto", True, bool))
+        auto.toggled.connect(lambda on: self.settings.setValue("updates/auto", on))
+        help_menu.addAction(auto)
 
     def _build_sidebar(self) -> QWidget:
         side, lay = panel("true", margins=20, spacing=14)
