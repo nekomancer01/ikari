@@ -46,6 +46,7 @@ TIMEOUT_TRIES = 3  # query timeouts on one request before the caller is asked to
 MIN_WINDOW = 600  # seconds; a timing-out window is halved down to this
 TREE_LIMIT = 1000
 TREE_MAX = 25000  # the most comments the tree endpoint returns in one request
+UNKNOWN_THREAD = 1000  # what fetch_all_comments asks for when a post's comment count isn't known yet
 COUNT_CHUNK_DAYS = 31  # days per aggregate request; a timing-out chunk is split down to one day
 DAY = 86400
 
@@ -427,7 +428,7 @@ class ArcticShiftClient:
     def fetch_all_comments(self, post: Post) -> tuple[list[Comment], bool]:
         """Every comment the archive has on ``post`` (up to TREE_MAX), and whether that is the whole
         thread: False when the archive cut it short or left replies collapsed."""
-        known = post.num_comments if post.num_comments is not None else TREE_LIMIT
+        known = post.num_comments if post.num_comments is not None else UNKNOWN_THREAD
         size = min(TREE_MAX, max(PAGE, known + 50))
         comments, items, collapsed = self._thread(post, size)
         sent = _number(self.last_params.get("limit"), size)  # smaller if the archive timed out

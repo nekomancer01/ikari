@@ -176,11 +176,9 @@ def test_rows_added_during_a_fetch_are_appended_and_fade_in():
 def test_coverage_window_lists_days_and_downloads_through_the_fetch_job(make_window, monkeypatch):
     from subsentiment.gui import coverage
 
-    class Counts(coverage.CountWorker):  # no network: the archive "has" 5 posts every day
-        def run(self):
-            sub, after, before = self.args
-            self.finished.emit({d: 5 for d in range(int(after), int(before), 86400)})
-    monkeypatch.setattr(coverage, "CountWorker", Counts)
+    def count(self, after, before):  # no network or thread: the archive "has" 5 posts every day
+        self._on_counts(self.subreddit, {d: 5 for d in range(int(after), int(before), 86400)})
+    monkeypatch.setattr(coverage.CoverageWindow, "_count", count)
     w = make_window()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     w.range.setCurrentIndex(w.range.findData("custom"))
@@ -190,12 +188,6 @@ def test_coverage_window_lists_days_and_downloads_through_the_fetch_job(make_win
     monkeypatch.setattr(w, "_launch", lambda req, msg: started.append(req))
     w._show_coverage()
     c = w.coverage
-    for _ in range(50):
-        QApplication.processEvents()
-        if c._count_thread is None and c.totals:
-            break
-        c._count_thread and c._count_thread.wait(50)
-    QApplication.processEvents()
     c.refresh_saved()
     day = 1_699_920_000  # 14 Nov 2023 00:00 UTC
     assert day in c.days and c.days == sorted(c.days, reverse=True)
