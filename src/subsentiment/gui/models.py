@@ -11,6 +11,8 @@ from subsentiment.gui.charts import palette
 
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1
 NUMERIC = ("sentiment", "score", "num_comments")
+PENDING = ("score", "num_comments")  # None until Arctic Shift re-fetches the item, about 36 hours in
+PENDING_TIP = "Arctic Shift fills this in about 36 hours after posting. Fetch this range again later to update it."
 
 
 def _fmt_time(ts: float) -> str:
@@ -76,8 +78,8 @@ class RowsModel(QAbstractTableModel):
             return None
         if role == Qt.ItemDataRole.DisplayRole:
             return self.columns[section][0]
-        if role == Qt.ItemDataRole.TextAlignmentRole and self.columns[section][1] in NUMERIC:
-            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        # Titles stay left-aligned even over numbers: with a stylesheet, Qt elides a right-aligned
+        # title when its column is sorted ("Sentim" instead of "Sentiment").
         return None
 
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
@@ -87,11 +89,17 @@ class RowsModel(QAbstractTableModel):
         _, key, fmt = self.columns[index.column()]
         value = row[key]
         if role == Qt.ItemDataRole.DisplayRole:
-            return fmt(value) if value is not None else ""
+            if value is None:
+                return "–" if key in PENDING else ""
+            return fmt(value)
         if role == SORT_ROLE:
-            return value if value is not None else ""
+            if value is None:
+                return -1 if key in NUMERIC else ""  # keeps unknown numbers sortable alongside real ones
+            return value
         if role == Qt.ItemDataRole.DecorationRole and key == "label":
             return self._icons.get(value)
+        if role == Qt.ItemDataRole.ToolTipRole and key in PENDING and value is None:
+            return PENDING_TIP
         if role == Qt.ItemDataRole.ToolTipRole and key in ("title", "body"):
             return (row["title"] + "\n\n" + (row["selftext"] or "")) if key == "title" else row["body"]
         if role == Qt.ItemDataRole.TextAlignmentRole and key in NUMERIC:

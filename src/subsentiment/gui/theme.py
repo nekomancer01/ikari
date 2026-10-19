@@ -204,16 +204,21 @@ QLabel[role="caption"], QLabel[role="muted"] {{ color: {t['muted']}; }}
 QLabel[role="status"] {{ color: {t['muted']}; padding: 2px 6px; }}
 
 /* Inputs */
-QLineEdit, QSpinBox, QComboBox {{
+QLineEdit, QSpinBox, QComboBox, QDateEdit {{
     background: {strong}; border: 1px solid {edge}; border-radius: 10px;
     padding: 6px 10px; min-height: 20px; selection-background-color: {t['accent']}; selection-color: {t['on_accent']};
 }}
-QLineEdit:hover, QSpinBox:hover, QComboBox:hover {{ border-color: {t['faint']}; }}
-QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QComboBox:on {{ border: 1px solid {t['accent']}; }}
-QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{ color: {t['faint']}; background: {soft}; }}
+QLineEdit:hover, QSpinBox:hover, QComboBox:hover, QDateEdit:hover {{ border-color: {t['faint']}; }}
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QComboBox:on, QDateEdit:focus {{ border: 1px solid {t['accent']}; }}
+QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled, QDateEdit:disabled {{ color: {t['faint']}; background: {soft}; }}
 QLineEdit[placeholderText] {{ }}
-QComboBox::drop-down {{ border: none; width: 26px; }}
-QComboBox::down-arrow {{ image: url("{icons}/{_mode}-down.svg"); width: 12px; height: 12px; }}
+QComboBox::drop-down, QDateEdit::drop-down {{ border: none; width: 26px; background: transparent; }}
+QComboBox::down-arrow, QDateEdit::down-arrow {{ image: url("{icons}/{_mode}-down.svg"); width: 12px; height: 12px; }}
+QDateEdit {{ padding-right: 26px; }}
+QCalendarWidget QWidget {{ background: {t['menu']}; color: {t['text']}; alternate-background-color: {t['menu']}; }}
+QCalendarWidget QAbstractItemView {{ selection-background-color: {t['accent']}; selection-color: {t['on_accent']}; }}
+QCalendarWidget QAbstractItemView:disabled {{ color: {t['faint']}; }}
+QCalendarWidget QToolButton {{ background: transparent; color: {t['text']}; border: none; padding: 4px 8px; font-weight: 600; }}
 QComboBox QAbstractItemView {{
     background: {t['menu']}; border: 1px solid {edge}; border-radius: 10px; padding: 4px;
     selection-background-color: {sel}; selection-color: {t['text']}; outline: 0;

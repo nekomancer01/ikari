@@ -25,7 +25,7 @@ for Windows, macOS and Linux.</p>
   <a href="#how-it-works">How it works</a> ·
   <a href="#download">Download</a> ·
   <a href="#run-from-source">Run from source</a> ·
-  <a href="#reddit-access">Reddit access</a> ·
+  <a href="#where-the-data-comes-from">Where the data comes from</a> ·
   <a href="#development">Development</a>
 </p>
 
@@ -63,8 +63,9 @@ r/riverton, whose new tram line breaks down for a week. Regenerate them with
 
 ## Features
 
-- 📥 **Fetch** any subreddit by sort (hot, new, top, rising, controversial) and time range, or
-  search within it. Comments are optional and come with full reply trees.
+- 📥 **Fetch** any subreddit for a date range (a preset like "Past week", or your own From and To
+  dates), optionally narrowed by keywords. Comments come along by default. No Reddit account or API
+  key is needed.
 - 🧠 **Score sentiment offline** with a small bundled classifier (TF-IDF plus
   [VADER](https://github.com/cjhutto/vaderSentiment) features) trained on GoEmotions Reddit
   comments. Nothing leaves your machine for scoring.
@@ -96,7 +97,7 @@ model is missing. Reproduce the numbers with `tools/eval_sentiment.py`.
 
 ```mermaid
 flowchart LR
-    A["Reddit<br/>public JSON or OAuth"] --> B["Fetch<br/>posts + comment trees"]
+    A["Arctic Shift<br/>Reddit archive"] --> B["Fetch<br/>posts + comments, rate limited"]
     B --> C["Clean<br/>strip quotes, code, URLs"]
     C --> D["Score<br/>bundled classifier"]
     D --> E[("SQLite<br/>on your machine")]
@@ -155,8 +156,7 @@ python packaging/build.py        # Linux: add --no-appimage to skip the AppImage
 On Windows you can instead double-click `packaging\build-windows.bat`. Everything lands in
 `dist/`: the zip and installer on Windows (the installer needs
 [Inno Setup 6](https://jrsoftware.org/isinfo.php)), the `.app` and `.dmg` on macOS, and the
-AppImage and `.tar.gz` on Linux. (The folder keeps the
-app's former name so existing data and saved Reddit secrets carry over.)
+AppImage and `.tar.gz` on Linux.
 
 The workflow in `.github/workflows/build.yml` builds and launch-checks all four targets on every
 push to `main` and every pull request. Pushing a `v*` tag also publishes a GitHub release with
@@ -169,7 +169,7 @@ the packages attached. The version comes from `__version__` in `src/subsentiment
 <details>
 <summary>What ikari does differently on each OS, and where it keeps its data</summary>
 
-- **macOS:** Settings, About and Quit sit in the app menu with the standard shortcuts (⌘, and ⌘Q).
+- **macOS:** About and Quit sit in the app menu, with the standard ⌘Q shortcut.
 - **macOS:** the title bar's light or dark look follows the app's theme. Optional "macOS vibrancy"
   background (View → Window background) gives a real frosted blur; off by default, applies on next
   launch.
@@ -179,36 +179,39 @@ the packages attached. The version comes from `__version__` in `src/subsentiment
   reading the GNOME/GTK setting.
 - **Windows:** title bar matches the theme; optional Mica or Acrylic background on Windows 11
   22H2+; taskbar shows the app's own icon.
-- **All platforms:** the API secret goes in the OS keychain, falling back to app settings only if
-  none is available.
 
 Data lives in the OS's app-data folder: `%APPDATA%\subsentiment\Subreddit Sentiment\` on
 Windows, `~/Library/Application Support/subsentiment/Subreddit Sentiment/` on macOS, and
 `~/.local/share/subsentiment/Subreddit Sentiment/` on Linux. The folder keeps the
-app's former name so existing data and saved Reddit secrets carry over.
+app's former name so existing data carries over.
 
 </details>
 
-## Reddit access
+## Where the data comes from
 
-With no setup, the app reads from [Arctic Shift](https://github.com/ArthurHeitmann/arctic_shift), a
-free, community-run archive of Reddit posts and comments. It needs no account or key. Reddit stopped
-serving its public JSON endpoints to logged-out requests in 2026, so the app no longer uses them.
+Posts and comments come from [Arctic Shift](https://github.com/ArthurHeitmann/arctic_shift), a free,
+community-run archive of Reddit. It needs no account or key. ikari doesn't use Reddit's own API:
+Reddit stopped serving its public JSON to logged-out requests in 2026, now requires approval for
+new API apps, and has announced that its public API closes in March 2027.
 
 Things to know about the archive:
 
-- Results come in date order. **new**, **hot** and **rising** all mean newest first; **top** and
-  **controversial** take the newest posts in the chosen time range and rank them.
-- New posts appear quickly, but scores and comment counts only settle after about 36 hours.
-- It's a volunteer service with no uptime guarantee. The app sends at most one request a second.
+- **You pick a date range, not a sort.** The archive returns posts newest first within the range,
+  so there's no hot, top or rising. Choose a preset under **Posted** or set your own **From** and
+  **To** dates. **Max posts** caps how many come back, starting from the newest.
+- **Scores and comment counts arrive late.** The archive saves each post within seconds, then fetches
+  it again about 36 hours later. Until then Reddit's numbers aren't known, so the Score and Comments
+  columns show a dash. Fetching the same range again later fills them in.
+- **Requests are rate limited.** ikari sends at most one request a second. It waits when the archive
+  says to (HTTP 429), backs off on server and network errors, and asks for smaller pages when a query
+  times out. Fetching comments takes one request per post, so 100 posts with comments take about two
+  minutes.
+- **It's a volunteer service** with no uptime guarantee. Items that were removed or deleted on Reddit
+  are skipped.
 
-If Reddit has approved a **script** app of yours under its
-[Responsible Builder Policy](https://support.reddithelp.com/hc/en-us/articles/42728983564564-Responsible-Builder-Policy),
-enter its client id and secret under **File → Reddit API settings** and the app reads Reddit
-directly instead (app-only OAuth, read-only, about 100 requests a minute). Reddit has announced that
-this public API closes in March 2027. The secret goes into the system credential store (Windows
-Credential Manager, macOS Keychain, or Secret Service on Linux); only if none is available is it
-kept in the app's settings unencrypted.
+Upgrading from a version that used Reddit API keys? ikari clears the saved client id and secret from
+its settings on start. A copy may remain in your system's credential store (Windows Credential
+Manager, macOS Keychain or Secret Service) under "Subreddit Sentiment", and you can delete it there.
 
 ## Design notes
 
@@ -242,9 +245,8 @@ Layout:
 
 | Path | Purpose |
 |---|---|
-| `src/subsentiment/reddit.py` | Reddit client: anonymous or OAuth, pagination, rate limiting, comment trees |
-| `src/subsentiment/arctic_shift.py` | Arctic Shift archive client (the default source) |
-| `src/subsentiment/sources.py` | Picks Reddit's API or Arctic Shift from the saved settings |
+| `src/subsentiment/arctic_shift.py` | Arctic Shift client: date-range paging, comments, rate limiter and retries |
+| `src/subsentiment/reddit.py` | Post and comment data types, subreddit-name checks |
 | `src/subsentiment/sentiment.py` | Text cleanup + scoring (bundled model, VADER fallback) |
 | `src/subsentiment/sentiment_model.py` | Loads the bundled classifier and its feature code |
 | `src/subsentiment/store.py` | SQLite storage, CSV export, summary helpers |
@@ -254,7 +256,7 @@ Layout:
 | `tools/screenshot.py` | Renders the README screenshots in `docs/` from invented sample data |
 | `tools/sample_text.py` | The invented r/riverton posts and comments the screenshots use |
 | `src/subsentiment/collect.py` | One fetch job: fetch → score → store |
-| `src/subsentiment/gui/` | Qt main window, charts, table models, background worker, settings |
+| `src/subsentiment/gui/` | Qt main window, charts, table models, background worker |
 | `src/subsentiment/gui/theme.py` | Glass theme: color tokens, stylesheet, fonts, backdrop |
 | `src/subsentiment/gui/native/` | Per-OS integration: Windows title bar and Mica/Acrylic, macOS menus and vibrancy, Linux desktop id and theme |
 | `packaging/build.py` | One build entry for all platforms (PyInstaller, then zip/installer, .dmg, or AppImage/.tar.gz) |

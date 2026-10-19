@@ -5,18 +5,18 @@ from dataclasses import dataclass
 from typing import Callable
 
 from subsentiment import sentiment
-from subsentiment.sources import Source
+from subsentiment.arctic_shift import ArcticShiftClient
 from subsentiment.store import Store
 
 
 @dataclass
 class FetchRequest:
     subreddit: str
-    sort: str = "hot"
-    time_filter: str = "week"
+    after: float | None = None  # epoch seconds, inclusive
+    before: float | None = None  # epoch seconds, exclusive
     limit: int = 100
     query: str = ""
-    include_comments: bool = False
+    include_comments: bool = True
     comments_per_post: int = 50
 
 
@@ -28,10 +28,10 @@ class FetchResult:
     stopped: bool
 
 
-def run(client: Source, store: Store, req: FetchRequest,
+def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         progress: Callable[[int, int, str], None] = lambda done, total, msg: None,
         should_stop: Callable[[], bool] = lambda: False) -> FetchResult:
-    posts = client.fetch_posts(req.subreddit, req.sort, req.time_filter, req.limit, req.query,
+    posts = client.fetch_posts(req.subreddit, req.after, req.before, req.limit, req.query,
                                progress=lambda msg: progress(0, 0, msg), should_stop=should_stop)
     if not posts:
         return FetchResult(req.subreddit, 0, 0, should_stop())
@@ -46,7 +46,7 @@ def run(client: Source, store: Store, req: FetchRequest,
             if should_stop():
                 break
             progress(i - 1, len(posts), f"Comments for post {i}/{len(posts)}: {p.title[:60]}")
-            if p.num_comments == 0:
+            if p.num_comments == 0:  # None (not settled yet) still gets looked up
                 continue
             for c in client.fetch_comments(p, req.comments_per_post):
                 store.save_comment(c, *sentiment.score(c.body))

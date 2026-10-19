@@ -9,7 +9,7 @@ import os
 import re
 import sys
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files
 
 HERE = SPECPATH  # noqa: F821 (provided by PyInstaller)
 ROOT = os.path.dirname(HERE)
@@ -19,10 +19,9 @@ with open(os.path.join(ROOT, "src", "subsentiment", "__init__.py"), encoding="ut
     VERSION = re.search(r'__version__ = "([^"]+)"', f.read()).group(1)
 
 datas = collect_data_files("subsentiment") + collect_data_files("vaderSentiment")
-hiddenimports = collect_submodules("keyring.backends")  # keyring picks its backend at runtime
+hiddenimports = []
 if sys.platform == "darwin":
-    # gui/native/macos.py imports these lazily, and keyring's macOS backend needs objc too.
-    hiddenimports += ["objc", "AppKit", "Foundation"]
+    hiddenimports += ["objc", "AppKit", "Foundation"]  # gui/native/macos.py imports these lazily
 
 
 def windows_version_file():

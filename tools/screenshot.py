@@ -20,6 +20,7 @@ from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication
 
 from subsentiment import sentiment
+from subsentiment.arctic_shift import SETTLE_SECONDS
 from subsentiment.gui import native, theme
 from subsentiment.gui.main_window import MainWindow
 from subsentiment.reddit import Comment, Post
@@ -73,12 +74,15 @@ def seed(path: str) -> None:
             c_score, c_label = sentiment.score(text)
             comment = Comment(id=f"c{i:04d}{j}", post_id=f"p{i:04d}", subreddit=SUBREDDIT,
                               parent_id=f"t3_p{i:04d}", author=rng.choice(USERS),
-                              body=text, score=rng.randint(0, 200), created_utc=created + 1800 * (j + 1),
+                              body=text, score=rng.randint(0, 200) if created < time.time() - SETTLE_SECONDS else None,
+                              created_utc=created + 1800 * (j + 1),
                               depth=0, permalink=f"/r/{SUBREDDIT}/comments/p{i:04d}/c{j}/")
             comments.append((comment, c_score, c_label))
+        settled = created < time.time() - SETTLE_SECONDS  # the archive hasn't re-fetched newer posts yet
         post = Post(id=f"p{i:04d}", subreddit=SUBREDDIT, title=title, selftext="",
-                    author=rng.choice(USERS), score=rng.randint(1, 900),
-                    upvote_ratio=round(rng.uniform(0.6, 0.98), 2), num_comments=len(comments),
+                    author=rng.choice(USERS), score=rng.randint(1, 900) if settled else None,
+                    upvote_ratio=round(rng.uniform(0.6, 0.98), 2) if settled else None,
+                    num_comments=len(comments) if settled else None,
                     created_utc=created, permalink=f"/r/{SUBREDDIT}/comments/p{i:04d}/",
                     url=f"https://example.com/p{i:04d}")
         store.save_post(post, score, label)

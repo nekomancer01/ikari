@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from subsentiment import collect  # noqa: E402
 from subsentiment.gui import worker as worker_mod  # noqa: E402
-from subsentiment.reddit import Comment, Post, RedditError  # noqa: E402
+from subsentiment.reddit import Comment, FetchError, Post  # noqa: E402
 
 
 def post(i):
@@ -35,8 +35,8 @@ class FakeClient:
 def run(monkeypatch, tmp_path):
     def _run(error=None, include_comments=False, stop=False):
         FakeClient.error = error
-        monkeypatch.setattr(worker_mod, "make_client", lambda creds: FakeClient(**creds))
-        w = worker_mod.FetchWorker({"client_id": "id"}, collect.FetchRequest("python", include_comments=include_comments),
+        monkeypatch.setattr(worker_mod, "ArcticShiftClient", FakeClient)
+        w = worker_mod.FetchWorker(collect.FetchRequest("python", include_comments=include_comments),
                                    str(tmp_path / "w.db"))
         events = {"finished": [], "failed": [], "progress": []}
         w.finished.connect(events["finished"].append)
@@ -65,7 +65,7 @@ def test_stop_before_comments_reports_stopped(run):
 
 
 @pytest.mark.parametrize("error, text", [
-    (RedditError("Access denied (HTTP 403)"), "Access denied (HTTP 403)"),
+    (FetchError("Access denied (HTTP 403)"), "Access denied (HTTP 403)"),
     (requests.ConnectionError("dns"), "Network error: dns"),
     (ValueError("boom"), "ValueError: boom"),
 ])
@@ -78,5 +78,5 @@ def test_connection_is_closed_even_on_failure(run, monkeypatch):
     closed = []
     real_close = worker_mod.Store.close
     monkeypatch.setattr(worker_mod.Store, "close", lambda self: (closed.append(1), real_close(self)))
-    run(error=RedditError("x"))
+    run(error=FetchError("x"))
     assert closed == [1]
