@@ -74,12 +74,24 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
 
     # 2. New posts. An even sample skips everything already saved, so a repeat fetch adds new posts;
     #    top mode ranks everything, then keeps the ones that aren't saved yet.
+    # Each post is saved and announced the moment it is downloaded, so a UI can show it right away.
+    streamed: set[str] = set()
+
+    def save_streamed(batch: list[Post]) -> None:
+        for p in batch:
+            if p.id not in stored and p.id not in streamed:
+                store.save_post(p, *sentiment.score(p.text))
+                store.commit()
+                streamed.add(p.id)
+                saved()
+
     picked = client.fetch_posts(name, req.after, req.before, req.limit, req.query, top=req.top,
                                 skip=() if req.top else stored.keys(),
-                                progress=note, should_stop=should_stop)
+                                progress=note, should_stop=should_stop, on_posts=save_streamed)
     new = [p for p in picked if p.id not in stored]
     for p in new:
-        store.save_post(p, *sentiment.score(p.text))
+        if p.id not in streamed:
+            store.save_post(p, *sentiment.score(p.text))
     if req.everything and req.after is not None and not should_stop() and len(new) < req.limit:
         store.mark_complete("posts", name, str(int(req.after)))
     store.commit()
@@ -115,11 +127,11 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
             failed_in_row = 0
             for c in comments:
                 store.save_comment(c, *sentiment.score(c.body))
+                store.commit()
                 n_comments += 1
+                saved()
             store.mark_comments(p.id, ok=True, settled=p.score is not None)
             store.commit()
-            if comments:
-                saved()
         if todo:
             progress(len(todo), len(todo), "Done")
     return FetchResult(subreddit, len(new), n_comments, should_stop(), updated=len(updated),

@@ -16,7 +16,7 @@ PENDING = ("score", "num_comments")  # None until Arctic Shift re-fetches the it
 PENDING_TIP = "Arctic Shift fills this in about 36 hours after posting. Fetch this range again later with Update saved posts ticked."
 HEADER_TIP = ("From the Arctic Shift archive of Reddit. These appear once the archive re-checks a post, usually "
               "36 hours after posting; a dash means not yet.")
-FADE_SECONDS = 0.9  # rows that arrive during a fetch fade in over this long
+FADE_SECONDS = 1.4  # rows that arrive during a fetch fade in over this long
 
 
 def _fmt_time(ts: float) -> str:
@@ -97,6 +97,24 @@ class RowsModel(QAbstractTableModel):
         self._colors = palette()
         self._icons = {k: _swatch(self._colors[k]) for k in ("positive", "neutral", "negative")}
         self.endResetModel()
+
+    def append_rows(self, rows: list) -> int:
+        """Add rows not shown yet, each fading in from now; returns how many were new."""
+        have = {r["id"] for r in self.rows}
+        added = [r for r in rows if r["id"] not in have]
+        if not added:
+            return 0
+        if not self._colors:
+            self._colors = palette()
+            self._icons = {k: _swatch(self._colors[k]) for k in ("positive", "neutral", "negative")}
+        start = len(self.rows)
+        self.beginInsertRows(QModelIndex(), start, start + len(added) - 1)
+        self.rows.extend(added)
+        self.endInsertRows()
+        now = self._clock()
+        self._born.update({i: now for i in range(start, start + len(added))})
+        self._fade.start()
+        return len(added)
 
     def _tick(self) -> None:
         now = self._clock()

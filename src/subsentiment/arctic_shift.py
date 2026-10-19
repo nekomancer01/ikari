@@ -256,6 +256,7 @@ class ArcticShiftClient:
         skip: Collection[str] = (),
         progress: ProgressFn | None = None,
         should_stop: StopFn | None = None,
+        on_posts: Callable[[list[Post]], None] | None = None,
     ) -> list[Post]:
         """Up to ``limit`` posts created in [after, before), spread evenly over the range, oldest first.
 
@@ -264,6 +265,9 @@ class ArcticShiftClient:
         is its earliest posts not in ``skip``, so a repeat fetch picks up posts it didn't have. With
         ``top``, each slice's share is the highest-scored posts from a pool pulled from across the
         slice; only settled posts have scores, so in a range that is all recent posts, nothing ranks.
+
+        ``on_posts`` is given each batch of posts as soon as it is downloaded (every request, outside top
+        mode, where posts can only be ranked at the end), so a caller can show them while the rest comes.
         """
         subreddit = normalize_subreddit(subreddit)
         if error := subreddit_error(subreddit):
@@ -290,7 +294,8 @@ class ArcticShiftClient:
                 picked[i], spare[i] = ranked[:want], ranked[want:]
                 more[i] = False
             else:
-                picked[i], cursors[i], more[i] = self._earliest(base, lo, hi, want, skip, should_stop)
+                picked[i], cursors[i], more[i] = self._earliest(base, lo, hi, want, skip, should_stop,
+                                                                on_posts)
             if progress:
                 got = sum(map(len, picked))
                 progress(f"{what} posts from r/{subreddit}: part {i + 1} of {len(windows)}, {got:,} so far")
@@ -314,12 +319,14 @@ class ArcticShiftClient:
                 else:
                     have = skip | {p.id for p in picked[i]}
                     extra, cursors[i], more[i] = self._earliest(base, cursors[i], windows[i][1], want, have,
-                                                                should_stop)
+                                                                should_stop, on_posts)
                     picked[i] += extra
         if top:
             picked = self._hydrate(picked, spare, should_stop)
         posts = [p for group in picked for p in group]
         posts.sort(key=lambda p: p.created_utc)
+        if top and on_posts and posts:
+            on_posts(posts)
         return posts
 
     def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int]:
@@ -333,7 +340,8 @@ class ArcticShiftClient:
                     raise
                 hi = lo + (hi - lo) // 2
 
-    def _earliest(self, base, lo, hi, want, skip, should_stop) -> tuple[list[Post], int, bool]:
+    def _earliest(self, base, lo, hi, want, skip, should_stop,
+                  on_posts=None) -> tuple[list[Post], int, bool]:
         """The first ``want`` usable posts in [lo, hi) that aren't in ``skip``, where to carry on
         reading from, and whether the slice may hold more."""
         out: list[Post] = []
@@ -344,11 +352,15 @@ class ArcticShiftClient:
             size = PAGE if skip else min(PAGE, want - len(out) + 5)
             page, end = self._page(base, cursor, hi, size)
             new = [d for d in page if d.get("id") and d["id"] not in seen]
+            fresh: list[Post] = []
             for d in new:
                 seen.add(d["id"])
                 if d["id"] not in skip and not _removed(d) and len(out) < want:
                     out.append(_post(d))
+                    fresh.append(out[-1])
                     cursor = max(cursor, int(_number(d.get("created_utc"), 0)) - 1)
+            if fresh and on_posts:
+                on_posts(fresh)
             if len(out) >= want or (should_stop and should_stop()):
                 return out, cursor, True
             if end < hi and (len(page) < size or not new):  # only part of the window was searched
