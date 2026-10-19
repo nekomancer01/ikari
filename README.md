@@ -212,8 +212,9 @@ Things to know about the archive:
 - **Requests are rate limited and shared.** Every request in a fetch (posts, score updates and
   comments) goes through one limiter, at most one a second. When the archive says to slow down
   (HTTP 429) ikari waits as long as it asks and spaces later requests further apart; it also backs
-  off on server and network errors, and asks for smaller pages when a query times out. The status
-  line says when it's waiting and why.
+  off on server and network errors. When a query times out ("Timeout. Maybe slow down a bit"), it
+  waits, asks for a smaller page, then searches a narrower slice of time. The status line says when
+  it's waiting and why.
 - **Comments take one request per post.** ikari asks for each post's whole comment tree at once and
   keeps the highest-scored. If a post's comments can't be fetched, it moves on to the next; after
   five failures in a row it stops asking, and the next fetch of the range picks up the posts that

@@ -38,13 +38,20 @@ MAX_INTERVAL = 10.0
 SLOTS_PER_DAY = 4  # a day is split into at most this many slices, so posts spread across the day too
 MIN_SLOTS = 60  # ...but a long range is split into at least this many (or one per day, if fewer)
 TOP_SLOTS = 60  # top mode pulls a big pool per slice, so it uses fewer slices
-TOP_PAGES = 3  # pages of up to 1000 posts pulled per slice in top mode
+TOP_PAGES = 4  # pages pulled per slice in top mode
 SLOT_PAGES = 10
+TIMEOUT_TRIES = 3  # query timeouts on one request before the caller is asked to narrow it
+MIN_WINDOW = 600  # seconds; a timing-out window is halved down to this
 TREE_LIMIT = 1000
 
 _GONE = ("[deleted]", "[removed]")
 
 WaitFn = Callable[[float, str], None]
+
+
+class QueryTimeout(FetchError):
+    """The archive gave up on a query as too slow, even with small pages. A narrower date window
+    usually works."""
 
 
 class RateLimiter:
@@ -173,9 +180,10 @@ class ArcticShiftClient:
     # -- HTTP ---------------------------------------------------------------
 
     def get(self, path: str, params: dict) -> list:
-        """One API call with retries: waits on 429, backs off on 5xx and network errors, and asks
-        for smaller pages when the archive says the query timed out."""
+        """One API call with retries: waits on 429, backs off on 5xx and network errors, and on a
+        query timeout backs off and asks for smaller pages, raising QueryTimeout if that doesn't help."""
         params = dict(params)
+        timeouts = 0
         for attempt in range(ATTEMPTS):
             backoff = min(5.0 * 2 ** attempt, MAX_WAIT)
             self.limiter.wait()
@@ -192,17 +200,24 @@ class ArcticShiftClient:
                 self.limiter.ok()
                 data = resp.json().get("data")
                 return data if isinstance(data, list) else []
-            limit = params.get("limit")
-            if "limit" in params and "timed out" in error.lower() and limit != 10:
-                # "auto" is the server's own choice of 100-1000; a timeout there falls back to pages
-                params["limit"] = PAGE if not isinstance(limit, int) else max(10, limit // 2)
+            if _is_timeout(resp.status_code, error):
+                # The archive answers slow queries with "Query timed out" (HTTP 200) or "Timeout. Maybe
+                # slow down a bit" (HTTP 422). Wait, then try a smaller page.
+                timeouts += 1
+                if timeouts >= TIMEOUT_TRIES:
+                    raise QueryTimeout("Arctic Shift timed out on this query. Try a shorter date range or "
+                                       "fewer posts, or try again in a few minutes.")
+                self.limiter.hold(backoff, "Arctic Shift is slow right now")
+                limit = params.get("limit")
+                if "limit" in params:
+                    params["limit"] = PAGE // 4 if not isinstance(limit, int) else max(10, limit // 2)
                 continue
             if resp.status_code == 429:
                 self.limiter.slow_down()
                 self.limiter.hold(self.limiter.reset_after(resp.headers, backoff),
                                   "Arctic Shift asked ikari to slow down")
                 continue
-            if resp.status_code >= 500 or "timed out" in error.lower():
+            if resp.status_code >= 500:
                 self.limiter.hold(backoff)
                 continue
             if resp.status_code == 200:
@@ -287,8 +302,16 @@ class ArcticShiftClient:
         posts.sort(key=lambda p: p.created_utc)
         return posts
 
-    def _page(self, base: dict, lo: int, hi: int, size) -> list[dict]:
-        return self.get("/api/posts/search", dict(base, after=lo, before=hi, limit=size))
+    def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int]:
+        """Posts from [lo, hi) and the end of the window actually searched: when the archive times
+        out, the window is halved (down to MIN_WINDOW) and only its first part is searched."""
+        while True:
+            try:
+                return self.get("/api/posts/search", dict(base, after=lo, before=hi, limit=size)), hi
+            except QueryTimeout:
+                if hi - lo <= MIN_WINDOW:
+                    raise
+                hi = lo + (hi - lo) // 2
 
     def _earliest(self, base, lo, hi, want, skip, should_stop) -> tuple[list[Post], int, bool]:
         """The first ``want`` usable posts in [lo, hi) that aren't in ``skip``, where to carry on
@@ -299,30 +322,33 @@ class ArcticShiftClient:
         for _ in range(SLOT_PAGES):
             # A few spare for removed posts; a full page when saved posts may need skipping.
             size = PAGE if skip else min(PAGE, want - len(out) + 5)
-            page = self._page(base, cursor, hi, size)
+            page, end = self._page(base, cursor, hi, size)
             new = [d for d in page if d.get("id") and d["id"] not in seen]
             for d in new:
                 seen.add(d["id"])
                 if d["id"] not in skip and not _removed(d) and len(out) < want:
                     out.append(_post(d))
                     cursor = max(cursor, int(_number(d.get("created_utc"), 0)) - 1)
-            if len(page) < size or not new:
-                return out, cursor, False
             if len(out) >= want or (should_stop and should_stop()):
                 return out, cursor, True
+            if end < hi and (len(page) < size or not new):  # only part of the window was searched
+                cursor = end - 1
+                continue
+            if len(page) < size or not new:
+                return out, cursor, False
             # The next page starts a second before this one ended, so posts sharing that timestamp
             # aren't lost; `seen` drops the repeats.
             cursor = int(max(_number(d.get("created_utc"), 0) for d in page)) - 1
         return out, cursor, True
 
     def _top_pool(self, base, lo, hi, should_stop) -> list[Post]:
-        """Candidates for the top posts of [lo, hi): one large page from each of TOP_PAGES equal parts
-        of the slice, so a busy slice isn't judged on its first few hours only."""
+        """Candidates for the top posts of [lo, hi): a page from each of TOP_PAGES equal parts of the
+        slice, so a busy slice isn't judged on its first few hours only."""
         pool: dict[str, Post] = {}
         for start, end in slices(lo, hi, TOP_PAGES):
             if should_stop and should_stop():
                 break
-            for d in self._page(base, start, end, "auto"):
+            for d in self._page(base, start, end, PAGE)[0]:
                 if d.get("id") and not _removed(d):
                     pool[d["id"]] = _post(d)
         return list(pool.values())
@@ -383,6 +409,11 @@ def _walk(items: list, depth: int = 0):
         replies = d.get("replies")
         if isinstance(replies, dict):
             yield from _walk((replies.get("data") or {}).get("children"), d["depth"] + 1)
+
+
+def _is_timeout(status: int, error: str) -> bool:
+    text = error.lower()
+    return "timed out" in text or "timeout" in text or (status == 422 and "slow down" in text)
 
 
 def _error_text(resp) -> str:

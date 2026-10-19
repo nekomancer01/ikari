@@ -2,7 +2,7 @@ import pytest
 import requests
 
 from subsentiment.arctic_shift import (
-    BASE_URL, SETTLE_SECONDS, ArcticShiftClient, RateLimiter, quotas, slices, slot_count,
+    BASE_URL, SETTLE_SECONDS, ArcticShiftClient, QueryTimeout, RateLimiter, quotas, slices, slot_count,
 )
 from subsentiment.reddit import FetchError, Post
 
@@ -172,7 +172,7 @@ def test_quiet_slices_hand_their_share_to_busy_ones():
 
 def test_top_mode_ranks_settled_scores_within_each_day():
     items = [at(T0 + d * DAY + 600 * k, d * 100 + k, score=(k * 37) % 101) for d in range(3) for k in range(100)]
-    c = archive(items, page_cap=1000)
+    c = archive(items)
     posts = c.fetch_posts("python", after=T0, before=T0 + 3 * DAY, limit=6, top=True)
     assert len(posts) == 6
     for d in range(3):
@@ -180,7 +180,7 @@ def test_top_mode_ranks_settled_scores_within_each_day():
                      key=lambda x: x["score"], reverse=True)
         assert {p.id for p in posts if T0 + d * DAY <= p.created_utc < T0 + (d + 1) * DAY} == \
             {x["id"] for x in day[:2]}
-    assert {params["limit"] for _, params in c.session.calls} == {"auto"}
+    assert {params["limit"] for _, params in c.session.calls} == {100}
 
 
 def test_top_mode_puts_unscored_posts_last():
@@ -348,15 +348,43 @@ def test_network_error_on_the_last_attempt_is_raised():
         c.get(*SEARCH)
 
 
-def test_query_timeout_retries_with_smaller_pages_then_waits():
-    timeout = FakeResponse(200, {"data": None, "error": "Query timed out"})
-    c = client([timeout, timeout, ok([post(1)])])
-    c.get("/api/posts/search", {"limit": "auto"})
-    assert [params["limit"] for _, params in c.session.calls] == ["auto", 100, 50]
-    c = client([timeout] * 4 + [ok([])])
-    c.get("/api/posts/search", {"limit": 20})
-    assert [params["limit"] for _, params in c.session.calls] == [20, 10, 10, 10, 10]
-    assert c.clock.sleeps == [1.0, 10.0, 20.0, 40.0]  # at the smallest page it backs off instead
+def test_query_timeouts_back_off_with_smaller_pages_then_give_up():
+    slow = FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
+    c = client([slow, ok([post(1)])])
+    assert len(c.get("/api/posts/search", {"limit": 100})) == 1
+    assert [params["limit"] for _, params in c.session.calls] == [100, 50]
+    assert c.clock.sleeps == [5.0]
+
+    timed_out = FakeResponse(200, {"data": None, "error": "Query timed out"})
+    c = client([timed_out, slow, slow])
+    with pytest.raises(QueryTimeout, match="shorter date range"):
+        c.get("/api/posts/search", {"limit": 20})
+    assert [params["limit"] for _, params in c.session.calls] == [20, 10, 10]
+
+
+class SlowArchive(ArchiveSession):
+    """Times out on any search window longer than ``max_window`` seconds."""
+
+    def __init__(self, items, max_window):
+        super().__init__(items)
+        self.max_window = max_window
+
+    def get(self, url, params=None, timeout=None):
+        if params["before"] - params["after"] > self.max_window:
+            self.calls.append((url, dict(params)))
+            return FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
+        return super().get(url, params, timeout)
+
+
+def test_a_timing_out_window_is_narrowed_and_the_rest_still_read():
+    items = [at(T0 + 100 + i * 600, i) for i in range(30)]  # one post every 10 minutes for 5 hours
+    clock = FakeClock()
+    session = SlowArchive(items, max_window=1800)
+    c = ArcticShiftClient(session=session, limiter=RateLimiter(0.0, clock, clock.sleep))
+    posts = c.fetch_posts("python", after=T0, before=T0 + 6 * 3600, limit=30)  # four 90-minute slices
+    assert [p.id for p in posts] == [f"p{i}" for i in range(30)]
+    widths = {params["before"] - params["after"] for _, params in session.calls}
+    assert max(widths) == 5400 and min(widths) <= 1800  # gave up on 90 minutes, read 22-minute windows
 
 
 def test_other_errors_are_reported():
