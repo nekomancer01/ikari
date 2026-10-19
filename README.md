@@ -18,46 +18,80 @@ sentiment, and lets you explore and export the results.
 - Everything is saved to a local SQLite database, so earlier fetches stay available under
   "Saved data". Fetching again updates existing rows. File → Export writes CSV.
 
-## Windows
+## Download
 
-**Easiest: run from source.** Install Python 3.10 or newer from
-[python.org](https://www.python.org/downloads/) (tick *Add python.exe to PATH*), then double-click
-`run-windows.bat`. The first run sets up a private environment in `.venv` (about a minute); after
-that it opens straight away. Delete `.venv` to reinstall.
+Ready-made builds for Windows, macOS and Linux are attached to each
+[release](https://github.com/nekomancer01/ikari/releases). Builds of the latest `main` are on the
+[Actions tab](https://github.com/nekomancer01/ikari/actions/workflows/build.yml) (open a run, then
+*Artifacts*).
 
-**Build a standalone app (.exe).** On a Windows machine with Python, double-click
-`packaging\build-windows.bat`. It produces:
+| OS | Download | How to run |
+|---|---|---|
+| Windows 10/11 (x64) | `SubredditSentiment-Setup-<version>.exe` | Run the installer. Or unzip `SubredditSentiment-<version>-windows-x64.zip` and run `SubredditSentiment.exe`. |
+| macOS 11+ (Apple Silicon) | `SubredditSentiment-<version>-macos-arm64.dmg` | Open the .dmg and drag the app to Applications. |
+| macOS 11+ (Intel) | `SubredditSentiment-<version>-macos-x86_64.dmg` | As above. |
+| Linux (x86_64) | `SubredditSentiment-<version>-linux-x86_64.AppImage` | `chmod +x` it, then run it. Or unpack the `.tar.gz` and run `./install.sh` to add it to your app menu (`./install.sh --uninstall` removes it). |
 
-- `dist\SubredditSentiment\SubredditSentiment.exe`, a folder you can copy anywhere and run
-- `dist\SubredditSentiment-windows-portable.zip`, the same folder zipped
-- `dist\SubredditSentiment-Setup-0.2.0.exe`, an installer with a Start menu entry (only if
-  [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed)
+The builds aren't code-signed, so the first launch shows a warning:
 
-The GitHub Actions workflow in `.github/workflows/windows-build.yml` does the same on every push
-to `main` and attaches the zip and installer to the run.
+- **Windows** SmartScreen ("Windows protected your PC"): choose **More info → Run anyway**.
+- **macOS** Gatekeeper ("can't be opened because Apple cannot check it"): right-click the app,
+  choose **Open**, then **Open** again. On macOS 15, if there's no Open button, go to
+  **System Settings → Privacy & Security** and click **Open Anyway**.
+- **Linux**: the AppImage needs FUSE 2 (`sudo apt install libfuse2` on Ubuntu 22.04,
+  `libfuse2t64` on 24.04), or run it with `--appimage-extract-and-run`. Qt also needs
+  `libxcb-cursor0` on X11, which some minimal installs lack.
 
-The app isn't code-signed, so Windows SmartScreen will warn the first time ("Windows protected your
-PC"). Choose **More info → Run anyway**.
+## Run from source
 
-**Windows-specific features**
+Install Python 3.10 or newer, then:
 
-- The title bar follows the app's light or dark theme and, on Windows 11, takes the window's color.
-- **View → Window background → Windows Acrylic** or **Windows Mica** uses the real Windows 11
-  frosted-glass material behind the app (Windows 11 22H2 or later; takes effect after a restart).
-  Acrylic blurs whatever is behind the window; Mica tints with your wallpaper.
-- Your Reddit API secret is stored in Windows Credential Manager, not in a plain settings file.
-- The taskbar shows the app's own icon.
-- Data lives in `%APPDATA%\subsentiment\Subreddit Sentiment\subsentiment.db`.
+- **Windows:** double-click `run-windows.bat` (tick *Add python.exe to PATH* when installing
+  Python from [python.org](https://www.python.org/downloads/)).
+- **macOS:** double-click `run-macos.command`, or run `./run.sh` in Terminal.
+- **Linux:** run `./run.sh`.
 
-## macOS / Linux
+The first run sets up a private environment in `.venv` (about a minute); after that it opens
+straight away. Delete `.venv` to reinstall.
+
+## Build the app yourself
+
+Builds are made on the OS they're for. In a Python environment:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
-.venv/bin/subsentiment          # or: .venv/bin/python -m subsentiment
+pip install . pyinstaller
+python packaging/build.py        # Linux: add --no-appimage to skip the AppImage
 ```
 
-### Reddit access
+On Windows you can instead double-click `packaging\build-windows.bat`. Everything lands in
+`dist/`: the zip and installer on Windows (the installer needs
+[Inno Setup 6](https://jrsoftware.org/isinfo.php)), the `.app` and `.dmg` on macOS, and the
+AppImage and `.tar.gz` on Linux.
+
+The workflow in `.github/workflows/build.yml` builds and launch-checks all four targets on every
+push to `main` and every pull request. Pushing a `v*` tag also publishes a GitHub release with
+the packages attached. The version comes from `__version__` in `src/subsentiment/__init__.py`.
+
+## Platform features
+
+- **macOS:** Settings, About and Quit sit in the app menu with the standard shortcuts (⌘, and ⌘Q).
+- **macOS:** the title bar's light or dark look follows the app's theme. Optional "macOS vibrancy"
+  background (View → Window background) gives a real frosted blur; off by default, applies on next
+  launch.
+- **Linux:** registers as `io.github.subsentiment.SubredditSentiment`, so docks and Wayland
+  compositors show the right icon and name.
+- **Linux:** "Match system theme" also works on desktops that don't report dark mode to Qt, by
+  reading the GNOME/GTK setting.
+- **Windows:** title bar matches the theme; optional Mica or Acrylic background on Windows 11
+  22H2+; taskbar shows the app's own icon.
+- **All platforms:** the API secret goes in the OS keychain, falling back to app settings only if
+  none is available.
+
+Data lives in the OS's app-data folder: `%APPDATA%\subsentiment\Subreddit Sentiment\` on
+Windows, `~/Library/Application Support/subsentiment/Subreddit Sentiment/` on macOS, and
+`~/.local/share/subsentiment/Subreddit Sentiment/` on Linux.
+
+## Reddit access
 
 With no setup, the app uses Reddit's public JSON endpoints. These are slow (about one request every
 6 seconds) and Reddit often blocks them from cloud, VPN and datacenter IPs (HTTP 403).
@@ -95,6 +129,7 @@ Layout:
 | `src/subsentiment/collect.py` | One fetch job: fetch → score → store |
 | `src/subsentiment/gui/` | Qt main window, charts, table models, background worker, settings |
 | `src/subsentiment/gui/theme.py` | Glass theme: color tokens, stylesheet, fonts, backdrop |
-| `src/subsentiment/gui/win_native.py` | Windows title bar, Mica/Acrylic, taskbar identity |
-| `packaging/` | PyInstaller spec, Windows build script, Inno Setup installer |
-| `tools/make_icon.py` | Regenerates the app icon (needs Pillow) |
+| `src/subsentiment/gui/native/` | Per-OS integration: Windows title bar and Mica/Acrylic, macOS menus and vibrancy, Linux desktop id and theme |
+| `packaging/build.py` | One build entry for all platforms (PyInstaller, then zip/installer, .dmg, or AppImage/.tar.gz) |
+| `packaging/` | PyInstaller spec, Inno Setup installer, Linux AppRun/.desktop/install.sh |
+| `tools/make_icon.py` | Regenerates the app icons (needs Pillow) |
