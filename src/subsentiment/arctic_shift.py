@@ -315,7 +315,7 @@ class ArcticShiftClient:
                 picked[i], cursors[i], more[i] = self._earliest(base, lo, hi, want, skip, should_stop,
                                                                 on_posts)
             if progress:
-                got = sum(map(len, picked))
+                got = sum(map(len, picked)) + sum(min(len(light), n) for _, light, n in pending)
                 progress(f"{what} posts from r/{subreddit}: part {i + 1} of {len(windows)}, {got:,} so far")
         flush()
 

@@ -26,11 +26,28 @@ def app_run(sub: str, days: int) -> None:
 
     store = Store(Path(tempfile.mkdtemp()) / "check.db")
     client = ArcticShiftClient()
+    calls: list[tuple[str, float]] = []  # (endpoint, seconds the server took)
+    real_get = client.session.get
+
+    def timed_get(url, *a, **kw):
+        t = time.time()
+        try:
+            return real_get(url, *a, **kw)
+        finally:
+            calls.append((url.rsplit("/api/", 1)[-1], time.time() - t))
+    client.session.get = timed_get
     req = collect.FetchRequest(sub, after=time.time() - days * 86400, limit=30, comments_per_post=50)
-    start = time.time()
     for run in (1, 2):
+        calls.clear()
+        start = time.time()
         result = collect.run(client, store, req, progress=lambda d, t, m: print(f"  {m}") if not t or d % 10 == 0 else None)
-        print(f"\nRun {run}: {result} in {time.time() - start:.0f} s")
+        took = time.time() - start
+        print(f"\nRun {run}: {result} in {took:.0f} s")
+        for endpoint in sorted({e for e, _ in calls}):
+            secs = [s for e, s in calls if e == endpoint]
+            print(f"  {endpoint}: {len(secs)} requests, {sum(secs):.0f} s waiting on the server "
+                  f"(slowest {max(secs):.1f} s)")
+        print(f"  the rest (spacing between requests, pauses, saving): {took - sum(s for _, s in calls):.0f} s")
     rows = store.posts(sub)
     with_comments = {r["post_id"] for r in store.comments(sub)}
     print(f"{len(rows)} posts saved, {len(with_comments)} with comments, {len(store.comments(sub))} comments in all")
