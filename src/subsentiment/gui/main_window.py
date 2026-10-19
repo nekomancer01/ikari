@@ -20,8 +20,54 @@ from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, Ro
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.worker import FetchWorker
-from subsentiment.reddit import LISTING_SORTS, SEARCH_SORTS, TIME_FILTERS
+from subsentiment.reddit import LISTING_SORTS, SEARCH_SORTS, TIME_FILTERS, normalize_subreddit, subreddit_error
 from subsentiment.store import Store, daily_means, summarize
+
+
+# Reddit's API keys stay the stored values; these are only what the controls show.
+SORT_LABELS = {"hot": "Hot", "new": "New", "top": "Top", "rising": "Rising", "controversial": "Controversial",
+               "relevance": "Relevance", "comments": "Most comments"}
+TIME_LABELS = {"hour": "Past hour", "day": "Past 24 hours", "week": "Past week", "month": "Past month",
+               "year": "Past year", "all": "All time"}
+TIMED_SORTS = ("top", "controversial")  # listing sorts that take a time range; searches always do
+
+# Last-used fetch form, restored at startup. Keys live under "fetch/" in QSettings.
+FETCH_DEFAULTS = {"subreddit": "", "query": "", "sort": "hot", "time_filter": "week", "limit": 100,
+                  "include_comments": False, "comments_per_post": 50}
+
+
+def fill_combo(combo: QComboBox, keys, labels: dict, keep: str | None = None) -> None:
+    """Show labels for keys (stored as item data), keeping keep selected when it's still offered."""
+    combo.blockSignals(True)
+    combo.clear()
+    for k in keys:
+        combo.addItem(labels.get(k, k), k)
+    i = combo.findData(keep)
+    combo.setCurrentIndex(max(i, 0))
+    combo.blockSignals(False)
+
+
+def spin_box(lo: int, hi: int, step: int, value: int, suffix: str = "") -> QSpinBox:
+    spin = QSpinBox()
+    spin.setRange(lo, hi)
+    spin.setSingleStep(step)
+    spin.setValue(value)
+    spin.setSuffix(suffix)
+    # The stylesheet's horizontal padding doesn't reach a spin box's inner editor; match the other inputs.
+    spin.findChild(QLineEdit).setTextMargins(8, 0, 0, 0)
+    return spin
+
+
+def human_size(n: int) -> str:
+    for unit in ("bytes", "KB", "MB"):
+        if n < 1024 or unit == "MB":
+            return f"{n:,.0f} {unit}" if unit == "bytes" else f"{n:,.1f} {unit}"
+        n /= 1024
+    return ""
+
+
+def when_text(ts: float | None) -> str:
+    return datetime.fromtimestamp(ts).strftime("%d %b %Y, %H:%M") if ts else "never"
 
 
 def panel(kind: str = "true", margins: int = 18, spacing: int = 12) -> tuple[QFrame, QVBoxLayout]:
@@ -184,6 +230,7 @@ class MainWindow(QMainWindow):
         self.thread: QThread | None = None
         self.worker: FetchWorker | None = None
         self.current: str | None = None
+        self.request: collect.FetchRequest | None = None
         self.posts: list = []
         self.comments: list = []
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
@@ -200,9 +247,13 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_sidebar())
         root.addWidget(self._build_content(), 1)
         self.setCentralWidget(backdrop)
-        self.statusBar().showMessage(self._mode_text())
+        # Permanent, so temporary messages (exports, restarts) don't wipe the access-mode note.
+        self.mode_label = label(self._mode_text(), "status")
+        self.statusBar().addPermanentWidget(self.mode_label)
         QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _: self._apply_theme())
-        self._refresh_datasets()
+        self._refresh_datasets(select=self.settings.value("ui/last_dataset", "", str))
+        self.tabbar.setCurrentIndex(self.settings.value("ui/tab", 0, int))
+        self.tabbar.currentChanged.connect(lambda i: self.settings.setValue("ui/tab", i))
         if self.settings.value("updates/auto", True, bool):
             QTimer.singleShot(3000, lambda: self.updates.check(silent=True))
 
@@ -214,6 +265,11 @@ class MainWindow(QMainWindow):
         self.export_comments = QAction("Export comments as CSV…", self, triggered=lambda: self._export("comments"))
         file_menu.addAction(self.export_posts)
         file_menu.addAction(self.export_comments)
+        file_menu.addSeparator()
+        self.delete_act = QAction("Delete saved data for this subreddit…", self, triggered=self._delete_dataset)
+        self.delete_all_act = QAction("Delete all saved data…", self, triggered=self._delete_all)
+        file_menu.addAction(self.delete_act)
+        file_menu.addAction(self.delete_all_act)
         file_menu.addSeparator()
         # On macOS Qt moves the Preferences, Quit and About roles into the application menu.
         file_menu.addAction(QAction("Reddit API settings…", self, shortcut=QKeySequence.StandardKey.Preferences,
@@ -274,26 +330,31 @@ class MainWindow(QMainWindow):
         lay.addSpacing(6)
 
         self.subreddit = QLineEdit()
-        self.subreddit.setPlaceholderText("python")
+        self.subreddit.setPlaceholderText("e.g. python")
+        self.subreddit.setToolTip("A subreddit name; r/name and reddit.com links work too.")
         self.subreddit.returnPressed.connect(self._start_fetch)
         self.query = QLineEdit()
         self.query.setPlaceholderText("Optional keywords")
+        self.query.setClearButtonEnabled(True)
+        self.query.returnPressed.connect(self._start_fetch)
         self.query.textChanged.connect(self._update_sort_options)
         self.sort = QComboBox()
-        self.sort.currentTextChanged.connect(self._update_time_enabled)
+        self.sort.currentIndexChanged.connect(self._update_time_enabled)
         self.time_filter = QComboBox()
-        self.time_filter.addItems(TIME_FILTERS)
-        self.time_filter.setCurrentText("week")
-        self.limit = QSpinBox()
-        self.limit.setRange(1, 1000)
-        self.limit.setValue(100)
-        self.include_comments = QCheckBox("Also fetch comments")
-        self.comments_per_post = QSpinBox()
-        self.comments_per_post.setRange(1, 500)
-        self.comments_per_post.setValue(50)
-        self.comments_per_post.setEnabled(False)
-        self.include_comments.toggled.connect(self.comments_per_post.setEnabled)
-        self._update_sort_options()
+        fill_combo(self.time_filter, TIME_FILTERS, TIME_LABELS, keep=FETCH_DEFAULTS["time_filter"])
+        self.time_label = label("Time range", "muted")
+        self.limit = spin_box(1, 1000, 25, FETCH_DEFAULTS["limit"])
+        self.include_comments = QCheckBox("Fetch")
+        self.comments_per_post = spin_box(1, 500, 10, FETCH_DEFAULTS["comments_per_post"], " per post")
+        self.include_comments.toggled.connect(lambda _: self._update_comments_enabled())
+        comments_row = QWidget()
+        row = QHBoxLayout(comments_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+        row.addWidget(self.include_comments)
+        row.addWidget(self.comments_per_post, 1)
+        self._search_mode: bool | None = None
+        self._restore_fetch_settings()
 
         lay.addWidget(section("Fetch"))
         form = QFormLayout()
@@ -303,10 +364,9 @@ class MainWindow(QMainWindow):
         form.addRow(label("Subreddit", "muted"), self.subreddit)
         form.addRow(label("Search", "muted"), self.query)
         form.addRow(label("Sort", "muted"), self.sort)
-        form.addRow(label("Time range", "muted"), self.time_filter)
+        form.addRow(self.time_label, self.time_filter)
         form.addRow(label("Max posts", "muted"), self.limit)
-        form.addRow(self.include_comments)
-        form.addRow(label("Per post", "muted"), self.comments_per_post)
+        form.addRow(label("Comments", "muted"), comments_row)
         lay.addLayout(form)
 
         self.fetch_btn = mark(QPushButton("Fetch and analyse"), "primary", True)
@@ -332,12 +392,23 @@ class MainWindow(QMainWindow):
         lay.addWidget(section("Saved data"))
         self.datasets = QListWidget()
         self.datasets.setFrameShape(QFrame.Shape.NoFrame)
-        self.datasets.currentItemChanged.connect(
-            lambda item, _: self._show_dataset(item.data(Qt.ItemDataRole.UserRole) if item else ""))
+        self.datasets.currentItemChanged.connect(self._on_dataset_selected)
         lay.addWidget(self.datasets, 1)
-        self.delete_btn = mark(QPushButton("Delete selected"), "flat", True)
+        self.storage_info = label("", "muted")
+        self.storage_info.setWordWrap(True)
+        lay.addWidget(self.storage_info)
+        self.delete_btn = mark(QPushButton("Delete…"), "flat", True)
+        self.delete_btn.setToolTip("Delete the saved posts and comments for the selected subreddit")
         self.delete_btn.clicked.connect(self._delete_dataset)
-        lay.addWidget(self.delete_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        self.delete_all_btn = mark(QPushButton("Delete all…"), "flat", True)
+        self.delete_all_btn.setToolTip("Delete every saved subreddit")
+        self.delete_all_btn.clicked.connect(self._delete_all)
+        delete_row = QHBoxLayout()
+        delete_row.setSpacing(4)
+        delete_row.addWidget(self.delete_btn)
+        delete_row.addWidget(self.delete_all_btn)
+        delete_row.addStretch(1)
+        lay.addLayout(delete_row)
         return side
 
     def _build_content(self) -> QWidget:
@@ -467,56 +538,103 @@ class MainWindow(QMainWindow):
 
     # -- control state --------------------------------------------------------
 
+    def _sort_keys(self) -> tuple[str, ...]:
+        """Sorts the current fetch can use: Reddit's search endpoint takes a different set than listings."""
+        return SEARCH_SORTS if self._search_mode else LISTING_SORTS
+
+    def _time_applies(self) -> bool:
+        return bool(self._search_mode) or self.sort.currentData() in TIMED_SORTS
+
     def _update_sort_options(self) -> None:
-        options = SEARCH_SORTS if self.query.text().strip() else LISTING_SORTS
-        current = self.sort.currentText()
-        self.sort.blockSignals(True)
-        self.sort.clear()
-        self.sort.addItems(options)
-        if current in options:
-            self.sort.setCurrentText(current)
-        self.sort.blockSignals(False)
+        searching = bool(self.query.text().strip())
+        if searching == self._search_mode:
+            return  # only rebuild when switching between listing and search, not on every keystroke
+        self._search_mode = searching
+        keep = self.sort.currentData()
+        if keep not in self._sort_keys():
+            keep = "relevance" if searching else "hot"
+        fill_combo(self.sort, self._sort_keys(), SORT_LABELS, keep=keep)
         self._update_time_enabled()
 
     def _update_time_enabled(self) -> None:
-        searching = bool(self.query.text().strip())
-        self.time_filter.setEnabled(searching or self.sort.currentText() in ("top", "controversial"))
+        on = self.thread is None and self._time_applies()
+        self.time_filter.setEnabled(on)
+        self.time_label.setEnabled(on)
+        tip = "" if self._time_applies() else "Only used by Top and Controversial, and by searches."
+        self.time_filter.setToolTip(tip)
+        self.time_label.setToolTip(tip)
+
+    def _update_comments_enabled(self) -> None:
+        self.comments_per_post.setEnabled(self.thread is None and self.include_comments.isChecked())
+
+    def _restore_fetch_settings(self) -> None:
+        v = {k: self.settings.value(f"fetch/{k}", d, type(d)) for k, d in FETCH_DEFAULTS.items()}
+        self.subreddit.setText(v["subreddit"])
+        self.query.setText(v["query"])
+        self._update_sort_options()
+        if self.sort.findData(v["sort"]) >= 0:
+            self.sort.setCurrentIndex(self.sort.findData(v["sort"]))
+        if self.time_filter.findData(v["time_filter"]) >= 0:
+            self.time_filter.setCurrentIndex(self.time_filter.findData(v["time_filter"]))
+        self.limit.setValue(v["limit"])
+        self.include_comments.setChecked(v["include_comments"])
+        self.comments_per_post.setValue(v["comments_per_post"])
+        self._update_time_enabled()
+        self._update_comments_enabled()
+
+    def _save_fetch_settings(self) -> None:
+        for k, v in {"subreddit": self.subreddit.text().strip(), "query": self.query.text().strip(),
+                     "sort": self.sort.currentData(), "time_filter": self.time_filter.currentData(),
+                     "limit": self.limit.value(), "include_comments": self.include_comments.isChecked(),
+                     "comments_per_post": self.comments_per_post.value()}.items():
+            self.settings.setValue(f"fetch/{k}", v)
 
     def _mode_text(self) -> str:
         creds = settings_dialog.load(self.settings)
         if creds["client_id"] and creds["client_secret"]:
             return "Connected with Reddit API credentials."
         where = "ikari → Settings" if native.platform_name() == "macos" else "File → Reddit API settings"
-        return f"Anonymous mode (slow). Add API credentials under {where} for faster, reliable fetching."
+        return f"Anonymous mode: Reddit now refuses most requests without API credentials. Add them under {where}."
 
     def _set_busy(self, busy: bool) -> None:
+        # Called after self.thread is set (busy) or cleared (idle); the update helpers read it.
         self.fetch_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
         self.progress.setVisible(busy)
-        for w in (self.subreddit, self.query, self.sort, self.limit, self.include_comments):
-            w.setEnabled(not busy)
         if busy:
             self.progress.setRange(0, 0)
-            self.time_filter.setEnabled(False)
-            self.comments_per_post.setEnabled(False)
-        else:
-            self._update_time_enabled()
-            self.comments_per_post.setEnabled(self.include_comments.isChecked())
+        for w in (self.subreddit, self.query, self.sort, self.limit, self.include_comments):
+            w.setEnabled(not busy)
+        self._update_time_enabled()
+        self._update_comments_enabled()
+        self._update_delete_enabled()  # don't delete rows the fetch thread is writing
+
+    def _update_delete_enabled(self) -> None:
+        idle = self.thread is None
+        self.delete_btn.setEnabled(idle and bool(self.current))
+        self.delete_act.setEnabled(idle and bool(self.current))
+        self.delete_all_btn.setEnabled(idle and self.datasets.count() > 0)
+        self.delete_all_act.setEnabled(idle and self.datasets.count() > 0)
 
     # -- fetching -------------------------------------------------------------
 
     def _start_fetch(self) -> None:
         if self.thread is not None:
             return
-        name = self.subreddit.text().strip()
-        if not name:
+        name = normalize_subreddit(self.subreddit.text())
+        if error := subreddit_error(name):
+            self.progress_msg.setText(error)
             self.subreddit.setFocus()
+            self.subreddit.selectAll()
             return
+        self.subreddit.setText(name)
+        self._save_fetch_settings()
         req = collect.FetchRequest(
-            subreddit=name, sort=self.sort.currentText(), time_filter=self.time_filter.currentText(),
+            subreddit=name, sort=self.sort.currentData(), time_filter=self.time_filter.currentData(),
             limit=self.limit.value(), query=self.query.text().strip(),
             include_comments=self.include_comments.isChecked(),
             comments_per_post=self.comments_per_post.value())
+        self.request = req
         self.thread = QThread(self)
         self.worker = FetchWorker(settings_dialog.load(self.settings), req, self.db_path)
         self.worker.moveToThread(self.thread)
@@ -545,17 +663,23 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, result: collect.FetchResult) -> None:
         if result.posts == 0:
-            self.progress_msg.setText("No posts found.")
+            if result.stopped:
+                self.progress_msg.setText("Stopped before any posts were fetched.")
+            else:
+                matching = f" matching \u201c{self.request.query}\u201d" if self.request.query else ""
+                self.progress_msg.setText(f"No posts found in r/{result.subreddit}{matching}.")
             return
-        extra = f" and {result.comments} comments" if result.comments else ""
+        extra = f" and {result.comments:,} comments" if self.request.include_comments else ""
         stopped = " (stopped early)" if result.stopped else ""
-        self.progress_msg.setText(f"Analysed {result.posts} posts{extra} from r/{result.subreddit}{stopped}.")
+        self.progress_msg.setText(f"Analysed {result.posts:,} posts{extra} from r/{result.subreddit}{stopped}.")
         self._refresh_datasets(select=result.subreddit)
 
     def _on_failed(self, message: str) -> None:
-        self.progress_msg.setText("Fetch failed.")
+        self._refresh_datasets(select=self.request.subreddit)  # show anything stored before the error
+        kept = self.current and self.current.lower() == self.request.subreddit.lower()
+        self.progress_msg.setText("Fetch failed. What was fetched before the error is saved." if kept
+                                  else "Fetch failed.")
         QMessageBox.warning(self, "Fetch failed", message)
-        self._refresh_datasets(select=self.current)  # show anything stored before the error
 
     def _on_thread_done(self) -> None:
         self.thread.deleteLater()
@@ -566,20 +690,36 @@ class MainWindow(QMainWindow):
     # -- datasets -------------------------------------------------------------
 
     def _refresh_datasets(self, select: str | None = None) -> None:
-        names = self.store.subreddits()
-        select = select or self.current or (names[0] if names else None)
+        """Reload the saved-data list, selecting select, else the current dataset, else the newest."""
+        sets = self.store.datasets()
+        names = [d["name"] for d in sets]
         self.datasets.blockSignals(True)
         self.datasets.clear()
-        for n in names:
-            item = QListWidgetItem(f"r/{n}")
-            item.setData(Qt.ItemDataRole.UserRole, n)
+        for d in sets:
+            item = QListWidgetItem(f"r/{d['name']}")
+            item.setData(Qt.ItemDataRole.UserRole, d["name"])
+            item.setToolTip(f"{d['posts']:,} posts and {d['comments']:,} comments · "
+                            f"last fetched {when_text(d['last_fetched'])}")
             self.datasets.addItem(item)
+        lowered = [n.lower() for n in names]
+        row = next((lowered.index(c.lower()) for c in (select, self.current) if c and c.lower() in lowered),
+                   0 if names else None)
+        if row is not None:
+            self.datasets.setCurrentRow(row)
         self.datasets.blockSignals(False)
-        match = next((i for i, n in enumerate(names) if select and n.lower() == select.lower()), None)
-        if match is not None:
-            self.datasets.setCurrentRow(match)  # emits currentItemChanged -> _show_dataset
-        else:
-            self._show_dataset("")
+        self._on_dataset_selected(self.datasets.currentItem())  # reload even when the selection is unchanged
+        posts, comments = sum(d["posts"] for d in sets), sum(d["comments"] for d in sets)
+        self.storage_info.setText(
+            f"{len(sets)} subreddit{'s' if len(sets) != 1 else ''}, {posts:,} posts, {comments:,} comments · "
+            f"{human_size(self.store.size_bytes())} on this computer" if sets
+            else "Nothing saved yet. Fetched data is kept on this computer between sessions.")
+        self._update_delete_enabled()
+
+    def _on_dataset_selected(self, item: QListWidgetItem | None) -> None:
+        name = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        self._show_dataset(name)
+        if name:
+            self.settings.setValue("ui/last_dataset", name)
 
     def _show_dataset(self, name: str) -> None:
         self.current = name or None
@@ -589,14 +729,14 @@ class MainWindow(QMainWindow):
         self.comments_tab.load(self.comments)
         self.export_posts.setEnabled(bool(self.posts))
         self.export_comments.setEnabled(bool(self.comments))
-        self.delete_btn.setEnabled(bool(name))
+        self._update_delete_enabled()
         self.tabbar.setTabText(1, f"Posts  {len(self.posts):,}")
         self.tabbar.setTabText(2, f"Comments  {len(self.comments):,}")
         if self.current:
             self.heading.setText(f"r/{self.current}")
             fetched = max((r["fetched_at"] for r in self.posts), default=None)
-            when = datetime.fromtimestamp(fetched).strftime("%d %b %Y, %H:%M") if fetched else "never"
-            self.subheading.setText(f"{len(self.posts):,} posts and {len(self.comments):,} comments · last fetched {when}")
+            self.subheading.setText(f"{len(self.posts):,} posts and {len(self.comments):,} comments · "
+                                    f"last fetched {when_text(fetched)}")
         else:
             self.heading.setText("No data yet")
             self.subheading.setText("Enter a subreddit on the left and press Fetch and analyse.")
@@ -632,12 +772,29 @@ class MainWindow(QMainWindow):
             widget.addItem(item)
 
     def _delete_dataset(self) -> None:
-        if not self.current:
+        if not self.current or self.thread is not None:
             return
-        if QMessageBox.question(self, "Delete data", f"Delete all stored posts and comments for r/{self.current}?") \
-                != QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(
+                self, "Delete saved data",
+                f"Delete the {len(self.posts):,} posts and {len(self.comments):,} comments saved for "
+                f"r/{self.current}? This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_subreddit(self.current)
+        self.statusBar().showMessage(f"Deleted the saved data for r/{self.current}.", 8000)
+        self.current = None
+        self._refresh_datasets()
+
+    def _delete_all(self) -> None:
+        if self.thread is not None or not self.datasets.count():
+            return
+        if QMessageBox.question(
+                self, "Delete all saved data",
+                f"Delete everything saved for all {self.datasets.count()} subreddits? "
+                "This can't be undone.") != QMessageBox.StandardButton.Yes:
+            return
+        self.store.delete_all()
+        self.settings.remove("ui/last_dataset")
+        self.statusBar().showMessage("Deleted all saved data.", 8000)
         self.current = None
         self._refresh_datasets()
 
@@ -651,7 +808,7 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self) -> None:
         if settings_dialog.SettingsDialog(self.settings, self).exec():
-            self.statusBar().showMessage(self._mode_text())
+            self.mode_label.setText(self._mode_text())
 
     def _show_about(self) -> None:
         QMessageBox.about(self, "About ikari", (
@@ -663,6 +820,7 @@ class MainWindow(QMainWindow):
         paint_backdrop(self, over_native=self._native_backdrop is not None)
 
     def closeEvent(self, event) -> None:
+        self._save_fetch_settings()
         if self.worker:
             self.worker.stop()
             self.thread.quit()

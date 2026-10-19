@@ -49,3 +49,17 @@ def test_collect_run_scores_and_stores(tmp_path):
     result = collect.run(FakeClient(), s, req)
     assert (result.subreddit, result.posts, result.comments) == ("AskScience", 2, 2)
     assert all(r["label"] == "positive" for r in s.comments("askscience"))
+
+
+def test_datasets_summarise_each_subreddit_and_delete_all_empties_the_store(tmp_path):
+    s = Store(tmp_path / "x.db")
+    s.save_post(make_post(1), 0.5, "positive")
+    s.save_post(make_post(2, sub="rust"), 0.1, "positive")
+    s.save_comment(Comment("c1", "p1", "python", "t3_p1", "b", "hi", 1, 1_700_000_100, 0, "u"), 0.0, "neutral")
+    s.commit()
+    by_name = {d["name"]: d for d in s.datasets()}
+    assert by_name["Python"]["posts"] == 1 and by_name["Python"]["comments"] == 1  # comment casing differs
+    assert by_name["rust"]["comments"] == 0 and by_name["rust"]["last_fetched"]
+    assert s.size_bytes() > 0
+    s.delete_all()
+    assert s.datasets() == [] and s.comments("python") == []

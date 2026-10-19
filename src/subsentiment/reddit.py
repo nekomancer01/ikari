@@ -2,13 +2,14 @@
 
 Two modes:
   * anonymous: the public ``.json`` endpoints on www.reddit.com. No setup, but
-    Reddit rate-limits these hard and blocks many datacenter/VPN IPs (HTTP 403).
+    Reddit rate-limits these hard and, since mid-2026, refuses most of them (HTTP 403).
   * app-only OAuth: a "script" app's client id/secret from
     https://www.reddit.com/prefs/apps, used with the client_credentials grant
     against oauth.reddit.com. Read-only, no Reddit username/password needed.
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterator
@@ -20,6 +21,9 @@ DEFAULT_USER_AGENT = "desktop:subsentiment:v0.1 (subreddit sentiment explorer)"
 LISTING_SORTS = ("hot", "new", "top", "rising", "controversial")
 SEARCH_SORTS = ("relevance", "hot", "top", "new", "comments")
 TIME_FILTERS = ("hour", "day", "week", "month", "year", "all")
+
+_SUBREDDIT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_]{1,20}")
+_SUBREDDIT_URL = re.compile(r"^(?:https?://)?(?:[a-z]+\.)?reddit\.com/", re.IGNORECASE)
 
 ProgressFn = Callable[[str], None]
 StopFn = Callable[[], bool]
@@ -60,6 +64,23 @@ class Comment:
     created_utc: float
     depth: int
     permalink: str
+
+
+def normalize_subreddit(name: str) -> str:
+    """Turn "r/Python", "/r/Python/" or a pasted subreddit URL into "Python"; "" when nothing is left."""
+    name = _SUBREDDIT_URL.sub("", name.strip()).lstrip("/")
+    if name.lower().startswith("r/"):
+        name = name[2:]
+    return name.split("/", 1)[0].strip()
+
+
+def subreddit_error(name: str) -> str | None:
+    """Why a normalised name can't be fetched, or None when it looks valid."""
+    if not name:
+        return "Enter a subreddit name."
+    if not _SUBREDDIT_NAME.fullmatch(name):
+        return f"“{name}” isn't a valid subreddit name: use 2–21 letters, digits or underscores."
+    return None
 
 
 def _post_from(d: dict) -> Post:
@@ -183,7 +204,7 @@ class RedditClient:
                 continue
             if resp.status_code == 403:
                 hint = (
-                    " Reddit often blocks anonymous requests from cloud/VPN IPs; add API credentials in Settings."
+                    " Reddit now blocks most anonymous requests; add Reddit API credentials in Settings."
                     if not self.authenticated else " The subreddit may be private or quarantined."
                 )
                 raise RedditError(f"Access denied (HTTP 403) for {path}.{hint}")
@@ -207,9 +228,9 @@ class RedditClient:
         progress: ProgressFn | None = None,
         should_stop: StopFn | None = None,
     ) -> list[Post]:
-        subreddit = subreddit.strip().removeprefix("r/").removeprefix("/r/").strip("/")
-        if not subreddit:
-            raise RedditError("Enter a subreddit name.")
+        subreddit = normalize_subreddit(subreddit)
+        if error := subreddit_error(subreddit):
+            raise RedditError(error)
         if query:
             path = f"/r/{subreddit}/search"
             base = {"q": query, "restrict_sr": 1, "sort": sort if sort in SEARCH_SORTS else "relevance", "t": time_filter}

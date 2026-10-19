@@ -69,6 +69,21 @@ class Store:
             "SELECT subreddit, MAX(fetched_at) f FROM posts GROUP BY subreddit COLLATE NOCASE ORDER BY f DESC")
         return [r["subreddit"] for r in rows]
 
+    def datasets(self) -> list[dict]:
+        """One entry per stored subreddit, most recently fetched first: name, posts, comments, last_fetched."""
+        rows = self.db.execute(
+            "SELECT subreddit, COUNT(*) n, MAX(fetched_at) f FROM posts "
+            "GROUP BY subreddit COLLATE NOCASE ORDER BY f DESC").fetchall()
+        comments = {r["s"].lower(): r["n"] for r in self.db.execute(
+            "SELECT subreddit s, COUNT(*) n FROM comments GROUP BY subreddit COLLATE NOCASE")}
+        return [{"name": r["subreddit"], "posts": r["n"], "comments": comments.get(r["subreddit"].lower(), 0),
+                 "last_fetched": r["f"]} for r in rows]
+
+    def size_bytes(self) -> int:
+        """Disk used by the database, including its WAL file."""
+        return sum(p.stat().st_size for p in (self.path, self.path.with_name(self.path.name + "-wal"))
+                   if p.exists())
+
     def posts(self, subreddit: str) -> list[sqlite3.Row]:
         return self.db.execute(
             "SELECT * FROM posts WHERE subreddit = ? COLLATE NOCASE ORDER BY created_utc DESC",
@@ -84,6 +99,21 @@ class Store:
         self.db.execute("DELETE FROM posts WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
         self.db.execute("DELETE FROM comments WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
         self.db.commit()
+        self._compact()
+
+    def delete_all(self) -> None:
+        self.db.execute("DELETE FROM posts")
+        self.db.execute("DELETE FROM comments")
+        self.db.commit()
+        self._compact()
+
+    def _compact(self) -> None:
+        """Give deleted rows' space back to the OS, so deleting data actually frees disk."""
+        try:
+            self.db.execute("VACUUM")
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError:  # another connection is mid-write; space is reused later anyway
+            pass
 
     def export_csv(self, subreddit: str, kind: str, path: str | Path) -> int:
         rows = self.posts(subreddit) if kind == "posts" else self.comments(subreddit)
