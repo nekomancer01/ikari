@@ -301,7 +301,7 @@ class StatTile(QFrame):
         super().__init__()
         mark(self, "glass", "tile")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setContentsMargins(16, 14, 16, 14)
         lay.setSpacing(4)
         self.value = label("–", "value")
         lay.addWidget(label(caption.upper(), "section"))
@@ -552,7 +552,6 @@ class MainWindow(QMainWindow):
         brand.addWidget(label("ikari", "title"))
         brand.addWidget(label("Gather posts and read the mood", "subtitle"))
         lay.addLayout(brand)
-        lay.addSpacing(6)
 
         self.subreddit = QLineEdit()
         self.subreddit.setPlaceholderText("e.g. python")
@@ -607,35 +606,44 @@ class MainWindow(QMainWindow):
         form.addRow(label("Comments", "muted"), comments_row)
         form.addRow(label("Scores", "muted"), self.refresh_scores)
         lay.addLayout(form)
+        # Each label as tall as its field and centred in it: QFormLayout top-aligns a short label, which put
+        # labels a few pixels above their fields' centres where the text is small (macOS).
+        for row in range(form.rowCount()):
+            name = form.itemAt(row, QFormLayout.ItemRole.LabelRole).widget()
+            field = form.itemAt(row, QFormLayout.ItemRole.FieldRole)
+            name.setMinimumHeight(field.sizeHint().height())
+            name.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         self.fetch_btn = mark(QPushButton("Fetch and analyse"), "primary", True)
         self.fetch_btn.setDefault(True)
         self.fetch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.fetch_btn.clicked.connect(self._start_fetch)
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self._stop_fetch)
-        buttons = QHBoxLayout()
-        buttons.setSpacing(8)
-        buttons.addWidget(self.fetch_btn, 1)
-        buttons.addWidget(self.stop_btn)
-        lay.addLayout(buttons)
         self.live_btn = QPushButton("Live feed")
         self.live_btn.setCheckable(True)
         self.live_btn.setToolTip("Keep checking Arctic Shift for new posts in this subreddit and add them as they appear")
         self.live_btn.toggled.connect(self._toggle_live)
-        lay.addWidget(self.live_btn)
-        self.live_msg = label("", "muted")
-        self.live_msg.setWordWrap(True)
-        self.live_msg.setVisible(False)
+        # Fetch and Live feed share a row, and Stop sits by the progress bar while a fetch runs: three rows of
+        # buttons made the panel taller than a 150% maximized window.
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addWidget(self.fetch_btn, 1)
+        buttons.addWidget(self.live_btn)
+        lay.addLayout(buttons)
+        self.live_msg = StatusLabel()
         lay.addWidget(self.live_msg)
         self.progress = QProgressBar()
-        self.progress.setVisible(False)
+        self.stop_btn = mark(QPushButton("Stop"), "small", True)
+        self.stop_btn.clicked.connect(self._stop_fetch)
+        progress_row = QHBoxLayout()
+        progress_row.setSpacing(8)
+        progress_row.addWidget(self.progress, 1, Qt.AlignmentFlag.AlignVCenter)
+        progress_row.addWidget(self.stop_btn)
+        for w in (self.progress, self.stop_btn):
+            w.setVisible(False)
         self.progress_msg = StatusLabel()
-        lay.addWidget(self.progress)
+        lay.addLayout(progress_row)
         lay.addWidget(self.progress_msg)
 
-        lay.addSpacing(6)
         self.delete_btn = mark(mark(QPushButton("Delete…"), "flat", True), "small", True)
         self.delete_btn.setToolTip("Delete the saved posts and comments for the selected subreddit")
         self.delete_btn.clicked.connect(self._delete_dataset)
@@ -688,16 +696,16 @@ class MainWindow(QMainWindow):
         self.scope.setCurrentIndex(max(self.scope.findText(saved), 0))
         self.scope.currentTextChanged.connect(self._on_scope_changed)
         self.heading.setMinimumWidth(QFontMetrics(theme.display_font(15, 650)).horizontalAdvance("r/subreddit"))
-        # The title and the Overview's scope picker share the first row and the subtitle runs under both;
-        # the tabs take both rows on the right. The subtitle used to share a narrow column with the title
-        # and wrapped at 150%, cutting off "last fetched".
+        # The title, the Overview's scope picker and the tabs share one centre line, and the subtitle runs
+        # the full width under them. It used to share a narrow column with the title and wrapped at 150%,
+        # cutting off "last fetched".
         header = QGridLayout()
         header.setHorizontalSpacing(12)
         header.setVerticalSpacing(2)
-        header.addWidget(self.heading, 0, 0)
+        header.addWidget(self.heading, 0, 0, Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.scope, 0, 1, Qt.AlignmentFlag.AlignVCenter)
-        header.addWidget(self.subheading, 1, 0, 1, 2)
-        header.addWidget(self.tabbar, 0, 2, 2, 1, Qt.AlignmentFlag.AlignBottom)
+        header.addWidget(self.tabbar, 0, 2, Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.subheading, 1, 0, 1, 3)
         header.setColumnStretch(0, 1)
         lay.addLayout(header)
 
@@ -730,8 +738,10 @@ class MainWindow(QMainWindow):
         }
         tiles = QHBoxLayout()
         tiles.setSpacing(14)
+        widest = max(t.minimumSizeHint().width() for t in self.tiles.values())
         for t in self.tiles.values():
-            tiles.addWidget(t, 1)  # equal widths, whatever the caption length
+            t.setMinimumWidth(widest)  # equal widths, whatever the caption length, down to the narrowest window
+            tiles.addWidget(t, 1)
         lay.addLayout(tiles)
 
         self.distribution = DistributionChart()
@@ -871,6 +881,7 @@ class MainWindow(QMainWindow):
         self.fetch_btn.setEnabled(not busy and self.live_thread is None)
         self.live_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
+        self.stop_btn.setVisible(busy)
         self.progress.setVisible(busy)
         if busy:
             self.progress.setRange(0, 0)
@@ -967,7 +978,6 @@ class MainWindow(QMainWindow):
         self.live_thread.finished.connect(self._on_live_done)
         for widget in (self.subreddit, self.fetch_btn):
             widget.setEnabled(False)
-        self.live_msg.setVisible(True)
         self._set_live_msg(f"Live: checking r/{name} for new posts…")
         self.live_thread.start()
 
@@ -987,7 +997,7 @@ class MainWindow(QMainWindow):
         self.live_btn.blockSignals(True)
         self.live_btn.setChecked(False)
         self.live_btn.blockSignals(False)
-        self.live_msg.setVisible(False)
+        self.live_msg.setText("")
 
     def _set_live_msg(self, text: str) -> None:
         self.live_msg.setText(text)
@@ -996,10 +1006,11 @@ class MainWindow(QMainWindow):
         stamp = datetime.now().strftime("%H:%M:%S")
         newest = (f" Newest post is {age_text(datetime.now().timestamp() - result.newest)} old."
                   if result.newest else "")
+        # Kept to a line or two so the panel doesn't outgrow the window; the caveat is in the tooltip.
         self._set_live_msg(
-            f"Live: r/{self.live_name}, {plural(self._live_seen + result.new, 'new post')} this session. "
-            f"Checked {stamp}.{newest} Arctic Shift archives posts a little after Reddit, so the feed "
-            "can trail by a few minutes.")
+            f"Live: {plural(self._live_seen + result.new, 'new post')} this session. Checked {stamp}.{newest}")
+        self.live_msg.setToolTip("Arctic Shift archives posts a little after Reddit, so the feed can trail "
+                                 "by a few minutes.")
 
     def _on_live_saved(self, new: int, newest) -> None:
         self._live_seen += new

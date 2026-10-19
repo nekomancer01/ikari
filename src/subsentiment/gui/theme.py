@@ -230,7 +230,7 @@ QLabel[role="status"] {{ color: {t['muted']}; padding: 2px 6px; }}
 /* Inputs */
 QLineEdit, QSpinBox, QComboBox, QDateEdit {{
     background: {strong}; border: 1px solid {edge}; border-radius: 10px;
-    padding: 6px 10px; min-height: 20px; max-height: 20px; selection-background-color: {t['accent']}; selection-color: {t['on_accent']};
+    padding: 5px 10px; min-height: 20px; max-height: 20px; selection-background-color: {t['accent']}; selection-color: {t['on_accent']};
 }}
 QLineEdit:hover, QSpinBox:hover, QComboBox:hover, QDateEdit:hover {{ border-color: {t['faint']}; }}
 QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QComboBox:on, QDateEdit:focus {{ border: 1px solid {t['accent']}; }}
@@ -269,6 +269,7 @@ QPushButton:hover {{ border-color: {t['faint']}; }}
 QPushButton:pressed {{ background: {glass}; }}
 QPushButton:disabled {{ color: {t['faint']}; background: {soft}; border-color: {edge}; }}
 QPushButton:focus {{ border-color: {t['accent']}; }}
+QPushButton:checked {{ background: {sel}; border-color: {t['accent']}; }}  /* a toggle that's on, like Live feed */
 QPushButton[primary="true"] {{
     color: {t['on_accent']}; border: 1px solid rgba(255, 255, 255, 60);
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {t['button0']}, stop:1 {t['button1']});
@@ -291,7 +292,7 @@ QTabWidget::tab-bar {{ left: 0; }}
 QTabBar {{ background: transparent; }}
 QTabBar::tab {{
     background: transparent; color: {t['muted']}; border: 1px solid transparent; border-radius: 10px;
-    padding: 7px 16px; margin: 0 4px 10px 0; font-weight: 600;
+    padding: 7px 16px; margin: 0 4px 0 0; font-weight: 600;
 }}
 QTabBar::tab:hover {{ color: {t['text']}; background: {soft}; }}
 QTabBar::tab:selected {{ color: {t['text']}; background: {strong}; border-color: {edge}; border-top-color: {hi}; }}

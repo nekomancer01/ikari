@@ -129,7 +129,20 @@ class Cell(QWidget):
         self.main.setText(main)
         self.side.setText(side)
         self.bar.set(share, complete)
-        self.setToolTip(tip)
+        self.setToolTip(tip if tip else (f"{main}, {side}" if side else main))
+        self._fit()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit()
+
+    def _fit(self) -> None:
+        """In a narrow column the right-hand note ("total unknown", "40%") steps aside rather than being cut
+        off; the bar and the tooltip still say it."""
+        m = self.layout().contentsMargins()
+        room = self.width() - m.left() - m.right()
+        need = self.main.sizeHint().width() + 8 + self.side.sizeHint().width()
+        self.side.setVisible(bool(self.side.text()) and need <= room)
 
 
 class ElidedLabel(QLabel):
@@ -264,6 +277,12 @@ class CoverageWindow(QDialog):
         top.addWidget(self.posts_title, 1)
         top.addWidget(self.all_comments)
         right_lay.addLayout(top)
+        # Room for each table's stretching column ("13 saved", a post title) even in the narrowest window.
+        for t, fixed, stretch in ((self.day_table, (0, 2), 90), (self.post_table, (1, 2), 120)):
+            h = t.horizontalHeader()
+            t.setMinimumWidth(sum(h.sectionSize(i) for i in fixed) + stretch + 12)
+        # Both panels' title rows as tall as the button, so the two tables start level.
+        left_lay.itemAt(0).widget().setMinimumHeight(self.all_comments.sizeHint().height())
         right_lay.addWidget(self.post_table, 1)
         right_lay.addWidget(self.posts_empty, 1)
 
