@@ -124,4 +124,4 @@ jobs:
         run: |
           ls -l packages
           gh release create "$GITHUB_REF_NAME" packages/* --repo "$GITHUB_REPOSITORY" \
-            --title "Subreddit Sentiment ${GITHUB_REF_NAME#v}" --generate-notes
+            --title "ikari ${GITHUB_REF_NAME#v}" --generate-notes
