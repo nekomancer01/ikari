@@ -308,7 +308,8 @@ class CoverageWindow(QDialog):
         top.addWidget(self.all_comments)
         right_lay.addLayout(top)
         # Room for each table's stretching column ("13 saved", a post title) even in the narrowest window.
-        for t, fixed, stretch in ((self.day_table, (0, 2), 90), (self.post_table, (1, 2), 120)):
+        day_room = self.day_table.fontMetrics().horizontalAdvance("9,999 saved so far") + 28  # plus the cell's margins
+        for t, fixed, stretch in ((self.day_table, (0, 2), day_room), (self.post_table, (1, 2), 120)):
             h = t.horizontalHeader()
             t.setMinimumWidth(sum(h.sectionSize(i) for i in fixed) + stretch + 12)
         # Both panels' title rows as tall as the button, so the two tables start level.
