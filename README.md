@@ -140,6 +140,22 @@ Install Python 3.10 or newer, then:
 The first run sets up a private environment in `.venv` (about a minute); after that it opens
 straight away. Delete `.venv` to reinstall.
 
+## Build it yourself on Windows
+
+For testing the latest `main` on your own PC. You need [Git](https://git-scm.com/download/win)
+and [Python 3.10+](https://www.python.org/downloads/) (tick *Add python.exe to PATH*);
+[Inno Setup 6](https://jrsoftware.org/isinfo.php) is optional and adds the installer.
+
+```bat
+git clone https://github.com/nekomancer01/ikari.git && cd ikari
+dev-windows.bat
+```
+
+After that, double-click `dev-windows.bat` whenever you want the newest build: it pulls, updates
+the build environment, builds into `dist\` and starts `dist\ikari\ikari.exe`. Options: `-Test`
+runs the test suite first, `-NoPull` builds what's on disk, `-NoLaunch` opens `dist\` instead of
+starting the app, `-Branch <name>` switches branch first.
+
 ## Build the app yourself
 
 <details>
@@ -257,6 +273,7 @@ Layout:
 | `src/subsentiment/gui/` | Qt main window, charts, table models, background worker, settings |
 | `src/subsentiment/gui/theme.py` | Glass theme: color tokens, stylesheet, fonts, backdrop |
 | `src/subsentiment/gui/native/` | Per-OS integration: Windows title bar and Mica/Acrylic, macOS menus and vibrancy, Linux desktop id and theme |
+| `dev-windows.bat` | Windows: pull, build and launch the app for testing (wraps `packaging/dev-windows.ps1` and `build.py`) |
 | `packaging/build.py` | One build entry for all platforms (PyInstaller, then zip/installer, .dmg, or AppImage/.tar.gz) |
 | `packaging/` | PyInstaller spec, Inno Setup installer, Linux AppRun/.desktop/install.sh |
 | `tools/make_icon.py` | Regenerates the app icons (needs Pillow) |

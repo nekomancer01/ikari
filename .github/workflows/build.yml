@@ -67,7 +67,14 @@ jobs:
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
 
       - name: Build
+        if: runner.os != 'Windows'
         run: python packaging/build.py
+
+      # Windows builds through the dev script so CI exercises what developers run locally.
+      - name: Build (Windows, via dev-windows.bat)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: dev-windows.bat -NoPull -NoLaunch
 
       - name: Check the app starts (Windows)
         if: runner.os == 'Windows'
