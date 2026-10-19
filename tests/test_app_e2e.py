@@ -251,7 +251,8 @@ def test_switching_subreddit_mid_fetch_keeps_each_table_to_its_own_rows(env):
     rust = next(i for i in range(w.datasets.count())
                 if w.datasets.item(i).data(Qt.ItemDataRole.UserRole).lower() == "rust")
     w._drip.setInterval(60000)  # hold back the queued rows, as a busy fetch does
-    pump(400)
+    while not any(w._queued.values()) and time.monotonic() < end:
+        pump(20)
     assert any(w._queued.values()), "some fetched rows should be waiting to fade in"
     w.datasets.setCurrentRow(rust)  # look at another subreddit while python is still downloading
     w._release_rows()
