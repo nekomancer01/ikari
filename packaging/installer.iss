@@ -1,6 +1,9 @@
-; Inno Setup 6 script. Build the app first (packaging\build-windows.ps1), then: ISCC packaging\installer.iss
+; Inno Setup 6 script. packaging\build.py runs it after PyInstaller, passing the version:
+;   ISCC /DAppVersion=0.3.0 packaging\installer.iss
 #define AppName "Subreddit Sentiment"
-#define AppVersion "0.2.0"
+#ifndef AppVersion
+  #define AppVersion "0.0.0"
+#endif
 #define AppExe "SubredditSentiment.exe"
 
 [Setup]

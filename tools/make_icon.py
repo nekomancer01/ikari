@@ -1,4 +1,7 @@
-"""Draw the app icon (assets/app.png and assets/app.ico). Run: python tools/make_icon.py (needs Pillow)."""
+"""Draw the app icon: assets/app.png, app-512.png (Linux), app.ico (Windows) and app.icns (macOS).
+
+Run: python tools/make_icon.py (needs Pillow).
+"""
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
@@ -48,6 +51,8 @@ for c, h in zip(colors, heights):
 
 ASSETS.mkdir(parents=True, exist_ok=True)
 icon.resize((256, 256), Image.LANCZOS).save(ASSETS / "app.png")
+icon.resize((512, 512), Image.LANCZOS).save(ASSETS / "app-512.png")
 icon.resize((256, 256), Image.LANCZOS).save(
     ASSETS / "app.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
-print("wrote", ASSETS / "app.png", ASSETS / "app.ico")
+icon.save(ASSETS / "app.icns")  # Pillow writes every size macOS needs, up to 1024 px
+print("wrote", *(ASSETS / n for n in ("app.png", "app-512.png", "app.ico", "app.icns")))

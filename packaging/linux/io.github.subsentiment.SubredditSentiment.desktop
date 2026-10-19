@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Subreddit Sentiment
+Comment=Gather subreddit posts and comments and analyse their sentiment
+Exec=SubredditSentiment
+Icon=io.github.subsentiment.SubredditSentiment
+Categories=Network;Utility;
+Terminal=false

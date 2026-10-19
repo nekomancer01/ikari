@@ -4,3 +4,7 @@
 *.ttf binary
 *.ico binary
 *.png binary
+*.icns binary
+*.sh text eol=lf
+*.command text eol=lf
+packaging/linux/AppRun text eol=lf

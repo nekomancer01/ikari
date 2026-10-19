@@ -1,0 +1,4 @@
+#!/bin/sh
+# AppImage entry point: run the bundled PyInstaller app.
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/lib/SubredditSentiment/SubredditSentiment" "$@"
