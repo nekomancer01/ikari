@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS complete (
 CREATE INDEX IF NOT EXISTS posts_sub ON posts(subreddit COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS comments_sub ON comments(subreddit COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS comments_post ON comments(post_id);
+-- A running fetch's new rows are read back by when they were saved.
+CREATE INDEX IF NOT EXISTS posts_fetched ON posts(subreddit COLLATE NOCASE, fetched_at);
+CREATE INDEX IF NOT EXISTS comments_fetched ON comments(subreddit COLLATE NOCASE, fetched_at);
 """
 
 POST_COLUMNS = ("id", "subreddit", "title", "selftext", "author", "score", "upvote_ratio",

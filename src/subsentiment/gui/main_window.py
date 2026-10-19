@@ -337,6 +337,8 @@ class MainWindow(QMainWindow):
         self._queued: dict[str, list] = {"posts": [], "comments": []}
         self._queued_ids: set[str] = set()
         self._since = 0.0  # rows saved since this moment belong to the running fetch
+        # How far each table has read the running fetch's rows, so each save reads only what's new.
+        self._read_to = {"posts": 0.0, "comments": 0.0}
         self.posts: list = []
         self.comments: list = []
         self.coverage = None  # the Download coverage window, once opened
@@ -799,6 +801,7 @@ class MainWindow(QMainWindow):
     def _launch(self, req: collect.FetchRequest, message: str) -> None:
         self.request = req
         self._since = time.time() - 1.0
+        self._read_to = {"posts": self._since, "comments": self._since}
         self._flush_rows()
         self.thread = QThread(self)
         self.worker = FetchWorker(req, self.db_path)
@@ -843,8 +846,10 @@ class MainWindow(QMainWindow):
         if self.thread is None or not self._showing_fetch():
             return
         name = self.current
-        for kind, rows in (("posts", self.store.posts_since(name, self._since)),
-                           ("comments", self.store.comments_since(name, self._since))):
+        for kind, read in (("posts", self.store.posts_since), ("comments", self.store.comments_since)):
+            rows = read(name, self._read_to[kind])
+            if rows:  # rows saved in the same instant as the last one read come back too; the ids catch them
+                self._read_to[kind] = rows[-1]["fetched_at"]
             for r in rows:
                 if r["id"] not in self._queued_ids:
                     self._queued_ids.add(r["id"])
@@ -965,6 +970,10 @@ class MainWindow(QMainWindow):
 
     def _show_dataset(self, name: str, animate: bool = False) -> None:
         """Show a saved subreddit. With animate (a fetch adding to it), new rows fade in."""
+        # Rows still queued from a running fetch belong to whatever was shown before; the tables are
+        # about to be reloaded from the store, which has them anyway.
+        self._drip.stop()
+        self._queued = {"posts": [], "comments": []}
         self.current = name or None
         self.posts = self.store.posts(name) if name else []
         self.comments = self.store.comments(name) if name else []
