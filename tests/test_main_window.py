@@ -110,3 +110,18 @@ def test_delete_one_then_all(make_window, monkeypatch):
     assert w.datasets.count() == 0 and w.current is None
     assert not w.delete_btn.isEnabled() and not w.delete_all_act.isEnabled()
     assert "Nothing saved yet" in w.storage_info.text()
+
+
+def test_background_mood_follows_the_dataset_and_can_be_turned_off(make_window):
+    from subsentiment.gui import theme
+    assert theme.mood_score(3, 1, 4) == 1.0 and theme.mood_score(1, 3, 10) == -0.4 and theme.mood_score(0, 0, 0) == 0
+    w = make_window()
+    w._show_dataset("Python")  # one positive post; the window isn't shown, so the tint jumps straight there
+    assert (w.mood.state.x(), w.mood.state.y()) == (1.0, 1.0)
+    w._show_dataset("")
+    assert w.mood.state.y() == 0.0  # no data: the plain backdrop
+    w.mood_act.setChecked(False)
+    w._show_dataset("Python")
+    assert w.mood.state.y() == 0.0
+    w.close()
+    assert make_window().mood_act.isChecked() is False

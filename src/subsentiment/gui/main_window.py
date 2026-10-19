@@ -272,6 +272,7 @@ class MainWindow(QMainWindow):
         # so a change applies on next launch.
         self._native_backdrop = native.prepare_window(self, self.settings.value("ui/backdrop", "gradient", str))
         self._shown = False
+        self.mood = theme.MoodTint(self, self.settings.value("ui/mood_tint", True, bool))
 
         self._build_menu()
         backdrop = QWidget()  # transparent: the window paints the backdrop behind menus too
@@ -322,6 +323,9 @@ class MainWindow(QMainWindow):
                                   checked=self.settings.value("ui/reduce_transparency", False, bool))
         self.reduce_act.toggled.connect(self._set_reduce)
         view.addAction(self.reduce_act)
+        self.mood_act = QAction("Tint background by sentiment", self, checkable=True, checked=self.mood.enabled)
+        self.mood_act.toggled.connect(self._set_mood_tint)
+        view.addAction(self.mood_act)
 
         options = native.backdrop_options()
         if len(options) > 1:  # Linux has only the painted gradient, so no menu there
@@ -543,6 +547,10 @@ class MainWindow(QMainWindow):
     def _set_reduce(self, on: bool) -> None:
         self.settings.setValue("ui/reduce_transparency", on)
         self._apply_theme()
+
+    def _set_mood_tint(self, on: bool) -> None:
+        self.settings.setValue("ui/mood_tint", on)
+        self.mood.set_enabled(on)
 
     def _set_backdrop(self, key: str) -> None:
         self.settings.setValue("ui/backdrop", key)
@@ -781,6 +789,7 @@ class MainWindow(QMainWindow):
         self.tiles["mean"].set(f"{s['mean']:+.3f}" if n else "–")
         self.tiles["positive"].set(f"{100 * pos:.0f}%" if n else "–", pos)
         self.tiles["negative"].set(f"{100 * neg:.0f}%" if n else "–", neg)
+        self.mood.set_counts(s["counts"]["positive"], s["counts"]["negative"], n)
         self.distribution.set_counts(s["counts"])
         self.timeline.set_points(daily_means(rows))
 
@@ -841,7 +850,7 @@ class MainWindow(QMainWindow):
             "<p>Fonts: Manrope and Sora, both under the SIL Open Font License 1.1.</p>"))
 
     def paintEvent(self, event) -> None:
-        paint_backdrop(self, over_native=self._native_backdrop is not None)
+        paint_backdrop(self, over_native=self._native_backdrop is not None, mood=self.mood.state)
 
     def closeEvent(self, event) -> None:
         self._save_fetch_settings()
