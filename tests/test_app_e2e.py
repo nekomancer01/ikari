@@ -76,10 +76,14 @@ def env(tmp_path, monkeypatch):
             return w
 
         def store(self):
-            return Store(self.db)
+            stores.append(Store(self.db))
+            return stores[-1]
+    stores = []
     yield Env()
     for w in windows:
         w.close()
+    for s in stores:
+        s.close()
     archive.close()
     assert archive.violations() == []  # nothing the real API would refuse was sent
     QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
