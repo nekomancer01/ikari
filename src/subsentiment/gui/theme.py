@@ -5,7 +5,8 @@ translucent fills over a smooth, low-contrast backdrop, plus a brighter top
 edge on each panel to catch the light. Following common glassmorphism
 guidance, glass is kept to chrome and summary cards; dense data (tables,
 lists) sits on a near-solid surface, and glass is never stacked on glass.
-"Reduce transparency" swaps every fill for a near-opaque one.
+A faint tiled grain on the glass gives it a frosted, physical texture.
+"Reduce transparency" swaps every fill for a near-opaque one and drops the grain.
 
 Type: Manrope for the interface and Sora for headings and big numbers, both
 SIL Open Font License, bundled in assets/. Tabular figures are switched on so
@@ -13,13 +14,14 @@ numbers line up in columns.
 """
 from __future__ import annotations
 
+import random
 import sys
 import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (
-    QColor, QFont, QFontDatabase, QGuiApplication, QLinearGradient, QPainter, QPalette,
+    QColor, QFont, QFontDatabase, QGuiApplication, QImage, QLinearGradient, QPainter, QPalette,
     QRadialGradient,
 )
 from PySide6.QtWidgets import QApplication, QWidget
@@ -39,6 +41,7 @@ THEMES = {
         "accent": "#3d6bff", "accent2": "#7a5cff", "on_accent": "#ffffff",
         "button0": "#3d6bff", "button1": "#7a5cff",
         "selection": (61, 107, 255, 40), "menu": "#f7f8fd", "shadow": (40, 52, 110, 40),
+        "grain": ((20, 26, 48, 11), (255, 255, 255, 20)),  # (dark speck, light speck), peak alpha
     },
     "dark": {
         "bg0": "#0c0f1d", "bg1": "#151a2f",
@@ -50,6 +53,7 @@ THEMES = {
         "accent": "#6d8dff", "accent2": "#9a7bff", "on_accent": "#ffffff",
         "button0": "#3f5fe8", "button1": "#6e45e0",  # deeper than the accent so white text keeps contrast
         "selection": (109, 141, 255, 60), "menu": "#1b2034", "shadow": (0, 0, 0, 120),
+        "grain": ((0, 0, 0, 17), (255, 255, 255, 8)),
     },
 }
 
@@ -132,12 +136,42 @@ def _icons(t: dict) -> Path:
     return _icon_dir
 
 
+GRAIN_TILE = 128  # px; big enough that the repeat doesn't show, small enough to cost nothing
+
+
+def _grain(t: dict) -> Path:
+    """Write a tileable noise texture for the glass panels, tuned per theme.
+
+    Each pixel is a light or dark speck at a random, mostly tiny alpha, so the
+    texture reads as grain rather than as a tint and leaves text contrast alone.
+    Painted once per theme and tiled by the stylesheet, so it's cheap to draw.
+    """
+    key = "".join(f"{v:02x}" for c in t["grain"] for v in c)  # retuned values get a fresh file
+    path = _icons(t) / f"{_mode}-grain-{key}.png"
+    if path.exists():
+        return path
+    (dr, dg, db, da), (lr, lg, lb, la) = t["grain"]
+    rng = random.Random(7)  # fixed seed: the same grain every run
+    img = QImage(GRAIN_TILE, GRAIN_TILE, QImage.Format.Format_ARGB32)
+    for y in range(GRAIN_TILE):
+        for x in range(GRAIN_TILE):
+            v = rng.random()
+            strength = rng.random() ** 2  # most specks faint, a few stronger
+            if v < 0.5:
+                img.setPixelColor(x, y, QColor(dr, dg, db, int(da * strength)))
+            else:
+                img.setPixelColor(x, y, QColor(lr, lg, lb, int(la * strength)))
+    img.save(str(path))
+    return path
+
+
 def stylesheet(t: dict) -> str:
     icons = _icons(t).as_posix()  # forward slashes; urls are quoted below for paths with spaces
     glass, strong, soft = _rgba(t["glass"]), _rgba(t["glass_strong"]), _rgba(t["glass_soft"])
     solid = _rgba(t["solid"])
     display = f'"{DISPLAY_FAMILY}"'
     hi, edge, sel = _rgba(t["edge_hi"]), _rgba(t["edge"]), _rgba(t["selection"])
+    grain = "none" if _reduce else f'url("{_grain(t).as_posix()}")'
     return f"""
 * {{ outline: 0; }}
 QWidget {{ color: {t['text']}; background: transparent; }}
@@ -146,12 +180,12 @@ QToolTip {{ background: {t['menu']}; color: {t['text']}; border: 1px solid {edge
 
 /* Panels */
 QFrame[glass="true"] {{
-    background: {glass};
+    background-color: {glass}; background-image: {grain};
     border: 1px solid {edge}; border-top-color: {hi}; border-left-color: {hi};
     border-radius: 18px;
 }}
 QFrame[glass="tile"] {{
-    background: {strong};
+    background-color: {strong}; background-image: {grain};
     border: 1px solid {edge}; border-top-color: {hi}; border-left-color: {hi};
     border-radius: 16px;
 }}
