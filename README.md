@@ -213,7 +213,8 @@ Things to know about the archive:
   range fills them in if **Scores: Update saved posts** is ticked; it re-checks those posts in batches
   of 500. It's off by default because it adds requests to every fetch.
 - **Requests are rate limited and shared.** Every request in a fetch (posts, score updates and
-  comments) goes through one limiter, at most one a second. When the archive says to slow down
+  comments) goes through one limiter, at most about two and a half a second (the archive's docs say "a few
+  requests per second is fine"). When the archive says to slow down
   (HTTP 429) ikari waits as long as it asks and spaces later requests further apart; it also backs
   off on server and network errors. When a query times out ("Timeout. Maybe slow down a bit"), it
   waits, asks for a smaller page, then searches a narrower slice of time. The status line says when
@@ -221,7 +222,7 @@ Things to know about the archive:
 - **Comments take one request per post.** ikari asks for each post's whole comment tree at once and
   keeps the highest-scored. If a post's comments can't be fetched, it moves on to the next; after
   five failures in a row it stops asking, and the next fetch of the range picks up the posts that
-  are still missing comments. 100 posts with comments take about two minutes.
+  are still missing comments. 100 posts with comments take about a minute.
 - **It's a volunteer service** with no uptime guarantee. Items that were removed or deleted on Reddit
   are skipped.
 
