@@ -105,6 +105,15 @@ def fit_to_screen(size: QSize, screen) -> QSize:
 
 def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
     """What a finished fetch did, for the line under the progress bar."""
+    if req.comment_posts:
+        parts = [f"Added {plural(result.comments, 'comment')} on {plural(len(req.comment_posts), 'post')} "
+                 f"from r/{result.subreddit}."]
+        if result.comment_errors:
+            parts.append(f"Comments couldn't be fetched for {plural(result.comment_errors, 'post')}; "
+                         "try again later.")
+        if result.stopped:
+            parts.append("Stopped early.")
+        return " ".join(parts)
     if not (result.posts or result.updated or result.already):
         if result.stopped:
             return "Stopped before any posts were fetched."
@@ -312,6 +321,7 @@ class MainWindow(QMainWindow):
         self._live.timeout.connect(self._live_refresh)
         self.posts: list = []
         self.comments: list = []
+        self.coverage = None  # the Download coverage window, once opened
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
         # A native material (Mica/Acrylic/vibrancy) needs a translucent window from the start,
         # so a change applies on next launch.
@@ -373,6 +383,11 @@ class MainWindow(QMainWindow):
         self.mood_act = QAction("Tint background by sentiment", self, checkable=True, checked=self.mood.enabled)
         self.mood_act.toggled.connect(self._set_mood_tint)
         view.addAction(self.mood_act)
+        view.addSeparator()
+        self.coverage_act = QAction("Download coverage…", self, shortcut=QKeySequence("Ctrl+D"),
+                                    triggered=self._show_coverage)
+        self.coverage_act.setToolTip("How much of each day's posts, and each post's comments, is saved")
+        view.addAction(self.coverage_act)
 
         options = native.backdrop_options()
         if len(options) > 1:  # Linux has only the painted gradient, so no menu there
@@ -719,6 +734,8 @@ class MainWindow(QMainWindow):
             w.setEnabled(not busy)
         self._update_comments_enabled()
         self._update_delete_enabled()  # don't delete rows the fetch thread is writing
+        if self.coverage is not None:
+            self.coverage.set_busy(busy)
 
     def _update_delete_enabled(self) -> None:
         idle = self.thread is None
@@ -746,6 +763,16 @@ class MainWindow(QMainWindow):
             subreddit=name, after=after, before=before, limit=self.limit.value(), query=self.query.text().strip(),
             include_comments=self.include_comments.isChecked(),
             comments_per_post=self.comments_per_post.value(), top=self.pick.currentData() == "top")
+        self._launch(req, f"Contacting Arctic Shift for r/{name}…")
+
+    def start_request(self, req: collect.FetchRequest, message: str) -> bool:
+        """Run a fetch the coverage panel asked for; False if one is already running."""
+        if self.thread is not None:
+            return False
+        self._launch(req, message)
+        return True
+
+    def _launch(self, req: collect.FetchRequest, message: str) -> None:
         self.request = req
         self.thread = QThread(self)
         self.worker = FetchWorker(req, self.db_path)
@@ -759,7 +786,7 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.thread.quit)
         self.thread.finished.connect(self._on_thread_done)
         self._set_busy(True)
-        self.progress_msg.setText(f"Contacting Arctic Shift for r/{name}…")
+        self.progress_msg.setText(message)
         self.thread.start()
 
     def _stop_fetch(self) -> None:
@@ -773,6 +800,8 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, total)
             self.progress.setValue(done)
         self.progress_msg.setText(msg)
+        if self.coverage is not None:
+            self.coverage.set_progress(done, total, msg)
 
     def _on_saved(self) -> None:
         # Rows arrive in bursts; redraw at most about once a second so big fetches stay smooth.
@@ -790,9 +819,13 @@ class MainWindow(QMainWindow):
             name = item.data(Qt.ItemDataRole.UserRole) if item else None
             if name and name.lower() == target:
                 self._show_dataset(name, animate=self.current is not None)
+        if self.coverage is not None:
+            self.coverage.refresh_saved()
 
     def _on_finished(self, result: collect.FetchResult) -> None:
         self.progress_msg.setText(finish_text(result, self.request))
+        if self.coverage is not None:
+            self.coverage.set_progress(0, 0, self.progress_msg.text())
         self._live.stop()
         if self.current and self.current.lower() == result.subreddit.lower():
             self._refresh_datasets(reload=False)
@@ -812,6 +845,8 @@ class MainWindow(QMainWindow):
         self.worker.deleteLater()
         self.thread = self.worker = None
         self._set_busy(False)
+        if self.coverage is not None:
+            self.coverage.refresh_saved()
 
     # -- datasets -------------------------------------------------------------
 
@@ -870,6 +905,9 @@ class MainWindow(QMainWindow):
             self.heading.setText("No data yet")
             self.subheading.setText("Enter a subreddit on the left and press Fetch and analyse.")
         self._render_overview()
+        self.coverage_act.setEnabled(bool(self.current))
+        if self.coverage is not None:
+            self.coverage.set_subreddit(self.current)
 
     def _on_scope_changed(self, text: str) -> None:
         self.settings.setValue("ui/overview_scope", text)
@@ -940,6 +978,27 @@ class MainWindow(QMainWindow):
             n = self.store.export_csv(self.current, kind, path)
             self.statusBar().showMessage(f"Exported {n} {kind} to {path}", 8000)
 
+    def fetch_range(self) -> tuple[float, float]:
+        """The sidebar's date range as (after, before), before being now for "up to now"."""
+        after, before = range_bounds(self.range.currentData(), self.date_from.date(), self.date_to.date())
+        return after, before if before is not None else datetime.now().timestamp()
+
+    def comment_settings(self) -> tuple[bool, int]:
+        """The sidebar's Comments choice: (fetch them, how many per post)."""
+        return self.include_comments.isChecked(), self.comments_per_post.value()
+
+    def _show_coverage(self) -> None:
+        if not self.current:
+            return
+        if self.coverage is None:
+            from subsentiment.gui.coverage import CoverageWindow  # it imports this module's helpers
+            self.coverage = CoverageWindow(self)
+        self.coverage.set_subreddit(self.current)
+        self.coverage.set_busy(self.thread is not None)
+        self.coverage.show()
+        self.coverage.raise_()
+        self.coverage.activateWindow()
+
     def _show_about(self) -> None:
         QMessageBox.about(self, "About ikari", (
             f"<h3>ikari {__version__}</h3>"
@@ -951,6 +1010,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._save_fetch_settings()
+        if self.coverage is not None:
+            self.coverage.close()
         if self.worker:
             self.worker.stop()
             self.thread.quit()

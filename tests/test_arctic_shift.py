@@ -392,3 +392,45 @@ def test_other_errors_are_reported():
         client([FakeResponse(400, {"error": "bad param"})]).get(*SEARCH)
     with pytest.raises(FetchError, match="^Arctic Shift: unknown field$"):
         client([FakeResponse(200, {"data": None, "error": "unknown field"})]).get(*SEARCH)
+
+
+# -- coverage: day counts and whole threads ------------------------------------
+
+D0 = 1_791_936_000  # a UTC midnight
+
+
+def test_day_counts_read_each_bucket_format_and_fill_empty_days():
+    buckets = [{"created_utc": "2026-10-14T00:00:00.000Z", "count": 12},  # an ISO date
+               {"created_utc": (D0 + DAY) * 1000, "count": 3},  # milliseconds
+               {"created_utc": D0 + 3 * DAY, "doc_count": 7}]  # seconds
+    c = client([ok(buckets)])
+    counts = c.day_counts("r/Python", D0 + 3600, D0 + 4 * DAY - 10)
+    assert counts == {D0: 12, D0 + DAY: 3, D0 + 2 * DAY: 0, D0 + 3 * DAY: 7}
+    url, params = c.session.calls[0]
+    assert url == BASE_URL + "/api/posts/search/aggregate"
+    assert params == {"subreddit": "Python", "aggregate": "created_utc", "frequency": "day",
+                      "after": D0, "before": D0 + 4 * DAY, "limit": 5}
+
+
+def test_a_timing_out_count_is_split_and_a_day_that_still_times_out_is_left_out():
+    slow = FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
+    # two days: the whole range times out three times, then day one works and day two keeps timing out
+    c = client([slow] * 3 + [ok([{"created_utc": D0, "count": 4}])] + [slow] * 3)
+    assert c.day_counts("Python", D0, D0 + 2 * DAY) == {D0: 4}
+    assert [p["limit"] for _, p in c.session.calls] == [3, 3, 3, 2, 2, 2, 2]  # never shrunk like a page
+
+
+def test_all_comments_ask_for_the_whole_thread_and_say_whether_it_is_complete():
+    p = Post("p1", "Python", "t", "", "a", 10, 0.9, 1200, 1.0, "u", "")
+    tree = [node(comment(f"c{i}", "t3_p1", i)) for i in range(5)]
+    c = client([ok(tree)])
+    comments, whole = c.fetch_all_comments(p)
+    assert len(comments) == 5 and whole
+    assert c.session.calls[0][1] == {"link_id": "p1", "limit": 1250}
+
+    collapsed = tree + [{"kind": "more", "data": {"count": 4, "children": ["x1", "x2"]}}]
+    assert client([ok(collapsed)]).fetch_all_comments(p)[1] is False
+
+    small = Post("p1", "Python", "t", "", "a", 10, 0.9, 0, 1.0, "u", "")  # asks for at least a page
+    full = [node(comment(f"c{i}", "t3_p1", i)) for i in range(100)]
+    assert client([ok(full)]).fetch_all_comments(small)[1] is False  # a full page may have been cut short
