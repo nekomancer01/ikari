@@ -4,55 +4,52 @@ Run: python tools/make_icon.py (needs Pillow).
 """
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 
 ASSETS = Path(__file__).resolve().parents[1] / "src" / "subsentiment" / "gui" / "assets"
 N = 1024  # draw large, downsample for smooth edges
 
-
-def gradient(size, c0, c1):
-    """Diagonal gradient from top-left c0 to bottom-right c1."""
-    ramp = Image.linear_gradient("L").resize((size, size))
-    diag = Image.blend(ramp.rotate(90), ramp, 0.5)  # 45 degree ramp
-    return Image.composite(Image.new("RGB", (size, size), c1), Image.new("RGB", (size, size), c0), diag)
-
-
-def rounded_mask(size, box, radius):
-    m = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(m).rounded_rectangle(box, radius=radius, fill=255)
-    return m
-
+# Flat: solid fills only, no gradients, sheen or shadows. Colours match the theme
+# accent and the chart's sentiment colours.
+TILE = (78, 100, 255)  # between the theme's accent and accent2
+WHITE = (255, 255, 255, 255)
+COLORS = [(227, 73, 72), (138, 137, 132), (42, 120, 214)]  # negative, neutral, positive
 
 icon = Image.new("RGBA", (N, N), (0, 0, 0, 0))
-tile = gradient(N, (61, 107, 255), (122, 92, 255)).convert("RGBA")
+d = ImageDraw.Draw(icon)
 pad = 64
-icon.paste(tile, (0, 0), rounded_mask(N, (pad, pad, N - pad, N - pad), 220))
-
-# Soft highlight on the top half: the "glass" sheen.
-sheen = Image.new("L", (N, N), 0)
-ImageDraw.Draw(sheen).ellipse((-N * 0.3, -N * 0.75, N * 1.3, N * 0.45), fill=70)
-sheen = ImageChops.multiply(sheen.filter(ImageFilter.GaussianBlur(40)),
-                            rounded_mask(N, (pad, pad, N - pad, N - pad), 220))
-icon = Image.composite(Image.new("RGBA", (N, N), (255, 255, 255, 255)), icon, sheen)
+d.rounded_rectangle((pad, pad, N - pad, N - pad), radius=220, fill=TILE)
 
 # Speech bubble with three bars: posts and their sentiment.
-d = ImageDraw.Draw(icon)
 bx0, by0, bx1, by1 = 230, 250, 794, 690
-d.rounded_rectangle((bx0, by0, bx1, by1), radius=110, fill=(255, 255, 255, 245))
-d.polygon([(330, 660), (300, 800), (470, 680)], fill=(255, 255, 255, 245))
-colors = [(227, 73, 72), (138, 137, 132), (42, 120, 214)]  # negative, neutral, positive
+d.rounded_rectangle((bx0, by0, bx1, by1), radius=110, fill=WHITE)
+d.polygon([(330, 660), (300, 800), (470, 680)], fill=WHITE)
 heights = [150, 210, 300]
 bw, gap = 92, 46
 x = (bx0 + bx1) // 2 - (3 * bw + 2 * gap) // 2
 base = 610
-for c, h in zip(colors, heights):
-    d.rounded_rectangle((x, base - h, x + bw, base), radius=26, fill=c)
+for c, h in zip(COLORS, heights):
+    # Rounded top, square base: the same bar shape as the charts.
+    d.rounded_rectangle((x, base - h, x + bw, base), radius=30, fill=c, corners=(True, True, False, False))
     x += bw + gap
 
+# 16 px gets its own drawing on the pixel grid: no tail, wider bars and gaps, so the
+# three bars stay separate instead of blurring into one smudge.
+u = N // 16
+small = Image.new("RGBA", (N, N), (0, 0, 0, 0))
+d = ImageDraw.Draw(small)
+d.rounded_rectangle((u, u, 15 * u, 15 * u), radius=int(3.5 * u), fill=TILE)
+d.rounded_rectangle((3 * u, 3 * u, 13 * u, 13 * u), radius=2 * u, fill=WHITE)
+for i, (c, h) in enumerate(zip(COLORS, (3, 5, 7))):
+    x = (4 + 3 * i) * u
+    d.rounded_rectangle((x, (12 - h) * u, x + 2 * u, 12 * u), radius=u // 2, fill=c, corners=(True, True, False, False))
+small = small.resize((16, 16), Image.LANCZOS)
+
 ASSETS.mkdir(parents=True, exist_ok=True)
-icon.resize((256, 256), Image.LANCZOS).save(ASSETS / "app.png")
-icon.resize((512, 512), Image.LANCZOS).save(ASSETS / "app-512.png")
-icon.resize((256, 256), Image.LANCZOS).save(
-    ASSETS / "app.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
-icon.save(ASSETS / "app.icns")  # Pillow writes every size macOS needs, up to 1024 px
+sizes = (16, 24, 32, 48, 64, 128, 256, 512)
+frames = [small] + [icon.resize((n, n), Image.LANCZOS) for n in sizes[1:]]
+frames[6].save(ASSETS / "app.png")
+frames[7].save(ASSETS / "app-512.png")
+frames[6].save(ASSETS / "app.ico", sizes=[(n, n) for n in sizes[:7]], append_images=frames[:6])
+icon.save(ASSETS / "app.icns", append_images=frames)  # every size macOS needs, up to 1024 px
 print("wrote", *(ASSETS / n for n in ("app.png", "app-512.png", "app.ico", "app.icns")))
