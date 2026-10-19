@@ -12,7 +12,7 @@ What callers should know:
   * The archive keeps content that was later removed on Reddit; removed and deleted items are
     skipped.
   * Every request goes through one RateLimiter, so a whole job (posts, refreshes and comments) stays
-    at about one request a second and slows down further when the server pushes back.
+    at a few requests a second (BASE_INTERVAL) and slows down when the server sends a 429.
 """
 from __future__ import annotations
 
@@ -35,16 +35,21 @@ SETTLE_SECONDS = 36 * 3600
 PAGE = 100  # the API's largest fixed page size
 IDS_BATCH = 500  # most ids /api/posts/ids takes in one request
 ATTEMPTS = 8
+BASE_INTERVAL = 0.4  # seconds between requests: the API docs say "a few requests per second is fine"
 MAX_WAIT = 120.0
 MAX_INTERVAL = 10.0
 SLOTS_PER_DAY = 4  # a day is split into at most this many slices, so posts spread across the day too
 MIN_SLOTS = 60  # ...but a long range is split into at least this many (or one per day, if fewer)
 TOP_SLOTS = 60  # top mode pulls a big pool per slice, so it uses fewer slices
 TOP_PAGES = 4  # pages pulled per slice in top mode
+# Top mode ranks a light copy of each post (no title or text, so the archive's query stays cheap), then
+# fetches the winners in full by id. Removed posts only show up in the full copy, so a few spares are kept.
+TOP_FIELDS = "id,created_utc,score,num_comments"
+TOP_SPARE = 0.25
 SLOT_PAGES = 10
 TIMEOUT_TRIES = 3  # query timeouts on one request before the caller is asked to narrow it
 MIN_WINDOW = 600  # seconds; a timing-out window is halved down to this
-TREE_LIMIT = 1000
+TREE_LIMIT = 300  # comments asked for per thread; big trees are slow for the archive and trip its limits
 TREE_MAX = 25000  # the most comments the tree endpoint returns in one request
 UNKNOWN_THREAD = 1000  # what fetch_all_comments asks for when a post's comment count isn't known yet
 COUNT_CHUNK_DAYS = 31  # days per aggregate request; a timing-out chunk is split down to one day
@@ -69,7 +74,7 @@ class RateLimiter:
     successful requests ease it back to the base interval.
     """
 
-    def __init__(self, interval: float = 1.0, clock: Callable[[], float] = time.monotonic,
+    def __init__(self, interval: float = BASE_INTERVAL, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep, wall: Callable[[], float] = time.time):
         self.base = self.interval = interval
         self._clock = clock
@@ -99,7 +104,7 @@ class RateLimiter:
         self.interval = min(self.interval * 2, MAX_INTERVAL)
 
     def ok(self) -> None:
-        self.interval = max(self.base, self.interval * 0.9)
+        self.interval = max(self.base, self.interval * 0.8)
 
     def reset_after(self, headers, default: float) -> float:
         """Seconds until the server's limit resets, from whichever header it sent."""
@@ -174,9 +179,10 @@ def slot_count(after: float, before: float, limit: int, top: bool) -> int:
     return max(1, min(limit, days * SLOTS_PER_DAY, max(days, MIN_SLOTS)))
 
 
-def _rank(p: Post) -> tuple:
-    """Sort key for top mode: settled scores first, highest first; unscored ones after."""
-    return (p.score is not None, p.score or 0, p.num_comments or 0)
+def _light_rank(d: dict) -> tuple:
+    """Sort key for top mode's light copies. Posts the archive hasn't re-checked still carry placeholder
+    scores (usually 1), so they sink below real ones."""
+    return (_number(d.get("score"), 0), _number(d.get("num_comments"), 0))
 
 
 class ArcticShiftClient:
@@ -217,7 +223,9 @@ class ArcticShiftClient:
                 if timeouts >= TIMEOUT_TRIES:
                     raise QueryTimeout("Arctic Shift timed out on this query. Try a shorter date range or "
                                        "fewer posts, or try again in a few minutes.")
-                self.limiter.hold(backoff, "Arctic Shift is slow right now")
+                # A timeout is about how heavy the query was, not how often we ask, so it gets a short
+                # pause and a smaller page rather than slowing the whole job down.
+                self.limiter.hold(2.0 * timeouts, "Arctic Shift is slow right now")
                 limit = params.get("limit")
                 if shrink and "limit" in params:
                     params["limit"] = PAGE // 4 if not isinstance(limit, int) else max(10, limit // 2)
@@ -278,7 +286,7 @@ class ArcticShiftClient:
             if should_stop and should_stop():
                 break
             if top:
-                ranked = sorted(self._top_pool(base, lo, hi, should_stop), key=_rank, reverse=True)
+                ranked = sorted(self._top_pool(base, lo, hi, should_stop), key=_light_rank, reverse=True)
                 picked[i], spare[i] = ranked[:want], ranked[want:]
                 more[i] = False
             else:
@@ -308,9 +316,22 @@ class ArcticShiftClient:
                     extra, cursors[i], more[i] = self._earliest(base, cursors[i], windows[i][1], want, have,
                                                                 should_stop)
                     picked[i] += extra
+        if top:
+            picked = self._hydrate(picked, spare, should_stop)
         posts = [p for group in picked for p in group]
         posts.sort(key=lambda p: p.created_utc)
         return posts
+
+    def fetch_newer(self, subreddit: str, after: float, skip: Collection[str] = (),
+                    limit: int = PAGE) -> list[Post]:
+        """Posts created after ``after``, oldest first, in one request (the live feed's poll).
+        A full page (``limit`` rows) means there may be more; call again from the newest one."""
+        subreddit = normalize_subreddit(subreddit)
+        if error := subreddit_error(subreddit):
+            raise FetchError(error)
+        page = self.get("/api/posts/search", {"subreddit": subreddit, "sort": "asc",
+                                              "after": int(after), "limit": limit})
+        return [_post(d) for d in page if d.get("id") and d["id"] not in skip and not _removed(d)]
 
     def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int]:
         """Posts from [lo, hi) and the end of the window actually searched: when the archive times
@@ -351,17 +372,25 @@ class ArcticShiftClient:
             cursor = int(max(_number(d.get("created_utc"), 0) for d in page)) - 1
         return out, cursor, True
 
-    def _top_pool(self, base, lo, hi, should_stop) -> list[Post]:
-        """Candidates for the top posts of [lo, hi): a page from each of TOP_PAGES equal parts of the
-        slice, so a busy slice isn't judged on its first few hours only."""
-        pool: dict[str, Post] = {}
+    def _top_pool(self, base, lo, hi, should_stop) -> list[dict]:
+        """Light candidates (TOP_FIELDS only) for the top posts of [lo, hi): a page from each of
+        TOP_PAGES equal parts of the slice, so a busy slice isn't judged on its first few hours only."""
+        pool: dict[str, dict] = {}
         for start, end in slices(lo, hi, TOP_PAGES):
             if should_stop and should_stop():
                 break
-            for d in self._page(base, start, end, PAGE)[0]:
-                if d.get("id") and not _removed(d):
-                    pool[d["id"]] = _post(d)
+            for d in self._page(dict(base, fields=TOP_FIELDS), start, end, PAGE)[0]:
+                if d.get("id"):
+                    pool[d["id"]] = d
         return list(pool.values())
+
+    def _hydrate(self, picked: list[list[dict]], spare: list[list[dict]], should_stop) -> list[list[Post]]:
+        """Full copies of each slice's picks, in one batch by id. Picks that turn out to be removed are
+        replaced by that slice's next-best spares."""
+        want = [len(group) for group in picked]
+        ranked = [group + extra[:math.ceil(len(group) * TOP_SPARE)] for group, extra in zip(picked, spare)]
+        full = {p.id: p for p in self.fetch_posts_by_ids([d["id"] for group in ranked for d in group], should_stop)}
+        return [[full[d["id"]] for d in group if d["id"] in full][:n] for group, n in zip(ranked, want)]
 
     def fetch_posts_by_ids(self, ids: Iterable[str], should_stop: StopFn | None = None) -> list[Post]:
         """Current copies of the given posts, IDS_BATCH per request; removed ones are left out."""

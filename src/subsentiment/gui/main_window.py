@@ -22,7 +22,7 @@ from subsentiment.gui.charts import DistributionChart, TimelineChart, palette
 from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, RowsModel
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
-from subsentiment.gui.worker import FetchWorker
+from subsentiment.gui.worker import FetchWorker, LiveWorker
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, daily_means, summarize
 
@@ -133,6 +133,15 @@ def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
     if result.stopped:
         parts.append("Stopped early.")
     return " ".join(parts)
+
+
+def age_text(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return "under a minute" if seconds < 60 else "1 minute"
+    if seconds < 5400:
+        return f"{round(seconds / 60)} minutes"
+    return f"{seconds / 3600:.1f} hours" if seconds < 172800 else f"{seconds // 86400} days"
 
 
 def plural(n: int, noun: str) -> str:
@@ -319,6 +328,10 @@ class MainWindow(QMainWindow):
         self._live.setSingleShot(True)
         self._live.setInterval(1000)
         self._live.timeout.connect(self._live_refresh)
+        self.live_thread: QThread | None = None
+        self.live_worker: LiveWorker | None = None
+        self.live_name: str | None = None
+        self._live_seen = 0
         self.posts: list = []
         self.comments: list = []
         self.coverage = None  # the Download coverage window, once opened
@@ -504,6 +517,15 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self.fetch_btn, 1)
         buttons.addWidget(self.stop_btn)
         lay.addLayout(buttons)
+        self.live_btn = QPushButton("Live feed")
+        self.live_btn.setCheckable(True)
+        self.live_btn.setToolTip("Keep checking Arctic Shift for new posts in this subreddit and add them as they appear")
+        self.live_btn.toggled.connect(self._toggle_live)
+        lay.addWidget(self.live_btn)
+        self.live_msg = label("", "muted")
+        self.live_msg.setWordWrap(True)
+        self.live_msg.setVisible(False)
+        lay.addWidget(self.live_msg)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         self.progress_msg = label("", "muted")
@@ -730,7 +752,8 @@ class MainWindow(QMainWindow):
 
     def _set_busy(self, busy: bool) -> None:
         # Called after self.thread is set (busy) or cleared (idle); the update helpers read it.
-        self.fetch_btn.setEnabled(not busy)
+        self.fetch_btn.setEnabled(not busy and self.live_thread is None)
+        self.live_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
         self.progress.setVisible(busy)
         if busy:
@@ -753,7 +776,7 @@ class MainWindow(QMainWindow):
     # -- fetching -------------------------------------------------------------
 
     def _start_fetch(self) -> None:
-        if self.thread is not None:
+        if self.thread is not None or self.live_thread is not None:
             return
         name = normalize_subreddit(self.subreddit.text())
         if error := subreddit_error(name):
@@ -794,6 +817,84 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         self.progress_msg.setText(message)
         self.thread.start()
+
+    # -- live feed ------------------------------------------------------------
+
+    def _toggle_live(self, on: bool) -> None:
+        if on:
+            self._start_live()
+        else:
+            self._stop_live()
+
+    def _start_live(self) -> None:
+        name = normalize_subreddit(self.subreddit.text())
+        if error := subreddit_error(name):
+            self.progress_msg.setText(error)
+            self.live_btn.blockSignals(True)
+            self.live_btn.setChecked(False)
+            self.live_btn.blockSignals(False)
+            self.subreddit.setFocus()
+            return
+        self.subreddit.setText(name)
+        self.live_name = name
+        self._live_seen = 0
+        self.live_thread = QThread(self)
+        self.live_worker = LiveWorker(name, self.db_path)
+        w = self.live_worker
+        w.moveToThread(self.live_thread)
+        self.live_thread.started.connect(w.run)
+        w.status.connect(self._set_live_msg)
+        w.polled.connect(self._on_live_polled)
+        w.saved.connect(self._on_live_saved)
+        w.failed.connect(lambda m: QMessageBox.warning(self, "Live feed stopped", m))
+        w.finished.connect(self.live_thread.quit)
+        self.live_thread.finished.connect(self._on_live_done)
+        for widget in (self.subreddit, self.fetch_btn):
+            widget.setEnabled(False)
+        self.live_msg.setVisible(True)
+        self._set_live_msg(f"Live: checking r/{name} for new posts…")
+        self.live_thread.start()
+
+    def _stop_live(self) -> None:
+        if self.live_worker:
+            self.live_worker.stop()
+            self.live_btn.setEnabled(False)
+            self._set_live_msg("Stopping the live feed…")
+
+    def _on_live_done(self) -> None:
+        self.live_thread.deleteLater()
+        self.live_worker.deleteLater()
+        self.live_thread = self.live_worker = None
+        self.subreddit.setEnabled(True)
+        self.fetch_btn.setEnabled(self.thread is None)
+        self.live_btn.setEnabled(self.thread is None)
+        self.live_btn.blockSignals(True)
+        self.live_btn.setChecked(False)
+        self.live_btn.blockSignals(False)
+        self.live_msg.setVisible(False)
+
+    def _set_live_msg(self, text: str) -> None:
+        self.live_msg.setText(text)
+
+    def _on_live_polled(self, result) -> None:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        newest = (f" Newest post is {age_text(datetime.now().timestamp() - result.newest)} old."
+                  if result.newest else "")
+        self._set_live_msg(
+            f"Live: r/{self.live_name}, {plural(self._live_seen + result.new, 'new post')} this session. "
+            f"Checked {stamp}.{newest} Arctic Shift archives posts a little after Reddit, so the feed "
+            "can trail by a few minutes.")
+
+    def _on_live_saved(self, new: int, newest) -> None:
+        self._live_seen += new
+        name = self.live_name or ""
+        showing = self.current is None or self.current.lower() == name.lower()
+        self._refresh_datasets(select=None if self.current else name, reload=False)
+        if showing:
+            item = self.datasets.currentItem()
+            shown = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if shown and shown.lower() == name.lower():
+                self._show_dataset(shown, animate=self.current is not None)
 
     def _stop_fetch(self) -> None:
         if self.worker:
@@ -1018,6 +1119,10 @@ class MainWindow(QMainWindow):
         self._save_fetch_settings()
         if self.coverage is not None:
             self.coverage.close()
+        if self.live_worker:
+            self.live_worker.stop()
+            self.live_thread.quit()
+            self.live_thread.wait(3000)
         if self.worker:
             self.worker.stop()
             self.thread.quit()

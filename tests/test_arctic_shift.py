@@ -180,7 +180,10 @@ def test_top_mode_ranks_settled_scores_within_each_day():
                      key=lambda x: x["score"], reverse=True)
         assert {p.id for p in posts if T0 + d * DAY <= p.created_utc < T0 + (d + 1) * DAY} == \
             {x["id"] for x in day[:2]}
-    assert {params["limit"] for _, params in c.session.calls} == {100}
+    searches = [params for url, params in c.session.calls if url.endswith("/search")]
+    assert {params["limit"] for params in searches} == {100}
+    assert {params["fields"] for params in searches} == {"id,created_utc,score,num_comments"}  # light copies
+    assert [url.rsplit("/", 1)[1] for url, _ in c.session.calls][-1] == "ids"  # then the winners, in one batch
 
 
 def test_top_mode_puts_unscored_posts_last():
@@ -259,7 +262,7 @@ def test_comments_come_from_the_tree_in_one_request_ranked_by_score():
     assert comments[-1].score is None
     url, params = c.session.calls[0]
     assert url == BASE_URL + "/api/comments/tree"
-    assert params == {"link_id": "p1", "limit": 500}  # the post's comment count isn't known yet
+    assert params == {"link_id": "p1", "limit": 150}  # the post's comment count isn't known yet
     assert len(c.session.calls) == 1
     assert comments[0].permalink == "https://www.reddit.com/r/Python/comments/p1/x/c2/"
 
@@ -274,7 +277,7 @@ def test_big_threads_ask_for_a_bigger_tree_and_keep_the_top_ones():
     tree = [node(comment(f"c{i}", "t3_p1", i, score=i, depth=0)) for i in range(30)]
     c = client([ok(tree)])
     got = c.fetch_comments(p, limit=5)
-    assert c.session.calls[0][1]["limit"] == 1000
+    assert c.session.calls[0][1]["limit"] == 300
     assert [x.id for x in got] == ["c29", "c28", "c27", "c26", "c25"]
 
 
@@ -308,7 +311,7 @@ def test_429_without_a_header_backs_off_and_slows_later_requests():
     c = client([FakeResponse(429), FakeResponse(429), ok([]), ok([])])
     c.get(*SEARCH)
     assert c.clock.sleeps == [5.0, 10.0]
-    assert c.limiter.interval == 4.0 * 0.9  # doubled twice, eased once by the success
+    assert c.limiter.interval == 4.0 * 0.8  # doubled twice, eased once by the success
     c.get(*SEARCH)
     assert c.clock.sleeps[-1] == 4.0  # the next request waits 4 s instead of 1
 
@@ -353,7 +356,7 @@ def test_query_timeouts_back_off_with_smaller_pages_then_give_up():
     c = client([slow, ok([post(1)])])
     assert len(c.get("/api/posts/search", {"limit": 100})) == 1
     assert [params["limit"] for _, params in c.session.calls] == [100, 50]
-    assert c.clock.sleeps == [5.0]
+    assert c.clock.sleeps == [2.0]  # a short pause: timeouts are about query size, not request rate
 
     timed_out = FakeResponse(200, {"data": None, "error": "Query timed out"})
     c = client([timed_out, slow, slow])
@@ -392,6 +395,17 @@ def test_other_errors_are_reported():
         client([FakeResponse(400, {"error": "bad param"})]).get(*SEARCH)
     with pytest.raises(FetchError, match="^Arctic Shift: unknown field$"):
         client([FakeResponse(200, {"data": None, "error": "unknown field"})]).get(*SEARCH)
+
+
+def test_default_spacing_is_a_few_requests_a_second():
+    assert RateLimiter().interval == pytest.approx(0.4)
+
+
+def test_top_picks_that_turn_out_removed_are_replaced_by_the_next_best():
+    items = [at(T0 + 100 + k, k, score=100 - k) for k in range(10)]
+    items[0]["_meta"]["removal_type"] = "moderator"  # the best one was removed; only the full copy says so
+    posts = archive(items).fetch_posts("python", after=T0, before=T0 + DAY, limit=3, top=True)
+    assert sorted(p.id for p in posts) == ["p1", "p2", "p3"]
 
 
 # -- coverage: day counts and whole threads ------------------------------------

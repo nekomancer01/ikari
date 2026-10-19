@@ -126,6 +126,33 @@ def test_saved_is_reported_after_each_batch(tmp_path):
     assert len(seen) == 3  # the posts, then each post's comments
 
 
+class LiveClient:
+    def __init__(self, posts):
+        self.posts = posts
+        self.afters = []
+
+    def fetch_newer(self, subreddit, after, skip=(), limit=100):
+        self.afters.append(after)
+        return [p for p in self.posts if p.created_utc > after and p.id not in skip][:limit]
+
+
+def test_live_poll_saves_only_posts_newer_than_the_newest_saved(tmp_path):
+    s = store_with(tmp_path, [mk(1), mk(2)])
+    client = LiveClient([mk(1), mk(2), mk(3), mk(4)])
+    r = collect.poll_live(client, s, "Python", now=T + 10)
+    assert r.new == 2 and r.newest == T + 4
+    assert client.afters[0] == T + 2
+    assert {x["id"] for x in s.posts("Python")} == {"p1", "p2", "p3", "p4"}
+    assert collect.poll_live(client, s, "Python", now=T + 20).new == 0
+
+
+def test_live_poll_on_an_empty_dataset_starts_a_few_hours_back(tmp_path):
+    s = Store(tmp_path / "x.db")
+    client = LiveClient([])
+    collect.poll_live(client, s, "Python", now=T)
+    assert client.afters == [T - collect.LIVE_LOOKBACK]
+
+
 class FullThreadClient(FakeClient):
     def __init__(self, whole=True, **kw):
         super().__init__(**kw)
