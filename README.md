@@ -196,16 +196,29 @@ new API apps, and has announced that its public API closes in March 2027.
 
 Things to know about the archive:
 
-- **You pick a date range, not a sort.** The archive returns posts newest first within the range,
-  so there's no hot, top or rising. Choose a preset under **Posted** or set your own **From** and
-  **To** dates. **Max posts** caps how many come back, starting from the newest.
+- **You pick a date range, and posts are spread across it.** Choose a preset under **Posted** or set
+  your own **From** and **To** dates. The range is cut into equal parts (up to four a day) and
+  **Max posts** is shared equally between them, so a week with 70 posts gives about 10 a day instead
+  of the 70 newest. Quiet parts hand their share to busier ones. Fetching the same range again adds
+  posts you don't have yet, rather than the same ones.
+- **Top posts are ranked by ikari, not the archive.** The archive can only search by date. With
+  **Pick** set to **Top by score**, ikari reads a pool of posts from each day of the range and keeps
+  the highest-scored. Only posts the archive has re-checked have scores (see below), so the newest
+  posts can't be ranked and come after scored ones.
 - **Scores and comment counts arrive late.** The archive saves each post within seconds, then fetches
-  it again about 36 hours later. Until then Reddit's numbers aren't known, so the Score and Comments
-  columns show a dash. Fetching the same range again later fills them in.
-- **Requests are rate limited.** ikari sends at most one request a second. It waits when the archive
-  says to (HTTP 429), backs off on server and network errors, and asks for smaller pages when a query
-  times out. Fetching comments takes one request per post, so 100 posts with comments take about two
-  minutes.
+  it again later, usually about 36 hours after posting and sometimes up to a week. Until then
+  Reddit's numbers aren't known, so the Score and Comments columns show a dash. The next fetch of that
+  range re-checks those posts in batches of 500 and fills them in.
+- **Requests are rate limited and shared.** Every request in a fetch (posts, score updates and
+  comments) goes through one limiter, at most one a second. When the archive says to slow down
+  (HTTP 429) ikari waits as long as it asks and spaces later requests further apart; it also backs
+  off on server and network errors. When a query times out ("Timeout. Maybe slow down a bit"), it
+  waits, asks for a smaller page, then searches a narrower slice of time. The status line says when
+  it's waiting and why.
+- **Comments take one request per post.** ikari asks for each post's whole comment tree at once and
+  keeps the highest-scored. If a post's comments can't be fetched, it moves on to the next; after
+  five failures in a row it stops asking, and the next fetch of the range picks up the posts that
+  are still missing comments. 100 posts with comments take about two minutes.
 - **It's a volunteer service** with no uptime guarantee. Items that were removed or deleted on Reddit
   are skipped.
 
@@ -245,7 +258,7 @@ Layout:
 
 | Path | Purpose |
 |---|---|
-| `src/subsentiment/arctic_shift.py` | Arctic Shift client: date-range paging, comments, rate limiter and retries |
+| `src/subsentiment/arctic_shift.py` | Arctic Shift client: even and top sampling, batch refresh, comment trees, rate limiter |
 | `src/subsentiment/reddit.py` | Post and comment data types, subreddit-name checks |
 | `src/subsentiment/sentiment.py` | Text cleanup + scoring (bundled model, VADER fallback) |
 | `src/subsentiment/sentiment_model.py` | Loads the bundled classifier and its feature code |
@@ -255,10 +268,11 @@ Layout:
 | `tools/eval_sentiment.py` | Scores accuracy against GoEmotions (the numbers in Features) |
 | `tools/screenshot.py` | Renders the README screenshots in `docs/` from invented sample data |
 | `tools/sample_text.py` | The invented r/riverton posts and comments the screenshots use |
-| `src/subsentiment/collect.py` | One fetch job: fetch → score → store |
+| `src/subsentiment/collect.py` | One fetch job: refresh saved scores, pick new posts, fetch comments, score, store |
 | `src/subsentiment/gui/` | Qt main window, charts, table models, background worker |
 | `src/subsentiment/gui/theme.py` | Glass theme: color tokens, stylesheet, fonts, backdrop |
 | `src/subsentiment/gui/native/` | Per-OS integration: Windows title bar and Mica/Acrylic, macOS menus and vibrancy, Linux desktop id and theme |
 | `packaging/build.py` | One build entry for all platforms (PyInstaller, then zip/installer, .dmg, or AppImage/.tar.gz) |
 | `packaging/` | PyInstaller spec, Inno Setup installer, Linux AppRun/.desktop/install.sh |
+| `tools/live_check.py` | Fetches a small sample from the real archive and prints what came back |
 | `tools/make_icon.py` | Regenerates the app icons (needs Pillow) |

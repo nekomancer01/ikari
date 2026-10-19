@@ -47,6 +47,7 @@ def test_fetch_form_and_viewed_dataset_are_restored(make_window):
     w.query.setText("black holes")
     w.date_from.setDate(QDate(2026, 3, 1))  # editing a date switches to a custom range
     w.date_to.setDate(QDate(2026, 3, 31))
+    w.pick.setCurrentIndex(w.pick.findData("top"))
     w.limit.setValue(250)
     w.include_comments.setChecked(False)
     w.comments_per_post.setValue(20)
@@ -59,6 +60,7 @@ def test_fetch_form_and_viewed_dataset_are_restored(make_window):
     assert again.range.currentData() == "custom"
     assert (again.date_from.date(), again.date_to.date()) == (QDate(2026, 3, 1), QDate(2026, 3, 31))
     assert (again.limit.value(), again.include_comments.isChecked(), again.comments_per_post.value()) == (250, False, 20)
+    assert again.pick.currentData() == "top" and "36 hours" in again.pick.toolTip()
     assert not again.comments_per_post.isEnabled()
     assert again.current == "Python" and again.tabbar.currentIndex() == 1
 
@@ -125,3 +127,13 @@ def test_background_mood_follows_the_dataset_and_can_be_turned_off(make_window):
     assert w.mood.state.y() == 0.0
     w.close()
     assert make_window().mood_act.isChecked() is False
+
+
+def test_finish_text_says_what_the_fetch_did():
+    req = mw.collect.FetchRequest("python")
+    r = mw.collect.FetchResult("Python", 40, 900, False, updated=12, already=3, comment_errors=2)
+    text = mw.finish_text(r, req).replace("\u00a0", " ")
+    assert text == ("Added 40 new posts and 900 comments from r/Python. Updated scores on 12 saved posts. "
+                    "3 top posts were already saved. Comments couldn't be fetched for 2 posts; "
+                    "fetch again later to fill them in.")
+    assert mw.finish_text(mw.collect.FetchResult("Python", 0, 0, False), req).startswith("No new posts found")
