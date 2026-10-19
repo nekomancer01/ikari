@@ -68,7 +68,7 @@ def prepare_window(window, backdrop: str) -> str | None:
     if kind:  # a native material needs a translucent window from the start
         window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     if platform_name() == "macos":
-        macos.prepare_window(window)
+        macos.prepare_window(window, full_size=kind is not None)
     return kind
 
 

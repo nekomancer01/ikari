@@ -1,7 +1,7 @@
 """macOS integration. Every function is a no-op elsewhere, and every failure is a no-op too.
 
-- A unified, full-size title bar: the window's own backdrop runs under the
-  traffic lights (Qt 6.9+ window hints; older Qt keeps the standard title bar).
+- A unified title bar; with vibrancy on, a full-size one so the blur runs under
+  the traffic lights (Qt 6.9+ window hints; older Qt keeps the standard title bar).
 - Light/dark appearance of the title bar and native dialogs follows the app
   theme, not only the system.
 - An optional "vibrancy" backdrop: an NSVisualEffectView behind the Qt
@@ -55,15 +55,19 @@ def set_process_name() -> None:
         pass
 
 
-def prepare_window(window) -> None:
-    """Before first show: unified title bar, and full-size content where Qt supports it."""
+def prepare_window(window, full_size: bool = False) -> None:
+    """Before first show: unified title bar; with full_size, content runs under the title bar.
+
+    full_size is only used with vibrancy, so the default window keeps the standard
+    title bar until the Qt 6.9 safe-area handling has been checked on a real Mac.
+    """
     if not IS_MACOS:
         return
     try:
         from PySide6.QtCore import Qt
         window.setUnifiedTitleAndToolBarOnMac(True)
         hints = [getattr(Qt.WindowType, n, None) for n in ("ExpandedClientAreaHint", "NoTitleBarBackgroundHint")]
-        if None not in hints:  # Qt 6.9+: layouts keep clear of the title bar through the safe-area margins
+        if full_size and None not in hints:  # Qt 6.9+: layouts keep clear of the title bar through the safe-area margins
             for hint in hints:
                 window.setWindowFlag(hint, True)
     except Exception:
