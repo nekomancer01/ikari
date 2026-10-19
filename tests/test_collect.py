@@ -184,6 +184,20 @@ def test_each_post_and_comment_is_saved_and_announced_as_it_arrives(tmp_path):
     assert counts[:3] == [1, 2, 3]  # the table grows one post at a time
 
 
+def test_a_fetch_does_not_download_comments_for_saved_posts_nobody_asked_about(tmp_path):
+    s = store_with(tmp_path, [mk(1), mk(2)])  # saved earlier, comments never requested
+    c = FakeClient(posts=[mk(3)])
+    collect.run(c, s, collect.FetchRequest("python"))
+    assert [call[1] for call in c.calls if call[0] == "comments"] == ["p3"]
+
+
+def test_top_mode_gets_comments_for_a_picked_saved_post_that_never_had_them(tmp_path):
+    s = store_with(tmp_path, [mk(1), mk(2)])  # saved earlier, comments never requested
+    c = FakeClient(posts=[mk(1), mk(3)])
+    collect.run(c, s, collect.FetchRequest("python", top=True))  # top mode picks p1 again, plus p3
+    assert sorted(call[1] for call in c.calls if call[0] == "comments") == ["p1", "p3"]  # not p2
+
+
 def test_today_is_never_marked_complete(tmp_path):
     import time
     s = store_with(tmp_path, [])
