@@ -22,6 +22,7 @@ It can also be told to answer some requests with errors first (``fail``), or to 
 from __future__ import annotations
 
 import json
+import math
 import random
 import threading
 import time
@@ -189,7 +190,7 @@ class FakeArchive:
         self.used += 1
         reset = max(0.0, window - (now - self.window_start))
         return {"X-RateLimit-Remaining": str(budget - self.used) if self.used <= budget else "-1",
-                "X-RateLimit-Reset": f"{reset:.2f}"}
+                "X-RateLimit-Reset": f"{math.ceil(reset * 100) / 100:.2f}"}  # rounded up, never early
 
     def violations(self) -> list[tuple[str, dict, int, str]]:
         """Requests the real API would refuse for their parameters (not rate limits or timeouts)."""
