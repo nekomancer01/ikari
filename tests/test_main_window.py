@@ -51,6 +51,8 @@ def test_fetch_form_and_viewed_dataset_are_restored(make_window):
     w.limit.setValue(250)
     w.include_comments.setChecked(False)
     w.comments_per_post.setValue(20)
+    assert not w.refresh_scores.isChecked()  # off by default
+    w.refresh_scores.setChecked(True)
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     w.tabbar.setCurrentIndex(1)
     w.close()
@@ -62,6 +64,7 @@ def test_fetch_form_and_viewed_dataset_are_restored(make_window):
     assert (again.limit.value(), again.include_comments.isChecked(), again.comments_per_post.value()) == (250, False, 20)
     assert again.pick.currentData() == "top" and "36 hours" in again.pick.toolTip()
     assert not again.comments_per_post.isEnabled()
+    assert again.refresh_scores.isChecked()
     assert again.current == "Python" and again.tabbar.currentIndex() == 1
 
 
