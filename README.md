@@ -6,12 +6,12 @@
 
 <p><b>Read the mood of any subreddit.</b><br>
 Pull posts and comments, score their sentiment offline, and explore the results in a desktop app
-for Windows, macOS and Linux.</p>
+for Windows (macOS and Linux run from source, not released for now).</p>
 
 <p>
   <a href="https://github.com/nekomancer01/ikari/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/nekomancer01/ikari?style=flat-square&color=6C5CE7"></a>
   <a href="https://github.com/nekomancer01/ikari/actions/workflows/build.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/nekomancer01/ikari/build.yml?branch=main&style=flat-square&label=build"></a>
-  <img alt="Windows, macOS and Linux" src="https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-555?style=flat-square">
+  <img alt="Windows" src="https://img.shields.io/badge/platforms-Windows-555?style=flat-square">
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white">
   <img alt="Built with Qt" src="https://img.shields.io/badge/Qt-PySide6-41CD52?style=flat-square&logo=qt&logoColor=white">
 </p>
@@ -108,7 +108,7 @@ flowchart LR
 
 ## Download
 
-Ready-made builds for Windows, macOS and Linux are attached to each
+Ready-made builds for Windows are attached to each
 [release](https://github.com/nekomancer01/ikari/releases). Builds of the latest `main` are on the
 [Actions tab](https://github.com/nekomancer01/ikari/actions/workflows/build.yml) (open a run, then
 *Artifacts*).
@@ -116,18 +116,20 @@ Ready-made builds for Windows, macOS and Linux are attached to each
 | OS | Download | How to run |
 |---|---|---|
 | Windows 10/11 (x64) | `ikari-Setup-<version>.exe` | Run the installer. Or unzip `ikari-<version>-windows-x64.zip` and run `ikari.exe`. |
-| macOS 11+ (Apple Silicon) | `ikari-<version>-macos-arm64.dmg` | Open the .dmg and drag the app to Applications. |
-| macOS 11+ (Intel) | `ikari-<version>-macos-x86_64.dmg` | As above. |
-| Linux (x86_64) | `ikari-<version>-linux-x86_64.AppImage` | `chmod +x` it, then run it. Or unpack the `.tar.gz` and run `./install.sh` to add it to your app menu (`./install.sh --uninstall` removes it). |
+
+> [!NOTE]
+> **Windows only for now.** macOS and Linux releases are paused while those ports catch up. The
+> code, packaging and CI steps for them are still in the repo, and you can run from source on either
+> (below). Run the *Build* workflow by hand with "all_platforms" ticked to build them.
 
 > [!NOTE]
 > The builds aren't code-signed, so the first launch shows a warning.
 >
 > - **Windows** SmartScreen ("Windows protected your PC"): choose **More info → Run anyway**.
-> - **macOS** Gatekeeper ("can't be opened because Apple cannot check it"): right-click the app,
+> - **macOS** (when built yourself) Gatekeeper ("can't be opened because Apple cannot check it"): right-click the app,
 >   choose **Open**, then **Open** again. On macOS 15, if there's no Open button, go to
 >   **System Settings → Privacy & Security** and click **Open Anyway**.
-> - **Linux**: the AppImage needs FUSE 2 (`sudo apt install libfuse2` on Ubuntu 22.04,
+> - **Linux** (when built yourself): the AppImage needs FUSE 2 (`sudo apt install libfuse2` on Ubuntu 22.04,
 >   `libfuse2t64` on 24.04), or run it with `--appimage-extract-and-run`. Qt also needs
 >   `libxcb-cursor0` on X11, which some minimal installs lack.
 

@@ -1,6 +1,7 @@
 """One fetch job: pull posts (and optionally comments), score them, store them."""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -92,7 +93,9 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     for p in new:
         if p.id not in streamed:
             store.save_post(p, *sentiment.score(p.text))
-    if req.everything and req.after is not None and not should_stop() and len(new) < req.limit:
+    # A day that isn't over yet can still get posts, so it's never recorded as complete.
+    if (req.everything and req.after is not None and req.before is not None and req.before <= time.time()
+            and not should_stop() and len(new) < req.limit):
         store.mark_complete("posts", name, str(int(req.after)))
     store.commit()
     saved()

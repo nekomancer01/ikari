@@ -1062,10 +1062,6 @@ class MainWindow(QMainWindow):
         after, before = range_bounds(self.range.currentData(), self.date_from.date(), self.date_to.date())
         return after, before if before is not None else datetime.now().timestamp()
 
-    def comment_settings(self) -> tuple[bool, int]:
-        """The sidebar's Comments choice: (fetch them, how many per post)."""
-        return self.include_comments.isChecked(), self.comments_per_post.value()
-
     def _show_coverage(self) -> None:
         if not self.current:
             return

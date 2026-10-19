@@ -196,3 +196,12 @@ def test_top_mode_gets_comments_for_a_picked_saved_post_that_never_had_them(tmp_
     c = FakeClient(posts=[mk(1), mk(3)])
     collect.run(c, s, collect.FetchRequest("python", top=True))  # top mode picks p1 again, plus p3
     assert sorted(call[1] for call in c.calls if call[0] == "comments") == ["p1", "p3"]  # not p2
+
+
+def test_today_is_never_marked_complete(tmp_path):
+    import time
+    s = store_with(tmp_path, [])
+    start = time.time() // 86400 * 86400
+    collect.run(FakeClient(posts=[mk(1)]), s, collect.FetchRequest("python", after=start, before=start + 86400,
+                                                                  limit=50, everything=True, include_comments=False))
+    assert s.complete_keys("posts", "python") == set()
