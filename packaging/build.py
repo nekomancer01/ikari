@@ -1,14 +1,14 @@
-"""Build Subreddit Sentiment for the OS this runs on. Run from anywhere, inside an environment
+"""Build ikari for the OS this runs on. Run from anywhere, inside an environment
 with the app and PyInstaller installed:
 
     pip install . pyinstaller
     python packaging/build.py
 
 Output in dist/:
-  Windows: SubredditSentiment/ (the app folder), SubredditSentiment-<v>-windows-x64.zip and,
-           if Inno Setup 6 is installed, SubredditSentiment-Setup-<v>.exe
-  macOS:   Subreddit Sentiment.app (ad-hoc signed) and SubredditSentiment-<v>-macos-<arch>.dmg
-  Linux:   SubredditSentiment-<v>-linux-x86_64.AppImage and SubredditSentiment-<v>-linux-x86_64.tar.gz
+  Windows: ikari/ (the app folder), ikari-<v>-windows-x64.zip and,
+           if Inno Setup 6 is installed, ikari-Setup-<v>.exe
+  macOS:   ikari.app (ad-hoc signed) and ikari-<v>-macos-<arch>.dmg
+  Linux:   ikari-<v>-linux-x86_64.AppImage and ikari-<v>-linux-x86_64.tar.gz
            (the app folder plus install.sh). --no-appimage skips the AppImage, which needs
            appimagetool (found on PATH, in $APPIMAGETOOL, or downloaded).
 """
@@ -31,7 +31,7 @@ PACKAGING = ROOT / "packaging"
 ASSETS = ROOT / "src" / "subsentiment" / "gui" / "assets"
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
-APP_ID = "io.github.subsentiment.SubredditSentiment"
+APP_ID = "io.github.nekomancer01.ikari"
 APPIMAGETOOL_URL = ("https://github.com/AppImage/appimagetool/releases/download/continuous/"
                     "appimagetool-x86_64.AppImage")
 
@@ -52,8 +52,8 @@ def pyinstaller() -> None:
 
 
 def build_windows(v: str) -> None:
-    app = DIST / "SubredditSentiment"
-    zip_base = DIST / f"SubredditSentiment-{v}-windows-x64"
+    app = DIST / "ikari"
+    zip_base = DIST / f"ikari-{v}-windows-x64"
     shutil.make_archive(str(zip_base), "zip", DIST, app.name)
     print("wrote", zip_base.with_suffix(".zip"))
 
@@ -66,7 +66,7 @@ def build_windows(v: str) -> None:
 
 
 def build_macos(v: str) -> None:
-    app = DIST / "Subreddit Sentiment.app"
+    app = DIST / "ikari.app"
     # Ad-hoc signature: not trusted by Gatekeeper, but Apple Silicon refuses unsigned code entirely.
     run("codesign", "--force", "--deep", "--sign", "-", app)
     run("codesign", "--verify", "--deep", "--strict", app)
@@ -77,9 +77,9 @@ def build_macos(v: str) -> None:
     run("ditto", app, stage / app.name)  # ditto keeps the bundle's symlinks and signature intact
     (stage / "Applications").symlink_to("/Applications")
     arch = platform.machine()  # arm64 or x86_64
-    dmg = DIST / f"SubredditSentiment-{v}-macos-{arch}.dmg"
+    dmg = DIST / f"ikari-{v}-macos-{arch}.dmg"
     dmg.unlink(missing_ok=True)
-    run("hdiutil", "create", "-volname", "Subreddit Sentiment", "-srcfolder", stage,
+    run("hdiutil", "create", "-volname", "ikari", "-srcfolder", stage,
         "-ov", "-format", "UDZO", dmg)
 
 
@@ -97,9 +97,9 @@ def appimagetool() -> Path:
 
 
 def build_linux(v: str, make_appimage: bool) -> None:
-    app = DIST / "SubredditSentiment"
+    app = DIST / "ikari"
     linux = PACKAGING / "linux"
-    name = f"SubredditSentiment-{v}-linux-x86_64"
+    name = f"ikari-{v}-linux-x86_64"
 
     # Portable tarball: the app folder plus a per-user installer.
     stage = BUILD / "tarball" / name
@@ -138,7 +138,7 @@ def main() -> int:
     args = parser.parse_args()
 
     v = version()
-    print(f"Building Subreddit Sentiment {v} for {sys.platform}", flush=True)
+    print(f"Building ikari {v} for {sys.platform}", flush=True)
     pyinstaller()
     if sys.platform == "win32":
         build_windows(v)

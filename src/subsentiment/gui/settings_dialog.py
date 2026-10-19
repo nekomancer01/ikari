@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 
 from subsentiment.reddit import DEFAULT_USER_AGENT
 
-KEYRING_SERVICE = "Subreddit Sentiment"
+KEYRING_SERVICE = "Subreddit Sentiment"  # legacy name, kept so saved Reddit secrets survive the rename
 
 
 def _keyring():

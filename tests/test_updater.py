@@ -4,8 +4,8 @@ from subsentiment import updater
 from subsentiment.updater import Release, UpdateError, is_newer, parse_version, pick_asset
 
 ASSETS = [{"name": n, "browser_download_url": f"https://x/{n}", "size": 4} for n in (
-    "SubredditSentiment-windows-portable.zip", "SubredditSentiment-Setup-0.3.0.exe",
-    "SubredditSentiment.dmg", "SubredditSentiment-x86_64.AppImage", "SubredditSentiment-linux.tar.gz")]
+    "ikari-windows-portable.zip", "ikari-Setup-0.3.0.exe",
+    "ikari.dmg", "ikari-x86_64.AppImage", "ikari-linux.tar.gz")]
 
 
 def test_parse_and_compare():

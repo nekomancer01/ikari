@@ -2,9 +2,9 @@
 # makes the zip/installer, .dmg or AppImage. Direct use, from the repo root:
 #   pyinstaller packaging/subsentiment.spec --noconfirm
 # Output:
-#   Windows: dist/SubredditSentiment/SubredditSentiment.exe
-#   macOS:   dist/Subreddit Sentiment.app
-#   Linux:   dist/SubredditSentiment/SubredditSentiment
+#   Windows: dist/ikari/ikari.exe
+#   macOS:   dist/ikari.app
+#   Linux:   dist/ikari/ikari
 import os
 import re
 import sys
@@ -36,11 +36,11 @@ def windows_version_file():
                     fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[
     StringFileInfo([StringTable("040904B0", [
-      StringStruct("FileDescription", "Subreddit Sentiment"),
+      StringStruct("FileDescription", "ikari"),
       StringStruct("FileVersion", "{VERSION}"),
-      StringStruct("InternalName", "SubredditSentiment"),
-      StringStruct("OriginalFilename", "SubredditSentiment.exe"),
-      StringStruct("ProductName", "Subreddit Sentiment"),
+      StringStruct("InternalName", "ikari"),
+      StringStruct("OriginalFilename", "ikari.exe"),
+      StringStruct("ProductName", "ikari"),
       StringStruct("ProductVersion", "{VERSION}")])]),
     VarFileInfo([VarStruct("Translation", [1033, 1200])])
   ]
@@ -72,21 +72,21 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="SubredditSentiment",
+    name="ikari",
     console=False,  # GUI app: no console window
     **exe_options,
 )
-coll = COLLECT(exe, a.binaries, a.datas, name="SubredditSentiment")
+coll = COLLECT(exe, a.binaries, a.datas, name="ikari")
 
 if sys.platform == "darwin":
     app = BUNDLE(
         coll,
-        name="Subreddit Sentiment.app",
+        name="ikari.app",
         icon=os.path.join(ASSETS, "app.icns"),
-        bundle_identifier="io.github.subsentiment.SubredditSentiment",
+        bundle_identifier="io.github.nekomancer01.ikari",
         version=VERSION,
         info_plist={
-            "CFBundleDisplayName": "Subreddit Sentiment",
+            "CFBundleDisplayName": "ikari",
             "CFBundleShortVersionString": VERSION,
             "CFBundleVersion": VERSION,
             "LSMinimumSystemVersion": "11.0",
