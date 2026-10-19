@@ -169,14 +169,15 @@ def test_portable_swap_script_end_to_end(tmp_path):
     with __import__("zipfile").ZipFile(z, "w") as zf:
         zf.write(exe, "ikari/ikari.exe")
         zf.writestr("ikari/_internal/new.dll", b"new")
-    gone = subprocess.Popen(["cmd", "/c", "exit"])
-    gone.wait()
-    script = updater.stage_portable_update(z, app, gone.pid, "ikari.exe")
-    subprocess.run(["cmd.exe", "/d", "/c", str(script)], cwd=str(script.parent), timeout=60)
+    alive = subprocess.Popen(["ping", "-n", "3", "127.0.0.1"], stdout=subprocess.DEVNULL)
+    script = updater.stage_portable_update(z, app, alive.pid, "ikari.exe")
+    started = time.monotonic()
+    subprocess.run(["cmd.exe", "/d", "/c", str(script)], cwd=str(app), timeout=60)
     for _ in range(50):  # the script deletes its own folder as it exits
         if not (app / updater.STAGING).exists():
             break
         time.sleep(0.2)
+    assert alive.poll() is not None and time.monotonic() - started > 1  # waited for the app to exit
     assert (app / "_internal" / "new.dll").exists()
     assert not (app / "_internal" / "old.dll").exists()
     assert (app / "notes.txt").read_text() == "keep me"

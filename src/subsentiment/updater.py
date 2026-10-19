@@ -173,12 +173,12 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9._ -]+$")
 
 # Runs from <app>\.ikari-update\. Every path is relative to the app folder, so nothing from the
 # user's file system is ever spliced into the script. {pid}, {exe} and {items} are filled in below.
+# No setlocal: ending it would move cmd back into the staging folder, which then can't be deleted.
 _SWAP_SCRIPT = r"""@echo off
-setlocal
 cd /d "%~dp0.."
 set tries=0
 :wait
-tasklist /FI "PID eq {pid}" /NH 2>nul | find " {pid} " >nul || goto swap
+"%SystemRoot%\System32\tasklist.exe" /FI "PID eq {pid}" /NH 2>nul | "%SystemRoot%\System32\find.exe" " {pid} " >nul || goto swap
 set /a tries+=1
 if %tries% geq 120 goto cleanup
 ping -n 2 127.0.0.1 >nul
@@ -266,7 +266,7 @@ def launch_installer(path: Path, platform: str = sys.platform) -> bool:
         # A hidden console for the script and everything it runs. The reset variable makes the
         # relaunched ikari.exe start fresh instead of treating itself as a child of this process.
         subprocess.Popen(["cmd.exe", "/d", "/c", str(script)], close_fds=True,
-                         cwd=str(script.parent),
+                         cwd=str(script.parent.parent),
                          env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"},
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                          | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
