@@ -1,5 +1,7 @@
 """Windows 10/11 integration through the DWM API. Every function is a no-op elsewhere.
 
+Use it through the platform-neutral facade in subsentiment.gui.native.
+
 - A title bar that matches the app theme (dark mode flag, plus caption colors on Windows 11).
 - An optional system backdrop material (Mica or Acrylic) on Windows 11 22H2+
   (build 22523+, the documented DWMWA_SYSTEMBACKDROP_TYPE attribute). The window

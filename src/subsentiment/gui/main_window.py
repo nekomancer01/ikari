@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from subsentiment import collect
-from subsentiment.gui import settings_dialog, theme, win_native
+from subsentiment import __version__, collect
+from subsentiment.gui import native, settings_dialog, theme
 from subsentiment.gui.charts import DistributionChart, TimelineChart, palette
 from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, RowsModel
 from subsentiment.gui.theme import mark, paint_backdrop
@@ -52,6 +52,12 @@ class Meter(QWidget):
     def set_share(self, share: float) -> None:
         self.share = max(0.0, min(1.0, share))
         self.update()
+
+    def _show_about(self) -> None:
+        QMessageBox.about(self, "About Subreddit Sentiment", (
+            f"<h3>Subreddit Sentiment {__version__}</h3>"
+            "<p>Gather subreddit posts and comments and score their sentiment with VADER.</p>"
+            "<p>Fonts: Manrope and Sora, both under the SIL Open Font License 1.1.</p>"))
 
     def paintEvent(self, event) -> None:
         p = QPainter(self)
@@ -179,11 +185,9 @@ class MainWindow(QMainWindow):
         self.posts: list = []
         self.comments: list = []
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
-        # Windows 11 Mica/Acrylic needs a translucent window from the start, so it applies on next launch.
-        backdrop = self.settings.value("ui/backdrop", "gradient", str)
-        self._native_backdrop = backdrop if win_native.backdrop_supported() and backdrop in win_native.BACKDROPS else None
-        if self._native_backdrop:
-            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # A native material (Mica/Acrylic/vibrancy) needs a translucent window from the start,
+        # so a change applies on next launch.
+        self._native_backdrop = native.prepare_window(self, self.settings.value("ui/backdrop", "gradient", str))
         self._shown = False
 
         self._build_menu()
@@ -207,9 +211,12 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.export_posts)
         file_menu.addAction(self.export_comments)
         file_menu.addSeparator()
-        file_menu.addAction(QAction("Reddit API settings…", self, triggered=self._open_settings))
+        # On macOS Qt moves the Preferences, Quit and About roles into the application menu.
+        file_menu.addAction(QAction("Reddit API settings…", self, shortcut=QKeySequence.StandardKey.Preferences,
+                                    menuRole=QAction.MenuRole.PreferencesRole, triggered=self._open_settings))
         file_menu.addSeparator()
-        file_menu.addAction(QAction("Quit", self, shortcut=QKeySequence.StandardKey.Quit, triggered=self.close))
+        file_menu.addAction(QAction("Quit", self, shortcut=QKeySequence.StandardKey.Quit,
+                                    menuRole=QAction.MenuRole.QuitRole, triggered=self.close))
 
         view = self.menuBar().addMenu("&View")
         group = QActionGroup(self)
@@ -225,18 +232,26 @@ class MainWindow(QMainWindow):
         self.reduce_act.toggled.connect(self._set_reduce)
         view.addAction(self.reduce_act)
 
-        bg_menu = view.addMenu("Window background")
-        bg_group = QActionGroup(self)
-        current_bg = self.settings.value("ui/backdrop", "gradient", str)
-        for key, text in (("gradient", "Gradient"), ("mica", "Windows Mica"), ("acrylic", "Windows Acrylic (most glassy)")):
-            act = QAction(text, self, checkable=True, checked=key == current_bg)
-            if key != "gradient" and not win_native.backdrop_supported():
-                act.setEnabled(False)
-                act.setToolTip("Needs Windows 11 version 22H2 or later")
-            act.triggered.connect(lambda _=False, k=key: self._set_backdrop(k))
-            bg_group.addAction(act)
-            bg_menu.addAction(act)
-        bg_menu.setToolTipsVisible(True)
+        options = native.backdrop_options()
+        if len(options) > 1:  # Linux has only the painted gradient, so no menu there
+            bg_menu = view.addMenu("Window background")
+            bg_group = QActionGroup(self)
+            current_bg = self.settings.value("ui/backdrop", "gradient", str)
+            if current_bg not in {o.key for o in options}:
+                current_bg = native.GRADIENT
+            for opt in options:
+                act = QAction(opt.label, self, checkable=True, checked=opt.key == current_bg)
+                if opt.unavailable:
+                    act.setEnabled(False)
+                    act.setToolTip(opt.unavailable)
+                act.triggered.connect(lambda _=False, k=opt.key: self._set_backdrop(k))
+                bg_group.addAction(act)
+                bg_menu.addAction(act)
+            bg_menu.setToolTipsVisible(True)
+
+        help_menu = self.menuBar().addMenu("&Help")
+        help_menu.addAction(QAction("About Subreddit Sentiment", self, menuRole=QAction.MenuRole.AboutRole,
+                                    triggered=self._show_about))
 
     def _build_sidebar(self) -> QWidget:
         side, lay = panel("true", margins=20, spacing=14)
@@ -416,27 +431,27 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Restart the app to change the window background.", 10000)
 
     def _style_native_frame(self) -> None:
-        hwnd = int(self.winId())
         t = theme.tokens()
         dark = theme.mode() == "dark"
         if self._native_backdrop:
-            win_native.style_title_bar(hwnd, dark)
+            native.style_title_bar(self, dark)
         else:
-            win_native.style_title_bar(hwnd, dark, caption=t["bg0"], text=t["text"])
+            native.style_title_bar(self, dark, caption=t["bg0"], text=t["text"])
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
         if not self._shown:
             self._shown = True
-            if self._native_backdrop and not win_native.apply_backdrop(int(self.winId()), self._native_backdrop):
+            if self._native_backdrop and not native.apply_backdrop(self, self._native_backdrop):
                 # Material refused: fall back to the painted gradient (opaque paint covers the translucency).
                 self._native_backdrop = None
                 self.update()
             self._style_native_frame()
 
     def _apply_theme(self) -> None:
-        theme.apply(QApplication.instance(), self.settings.value("ui/theme", "system", str),
-                    self.settings.value("ui/reduce_transparency", False, bool))
+        requested = self.settings.value("ui/theme", "system", str)
+        native.set_appearance(requested)
+        theme.apply(QApplication.instance(), requested, self.settings.value("ui/reduce_transparency", False, bool))
         self.update()
         self._style_native_frame()
         self._show_dataset(self.current or "")  # re-pick chart and swatch colors
@@ -462,7 +477,8 @@ class MainWindow(QMainWindow):
         creds = settings_dialog.load(self.settings)
         if creds["client_id"] and creds["client_secret"]:
             return "Connected with Reddit API credentials."
-        return "Anonymous mode (slow). Add API credentials under File → Reddit API settings for faster, reliable fetching."
+        where = "Subreddit Sentiment → Settings" if native.platform_name() == "macos" else "File → Reddit API settings"
+        return f"Anonymous mode (slow). Add API credentials under {where} for faster, reliable fetching."
 
     def _set_busy(self, busy: bool) -> None:
         self.fetch_btn.setEnabled(not busy)
@@ -627,6 +643,12 @@ class MainWindow(QMainWindow):
     def _open_settings(self) -> None:
         if settings_dialog.SettingsDialog(self.settings, self).exec():
             self.statusBar().showMessage(self._mode_text())
+
+    def _show_about(self) -> None:
+        QMessageBox.about(self, "About Subreddit Sentiment", (
+            f"<h3>Subreddit Sentiment {__version__}</h3>"
+            "<p>Gather subreddit posts and comments and score their sentiment with VADER.</p>"
+            "<p>Fonts: Manrope and Sora, both under the SIL Open Font License 1.1.</p>"))
 
     def paintEvent(self, event) -> None:
         paint_backdrop(self, over_native=self._native_backdrop is not None)

@@ -24,6 +24,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication, QWidget
 
+from subsentiment.gui import native
+
 ASSETS = Path(__file__).parent / "assets"
 
 THEMES = {
@@ -84,9 +86,12 @@ def display_font(point_size: float, weight: int = 600) -> QFont:
 
 def system_mode() -> str:
     hints = QGuiApplication.styleHints()
-    if hasattr(hints, "colorScheme") and hints.colorScheme() == Qt.ColorScheme.Dark:
+    scheme = hints.colorScheme() if hasattr(hints, "colorScheme") else Qt.ColorScheme.Unknown
+    if scheme == Qt.ColorScheme.Dark:
         return "dark"
-    return "light"
+    if scheme == Qt.ColorScheme.Light:
+        return "light"
+    return native.fallback_color_scheme() or "light"  # some Linux desktops don't report one to Qt
 
 
 def _rgba(c: tuple) -> str:
@@ -301,7 +306,7 @@ def mark(widget: QWidget, prop: str, value) -> QWidget:
 def paint_backdrop(widget: QWidget, over_native: bool = False) -> None:
     """Window background: a diagonal gradient with a few large, soft color glows.
 
-    over_native: a Windows Mica/Acrylic material is behind the window, so only
+    over_native: a native material (Windows Mica/Acrylic, macOS vibrancy) is behind the window, so only
     lay a thin tint over it (enough to keep text contrast) and fainter glows.
     """
     t = tokens()
