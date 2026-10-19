@@ -1,6 +1,7 @@
 """One fetch job: pull posts (and optionally comments), score them, store them."""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -125,3 +126,37 @@ def _comments_missing(r) -> bool:
 def _stored_post(r) -> Post:
     return Post(r["id"], r["subreddit"], r["title"] or "", r["selftext"] or "", r["author"] or "", r["score"],
                 r["upvote_ratio"], r["num_comments"], r["created_utc"] or 0.0, r["permalink"] or "", r["url"] or "")
+
+
+LIVE_LOOKBACK = 3 * 3600  # with nothing newer saved, a live feed starts this far back, not at the dawn of time
+LIVE_PAGE = 100
+
+
+@dataclass
+class LiveResult:
+    new: int  # posts saved by this poll
+    newest: float | None  # created time of the newest saved post, if any
+
+
+def poll_live(client: ArcticShiftClient, store: Store, subreddit: str,
+              now: float | None = None) -> LiveResult:
+    """One live-feed poll: save posts newer than the newest one already saved. Keeps reading while
+    the archive returns full pages, so a long gap is caught up in a few requests."""
+    name = normalize_subreddit(subreddit)
+    now = time.time() if now is None else now
+    saved_new = 0
+    for _ in range(5):
+        rows = store.posts_between(name, None, None)
+        newest = max((r["created_utc"] or 0.0 for r in rows), default=0.0)
+        after = max(newest, now - LIVE_LOOKBACK)
+        ids = {r["id"] for r in rows if (r["created_utc"] or 0.0) >= after - 60}
+        page = client.fetch_newer(name, after, skip=ids, limit=LIVE_PAGE)
+        for p in page:
+            store.save_post(p, *sentiment.score(p.text))
+        store.commit()
+        saved_new += len(page)
+        if len(page) < LIVE_PAGE - 10:
+            break
+    newest = store.db.execute("SELECT MAX(created_utc) FROM posts WHERE subreddit = ? COLLATE NOCASE",
+                              (name,)).fetchone()[0]
+    return LiveResult(saved_new, newest)
