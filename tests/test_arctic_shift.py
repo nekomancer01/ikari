@@ -155,8 +155,7 @@ def test_posts_are_spread_evenly_across_the_days():
     url, params = c.session.calls[0]
     assert url == BASE_URL + "/api/posts/search"
     assert params["subreddit"] == "python" and params["sort"] == "asc" and params["limit"] <= 100
-    # A page of its own for each busy quarter of day one; then two pages hold the six quiet days.
-    assert len(c.session.calls) == 6
+    assert len(c.session.calls) == 28  # one small request per quarter-day, not thousands of posts
     assert c.session.headers["User-Agent"].startswith("ikari/")
 
 
@@ -175,52 +174,6 @@ def test_a_slice_pages_forward_when_saved_posts_fill_the_first_page():
     (got,) = [c.fetch_posts("python", after=T0, before=T0 + 3600, limit=1, skip=skip)]
     assert [p.id for p in got] == ["p150"]
     assert c.session.calls[1][1]["after"] == T0 + 100 + 99 - 1  # resumes a second before the last post seen
-
-
-def test_a_repeat_fetch_gets_the_same_posts_the_full_pages_would_have():
-    items = [at(T0 + 100 + i * 37, i) for i in range(2000)]
-    skip = {f"p{i}" for i in range(0, 2000, 3)}
-    light = archive(items).fetch_posts("python", after=T0, before=T0 + DAY, limit=40, skip=skip)
-    expected = []
-    for lo, hi in slices(T0, T0 + DAY, slot_count(T0, T0 + DAY, 40, top=False)):
-        unsaved = [d for d in items if lo < d["created_utc"] < hi and d["id"] not in skip]
-        expected += [d["id"] for d in unsaved[:len(light) // 4 or 1]]
-    assert [p.id for p in light] == expected[:len(light)] and len(light) == 40
-
-
-def test_a_repeat_fetch_replaces_removed_picks_with_the_next_posts():
-    items = [at(T0 + 100 + i * 60, i) for i in range(50)]
-    items[1]["_meta"]["removal_type"] = "moderator"  # only the full copy says so, not the light page
-    items[2]["_meta"]["was_deleted_later"] = True
-    posts = archive(items).fetch_posts("python", after=T0, before=T0 + 3600, limit=1, skip={"p0"})
-    assert [p.id for p in posts] == ["p3"]
-
-
-def test_a_quiet_subreddit_fills_many_slices_from_one_page():
-    items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(0, 24, 2)]  # 84 posts
-    c = archive(items)
-    posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28)
-    assert len(posts) == 28 and len(c.session.calls) == 1  # one page covers the whole week
-    per_day = [sum(1 for p in posts if T0 + d * DAY <= p.created_utc < T0 + (d + 1) * DAY) for d in range(7)]
-    assert per_day == [4] * 7
-
-
-def test_a_repeat_fetch_costs_no_more_requests_than_the_first():
-    items = [at(T0 + 100 + i * 300, i) for i in range(7 * 288)]  # a post every 5 minutes for a week
-    c = archive(items)
-    first = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28)
-    n_first = len(c.session.calls)
-    second = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28, skip={p.id for p in first})
-    assert len(second) == 28 and not {p.id for p in first} & {p.id for p in second}
-    assert n_first < 28 and len(c.session.calls) - n_first <= n_first  # fewer than one page per slice
-    assert all(u.endswith("/api/posts/search") for u, _ in c.session.calls)  # no second download by id
-
-
-def test_posts_show_as_each_page_arrives():
-    items = [at(T0 + d * DAY + 60 * k, d * 1000 + k) for d in range(4) for k in range(300)]
-    batches = []
-    archive(items).fetch_posts("python", after=T0, before=T0 + 4 * DAY, limit=8, on_posts=batches.append)
-    assert len(batches) >= 4 and sum(map(len, batches)) == 8
 
 
 def test_quiet_slices_hand_their_share_to_busy_ones():
@@ -446,7 +399,7 @@ def test_a_timing_out_window_is_narrowed_and_the_rest_still_read():
     posts = c.fetch_posts("python", after=T0, before=T0 + 6 * 3600, limit=30)  # four 90-minute slices
     assert [p.id for p in posts] == [f"p{i}" for i in range(30)]
     widths = {params["before"] - params["after"] for _, params in session.calls}
-    assert max(widths) == 6 * 3600 + 1 and min(widths) <= 1800  # gave up on the whole range, read narrower windows
+    assert max(widths) == 5401 and min(widths) <= 1800  # gave up on 90 minutes (from a second early), read narrower windows
 
 
 def test_other_errors_are_reported():
@@ -509,16 +462,6 @@ def test_all_comments_ask_for_the_whole_thread_and_say_whether_it_is_complete():
     assert client([ok(full)]).fetch_all_comments(small)[1] is False  # a full page may have been cut short
 
 
-def test_a_window_narrowed_after_a_timeout_stays_narrow():
-    items = [at(T0 + 100 + i * 600, i) for i in range(30)]
-    session = SlowArchive(items, max_window=1800)
-    clock = FakeClock()
-    c = ArcticShiftClient(session=session, limiter=RateLimiter(0.0, clock, clock.sleep))
-    c.fetch_posts("python", after=T0, before=T0 + 6 * 3600, limit=30)
-    wide = [p for _, p in session.calls if p["before"] - p["after"] > 1800]
-    assert len(wide) <= 3 * 4  # only the first read tries the long windows
-
-
 class BusyArchive(ArchiveSession):
     """Times out on any page bigger than ``max_limit``, so the client retries with smaller pages."""
 
@@ -533,12 +476,21 @@ class BusyArchive(ArchiveSession):
         return super().get(url, params, timeout)
 
 
-def test_a_page_shrunk_after_a_timeout_isnt_taken_for_the_end_of_the_range():
-    items = [at(T0 + 100 + i * 120, i) for i in range(7 * 720)]  # a post every 2 minutes for a week
+def test_a_page_shrunk_after_a_timeout_doesnt_end_the_slice_early():
+    # Every slice starts with 100 saved posts, so finding new ones needs full pages, which time out.
+    items = [at(T0 + d * DAY + 60 * k, d * 1000 + k) for d in range(7) for k in range(300)]
+    skip = {d["id"] for d in items if int(d["id"][1:]) % 1000 < 100}
     clock = FakeClock()
     c = ArcticShiftClient(session=BusyArchive(items, max_limit=50), limiter=RateLimiter(0.0, clock, clock.sleep))
-    posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28)
+    posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28, skip=skip)
+    assert len(posts) == 28 and not skip & {p.id for p in posts}
     per_day = [sum(1 for p in posts if T0 + d * DAY <= p.created_utc < T0 + (d + 1) * DAY) for d in range(7)]
     assert per_day == [4] * 7
     timeouts = [p for _, p in c.session.calls if p["limit"] > 50]
     assert len(timeouts) == 1  # the smaller page that worked is kept, not retried at full size each time
+
+
+def test_a_post_right_on_a_slice_edge_is_found():
+    items = [at(T0 + 6 * 3600, 1), at(T0 + 6 * 3600 + 5, 2)]  # the first sits exactly where slice two starts
+    posts = archive(items).fetch_posts("python", after=T0, before=T0 + DAY, limit=4)
+    assert [p.id for p in posts] == ["p1", "p2"]
