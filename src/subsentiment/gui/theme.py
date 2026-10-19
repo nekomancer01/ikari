@@ -41,7 +41,7 @@ THEMES = {
         "accent": "#3d6bff", "accent2": "#7a5cff", "on_accent": "#ffffff",
         "button0": "#3d6bff", "button1": "#7a5cff",
         "selection": (61, 107, 255, 40), "menu": "#f7f8fd", "shadow": (40, 52, 110, 40),
-        "grain": ((20, 26, 48, 22), (255, 255, 255, 40)),  # (dark speck, light speck), peak alpha
+        "grain": ((20, 26, 48, 11), (255, 255, 255, 20)),  # (dark speck, light speck), peak alpha
     },
     "dark": {
         "bg0": "#0c0f1d", "bg1": "#151a2f",
@@ -53,7 +53,7 @@ THEMES = {
         "accent": "#6d8dff", "accent2": "#9a7bff", "on_accent": "#ffffff",
         "button0": "#3f5fe8", "button1": "#6e45e0",  # deeper than the accent so white text keeps contrast
         "selection": (109, 141, 255, 60), "menu": "#1b2034", "shadow": (0, 0, 0, 120),
-        "grain": ((0, 0, 0, 34), (255, 255, 255, 16)),
+        "grain": ((0, 0, 0, 17), (255, 255, 255, 8)),
     },
 }
 
