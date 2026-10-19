@@ -1,0 +1,56 @@
+name: UI matrix
+
+# Renders the main window on common screens and scalings with each OS's own font engine and uploads the
+# screenshots and report (tools/ui_matrix.py). Report only: it never blocks a merge.
+on:
+  pull_request:
+    paths:
+      - "src/subsentiment/gui/**"
+      - "tools/ui_matrix.py"
+      - "tools/screenshot.py"
+      - ".github/workflows/ui-matrix.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ui-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  render:
+    name: UI matrix (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Windows, os: windows-latest, screens: win- }
+          - { name: macOS, os: macos-15, screens: mac- }
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Render
+        shell: bash
+        run: |
+          python tools/ui_matrix.py --out ui-matrix/dark --only ${{ matrix.screens }}
+          python tools/ui_matrix.py --out ui-matrix/light --theme light --no-sweep --only ${{ matrix.screens }}
+          if [ "$RUNNER_OS" = Windows ]; then
+            # The text before the switch to grayscale edges, at the owner's 1920x1200 150%.
+            python tools/ui_matrix.py --out ui-matrix/cleartype --subpixel --no-sweep --only win-1920x1200-150
+          fi
+          cat ui-matrix/dark/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-matrix-${{ matrix.name }}
+          path: ui-matrix

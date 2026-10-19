@@ -3,16 +3,16 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import (
-    QDate, QEvent, QRectF, QSettings, QSize, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl,
+    QDate, QEvent, QObject, QRectF, QSettings, QSize, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl,
 )
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence,
     QPainter,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog, QFormLayout, QFrame,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTableView, QTabBar,
+    QAbstractItemView, QAbstractScrollArea, QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog, QFormLayout,
+    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStackedWidget, QTableView, QTabBar,
     QVBoxLayout, QWidget,
 )
 
@@ -151,6 +151,106 @@ def section(text: str) -> QLabel:
     return label(text.upper(), "section")
 
 
+class ElidedLabel(QLabel):
+    """One line that ends in "…" when there isn't room (the tooltip has it all), instead of wrapping.
+
+    A wrapped label in the main window's layout gets no extra height for its second line, so it was
+    cut off on narrow windows; and an unwrapped one would hold the window wider than small screens."""
+
+    def __init__(self, text: str, role: str):
+        super().__init__()
+        self.setProperty("role", role)
+        self._full = ""
+        self.setText(text)
+
+    def setText(self, text: str) -> None:
+        self._full = text
+        self._elide()
+
+    def full_text(self) -> str:
+        return self._full
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, super().minimumSizeHint().height())
+
+    def sizeHint(self) -> QSize:
+        return QSize(self.fontMetrics().horizontalAdvance(self._full) + 2, super().sizeHint().height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._elide()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange):
+            self._elide()
+
+    def _elide(self) -> None:
+        shown = self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, max(self.width(), 1))
+        super().setText(shown)
+        self.setToolTip(self._full if shown != self._full else "")
+
+
+class VerticalScrollArea(QScrollArea):
+    """Scrolls up and down only, and keeps the window at least as wide as its contents need."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def minimumSizeHint(self) -> QSize:
+        inner = self.widget().minimumSizeHint() if self.widget() else QSize(0, 0)
+        return QSize(inner.width() + self.verticalScrollBar().sizeHint().width(), 200)
+
+
+class ShrinkingComboBox(QComboBox):
+    """Full width when there's room; on a narrow window it gives up width (its text ends in "…")."""
+
+    def minimumSizeHint(self) -> QSize:
+        full = super().minimumSizeHint()
+        return QSize(min(full.width(), 120), full.height())
+
+
+class StatusLabel(QLabel):
+    """Wrapped muted text that takes no room in the panel while it's empty."""
+
+    def __init__(self):
+        super().__init__()
+        self.setProperty("role", "muted")
+        self.setWordWrap(True)
+        self.setVisible(False)
+
+    def setText(self, text: str) -> None:
+        super().setText(text)
+        self.setVisible(bool(text))
+
+
+class QuietScrollBars(QObject):
+    """Shows a list's scroll bar handle only while the pointer is over the list, like macOS overlay bars.
+
+    The bar keeps its place, so text doesn't shift when it appears."""
+
+    def __init__(self, area: QAbstractScrollArea):
+        super().__init__(area)
+        self._bar = area.verticalScrollBar()
+        self._bar.setProperty("quiet", True)
+        self._show(False)
+        area.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() in (QEvent.Type.Enter, QEvent.Type.Leave):
+            self._show(event.type() == QEvent.Type.Enter)
+        return False
+
+    def _show(self, on: bool) -> None:
+        self._bar.setProperty("hot", on)
+        self._bar.style().unpolish(self._bar)
+        self._bar.style().polish(self._bar)
+        self._bar.update()
+
+
 class Meter(QWidget):
     """Thin rounded bar showing a share from 0 to 1."""
 
@@ -188,12 +288,15 @@ class StatTile(QFrame):
         self.value = label("–", "value")
         lay.addWidget(label(caption.upper(), "section"))
         lay.addWidget(self.value)
+        # Tiles without a meter keep an empty slot its size, so every caption and value lines up.
         self.meter = Meter(meter) if meter else None
+        lay.addSpacing(4)
         if self.meter:
-            lay.addSpacing(4)
             lay.addWidget(self.meter)
         else:
-            lay.addSpacing(10)
+            slot = QWidget()
+            slot.setFixedHeight(6)
+            lay.addWidget(slot)
 
     def set(self, text: str, share: float | None = None) -> None:
         self.value.setText(text)
@@ -411,8 +514,8 @@ class MainWindow(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body = QWidget()
         lay = QVBoxLayout(body)
-        lay.setContentsMargins(19, 19, 19, 19)
-        lay.setSpacing(14)
+        lay.setContentsMargins(19, 16, 19, 16)
+        lay.setSpacing(10)
         scroll.setWidget(body)
         outer.addWidget(scroll)
 
@@ -461,7 +564,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(section("Fetch"))
         form = QFormLayout()
         form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(10)
+        form.setVerticalSpacing(8)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         form.addRow(label("Subreddit", "muted"), self.subreddit)
         form.addRow(label("Search", "muted"), self.query)
@@ -487,32 +590,37 @@ class MainWindow(QMainWindow):
         lay.addLayout(buttons)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
-        self.progress_msg = label("", "muted")
-        self.progress_msg.setWordWrap(True)
+        self.progress_msg = StatusLabel()
         lay.addWidget(self.progress)
         lay.addWidget(self.progress_msg)
 
-        lay.addSpacing(4)
-        lay.addWidget(section("Saved data"))
+        lay.addSpacing(6)
+        self.delete_btn = mark(mark(QPushButton("Delete…"), "flat", True), "small", True)
+        self.delete_btn.setToolTip("Delete the saved posts and comments for the selected subreddit")
+        self.delete_btn.clicked.connect(self._delete_dataset)
+        self.delete_all_btn = mark(mark(QPushButton("Delete all…"), "flat", True), "small", True)
+        self.delete_all_btn.setToolTip("Delete every saved subreddit")
+        self.delete_all_btn.clicked.connect(self._delete_all)
+        # The Delete buttons sit on the section's title row, so the panel fits a 150% maximized window.
+        saved_head = QHBoxLayout()
+        saved_head.setSpacing(2)
+        saved_head.addWidget(section("Saved data"), 1)
+        saved_head.addWidget(self.delete_btn)
+        saved_head.addWidget(self.delete_all_btn)
+        lay.addLayout(saved_head)
         self.datasets = QListWidget()
         self.datasets.setFrameShape(QFrame.Shape.NoFrame)
+        # Fills whatever height is left, down to two rows. Its default preferred height (about 190 px)
+        # counted in full and pushed the storage line below a 150% maximized window.
+        self.datasets.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        self.datasets.setMinimumHeight(84)
+        QuietScrollBars(self.datasets)
         self.datasets.currentItemChanged.connect(self._on_dataset_selected)
         lay.addWidget(self.datasets, 1)
         self.storage_info = label("", "muted")
         self.storage_info.setWordWrap(True)
+        self.storage_info.setToolTip("Saved on this computer, kept between sessions")
         lay.addWidget(self.storage_info)
-        self.delete_btn = mark(QPushButton("Delete…"), "flat", True)
-        self.delete_btn.setToolTip("Delete the saved posts and comments for the selected subreddit")
-        self.delete_btn.clicked.connect(self._delete_dataset)
-        self.delete_all_btn = mark(QPushButton("Delete all…"), "flat", True)
-        self.delete_all_btn.setToolTip("Delete every saved subreddit")
-        self.delete_all_btn.clicked.connect(self._delete_all)
-        delete_row = QHBoxLayout()
-        delete_row.setSpacing(4)
-        delete_row.addWidget(self.delete_btn)
-        delete_row.addWidget(self.delete_all_btn)
-        delete_row.addStretch(1)
-        lay.addLayout(delete_row)
         return side
 
     def _build_content(self) -> QWidget:
@@ -521,32 +629,35 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(14)
 
-        self.heading = label("No data yet", "heading")
-        self.subheading = label("Enter a subreddit on the left and press Fetch and analyse.", "subtitle")
-        self.subheading.setWordWrap(True)  # wraps on a narrow window instead of widening it
-        titles = QVBoxLayout()
-        titles.setSpacing(2)
-        titles.addWidget(self.heading)
-        titles.addWidget(self.subheading)
+        self.heading = ElidedLabel("No data yet", "heading")
+        self.subheading = ElidedLabel("Enter a subreddit on the left and press Fetch and analyse.", "subtitle")
 
         self.tabbar = QTabBar()
         self.tabbar.setDrawBase(False)
         self.tabbar.setExpanding(False)
-        self.tabbar.setUsesScrollButtons(False)  # all three tabs always show; the window is never narrower
+        self.tabbar.setUsesScrollButtons(False)  # all three tabs always show
+        self.tabbar.setElideMode(Qt.TextElideMode.ElideRight)  # at the narrowest, long counts end in "…"
         for t in ("Overview", "Posts", "Comments"):
             self.tabbar.addTab(t)
         # What the whole Overview (tiles, charts, strongest lists, mood tint) counts.
-        self.scope = QComboBox()
+        self.scope = ShrinkingComboBox()
         self.scope.addItems(SCOPES)
         self.scope.setToolTip("Count posts, comments or both on the Overview")
         saved = self.settings.value("ui/overview_scope", SCOPES[0], str)
         self.scope.setCurrentIndex(max(self.scope.findText(saved), 0))
         self.scope.currentTextChanged.connect(self._on_scope_changed)
-        header = QHBoxLayout()
-        header.setSpacing(12)
-        header.addLayout(titles, 1)
-        header.addWidget(self.scope, 0, Qt.AlignmentFlag.AlignBottom)
-        header.addWidget(self.tabbar, 0, Qt.AlignmentFlag.AlignBottom)
+        self.heading.setMinimumWidth(QFontMetrics(theme.display_font(15, 650)).horizontalAdvance("r/subreddit"))
+        # The title and the Overview's scope picker share the first row and the subtitle runs under both;
+        # the tabs take both rows on the right. The subtitle used to share a narrow column with the title
+        # and wrapped at 150%, cutting off "last fetched".
+        header = QGridLayout()
+        header.setHorizontalSpacing(12)
+        header.setVerticalSpacing(2)
+        header.addWidget(self.heading, 0, 0)
+        header.addWidget(self.scope, 0, 1, Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.subheading, 1, 0, 1, 2)
+        header.addWidget(self.tabbar, 0, 2, 2, 1, Qt.AlignmentFlag.AlignBottom)
+        header.setColumnStretch(0, 1)
         lay.addLayout(header)
 
         self.pages = QStackedWidget()
@@ -579,7 +690,7 @@ class MainWindow(QMainWindow):
         tiles = QHBoxLayout()
         tiles.setSpacing(14)
         for t in self.tiles.values():
-            tiles.addWidget(t)
+            tiles.addWidget(t, 1)  # equal widths, whatever the caption length
         lay.addLayout(tiles)
 
         self.distribution = DistributionChart()
@@ -602,6 +713,7 @@ class MainWindow(QMainWindow):
             lw.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             lw.setTextElideMode(Qt.TextElideMode.ElideRight)
             lw.setUniformItemSizes(True)
+            QuietScrollBars(lw)
             lw.itemDoubleClicked.connect(
                 lambda item: QDesktopServices.openUrl(QUrl(item.data(Qt.ItemDataRole.UserRole))))
             card, inner = panel("solid", margins=14, spacing=6)
@@ -609,7 +721,11 @@ class MainWindow(QMainWindow):
             inner.addWidget(lw)
             extremes.addWidget(card)
         lay.addLayout(extremes, 2)
-        return page
+        # On a short window (1366x768 or 1280x800 at 125%) the overview scrolls rather than holding the
+        # window taller than the screen or squeezing the charts.
+        scroll = VerticalScrollArea()
+        scroll.setWidget(page)
+        return scroll
 
     # -- theme ----------------------------------------------------------------
 
@@ -838,8 +954,7 @@ class MainWindow(QMainWindow):
             self._on_dataset_selected(self.datasets.currentItem())  # reload even when the selection is unchanged
         posts, comments = sum(d["posts"] for d in sets), sum(d["comments"] for d in sets)
         self.storage_info.setText(
-            f"{plural(len(sets), 'subreddit')}, {plural(posts, 'post')}, {plural(comments, 'comment')} · "
-            f"{human_size(self.store.size_bytes())} on this computer" if sets
+            f"{plural(posts, 'post')}, {plural(comments, 'comment')} · {human_size(self.store.size_bytes())}" if sets
             else "Nothing saved yet. Fetched data is kept on this computer between sessions.")
         self._update_delete_enabled()
 

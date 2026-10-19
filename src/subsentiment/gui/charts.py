@@ -81,7 +81,7 @@ class DistributionChart(QChartView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setStyleSheet("background: transparent; border: none;")
         self.setBackgroundBrush(Qt.GlobalColor.transparent)
-        self.setMinimumHeight(220)
+        self.setMinimumHeight(200)
         self._labels: list[tuple[QGraphicsSimpleTextItem, QGraphicsSimpleTextItem, int, float]] = []
         self._bars: list[tuple[QGraphicsPathItem, int, float]] = []
         self._series = None
@@ -117,6 +117,7 @@ class DistributionChart(QChartView):
         _style_axis(x, colors)
         x.setGridLineVisible(False)
         x.setLabelsColor(QColor(colors["text"]))
+        x.setTruncateLabels(False)  # Qt cut "Negative" to "Neg..." on a narrow card though the bar had room
         # Every bar carries its own count and share, so the value axis only sets the
         # scale: no labels or grid competing with the bars. Headroom for the labels.
         y = QValueAxis()
@@ -225,7 +226,7 @@ class TimelineChart(QChartView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setStyleSheet("background: transparent; border: none;")
         self.setBackgroundBrush(Qt.GlobalColor.transparent)
-        self.setMinimumHeight(220)
+        self.setMinimumHeight(200)
         self.set_points([])
 
     def set_points(self, points: list[tuple[int, float, int]]) -> None:
