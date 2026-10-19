@@ -1,7 +1,40 @@
-# ikari
+<p align="center">
+  <img src="src/subsentiment/gui/assets/app-512.png" width="112" alt="ikari icon">
+</p>
 
-Pull a subreddit's posts and comments, score their sentiment, and explore the results in a
-desktop app. Built with Python and Qt for Windows, macOS and Linux.
+<h1 align="center">ikari</h1>
+
+<p align="center">
+  Pull a subreddit's posts and comments, score their sentiment, and explore the results in a
+  desktop app for Windows, macOS and Linux.
+</p>
+
+<p align="center">
+  <a href="https://github.com/nekomancer01/ikari/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/nekomancer01/ikari"></a>
+  <a href="https://github.com/nekomancer01/ikari/actions/workflows/build.yml"><img alt="Build status" src="https://github.com/nekomancer01/ikari/actions/workflows/build.yml/badge.svg"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/nekomancer01/ikari/releases/latest"><img alt="Download the latest release" src="https://img.shields.io/badge/Download%20the%20latest%20release-6C5CE7?style=for-the-badge&logo=github&logoColor=white"></a>
+</p>
+
+## Screenshots
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/overview-dark.png">
+    <img alt="Overview tab: summary numbers, sentiment distribution and mean sentiment per day" src="docs/overview-light.png" width="100%">
+  </picture>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/posts-dark.png">
+    <img alt="Posts tab: a sortable, filterable table of posts with sentiment scores" src="docs/posts-light.png" width="100%">
+  </picture>
+</p>
+
+The images use invented sample data. Regenerate them with `QT_QPA_PLATFORM=offscreen python tools/screenshot.py`.
 
 ## Features
 
@@ -145,6 +178,7 @@ Layout:
 | `src/subsentiment/updater.py` | Looks up the latest GitHub release and downloads it |
 | `tools/train_model.py` | Trains the bundled sentiment classifier on GoEmotions |
 | `tools/eval_sentiment.py` | Scores accuracy against GoEmotions (the numbers in Features) |
+| `tools/screenshot.py` | Renders the README screenshots in `docs/` from invented sample data |
 | `src/subsentiment/collect.py` | One fetch job: fetch → score → store |
 | `src/subsentiment/gui/` | Qt main window, charts, table models, background worker, settings |
 | `src/subsentiment/gui/theme.py` | Glass theme: color tokens, stylesheet, fonts, backdrop |
