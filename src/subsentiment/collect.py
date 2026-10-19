@@ -105,8 +105,10 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     n_comments = errors = 0
     if req.include_comments and not should_stop():
         refreshed = {p.id for p in updated}
+        repicked = {p.id for p in picked if p.id in stored}  # top mode can pick posts that are already saved
         todo = new + updated + [_stored_post(r) for pid, r in stored.items()
-                                if pid not in refreshed and _comments_missing(r)]
+                                if pid not in refreshed and (_comments_missing(r)
+                                                             or (pid in repicked and _never_asked(r)))]
         todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up
         failed_in_row = 0
         for i, p in enumerate(todo, 1):
@@ -191,6 +193,10 @@ def _comments_missing(r) -> bool:
     # Only a post whose comments were asked for and failed is retried. Saved posts nobody asked comments
     # for are left alone: a fetch must not quietly download comments for posts it wasn't fetching.
     return r["comments_ok"] is not None and not r["comments_ok"]
+
+
+def _never_asked(r) -> bool:
+    return r["comments_ok"] is None and not r["has_comments"]
 
 
 def _stored_post(r) -> Post:
