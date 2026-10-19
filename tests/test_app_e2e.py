@@ -307,3 +307,76 @@ def test_when_the_server_says_no_requests_are_left_the_app_waits_for_the_reset(e
     fetch(w, comments=True, limit=4, rng="day")
     assert [r for r in env.archive.rejected if r[2] == 429] == []  # it waited instead of hitting the limit
     assert not env.warnings and len(env.store().posts("python")) == 4
+
+
+def open_coverage(w):
+    w.coverage_act.trigger()
+    end = time.monotonic() + 30
+    while (w.coverage._count_thread is not None or not w.coverage.days) and time.monotonic() < end:
+        pump(20)
+    pump(50)
+    return w.coverage
+
+
+def test_coverage_counts_a_busy_subreddit_without_downloading_anything(env):
+    w = env.window()
+    fetch(w, sub="askreddit", comments=False, limit=5, rng="day")
+    env.archive.clear()
+    w.range.setCurrentIndex(w.range.findData("month"))
+    cov = open_coverage(w)
+    paths = set(env.archive.paths())
+    assert paths == {AGG}  # only counts; the month-long count timed out and was split, never refused
+    assert [r for r in env.archive.rejected if r[2] == 422]
+    totals = cov.totals["askreddit"]
+    assert sum(totals.values()) == len([p for p in env.archive.posts if p["subreddit"] == "AskReddit"
+                                        and p["created_utc"] >= w.fetch_range()[0]])
+    for row in range(min(5, cov.day_table.rowCount())):  # browsing days and posts
+        cov.day_table.selectRow(row)
+        pump(30)
+    QTest.keyClick(cov.day_table, Qt.Key.Key_Return)
+    QTest.keyClick(cov.post_table, Qt.Key.Key_Return)
+    pump(500)
+    assert set(env.archive.paths()) == {AGG} and w.thread is None
+
+
+def test_coverage_downloads_do_only_what_they_say(env):
+    w = env.window()
+    fetch(w, comments=False, limit=3)
+    cov = open_coverage(w)
+    day_row = next(r for r, d in enumerate(cov.days) if cov.totals["python"].get(d))
+    cov.day_table.selectRow(day_row)
+    env.archive.clear()
+    QTest.mouseClick(cov.day_table.cellWidget(day_row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    assert set(env.archive.paths()) <= {SEARCH, AGG}  # the day's posts, no comments
+    pump(100)
+    env.archive.clear()
+    button = cov.post_table.cellWidget(0, 2).findChild(type(w.fetch_btn))
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    trees = [q for p, q in env.archive.requests if p == TREE]
+    assert len(trees) == 1 and set(env.archive.paths()) <= {TREE, IDS}
+
+
+def test_coverage_keeps_its_place_while_a_download_runs(env):
+    w = env.window()
+    fetch(w, comments=False, limit=3)
+    w.range.setCurrentIndex(w.range.findData("month"))
+    cov = open_coverage(w)
+    cov.resize(900, 400)
+    pump(50)
+    last = cov.day_table.rowCount() - 1
+    cov.day_table.selectRow(last)
+    cov.day_table.scrollToBottom()
+    pump(50)
+    scrolled = cov.day_table.verticalScrollBar().value()
+    assert scrolled > 0
+    env.archive.delay = 0.05
+    w.subreddit.setText("python")
+    w.include_comments.setChecked(True)
+    w.limit.setValue(20)
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    pump(2500)  # the window refreshes about once a second while rows arrive
+    assert cov.day_table.verticalScrollBar().value() == scrolled
+    assert cov._selected_day() == cov.days[last]
+    wait_idle(w)
