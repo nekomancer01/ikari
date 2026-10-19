@@ -8,6 +8,10 @@ lists) sits on a near-solid surface, and glass is never stacked on glass.
 A faint tiled grain on the glass gives it a frosted, physical texture.
 "Reduce transparency" swaps every fill for a near-opaque one and drops the grain.
 
+The backdrop can also carry the mood of the subreddit on screen: MoodTint pulls the glows and a
+soft wash toward green when it skews positive, white when it's neutral and red when it skews
+negative, easing between subreddits. It's a wash, not a fill, so panel and text contrast hold.
+
 Type: Manrope for the interface and Sora for headings and big numbers, both
 SIL Open Font License, bundled in assets/. Tabular figures are switched on so
 numbers line up in columns.
@@ -19,7 +23,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QEasingCurve, QObject, QPointF, QRectF, Qt, QVariantAnimation
 from PySide6.QtGui import (
     QColor, QFont, QFontDatabase, QGuiApplication, QImage, QLinearGradient, QPainter, QPalette,
     QRadialGradient,
@@ -66,6 +70,14 @@ OPAQUE = {
               "solid": (255, 255, 255, 255)},
     "dark": {"glass": (24, 29, 46, 255), "glass_strong": (33, 39, 58, 255), "glass_soft": (28, 33, 51, 255),
              "solid": (22, 27, 43, 255)},
+}
+
+# Sentiment wash over the backdrop: (rgb, peak alpha) per mood, and how far the glows lean toward it.
+MOOD = {
+    "light": {"positive": ((46, 196, 108), 70), "neutral": ((255, 255, 255), 120), "negative": ((236, 72, 72), 66),
+              "blob_mix": 0.75},
+    "dark": {"positive": ((34, 170, 92), 60), "neutral": ((214, 222, 240), 22), "negative": ((214, 52, 60), 64),
+             "blob_mix": 0.7},
 }
 
 _mode = "light"
@@ -337,11 +349,73 @@ def mark(widget: QWidget, prop: str, value) -> QWidget:
     return widget
 
 
-def paint_backdrop(widget: QWidget, over_native: bool = False) -> None:
+def mood_score(positive: int, negative: int, total: int) -> float:
+    """Net share of positive over negative items, scaled to -1..1 (±50 points of net share is the full tint)."""
+    if not total:
+        return 0.0
+    return max(-1.0, min(1.0, 2.0 * (positive - negative) / total))
+
+
+def _mix(a: QColor, b: QColor, f: float) -> QColor:
+    return QColor.fromRgbF(*(x + (y - x) * f for x, y in zip(a.getRgbF()[:3], b.getRgbF()[:3])), a.alphaF())
+
+
+def mood_color(score: float) -> tuple[QColor, float]:
+    """The wash for a mood score in -1..1: green, white or red (alpha carries its strength), and its weight 0..1."""
+    m = MOOD[_mode]
+    white, wa = m["neutral"]
+    far, fa = m["positive" if score >= 0 else "negative"]
+    f = abs(score)
+    c = _mix(QColor(*white), QColor(*far), f)
+    c.setAlpha(round(wa + (fa - wa) * f))
+    return c, f
+
+
+class MoodTint(QObject):
+    """Eases the backdrop's mood between datasets and repaints the window as it goes.
+
+    State is a point (score, presence): presence fades the wash in and out, so "no data" and
+    "tint off" look exactly like the plain backdrop.
+    """
+
+    def __init__(self, window: QWidget, enabled: bool = True):
+        super().__init__(window)
+        self._window = window
+        self.enabled = enabled
+        self._target = QPointF(0, 0)
+        self.state = QPointF(0, 0)
+        self._anim = QVariantAnimation(self, duration=900, easingCurve=QEasingCurve.Type.InOutCubic)
+        self._anim.valueChanged.connect(self._step)
+
+    def set_counts(self, positive: int, negative: int, total: int) -> None:
+        self._target = QPointF(mood_score(positive, negative, total), 1.0 if total else 0.0)
+        self._go()
+
+    def set_enabled(self, on: bool) -> None:
+        self.enabled = on
+        self._go()
+
+    def _go(self) -> None:
+        target = self._target if self.enabled else QPointF(self.state.x(), 0.0)
+        self._anim.stop()
+        if not self._window.isVisible():  # nothing to watch yet: jump straight there
+            self._step(target)
+            return
+        self._anim.setStartValue(QPointF(self.state))
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    def _step(self, value: QPointF) -> None:
+        self.state = QPointF(value)
+        self._window.update()
+
+
+def paint_backdrop(widget: QWidget, over_native: bool = False, mood: QPointF | None = None) -> None:
     """Window background: a diagonal gradient with a few large, soft color glows.
 
     over_native: a native material (Windows Mica/Acrylic, macOS vibrancy) is behind the window, so only
     lay a thin tint over it (enough to keep text contrast) and fainter glows.
+    mood: MoodTint.state, (score -1..1, presence 0..1); leans the glows and a diagonal wash toward its color.
     """
     t = tokens()
     p = QPainter(widget)
@@ -358,13 +432,26 @@ def paint_backdrop(widget: QWidget, over_native: bool = False) -> None:
     p.fillRect(r, base)
     p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
     w, h = r.width(), r.height()
+    presence = mood.y() if mood is not None else 0.0
+    wash, weight = mood_color(mood.x()) if presence > 0 else (QColor(0, 0, 0, 0), 0.0)
+    # Glows lean further toward green/red than toward white, which would just wash them out.
+    lean = MOOD[_mode]["blob_mix"] * presence * (0.35 + 0.65 * weight)
     spots = [(0.12, 0.08, 0.55), (0.92, 0.18, 0.5), (0.62, 1.0, 0.6)]
     for (fx, fy, fr), (hex_color, alpha) in zip(spots, t["blobs"]):
         radius = max(w, h) * fr
         g = QRadialGradient(QPointF(w * fx, h * fy), radius)
-        c = QColor(hex_color)
+        c = _mix(QColor(hex_color), wash, lean) if presence > 0 else QColor(hex_color)
         c.setAlpha(alpha // 2 if over_native else alpha)
         g.setColorAt(0, c)
         c.setAlpha(0)
         g.setColorAt(1, c)
+        p.fillRect(r, g)
+    if presence > 0:
+        # Strongest at the top left (where the eye lands first), fading to a trace at the far corner.
+        a = wash.alphaF() * presence * (0.5 if over_native else 1.0)
+        g = QLinearGradient(r.topLeft(), r.bottomRight())
+        for at, k in ((0.0, 1.0), (0.55, 0.7), (1.0, 0.35)):
+            c = QColor(wash)
+            c.setAlphaF(a * k)
+            g.setColorAt(at, c)
         p.fillRect(r, g)
