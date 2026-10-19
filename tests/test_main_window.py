@@ -291,3 +291,24 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     assert req.everything and req.after == today and req.limit == coverage.MAX_DAY_POSTS
     assert "so far today" in msg
     c.close()
+
+
+def test_a_day_whose_count_lags_behind_whats_saved_shows_no_total(make_window, monkeypatch):
+    from subsentiment.gui import coverage
+    yesterday = coverage.today() - 86400
+
+    def count(self, after, before):  # the archive's count for yesterday is still catching up
+        self._on_counts(self.subreddit, {d: (1 if d == yesterday else 9) for d in range(int(after), int(before), 86400)})
+    monkeypatch.setattr(coverage.CoverageWindow, "_count", count)
+    w = make_window()
+    for i in range(3):
+        w.store.save_post(Post(f"y{i}", "Python", "y", "", "a", None, None, None, yesterday + 60 + i, "u", ""), 0, "neutral")
+    w.store.commit()
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
+    w.range.setCurrentIndex(w.range.findData("week"))
+    w._show_coverage()
+    c = w.coverage
+    c.refresh_saved()
+    cell = c.day_table.cellWidget(c.days.index(yesterday), 1)
+    assert (cell.main.text(), cell.side.text()) == ("3 saved so far", "Still counting")
+    c.close()

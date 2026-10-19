@@ -62,6 +62,12 @@ def today() -> int:
     return int(time.time() // DAY * DAY)
 
 
+def no_total(day: int, saved: int, total: int | None, complete: bool) -> bool:
+    """True for a day whose archive count can't be shown: today (not over yet), or a recent day whose
+    count is still catching up and is below what's already saved."""
+    return day >= today() or (not complete and total is not None and total < saved)
+
+
 def share_text(saved: int, total: int | None, complete: bool, noun: str) -> tuple[str, str, float | None, str]:
     """(main text, side text, share 0..1 or None, tooltip) for one coverage cell."""
     if complete:
@@ -134,13 +140,15 @@ class Cell(QWidget):
         self.bar.setSizePolicy(keep)
         lay.addWidget(self.bar)
 
-    def set_open(self, saved: int) -> None:
-        """A day that isn't over: no total or share, just what's saved so far."""
+    def set_open(self, saved: int, is_today: bool = True) -> None:
+        """A day without a usable total: just what's saved so far, no share or estimate."""
         self.main.setText(f"{saved:,} saved so far")
-        self.side.setText("Today")
+        self.side.setText("Today" if is_today else "Still counting")
         self.bar.setVisible(False)  # an empty bar would read as 0%
         self.setToolTip("Today isn't over, so there's no total yet. Download all fetches everything "
-                        "posted today so far.")
+                        "posted today so far." if is_today else
+                        "Arctic Shift's count for this day is still catching up (it's lower than what's "
+                        "already saved). Download all fetches everything posted that day.")
 
     def set(self, saved: int, total: int | None, complete: bool, noun: str) -> None:
         main, side, share, tip = share_text(saved, total, complete, noun)
@@ -387,11 +395,12 @@ class CoverageWindow(QDialog):
             n, total, done = saved.get(day, 0), totals.get(day), str(day) in complete
             cell: Cell = t.cellWidget(row, 1)
             button: QPushButton = t.cellWidget(row, 2).findChild(QPushButton)
-            if day >= current:
-                cell.set_open(n)
+            if no_total(day, n, total, done):
+                cell.set_open(n, day >= current)
                 button.setText("Download all")
                 button.setEnabled(not self.busy)
-                button.setToolTip("Fetch everything posted today so far")
+                button.setToolTip("Fetch everything posted today so far" if day >= current
+                                  else f"Fetch every post from {day_text(day)}")
                 continue
             cell.set(n, total, done, "post")
             if total is None and counting and not done:
@@ -523,7 +532,7 @@ class CoverageWindow(QDialog):
             return
         total = self.totals.get(self.subreddit.lower(), {}).get(day)
         have = self.window_.store.posts_per_day(self.subreddit, day, day + DAY).get(day, 0)
-        if day >= today():  # still going: no total to go by, so take everything there is so far
+        if no_total(day, have, total, False):  # no total to go by, so take everything there is
             limit = MAX_DAY_POSTS
         else:
             limit = UNKNOWN_DAY_POSTS if total is None else max(total - have, 0) + SLACK
