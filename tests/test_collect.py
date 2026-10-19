@@ -23,9 +23,13 @@ class FakeClient:
         return [self.by_id[i] for i in ids if i in self.by_id]
 
     def fetch_posts(self, subreddit, after, before, limit, query, top=False, skip=(), progress=None,
-                    should_stop=None):
+                    should_stop=None, on_posts=None):
         self.calls.append(("posts", top, set(skip)))
-        return [p for p in self.posts if top or p.id not in skip][:limit]
+        picked = [p for p in self.posts if top or p.id not in skip][:limit]
+        for p in picked:  # the real client hands over each page as it is downloaded
+            if on_posts:
+                on_posts([p])
+        return picked
 
     def fetch_comments(self, post, limit):
         self.calls.append(("comments", post.id))
@@ -123,34 +127,7 @@ def test_saved_is_reported_after_each_batch(tmp_path):
     s = store_with(tmp_path, [])
     seen = []
     collect.run(FakeClient(posts=[mk(1), mk(2)]), s, collect.FetchRequest("python"), saved=lambda: seen.append(1))
-    assert len(seen) == 3  # the posts, then each post's comments
-
-
-class LiveClient:
-    def __init__(self, posts):
-        self.posts = posts
-        self.afters = []
-
-    def fetch_newer(self, subreddit, after, skip=(), limit=100):
-        self.afters.append(after)
-        return [p for p in self.posts if p.created_utc > after and p.id not in skip][:limit]
-
-
-def test_live_poll_saves_only_posts_newer_than_the_newest_saved(tmp_path):
-    s = store_with(tmp_path, [mk(1), mk(2)])
-    client = LiveClient([mk(1), mk(2), mk(3), mk(4)])
-    r = collect.poll_live(client, s, "Python", now=T + 10)
-    assert r.new == 2 and r.newest == T + 4
-    assert client.afters[0] == T + 2
-    assert {x["id"] for x in s.posts("Python")} == {"p1", "p2", "p3", "p4"}
-    assert collect.poll_live(client, s, "Python", now=T + 20).new == 0
-
-
-def test_live_poll_on_an_empty_dataset_starts_a_few_hours_back(tmp_path):
-    s = Store(tmp_path / "x.db")
-    client = LiveClient([])
-    collect.poll_live(client, s, "Python", now=T)
-    assert client.afters == [T - collect.LIVE_LOOKBACK]
+    assert len(seen) == 5  # each post as it arrives, the batch commit, then each comment
 
 
 class FullThreadClient(FakeClient):
@@ -197,3 +174,25 @@ def test_downloading_a_whole_day_marks_it_complete_only_when_the_archive_ran_out
                 collect.FetchRequest("python", after=T, before=T + 86400, limit=2, everything=True,
                                      include_comments=False))
     assert s2.complete_keys("posts", "python") == set()  # it may have had more than the 2 asked for
+
+
+def test_each_post_and_comment_is_saved_and_announced_as_it_arrives(tmp_path):
+    s = store_with(tmp_path, [])
+    counts = []
+    collect.run(FakeClient(posts=[mk(1), mk(2), mk(3)]), s, collect.FetchRequest("python"),
+                saved=lambda: counts.append(len(s.posts("python"))))
+    assert counts[:3] == [1, 2, 3]  # the table grows one post at a time
+
+
+def test_a_fetch_does_not_download_comments_for_saved_posts_nobody_asked_about(tmp_path):
+    s = store_with(tmp_path, [mk(1), mk(2)])  # saved earlier, comments never requested
+    c = FakeClient(posts=[mk(3)])
+    collect.run(c, s, collect.FetchRequest("python"))
+    assert [call[1] for call in c.calls if call[0] == "comments"] == ["p3"]
+
+
+def test_top_mode_gets_comments_for_a_picked_saved_post_that_never_had_them(tmp_path):
+    s = store_with(tmp_path, [mk(1), mk(2)])  # saved earlier, comments never requested
+    c = FakeClient(posts=[mk(1), mk(3)])
+    collect.run(c, s, collect.FetchRequest("python", top=True))  # top mode picks p1 again, plus p3
+    assert sorted(call[1] for call in c.calls if call[0] == "comments") == ["p1", "p3"]  # not p2

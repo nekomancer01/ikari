@@ -200,11 +200,11 @@ def alignment(window) -> list[str]:
     _same(problems, "form label left edges", labels)
     # Equal margins left and right of the sidebar's contents (inside the scroll bar when there is one).
     left = _rect(form.itemAt(0, QFormLayout.ItemRole.LabelRole).widget(), side).left()
-    right = side.width() - 1 - max(_rect(w, side).right() for w in [*fields.values(), window.fetch_btn, window.live_btn])
+    right = side.width() - 1 - max(_rect(w, side).right() for w in [*fields.values(), window.fetch_btn, window.stop_btn])
     _same(problems, "sidebar margins", {"left": left, "right": right})
     _same(problems, "Fetch row button tops", {"fetch": _rect(window.fetch_btn, side).top(),
-                                               "live": _rect(window.live_btn, side).top()})
-    _same(problems, "Fetch row button heights", {"fetch": window.fetch_btn.height(), "live": window.live_btn.height()})
+                                               "stop": _rect(window.stop_btn, side).top()})
+    _same(problems, "Fetch row button heights", {"fetch": window.fetch_btn.height(), "stop": window.stop_btn.height()})
     title = next(lab for lab in side.findChildren(QLabel) if lab.property("role") == "title")
     _same(problems, "sidebar left edges", {"form labels": _rect(form.itemAt(0, QFormLayout.ItemRole.LabelRole)
                                                                  .widget(), side).left(),
@@ -213,7 +213,7 @@ def alignment(window) -> list[str]:
                                             "saved list": _rect(window.datasets, side).left(),
                                             "storage line": _rect(window.storage_info, side).left()})
     _same(problems, "sidebar right edges", {"fields": max(_rect(w, side).right() for w in fields.values()),
-                                             "live feed": _rect(window.live_btn, side).right(),
+                                             "stop": _rect(window.stop_btn, side).right(),
                                              "saved list": _rect(window.datasets, side).right(),
                                              "delete all": _rect(window.delete_all_btn, side).right()})
 

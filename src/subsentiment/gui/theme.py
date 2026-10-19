@@ -269,7 +269,7 @@ QPushButton:hover {{ border-color: {t['faint']}; }}
 QPushButton:pressed {{ background: {glass}; }}
 QPushButton:disabled {{ color: {t['faint']}; background: {soft}; border-color: {edge}; }}
 QPushButton:focus {{ border-color: {t['accent']}; }}
-QPushButton:checked {{ background: {sel}; border-color: {t['accent']}; }}  /* a toggle that's on, like Live feed */
+QPushButton:checked {{ background: {sel}; border-color: {t['accent']}; }}  /* a toggle button that is on */
 QPushButton[primary="true"] {{
     color: {t['on_accent']}; border: 1px solid rgba(255, 255, 255, 60);
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {t['button0']}, stop:1 {t['button1']});
