@@ -6,6 +6,8 @@ from functools import lru_cache
 
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
+from subsentiment import sentiment_model
+
 # Standard VADER cut-offs on the compound score.
 POSITIVE_THRESHOLD = 0.05
 NEGATIVE_THRESHOLD = -0.05
@@ -39,10 +41,36 @@ def label_for(compound: float) -> str:
     return "neutral"
 
 
-def score(text: str) -> tuple[float, str]:
-    """Return (compound score in [-1, 1], label)."""
+def vader_features(cleaned: str) -> list[float]:
+    p = _analyzer().polarity_scores(cleaned) if cleaned else {"neg": 0, "neu": 1, "pos": 0, "compound": 0}
+    return [p["neg"], p["neu"], p["pos"], p["compound"], abs(p["compound"])]
+
+
+def score_vader(text: str) -> tuple[float, str]:
+    """Plain VADER: (compound score in [-1, 1], label from the +/-0.05 cut-offs)."""
     cleaned = clean(text)
     if not cleaned:
         return 0.0, "neutral"
     compound = _analyzer().polarity_scores(cleaned)["compound"]
     return compound, label_for(compound)
+
+
+def score_model(text: str) -> tuple[float, str] | None:
+    """Bundled classifier: (P(positive) - P(negative), most likely label), or None if not packaged."""
+    model = sentiment_model.load()
+    if model is None:
+        return None
+    cleaned = clean(text)
+    if not cleaned:
+        return 0.0, "neutral"
+    probs = model.probabilities(cleaned, vader_features(cleaned))
+    return probs["positive"] - probs["negative"], max(probs, key=probs.get)
+
+
+def score(text: str, scorer: str = "model") -> tuple[float, str]:
+    """Return (score in [-1, 1], label). Falls back to VADER if the model isn't available."""
+    if scorer == "model":
+        result = score_model(text)
+        if result is not None:
+            return result
+    return score_vader(text)

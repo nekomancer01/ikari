@@ -20,3 +20,17 @@ def test_quotes_and_code_are_ignored():
 
 def test_markdown_links_keep_their_text():
     assert sentiment.clean("see [the great docs](https://x.y)") == "see the great docs"
+
+
+def test_model_is_bundled_and_scores_plausibly():
+    assert sentiment.score_model("I love this, it's amazing!")[1] == "positive"
+    assert sentiment.score_model("This is terrible and I hate it.")[1] == "negative"
+    assert sentiment.score_model("The meeting is on Tuesday.")[1] == "neutral"
+    assert sentiment.score_model("") == (0.0, "neutral")
+
+
+def test_model_score_range_and_vader_fallback(monkeypatch):
+    compound, _ = sentiment.score("what a wonderful day")
+    assert -1 <= compound <= 1
+    monkeypatch.setattr(sentiment, "score_model", lambda text: None)
+    assert sentiment.score("I love this, it's amazing!") == sentiment.score_vader("I love this, it's amazing!")
