@@ -183,3 +183,11 @@ def test_portable_swap_script_end_to_end(tmp_path):
     assert (app / "notes.txt").read_text() == "keep me"
     assert not list(app.glob("*.old-update"))
     assert not (app / updater.STAGING).exists()
+
+
+def test_windows_only_release_keeps_windows_updates_and_degrades_elsewhere():
+    windows_only = [a for a in ASSETS if a["name"].endswith((".exe", "windows-portable.zip"))]
+    assert pick_asset(windows_only, "win32")["name"].endswith(".exe")
+    assert pick_asset(windows_only, "win32", portable=True)["name"].endswith(".zip")
+    assert pick_asset(windows_only, "darwin") is None
+    assert pick_asset(windows_only, "linux") is None
