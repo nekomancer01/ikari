@@ -371,6 +371,10 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._build_overview())
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
         self.comments_tab = TablePage(COMMENT_COLUMNS, stretch_col=2)
+        # The post title would otherwise size to its text and squeeze the comment column.
+        post_col = self.comments_tab.view.horizontalHeader()
+        post_col.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        post_col.resizeSection(4, 180)
         self.pages.addWidget(self.posts_tab)
         self.pages.addWidget(self.comments_tab)
         lay.addWidget(self.pages, 1)
