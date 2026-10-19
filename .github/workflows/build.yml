@@ -13,6 +13,10 @@ concurrency:
 
 jobs:
   build:
+    # Pull requests get a quick build (app folder + zip/tarball, no installer/DMG/AppImage);
+    # main and tags build every package.
+    env:
+      QUICK: ${{ github.event_name == 'pull_request' && '--quick' || '' }}
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -30,6 +34,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Check the tag matches the app version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -60,14 +66,15 @@ jobs:
           pytest -q
 
       - name: Install Inno Setup
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !env.QUICK
         shell: pwsh
         run: |
           $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
 
       - name: Build
-        run: python packaging/build.py
+        shell: bash
+        run: python packaging/build.py $QUICK
 
       - name: Check the app starts (Windows)
         if: runner.os == 'Windows'
@@ -77,12 +84,12 @@ jobs:
           Start-Sleep -Seconds 15
           if ($p.HasExited) { throw "App exited early with code $($p.ExitCode)" }
           Stop-Process -Id $p.Id
-          if (-not (Test-Path dist\ikari-Setup-*.exe)) { throw "Installer missing" }
+          if (-not $env:QUICK -and -not (Test-Path dist\ikari-Setup-*.exe)) { throw "Installer missing" }
 
       - name: Check the app starts (macOS)
         if: runner.os == 'macOS'
         run: |
-          hdiutil verify dist/ikari-*.dmg
+          if [ -z "$QUICK" ]; then hdiutil verify dist/ikari-*.dmg; fi
           "dist/ikari.app/Contents/MacOS/ikari" &
           pid=$!
           sleep 15
@@ -94,11 +101,15 @@ jobs:
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
-          xvfb-run -a dist/ikari-*.AppImage &
+          if [ -n "$QUICK" ]; then
+            xvfb-run -a dist/ikari/ikari &
+          else
+            xvfb-run -a dist/ikari-*.AppImage &
+          fi
           pid=$!
           sleep 15
           kill -0 "$pid" || { wait "$pid"; echo "App exited early with code $?"; exit 1; }
-          pkill -f lib/ikari/ikari || true
+          pkill -f "ikari/ikari" || true
 
       - uses: actions/upload-artifact@v5
         with:

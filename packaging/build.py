@@ -11,6 +11,9 @@ Output in dist/:
   Linux:   ikari-<v>-linux-x86_64.AppImage and ikari-<v>-linux-x86_64.tar.gz
            (the app folder plus install.sh). --no-appimage skips the AppImage, which needs
            appimagetool (found on PATH, in $APPIMAGETOOL, or downloaded).
+
+--quick is for test builds (CI on pull requests): it skips the slow installer, .dmg and
+AppImage steps and leaves just the app folder plus a plain zip/tarball to try out.
 """
 from __future__ import annotations
 
@@ -51,12 +54,14 @@ def pyinstaller() -> None:
         "--distpath", DIST, "--workpath", BUILD)
 
 
-def build_windows(v: str) -> None:
+def build_windows(v: str, quick: bool) -> None:
     app = DIST / "ikari"
     zip_base = DIST / f"ikari-{v}-windows-x64"
     shutil.make_archive(str(zip_base), "zip", DIST, app.name)
     print("wrote", zip_base.with_suffix(".zip"))
 
+    if quick:
+        return
     iscc = shutil.which("iscc") or os.path.join(os.environ.get("ProgramFiles(x86)", ""),
                                                 "Inno Setup 6", "ISCC.exe")
     if os.path.exists(iscc):
@@ -65,18 +70,22 @@ def build_windows(v: str) -> None:
         print("Inno Setup 6 not found; skipping the installer (https://jrsoftware.org/isinfo.php).")
 
 
-def build_macos(v: str) -> None:
+def build_macos(v: str, quick: bool) -> None:
     app = DIST / "ikari.app"
     # Ad-hoc signature: not trusted by Gatekeeper, but Apple Silicon refuses unsigned code entirely.
     run("codesign", "--force", "--deep", "--sign", "-", app)
     run("codesign", "--verify", "--deep", "--strict", app)
+
+    arch = platform.machine()  # arm64 or x86_64
+    if quick:
+        run("ditto", "-c", "-k", "--keepParent", app, DIST / f"ikari-{v}-macos-{arch}.zip")
+        return
 
     stage = BUILD / "dmg"
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True)
     run("ditto", app, stage / app.name)  # ditto keeps the bundle's symlinks and signature intact
     (stage / "Applications").symlink_to("/Applications")
-    arch = platform.machine()  # arm64 or x86_64
     dmg = DIST / f"ikari-{v}-macos-{arch}.dmg"
     dmg.unlink(missing_ok=True)
     run("hdiutil", "create", "-volname", "ikari", "-srcfolder", stage,
@@ -135,17 +144,19 @@ def build_linux(v: str, make_appimage: bool) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--no-appimage", action="store_true", help="Linux: only build the tarball")
+    parser.add_argument("--quick", action="store_true",
+                        help="test build: skip the installer, .dmg and AppImage")
     args = parser.parse_args()
 
     v = version()
     print(f"Building ikari {v} for {sys.platform}", flush=True)
     pyinstaller()
     if sys.platform == "win32":
-        build_windows(v)
+        build_windows(v, args.quick)
     elif sys.platform == "darwin":
-        build_macos(v)
+        build_macos(v, args.quick)
     else:
-        build_linux(v, make_appimage=not args.no_appimage)
+        build_linux(v, make_appimage=not (args.no_appimage or args.quick))
     print("\nDone. Packages are in", DIST)
     return 0
 
