@@ -282,8 +282,8 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     c.refresh_saved()
     row = c.days.index(today)
     cell = c.day_table.cellWidget(row, 1)
-    assert (cell.main.text(), cell.side.text()) == ("1 saved so far", "Today")
-    assert "of" not in cell.main.text() and "%" not in cell.side.text()
+    assert (cell.main.text(), cell.note.text()) == ("1 saved so far", "Today")
+    assert "of" not in cell.main.text() and "%" not in cell.note.text()
     button = c.day_table.cellWidget(row, 2).findChild(mw.QPushButton)
     assert button.text() == "Download all" and button.isEnabled()
     button.click()
@@ -313,7 +313,7 @@ def test_recent_days_and_lagging_counts_show_no_total(make_window, monkeypatch):
     c.refresh_saved()
     for day in (yesterday, older):  # yesterday's count (9) is above the 3 saved but still isn't shown
         cell = c.day_table.cellWidget(c.days.index(day), 1)
-        assert (cell.main.text(), cell.side.text()) == ("3 saved so far", "Still counting")
+        assert (cell.main.text(), cell.note.text()) == ("3 saved so far", "Still counting")
     cell = c.day_table.cellWidget(c.days.index(older + 86400), 1)
     assert (cell.main.text(), cell.side.text()) == ("0 of 9", "0%")  # a settled day keeps its total
     c.close()
