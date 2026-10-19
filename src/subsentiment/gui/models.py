@@ -13,7 +13,7 @@ from subsentiment.gui.charts import palette
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1
 NUMERIC = ("sentiment", "score", "num_comments")
 PENDING = ("score", "num_comments")  # None until Arctic Shift re-fetches the item, about 36 hours in
-PENDING_TIP = "Arctic Shift fills this in about 36 hours after posting. Fetch this range again later to update it."
+PENDING_TIP = "Arctic Shift fills this in about 36 hours after posting. Fetch this range again later with Update saved posts ticked."
 HEADER_TIP = ("From the Arctic Shift archive of Reddit. These appear once the archive re-checks a post, usually "
               "36 hours after posting; a dash means not yet.")
 FADE_SECONDS = 0.9  # rows that arrive during a fetch fade in over this long

@@ -24,6 +24,7 @@ class FetchRequest:
     include_comments: bool = True
     comments_per_post: int = 50
     top: bool = False  # highest-scored posts of each part of the range, instead of an even sample
+    refresh_scores: bool = False  # also re-check saved posts whose scores hadn't settled
     # Every post in [after, before), with limit as a cap; when the archive runs out first, the range
     # (one UTC day, starting at after) is recorded as fully downloaded.
     everything: bool = False
@@ -59,8 +60,8 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     name = normalize_subreddit(req.subreddit)
     stored = {r["id"]: r for r in store.posts_between(name, req.after, req.before)}
 
-    # 1. Saved posts from this range whose scores weren't settled yet: re-fetch them in batches.
-    stale = [pid for pid, r in stored.items() if r["score"] is None]
+    # 1. If asked, saved posts from this range whose scores weren't settled yet: re-fetch them in batches.
+    stale = [pid for pid, r in stored.items() if r["score"] is None] if req.refresh_scores else []
     updated: list[Post] = []
     if stale:
         note(f"Checking {len(stale):,} saved posts for updated scores…")

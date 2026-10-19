@@ -91,7 +91,9 @@ On the GoEmotions test split:
 | Plain VADER | 65% | 14 points |
 
 Quoted text, code blocks and URLs are stripped before scoring. Plain VADER is the fallback if the
-model is missing. Reproduce the numbers with `tools/eval_sentiment.py`.
+model is missing. Obvious sarcasm (a trailing `/s`, 🙄, or "gotta love…" wrapped around
+something bad) flips a positive score to negative; subtler sarcasm is scored literally.
+Reproduce the numbers with `tools/eval_sentiment.py` (add `--sarcasm` for the sarcasm slice).
 
 ## How it works
 
@@ -208,7 +210,8 @@ Things to know about the archive:
 - **Scores and comment counts arrive late.** The archive saves each post within seconds, then fetches
   it again later, usually about 36 hours after posting and sometimes up to a week. Until then
   Reddit's numbers aren't known, so the Score and Comments columns show a dash. The next fetch of that
-  range re-checks those posts in batches of 500 and fills them in.
+  range fills them in if **Scores: Update saved posts** is ticked; it re-checks those posts in batches
+  of 500. It's off by default because it adds requests to every fetch.
 - **Requests are rate limited and shared.** Every request in a fetch (posts, score updates and
   comments) goes through one limiter, at most one a second. When the archive says to slow down
   (HTTP 429) ikari waits as long as it asks and spaces later requests further apart; it also backs

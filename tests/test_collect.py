@@ -47,11 +47,18 @@ def store_with(tmp_path, posts, comments_for=()):
 def test_unsettled_saved_posts_are_refreshed_in_one_batch_and_get_comments(tmp_path):
     s = store_with(tmp_path, [mk(1, score=None, num_comments=None), mk(2)], comments_for=["p1", "p2"])
     c = FakeClient(by_id=[mk(1, score=77, num_comments=5)])
-    result = collect.run(c, s, collect.FetchRequest("python"))
+    result = collect.run(c, s, collect.FetchRequest("python", refresh_scores=True))
     assert c.calls[0] == ("ids", ["p1"])
     assert {r["id"]: r["score"] for r in s.posts("python")} == {"p1": 77, "p2": 10}
     assert result.updated == 1 and result.posts == 0
     assert ("comments", "p1") in c.calls and ("comments", "p2") not in c.calls
+
+
+def test_saved_scores_are_only_rechecked_when_asked(tmp_path):
+    s = store_with(tmp_path, [mk(1, score=None, num_comments=None)], comments_for=["p1"])
+    c = FakeClient(by_id=[mk(1, score=77)])
+    result = collect.run(c, s, collect.FetchRequest("python"))
+    assert not any(call[0] == "ids" for call in c.calls) and result.updated == 0
 
 
 def test_an_even_sample_skips_saved_posts(tmp_path):

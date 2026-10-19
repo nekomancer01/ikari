@@ -33,7 +33,7 @@ RANGES = {"day": ("Past 24 hours", 1), "week": ("Past week", 7), "month": ("Past
 
 # Last-used fetch form, restored at startup. Keys live under "fetch/" in QSettings.
 FETCH_DEFAULTS = {"subreddit": "", "query": "", "range": "week", "from": "", "to": "", "pick": "spread",
-                  "limit": 100, "include_comments": True, "comments_per_post": 50}
+                  "limit": 100, "include_comments": True, "comments_per_post": 50, "refresh_scores": False}
 
 SCOPES = ["Posts and comments", "Posts only", "Comments only"]
 
@@ -465,6 +465,9 @@ class MainWindow(QMainWindow):
         self.comments_per_post = spin_box(1, 500, 10, FETCH_DEFAULTS["comments_per_post"], " per post")
         self.comments_per_post.setMinimumWidth(100)  # its size hint would squeeze the form's labels
         self.include_comments.toggled.connect(lambda _: self._update_comments_enabled())
+        self.refresh_scores = QCheckBox("Update saved posts")
+        self.refresh_scores.setToolTip("Also re-check saved posts in this range whose scores and comment counts "
+                                       "hadn't come in yet. Takes extra requests, so it's off by default.")
         comments_row = QWidget()
         row = QHBoxLayout(comments_row)
         row.setContentsMargins(0, 0, 0, 0)
@@ -486,6 +489,7 @@ class MainWindow(QMainWindow):
         form.addRow(label("Pick", "muted"), self.pick)
         form.addRow(label("Max posts", "muted"), self.limit)
         form.addRow(label("Comments", "muted"), comments_row)
+        form.addRow(label("Scores", "muted"), self.refresh_scores)
         lay.addLayout(form)
 
         self.fetch_btn = mark(QPushButton("Fetch and analyse"), "primary", True)
@@ -709,6 +713,7 @@ class MainWindow(QMainWindow):
         self.pick.setToolTip(PICKS[self.pick.currentData()][1])
         self.limit.setValue(v["limit"])
         self.include_comments.setChecked(v["include_comments"])
+        self.refresh_scores.setChecked(v["refresh_scores"])
         self.comments_per_post.setValue(v["comments_per_post"])
         self._update_comments_enabled()
 
@@ -719,6 +724,7 @@ class MainWindow(QMainWindow):
                      "to": self.date_to.date().toString(Qt.DateFormat.ISODate),
                      "pick": self.pick.currentData(),
                      "limit": self.limit.value(), "include_comments": self.include_comments.isChecked(),
+                     "refresh_scores": self.refresh_scores.isChecked(),
                      "comments_per_post": self.comments_per_post.value()}.items():
             self.settings.setValue(f"fetch/{k}", v)
 
@@ -730,7 +736,7 @@ class MainWindow(QMainWindow):
         if busy:
             self.progress.setRange(0, 0)
         for w in (self.subreddit, self.query, self.range, self.date_from, self.date_to, self.pick,
-                  self.limit, self.include_comments):
+                  self.limit, self.include_comments, self.refresh_scores):
             w.setEnabled(not busy)
         self._update_comments_enabled()
         self._update_delete_enabled()  # don't delete rows the fetch thread is writing
@@ -761,7 +767,7 @@ class MainWindow(QMainWindow):
         after, before = range_bounds(self.range.currentData(), self.date_from.date(), self.date_to.date())
         req = collect.FetchRequest(
             subreddit=name, after=after, before=before, limit=self.limit.value(), query=self.query.text().strip(),
-            include_comments=self.include_comments.isChecked(),
+            include_comments=self.include_comments.isChecked(), refresh_scores=self.refresh_scores.isChecked(),
             comments_per_post=self.comments_per_post.value(), top=self.pick.currentData() == "top")
         self._launch(req, f"Contacting Arctic Shift for r/{name}…")
 

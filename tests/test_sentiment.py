@@ -34,3 +34,19 @@ def test_model_score_range_and_vader_fallback(monkeypatch):
     assert -1 <= compound <= 1
     monkeypatch.setattr(sentiment, "score_model", lambda text: None)
     assert sentiment.score("I love this, it's amazing!") == sentiment.score_vader("I love this, it's amazing!")
+
+
+def test_obvious_sarcasm_flips_positive_to_negative():
+    for text in ("Hooray for the cancer! /s",
+                 "Oh great now Soda is screaming again just what I needed.",
+                 "Gotta love trailing for 59+ minutes, so pathetic",
+                 "I wish that were a thing 🙄"):
+        compound, label = sentiment.score(text)
+        assert label == "negative" and compound < 0, text
+
+
+def test_sincere_text_is_not_flagged_as_sarcasm():
+    for text in ("I love it when cats go all airplane ears", "Thanks a lot!", "You forgot the /s"):
+        assert not sentiment.is_sarcastic(sentiment.clean(text)), text
+    # a /s inside quoted text is someone else's
+    assert sentiment.score("> great stuff /s\n\nThanks, that helped a lot!")[1] == "positive"

@@ -19,6 +19,26 @@ _MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _QUOTE = re.compile(r"^\s*>.*$", re.MULTILINE)  # quoted text is someone else's words
 _CODE = re.compile(r"```.*?```", re.DOTALL)
 
+# Obvious sarcasm: an explicit marker, an eye-roll emoji, or a stock positive frame
+# ("gotta love...", "oh great") wrapped around something negative. Only used to flip
+# text that would otherwise score positive; subtler sarcasm is left alone.
+_SARCASM_MARKER = re.compile(
+    r"(?<!\bthe )(?<!\ba )(?<!\byour )(?<!\bforgot )(?<!\bmissing )(?:^|(?<=\s))/s(?=\s|$|[.!)^*])"
+    r"|#(?:sarcasm|sarcastic)\b|\bsaid no ?(?:one|body) ever\b",
+    re.IGNORECASE,
+)
+_EYEROLL = re.compile("[\U0001F643\U0001F644]")  # upside-down face, rolling eyes
+_SARCASM_FRAME = re.compile(
+    r"\b(?:(?:i |i just |i really |just |don'?t you )?(?:love|adore) (?:it )?(?:when|how)"
+    r"|(?:you )?(?:gotta|got to|have to|ya gotta) love"
+    r"|oh,? (?:great|joy|goody|wonderful|fantastic|brilliant|wow)"
+    r"|just what (?:i|we) (?:needed|wanted)|thanks (?:a lot|a bunch|for nothing)"
+    r"|nothing (?:like|says)|yeah,? right|what could possibly go wrong|wow,? (?:thanks|just|what a)"
+    r"|real(?:ly)? (?:smooth|classy|mature)|what a (?:surprise|shock)|colou?r me (?:shocked|surprised)"
+    r"|(?:yay|hooray|woo+hoo+)\b)",
+    re.IGNORECASE,
+)
+
 
 @lru_cache(maxsize=1)
 def _analyzer() -> SentimentIntensityAnalyzer:
@@ -67,10 +87,34 @@ def score_model(text: str) -> tuple[float, str] | None:
     return probs["positive"] - probs["negative"], max(probs, key=probs.get)
 
 
+def _negative(cleaned: str) -> bool:
+    if _analyzer().polarity_scores(cleaned)["compound"] <= NEGATIVE_THRESHOLD:
+        return True
+    model = sentiment_model.load()
+    if model is None:
+        return False
+    probs = model.probabilities(cleaned, vader_features(cleaned))
+    return probs["negative"] > max(probs["positive"], 0.4)
+
+
+def is_sarcastic(cleaned: str) -> bool:
+    """True for obvious sarcasm in already-cleaned text (see the patterns above)."""
+    if _SARCASM_MARKER.search(cleaned) or _EYEROLL.search(cleaned):
+        return True
+    m = _SARCASM_FRAME.search(cleaned)
+    if m is None:
+        return False
+    rest = f"{cleaned[:m.start()]} {cleaned[m.end():]}".strip(" ,.!?")
+    return bool(rest) and _negative(rest)
+
+
 def score(text: str, scorer: str = "model") -> tuple[float, str]:
-    """Return (score in [-1, 1], label). Falls back to VADER if the model isn't available."""
-    if scorer == "model":
-        result = score_model(text)
-        if result is not None:
-            return result
-    return score_vader(text)
+    """Return (score in [-1, 1], label). Falls back to VADER if the model isn't available.
+
+    Text that reads positive but is obviously sarcastic is flipped to negative.
+    """
+    result = score_model(text) if scorer == "model" else None
+    compound, label = result if result is not None else score_vader(text)
+    if label == "positive" and is_sarcastic(clean(text)):
+        return -compound, "negative"
+    return compound, label

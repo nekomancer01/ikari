@@ -10,6 +10,11 @@ Usage:
     python tools/eval_sentiment.py                    # report on the test split
     python tools/eval_sentiment.py --split dev
     python tools/eval_sentiment.py --tune             # fit thresholds on dev, report on test
+    python tools/eval_sentiment.py --sarcasm          # also score the sarcasm slice (iSarcasmEval)
+
+The sarcasm slice is iSarcasmEval (Abu Farha et al., 2022): tweets their authors
+marked sarcastic, each with the author's own plain rephrasing. The rephrasing's
+label stands in for the intended sentiment.
 """
 from __future__ import annotations
 
@@ -28,6 +33,7 @@ from subsentiment import sentiment  # noqa: E402
 
 BASE = "https://raw.githubusercontent.com/google-research/google-research/master/goemotions/data/"
 CACHE = Path(__file__).resolve().parent / ".cache" / "goemotions"
+ISARCASM = "https://raw.githubusercontent.com/iabufarha/iSarcasmEval/main/train/train.En.csv"
 LABELS = sentiment.LABELS
 NEUTRAL_ID = 27  # emotions.txt lists 27 emotions; id 27 is "neutral"
 
@@ -57,6 +63,28 @@ def load(split: str) -> list[tuple[str, str]]:
             elif pols == {"negative"}:
                 rows.append((text, "negative"))
     return rows
+
+
+def load_sarcasm() -> list[tuple[str, str]]:
+    """(sarcastic tweet, its author's literal rephrasing) pairs."""
+    path = CACHE.parent / "isarcasmeval-train.En.csv"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(ISARCASM, path)
+    with path.open(encoding="utf-8", newline="") as f:
+        return [(r["tweet"], r["rephrase"]) for r in csv.DictReader(f)
+                if r["sarcastic"] == "1" and r["tweet"].strip() and r["rephrase"].strip()]
+
+
+def labels(rows, sarcasm: bool = True) -> list[str]:
+    """The app's labels; sarcasm=False turns off the sarcasm flip for comparison."""
+    original = sentiment.is_sarcastic
+    if not sarcasm:
+        sentiment.is_sarcastic = lambda cleaned: False
+    try:
+        return [sentiment.score(t)[1] for t, _ in rows]
+    finally:
+        sentiment.is_sarcastic = original
 
 
 def compounds(rows) -> list[float]:
@@ -118,6 +146,7 @@ def main():
     ap.add_argument("--model", action="store_true",
                     help="also train a TF-IDF + VADER-feature logistic regression on train and report it")
     ap.add_argument("--tune", action="store_true", help="fit thresholds on dev, report on --split")
+    ap.add_argument("--sarcasm", action="store_true", help="also report on the iSarcasmEval sarcasm slice")
     args = ap.parse_args()
 
     rows = load(args.split)
@@ -127,6 +156,18 @@ def main():
     print(f"GoEmotions {args.split}: {dist}")
     report(f"baseline (±{sentiment.POSITIVE_THRESHOLD})", gold,
            predict(scores, sentiment.POSITIVE_THRESHOLD, sentiment.NEGATIVE_THRESHOLD))
+    report("app labels, sarcasm flip off", gold, labels(rows, sarcasm=False))
+    report("app labels", gold, labels(rows))
+    if args.sarcasm:
+        pairs = load_sarcasm()
+        intended = labels([(r, None) for _, r in pairs], sarcasm=False)
+        print(f"\niSarcasmEval sarcastic tweets: n={len(pairs)}, intended (rephrase) labels "
+              + "  ".join(f"{l} {intended.count(l) / len(pairs):.3f}" for l in LABELS))
+        for title, on in (("sarcasm flip off", False), ("sarcasm flip on", True)):
+            pred = labels(pairs, sarcasm=on)
+            agree = sum(p == g for p, g in zip(pred, intended)) / len(pairs)
+            print(f"  {title:16s} agreement with intended {agree:.3f}  predicted "
+                  + "  ".join(f"{l} {pred.count(l) / len(pairs):.3f}" for l in LABELS))
     if args.tune:
         dev = load("dev")
         f, pos, neg = tune(compounds(dev), [g for _, g in dev])
