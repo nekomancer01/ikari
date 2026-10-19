@@ -151,3 +151,49 @@ def test_live_poll_on_an_empty_dataset_starts_a_few_hours_back(tmp_path):
     client = LiveClient([])
     collect.poll_live(client, s, "Python", now=T)
     assert client.afters == [T - collect.LIVE_LOOKBACK]
+
+
+class FullThreadClient(FakeClient):
+    def __init__(self, whole=True, **kw):
+        super().__init__(**kw)
+        self.whole = whole
+
+    def fetch_all_comments(self, post):
+        self.calls.append(("all", post.id, post.num_comments))
+        if post.id in self.failing:
+            raise FetchError("Arctic Shift: Query timed out")
+        return [Comment(f"c{post.id}{j}", post.id, "Python", "t3_" + post.id, "b", "ok", 1, T, 0, "u")
+                for j in range(3)], self.whole
+
+
+def test_all_comments_rechecks_unsettled_posts_then_marks_settled_threads_complete(tmp_path):
+    s = store_with(tmp_path, [mk(1, score=None, num_comments=None), mk(2), mk(3)])
+    c = FullThreadClient(by_id=[mk(1, score=5, num_comments=3)])
+    result = collect.run(c, s, collect.FetchRequest("python", comment_posts=("p1", "p2")))
+    assert c.calls[0] == ("ids", ["p1"])
+    assert ("all", "p1", 3) in c.calls and ("all", "p2", 2) in c.calls  # p1 with its fresh count
+    assert not any(call[0] == "posts" for call in c.calls)  # no post search
+    assert result.comments == 6 and result.updated == 1
+    assert s.complete_keys("comments", "Python") == {"p1", "p2"}
+    assert {r["id"]: r["saved_comments"] for r in s.comment_coverage("python", 0, 2e9)} == {"p1": 3, "p2": 3, "p3": 0}
+
+
+def test_a_cut_short_or_unsettled_thread_is_not_marked_complete(tmp_path):
+    s = store_with(tmp_path, [mk(1, score=None, num_comments=None), mk(2)])
+    collect.run(FullThreadClient(), s, collect.FetchRequest("python", comment_posts=("p1",)))
+    collect.run(FullThreadClient(whole=False), s, collect.FetchRequest("python", comment_posts=("p2",)))
+    assert s.complete_keys("comments", "python") == set()
+
+
+def test_downloading_a_whole_day_marks_it_complete_only_when_the_archive_ran_out(tmp_path):
+    s = store_with(tmp_path, [mk(1)])
+    c = FakeClient(posts=[mk(1), mk(2), mk(3)])
+    collect.run(c, s, collect.FetchRequest("python", after=T, before=T + 86400, limit=5, everything=True,
+                                           include_comments=False))
+    assert s.complete_keys("posts", "python") == {str(int(T))}
+
+    s2 = store_with(tmp_path / "b", [])
+    collect.run(FakeClient(posts=[mk(1), mk(2), mk(3)]), s2,
+                collect.FetchRequest("python", after=T, before=T + 86400, limit=2, everything=True,
+                                     include_comments=False))
+    assert s2.complete_keys("posts", "python") == set()  # it may have had more than the 2 asked for

@@ -171,3 +171,65 @@ def test_rows_added_during_a_fetch_are_appended_and_fade_in():
     assert m.data(m.index(1, 0), fg) is None
     m.set_rows([row(3)], animate=True)  # not a superset (another dataset): plain reload
     assert [r["id"] for r in m.rows] == ["p3"]
+
+
+def test_coverage_window_lists_days_and_downloads_through_the_fetch_job(make_window, monkeypatch):
+    from subsentiment.gui import coverage
+
+    def count(self, after, before):  # no network or thread: the archive "has" 5 posts every day
+        self._on_counts(self.subreddit, {d: 5 for d in range(int(after), int(before), 86400)})
+    monkeypatch.setattr(coverage.CoverageWindow, "_count", count)
+    w = make_window()
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
+    w.range.setCurrentIndex(w.range.findData("custom"))
+    w.date_from.setDate(QDate(2023, 11, 13))  # the saved post is from 14 Nov 2023 (UTC)
+    w.date_to.setDate(QDate(2023, 11, 15))
+    started = []
+    monkeypatch.setattr(w, "_launch", lambda req, msg: started.append(req))
+    w._show_coverage()
+    c = w.coverage
+    c.refresh_saved()
+    day = 1_699_920_000  # 14 Nov 2023 00:00 UTC
+    assert day in c.days and c.days == sorted(c.days, reverse=True)
+    row = c.days.index(day)
+    cell = c.day_table.cellWidget(row, 1)
+    assert cell.main.text() == "1 of 5" and cell.side.text() == "20%"
+    c.day_table.cellWidget(row, 2).findChild(mw.QPushButton).click()
+    req = started[-1]
+    assert (req.after, req.before, req.everything, req.subreddit) == (day, day + 86400, True, "Python")
+    assert req.limit == 4 + coverage.SLACK
+
+    c.day_table.selectRow(row)
+    QApplication.processEvents()
+    assert c.post_table.rowCount() == 1  # its one post, with 0 comments counted, so nothing to fetch
+    assert not c.post_table.cellWidget(0, 2).findChild(mw.QPushButton).isEnabled()
+    c.close()
+
+
+def test_archive_counts_arrive_on_the_gui_thread(make_window, monkeypatch):
+    import threading
+
+    from subsentiment.gui import coverage
+    seen = {}
+
+    class Counts(coverage.CountWorker):
+        def run(self):
+            self.finished.emit(self.args[0], {1_699_920_000: 5})
+    monkeypatch.setattr(coverage, "CountWorker", Counts)
+
+    class Totals(dict):  # notes which thread stores the counts
+        def setdefault(self, *a):
+            seen["thread"] = threading.current_thread()
+            return super().setdefault(*a)
+    w = make_window()
+    w.datasets.setCurrentRow(0)
+    c = coverage.CoverageWindow(w)
+    c.totals = Totals()
+    c.subreddit = "Python"
+    c._count(1_699_920_000, 1_699_920_000 + 86400)
+    c._count_thread.wait(5000)
+    for _ in range(20):
+        QApplication.processEvents()
+    assert seen["thread"] is threading.main_thread()
+    assert c.totals["python"] == {1_699_920_000: 5} and c._count_thread is None
+    c.close()

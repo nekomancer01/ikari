@@ -63,3 +63,23 @@ def test_datasets_summarise_each_subreddit_and_delete_all_empties_the_store(tmp_
     assert s.size_bytes() > 0
     s.delete_all()
     assert s.datasets() == [] and s.comments("python") == []
+
+
+def test_coverage_counts_per_day_and_complete_marks_are_cleared_with_the_data(tmp_path):
+    from subsentiment.reddit import Comment, Post
+    s = Store(tmp_path / "c.db")
+    day = 1_791_936_000
+    for i, t in enumerate((day + 10, day + 80000, day + 86400 + 5)):
+        s.save_post(Post(f"p{i}", "Python", "t", "", "a", 1, 0.9, 4, t, "u", ""), 0.0, "neutral")
+    s.save_comment(Comment("c1", "p0", "Python", "t3_p0", "b", "x", 1, day, 0, "u"), 0.0, "neutral")
+    s.mark_complete("posts", "Python", str(day))
+    s.mark_complete("comments", "rust", "r1")
+    s.commit()
+    assert s.posts_per_day("python", day, day + 2 * 86400) == {day: 2, day + 86400: 1}
+    assert [(r["id"], r["saved_comments"], r["num_comments"]) for r in s.comment_coverage("python", day, day + 86400)] \
+        == [("p1", 0, 4), ("p0", 1, 4)]
+    assert s.complete_keys("posts", "PYTHON") == {str(day)}
+    s.delete_subreddit("python")
+    assert s.complete_keys("posts", "python") == set() and s.complete_keys("comments", "rust") == {"r1"}
+    s.delete_all()
+    assert s.complete_keys("comments", "rust") == set()

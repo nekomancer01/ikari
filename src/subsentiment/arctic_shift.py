@@ -17,7 +17,9 @@ What callers should know:
 from __future__ import annotations
 
 import math
+import threading
 import time
+from datetime import datetime, timezone
 from typing import Callable, Collection, Iterable
 
 import requests
@@ -48,6 +50,10 @@ SLOT_PAGES = 10
 TIMEOUT_TRIES = 3  # query timeouts on one request before the caller is asked to narrow it
 MIN_WINDOW = 600  # seconds; a timing-out window is halved down to this
 TREE_LIMIT = 300  # comments asked for per thread; big trees are slow for the archive and trip its limits
+TREE_MAX = 25000  # the most comments the tree endpoint returns in one request
+UNKNOWN_THREAD = 1000  # what fetch_all_comments asks for when a post's comment count isn't known yet
+COUNT_CHUNK_DAYS = 31  # days per aggregate request; a timing-out chunk is split down to one day
+DAY = 86400
 
 _GONE = ("[deleted]", "[removed]")
 
@@ -76,14 +82,16 @@ class RateLimiter:
         self._wall = wall
         self._next = 0.0  # earliest time the next request may go out
         self.on_wait: WaitFn | None = None  # told about long pauses, so the UI can say why it's idle
+        self._lock = threading.Lock()  # one limiter can be shared by jobs on several threads
 
     def wait(self) -> None:
-        delay = self._next - self._clock()
-        if delay > 0:
-            if delay >= 3 and self.on_wait:
-                self.on_wait(delay, self._reason)
-            self._sleep(delay)
-        self._next = self._clock() + self.interval
+        with self._lock:
+            delay = self._next - self._clock()
+            if delay > 0:
+                if delay >= 3 and self.on_wait:
+                    self.on_wait(delay, self._reason)
+                self._sleep(delay)
+            self._next = self._clock() + self.interval
 
     def hold(self, seconds: float, reason: str = "Arctic Shift is busy") -> None:
         """Send nothing for the next ``seconds`` (capped at MAX_WAIT)."""
@@ -185,10 +193,12 @@ class ArcticShiftClient:
 
     # -- HTTP ---------------------------------------------------------------
 
-    def get(self, path: str, params: dict) -> list:
+    def get(self, path: str, params: dict, shrink: bool = True) -> list:
         """One API call with retries: waits on 429, backs off on 5xx and network errors, and on a
-        query timeout backs off and asks for smaller pages, raising QueryTimeout if that doesn't help."""
+        query timeout backs off and asks for smaller pages (unless ``shrink`` is False, for requests
+        whose ``limit`` isn't a page size), raising QueryTimeout if that doesn't help."""
         params = dict(params)
+        self.last_params = params  # what was finally sent, after any shrinking
         timeouts = 0
         for attempt in range(ATTEMPTS):
             backoff = min(5.0 * 2 ** attempt, MAX_WAIT)
@@ -217,7 +227,7 @@ class ArcticShiftClient:
                 # pause and a smaller page rather than slowing the whole job down.
                 self.limiter.hold(2.0 * timeouts, "Arctic Shift is slow right now")
                 limit = params.get("limit")
-                if "limit" in params:
+                if shrink and "limit" in params:
                     params["limit"] = PAGE // 4 if not isinstance(limit, int) else max(10, limit // 2)
                 continue
             if resp.status_code == 429:
@@ -393,6 +403,39 @@ class ArcticShiftClient:
                        if d.get("id") and not _removed(d))
         return out
 
+    def day_counts(self, subreddit: str, after: float, before: float,
+                   should_stop: StopFn | None = None) -> dict[int, int]:
+        """Posts the archive holds for each UTC day in [after, before), as {day start: count}, from its
+        aggregate endpoint. The counts include posts later removed on Reddit, which fetching skips. Days
+        the archive couldn't count (it times out on very busy subreddits) are left out."""
+        subreddit = normalize_subreddit(subreddit)
+        if error := subreddit_error(subreddit):
+            raise FetchError(error)
+        first, end = int(after // DAY * DAY), int(math.ceil(before / DAY) * DAY)
+        todo = [(lo, min(lo + COUNT_CHUNK_DAYS * DAY, end)) for lo in range(first, end, COUNT_CHUNK_DAYS * DAY)]
+        out: dict[int, int] = {}
+        while todo:
+            if should_stop and should_stop():
+                break
+            lo, hi = todo.pop(0)
+            params = {"subreddit": subreddit, "aggregate": "created_utc", "frequency": "day",
+                      "after": lo, "before": hi, "limit": (hi - lo) // DAY + 1}
+            try:
+                buckets = self.get("/api/posts/search/aggregate", params, shrink=False)
+            except QueryTimeout:
+                if hi - lo > DAY:  # try the halves; a single day that times out stays unknown
+                    mid = lo + (hi - lo) // DAY // 2 * DAY
+                    todo[:0] = [(lo, mid), (mid, hi)]
+                continue
+            for day in range(lo, hi, DAY):
+                out[day] = 0  # a day with no bucket had no posts
+            for b in buckets:
+                when, n = _bucket_time(b), _number((b or {}).get("count", (b or {}).get("doc_count")), None)
+                if when is not None and n is not None and lo <= when < hi:
+                    day = int(when // DAY * DAY)
+                    out[day] = out.get(day, 0) + int(n)
+        return out
+
     # -- comments ---------------------------------------------------------------
 
     def fetch_comments(self, post: Post, limit: int = 100) -> list[Comment]:
@@ -407,9 +450,27 @@ class ArcticShiftClient:
         # half the cap while it isn't (the post's numbers haven't settled).
         known = post.num_comments + 20 if post.num_comments is not None else TREE_LIMIT // 2
         size = min(TREE_LIMIT, max(limit, PAGE, known))
+        comments = self._thread(post, size)[0]
+        comments.sort(key=lambda c: -1 if c.score is None else c.score, reverse=True)
+        return comments[:limit]
+
+    def fetch_all_comments(self, post: Post) -> tuple[list[Comment], bool]:
+        """Every comment the archive has on ``post`` (up to TREE_MAX), and whether that is the whole
+        thread: False when the archive cut it short or left replies collapsed."""
+        known = post.num_comments if post.num_comments is not None else UNKNOWN_THREAD
+        size = min(TREE_MAX, max(PAGE, known + 50))
+        comments, items, collapsed = self._thread(post, size)
+        sent = _number(self.last_params.get("limit"), size)  # smaller if the archive timed out
+        return comments, items < sent and not collapsed
+
+    def _thread(self, post: Post, size: int) -> tuple[list[Comment], int, bool]:
+        """The usable comments of a post's tree (parents first), how many items came back, and whether
+        any replies were left collapsed."""
         tree = self.get("/api/comments/tree", {"link_id": post.id, "limit": size})
         comments: list[Comment] = []
+        items = 0
         for d in _walk(tree):
+            items += 1
             body = d.get("body") or ""
             if not d.get("id") or body in _GONE or _removed(d):
                 continue
@@ -426,8 +487,7 @@ class ArcticShiftClient:
                 depth=int(d["depth"]) if isinstance(d.get("depth"), int) else 0,
                 permalink="https://www.reddit.com" + permalink,
             ))
-        comments.sort(key=lambda c: -1 if c.score is None else c.score, reverse=True)
-        return comments[:limit]
+        return comments, items, _collapsed(tree)
 
 
 def _walk(items: list, depth: int = 0):
@@ -442,6 +502,37 @@ def _walk(items: list, depth: int = 0):
         replies = d.get("replies")
         if isinstance(replies, dict):
             yield from _walk((replies.get("data") or {}).get("children"), d["depth"] + 1)
+
+
+def _collapsed(items: list) -> bool:
+    """True if a comment tree holds any "more" stubs (replies the archive didn't expand)."""
+    for item in items or ():
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") == "more" and ((item.get("data") or {}).get("children") or
+                                           (item.get("data") or {}).get("count")):
+            return True
+        replies = (item.get("data") or {}).get("replies")
+        if isinstance(replies, dict) and _collapsed((replies.get("data") or {}).get("children")):
+            return True
+    return False
+
+
+def _bucket_time(b) -> float | None:
+    """A date bucket's start in epoch seconds. The archive may give seconds, milliseconds or an ISO date."""
+    if not isinstance(b, dict):
+        return None
+    v = b.get("created_utc", b.get("key", b.get("date")))
+    if isinstance(v, (int, float)) or (isinstance(v, str) and v.replace(".", "", 1).isdigit()):
+        v = float(v)
+        return v / 1000 if v > 1e11 else v
+    if isinstance(v, str):
+        try:
+            when = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)).timestamp()
+    return None
 
 
 def _is_timeout(status: int, error: str) -> bool:

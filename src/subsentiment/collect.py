@@ -26,6 +26,11 @@ class FetchRequest:
     comments_per_post: int = 50
     top: bool = False  # highest-scored posts of each part of the range, instead of an even sample
     refresh_scores: bool = False  # also re-check saved posts whose scores hadn't settled
+    # Every post in [after, before), with limit as a cap; when the archive runs out first, the range
+    # (one UTC day, starting at after) is recorded as fully downloaded.
+    everything: bool = False
+    # Only fetch every comment on these saved posts; the other fields but subreddit are ignored.
+    comment_posts: tuple[str, ...] = ()
 
 
 @dataclass
@@ -50,6 +55,9 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     if limiter is not None:
         limiter.on_wait = lambda secs, why: note(f"{why}. Waiting {secs:.0f} s before the next request…")
 
+    if req.comment_posts:
+        return _all_comments(client, store, req, progress, should_stop, saved)
+
     name = normalize_subreddit(req.subreddit)
     stored = {r["id"]: r for r in store.posts_between(name, req.after, req.before)}
 
@@ -73,6 +81,8 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     new = [p for p in picked if p.id not in stored]
     for p in new:
         store.save_post(p, *sentiment.score(p.text))
+    if req.everything and req.after is not None and not should_stop() and len(new) < req.limit:
+        store.mark_complete("posts", name, str(int(req.after)))
     store.commit()
     saved()
     first = (new or updated or picked or [None])[0]
@@ -115,6 +125,52 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
             progress(len(todo), len(todo), "Done")
     return FetchResult(subreddit, len(new), n_comments, should_stop(), updated=len(updated),
                        already=len(picked) - len(new), comment_errors=errors)
+
+
+def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, progress, should_stop,
+                  saved) -> FetchResult:
+    """Every comment on each post in req.comment_posts. Posts whose numbers hadn't settled are
+    re-checked first, so their comment totals are real where the archive has them by now."""
+    name = normalize_subreddit(req.subreddit)
+    posts = [_stored_post(r) for r in store.posts_by_ids(req.comment_posts)]
+    stale = [p.id for p in posts if p.score is None]
+    fresh: dict[str, Post] = {}
+    if stale:
+        progress(0, 0, f"Checking {len(stale):,} saved posts for updated comment counts…")
+        fresh = {p.id: p for p in client.fetch_posts_by_ids(stale, should_stop=should_stop) if p.score is not None}
+        for p in fresh.values():
+            store.save_post(p, *sentiment.score(p.text))
+        store.commit()
+        posts = [fresh.get(p.id, p) for p in posts]
+    n_comments = errors = failed_in_row = 0
+    for i, p in enumerate(posts, 1):
+        if should_stop():
+            break
+        progress(i - 1, len(posts), f"All comments for post {i}/{len(posts)}: {p.title[:60]}")
+        try:
+            comments, whole = client.fetch_all_comments(p)
+        except (FetchError, requests.RequestException):
+            store.mark_comments(p.id, ok=False, settled=False)
+            store.commit()
+            errors += 1
+            failed_in_row += 1
+            if failed_in_row >= GIVE_UP_AFTER:
+                errors += len(posts) - i
+                break
+            continue
+        failed_in_row = 0
+        for c in comments:
+            store.save_comment(c, *sentiment.score(c.body))
+            n_comments += 1
+        store.mark_comments(p.id, ok=True, settled=p.score is not None)
+        if whole and p.score is not None:  # an unsettled thread may still be growing
+            store.mark_complete("comments", name, p.id)
+        store.commit()
+        saved()
+    if posts:
+        progress(len(posts), len(posts), "Done")
+    subreddit = posts[0].subreddit if posts else name
+    return FetchResult(subreddit, 0, n_comments, should_stop(), updated=len(fresh), comment_errors=errors)
 
 
 def _comments_missing(r) -> bool:
