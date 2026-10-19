@@ -12,12 +12,14 @@ What callers should know:
   * The archive keeps content that was later removed on Reddit; removed and deleted items are
     skipped.
   * Every request goes through one RateLimiter, so a whole job (posts, refreshes and comments) stays
-    at about one request a second and slows down further when the server pushes back.
+    at a few requests a second (BASE_INTERVAL) and slows down when the server sends a 429.
 """
 from __future__ import annotations
 
 import math
+import threading
 import time
+from datetime import datetime, timezone
 from typing import Callable, Collection, Iterable
 
 import requests
@@ -33,16 +35,25 @@ SETTLE_SECONDS = 36 * 3600
 PAGE = 100  # the API's largest fixed page size
 IDS_BATCH = 500  # most ids /api/posts/ids takes in one request
 ATTEMPTS = 8
+BASE_INTERVAL = 0.4  # seconds between requests: the API docs say "a few requests per second is fine"
 MAX_WAIT = 120.0
 MAX_INTERVAL = 10.0
 SLOTS_PER_DAY = 4  # a day is split into at most this many slices, so posts spread across the day too
 MIN_SLOTS = 60  # ...but a long range is split into at least this many (or one per day, if fewer)
 TOP_SLOTS = 60  # top mode pulls a big pool per slice, so it uses fewer slices
 TOP_PAGES = 4  # pages pulled per slice in top mode
+# Top mode ranks a light copy of each post (no title or text, so the archive's query stays cheap), then
+# fetches the winners in full by id. Removed posts only show up in the full copy, so a few spares are kept.
+TOP_FIELDS = "id,created_utc,score,num_comments"
+TOP_SPARE = 0.25
 SLOT_PAGES = 10
 TIMEOUT_TRIES = 3  # query timeouts on one request before the caller is asked to narrow it
 MIN_WINDOW = 600  # seconds; a timing-out window is halved down to this
-TREE_LIMIT = 1000
+TREE_LIMIT = 300  # comments asked for per thread; big trees are slow for the archive and trip its limits
+TREE_MAX = 25000  # the most comments the tree endpoint returns in one request
+UNKNOWN_THREAD = 1000  # what fetch_all_comments asks for when a post's comment count isn't known yet
+COUNT_CHUNK_DAYS = 31  # days per aggregate request; a timing-out chunk is split down to one day
+DAY = 86400
 
 _GONE = ("[deleted]", "[removed]")
 
@@ -63,7 +74,7 @@ class RateLimiter:
     successful requests ease it back to the base interval.
     """
 
-    def __init__(self, interval: float = 1.0, clock: Callable[[], float] = time.monotonic,
+    def __init__(self, interval: float = BASE_INTERVAL, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep, wall: Callable[[], float] = time.time):
         self.base = self.interval = interval
         self._clock = clock
@@ -71,14 +82,16 @@ class RateLimiter:
         self._wall = wall
         self._next = 0.0  # earliest time the next request may go out
         self.on_wait: WaitFn | None = None  # told about long pauses, so the UI can say why it's idle
+        self._lock = threading.Lock()  # one limiter can be shared by jobs on several threads
 
     def wait(self) -> None:
-        delay = self._next - self._clock()
-        if delay > 0:
-            if delay >= 3 and self.on_wait:
-                self.on_wait(delay, self._reason)
-            self._sleep(delay)
-        self._next = self._clock() + self.interval
+        with self._lock:
+            delay = self._next - self._clock()
+            if delay > 0:
+                if delay >= 3 and self.on_wait:
+                    self.on_wait(delay, self._reason)
+                self._sleep(delay)
+            self._next = self._clock() + self.interval
 
     def hold(self, seconds: float, reason: str = "Arctic Shift is busy") -> None:
         """Send nothing for the next ``seconds`` (capped at MAX_WAIT)."""
@@ -91,7 +104,7 @@ class RateLimiter:
         self.interval = min(self.interval * 2, MAX_INTERVAL)
 
     def ok(self) -> None:
-        self.interval = max(self.base, self.interval * 0.9)
+        self.interval = max(self.base, self.interval * 0.8)
 
     def reset_after(self, headers, default: float) -> float:
         """Seconds until the server's limit resets, from whichever header it sent."""
@@ -166,9 +179,10 @@ def slot_count(after: float, before: float, limit: int, top: bool) -> int:
     return max(1, min(limit, days * SLOTS_PER_DAY, max(days, MIN_SLOTS)))
 
 
-def _rank(p: Post) -> tuple:
-    """Sort key for top mode: settled scores first, highest first; unscored ones after."""
-    return (p.score is not None, p.score or 0, p.num_comments or 0)
+def _light_rank(d: dict) -> tuple:
+    """Sort key for top mode's light copies. Posts the archive hasn't re-checked still carry placeholder
+    scores (usually 1), so they sink below real ones."""
+    return (_number(d.get("score"), 0), _number(d.get("num_comments"), 0))
 
 
 class ArcticShiftClient:
@@ -179,10 +193,12 @@ class ArcticShiftClient:
 
     # -- HTTP ---------------------------------------------------------------
 
-    def get(self, path: str, params: dict) -> list:
+    def get(self, path: str, params: dict, shrink: bool = True) -> list:
         """One API call with retries: waits on 429, backs off on 5xx and network errors, and on a
-        query timeout backs off and asks for smaller pages, raising QueryTimeout if that doesn't help."""
+        query timeout backs off and asks for smaller pages (unless ``shrink`` is False, for requests
+        whose ``limit`` isn't a page size), raising QueryTimeout if that doesn't help."""
         params = dict(params)
+        self.last_params = params  # what was finally sent, after any shrinking
         timeouts = 0
         for attempt in range(ATTEMPTS):
             backoff = min(5.0 * 2 ** attempt, MAX_WAIT)
@@ -207,9 +223,11 @@ class ArcticShiftClient:
                 if timeouts >= TIMEOUT_TRIES:
                     raise QueryTimeout("Arctic Shift timed out on this query. Try a shorter date range or "
                                        "fewer posts, or try again in a few minutes.")
-                self.limiter.hold(backoff, "Arctic Shift is slow right now")
+                # A timeout is about how heavy the query was, not how often we ask, so it gets a short
+                # pause and a smaller page rather than slowing the whole job down.
+                self.limiter.hold(2.0 * timeouts, "Arctic Shift is slow right now")
                 limit = params.get("limit")
-                if "limit" in params:
+                if shrink and "limit" in params:
                     params["limit"] = PAGE // 4 if not isinstance(limit, int) else max(10, limit // 2)
                 continue
             if resp.status_code == 429:
@@ -268,7 +286,7 @@ class ArcticShiftClient:
             if should_stop and should_stop():
                 break
             if top:
-                ranked = sorted(self._top_pool(base, lo, hi, should_stop), key=_rank, reverse=True)
+                ranked = sorted(self._top_pool(base, lo, hi, should_stop), key=_light_rank, reverse=True)
                 picked[i], spare[i] = ranked[:want], ranked[want:]
                 more[i] = False
             else:
@@ -298,9 +316,22 @@ class ArcticShiftClient:
                     extra, cursors[i], more[i] = self._earliest(base, cursors[i], windows[i][1], want, have,
                                                                 should_stop)
                     picked[i] += extra
+        if top:
+            picked = self._hydrate(picked, spare, should_stop)
         posts = [p for group in picked for p in group]
         posts.sort(key=lambda p: p.created_utc)
         return posts
+
+    def fetch_newer(self, subreddit: str, after: float, skip: Collection[str] = (),
+                    limit: int = PAGE) -> list[Post]:
+        """Posts created after ``after``, oldest first, in one request (the live feed's poll).
+        A full page (``limit`` rows) means there may be more; call again from the newest one."""
+        subreddit = normalize_subreddit(subreddit)
+        if error := subreddit_error(subreddit):
+            raise FetchError(error)
+        page = self.get("/api/posts/search", {"subreddit": subreddit, "sort": "asc",
+                                              "after": int(after), "limit": limit})
+        return [_post(d) for d in page if d.get("id") and d["id"] not in skip and not _removed(d)]
 
     def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int]:
         """Posts from [lo, hi) and the end of the window actually searched: when the archive times
@@ -341,17 +372,25 @@ class ArcticShiftClient:
             cursor = int(max(_number(d.get("created_utc"), 0) for d in page)) - 1
         return out, cursor, True
 
-    def _top_pool(self, base, lo, hi, should_stop) -> list[Post]:
-        """Candidates for the top posts of [lo, hi): a page from each of TOP_PAGES equal parts of the
-        slice, so a busy slice isn't judged on its first few hours only."""
-        pool: dict[str, Post] = {}
+    def _top_pool(self, base, lo, hi, should_stop) -> list[dict]:
+        """Light candidates (TOP_FIELDS only) for the top posts of [lo, hi): a page from each of
+        TOP_PAGES equal parts of the slice, so a busy slice isn't judged on its first few hours only."""
+        pool: dict[str, dict] = {}
         for start, end in slices(lo, hi, TOP_PAGES):
             if should_stop and should_stop():
                 break
-            for d in self._page(base, start, end, PAGE)[0]:
-                if d.get("id") and not _removed(d):
-                    pool[d["id"]] = _post(d)
+            for d in self._page(dict(base, fields=TOP_FIELDS), start, end, PAGE)[0]:
+                if d.get("id"):
+                    pool[d["id"]] = d
         return list(pool.values())
+
+    def _hydrate(self, picked: list[list[dict]], spare: list[list[dict]], should_stop) -> list[list[Post]]:
+        """Full copies of each slice's picks, in one batch by id. Picks that turn out to be removed are
+        replaced by that slice's next-best spares."""
+        want = [len(group) for group in picked]
+        ranked = [group + extra[:math.ceil(len(group) * TOP_SPARE)] for group, extra in zip(picked, spare)]
+        full = {p.id: p for p in self.fetch_posts_by_ids([d["id"] for group in ranked for d in group], should_stop)}
+        return [[full[d["id"]] for d in group if d["id"] in full][:n] for group, n in zip(ranked, want)]
 
     def fetch_posts_by_ids(self, ids: Iterable[str], should_stop: StopFn | None = None) -> list[Post]:
         """Current copies of the given posts, IDS_BATCH per request; removed ones are left out."""
@@ -362,6 +401,39 @@ class ArcticShiftClient:
                 break
             out.extend(_post(d) for d in self.get("/api/posts/ids", {"ids": ",".join(ids[i:i + IDS_BATCH])})
                        if d.get("id") and not _removed(d))
+        return out
+
+    def day_counts(self, subreddit: str, after: float, before: float,
+                   should_stop: StopFn | None = None) -> dict[int, int]:
+        """Posts the archive holds for each UTC day in [after, before), as {day start: count}, from its
+        aggregate endpoint. The counts include posts later removed on Reddit, which fetching skips. Days
+        the archive couldn't count (it times out on very busy subreddits) are left out."""
+        subreddit = normalize_subreddit(subreddit)
+        if error := subreddit_error(subreddit):
+            raise FetchError(error)
+        first, end = int(after // DAY * DAY), int(math.ceil(before / DAY) * DAY)
+        todo = [(lo, min(lo + COUNT_CHUNK_DAYS * DAY, end)) for lo in range(first, end, COUNT_CHUNK_DAYS * DAY)]
+        out: dict[int, int] = {}
+        while todo:
+            if should_stop and should_stop():
+                break
+            lo, hi = todo.pop(0)
+            params = {"subreddit": subreddit, "aggregate": "created_utc", "frequency": "day",
+                      "after": lo, "before": hi, "limit": (hi - lo) // DAY + 1}
+            try:
+                buckets = self.get("/api/posts/search/aggregate", params, shrink=False)
+            except QueryTimeout:
+                if hi - lo > DAY:  # try the halves; a single day that times out stays unknown
+                    mid = lo + (hi - lo) // DAY // 2 * DAY
+                    todo[:0] = [(lo, mid), (mid, hi)]
+                continue
+            for day in range(lo, hi, DAY):
+                out[day] = 0  # a day with no bucket had no posts
+            for b in buckets:
+                when, n = _bucket_time(b), _number((b or {}).get("count", (b or {}).get("doc_count")), None)
+                if when is not None and n is not None and lo <= when < hi:
+                    day = int(when // DAY * DAY)
+                    out[day] = out.get(day, 0) + int(n)
         return out
 
     # -- comments ---------------------------------------------------------------
@@ -378,9 +450,27 @@ class ArcticShiftClient:
         # half the cap while it isn't (the post's numbers haven't settled).
         known = post.num_comments + 20 if post.num_comments is not None else TREE_LIMIT // 2
         size = min(TREE_LIMIT, max(limit, PAGE, known))
+        comments = self._thread(post, size)[0]
+        comments.sort(key=lambda c: -1 if c.score is None else c.score, reverse=True)
+        return comments[:limit]
+
+    def fetch_all_comments(self, post: Post) -> tuple[list[Comment], bool]:
+        """Every comment the archive has on ``post`` (up to TREE_MAX), and whether that is the whole
+        thread: False when the archive cut it short or left replies collapsed."""
+        known = post.num_comments if post.num_comments is not None else UNKNOWN_THREAD
+        size = min(TREE_MAX, max(PAGE, known + 50))
+        comments, items, collapsed = self._thread(post, size)
+        sent = _number(self.last_params.get("limit"), size)  # smaller if the archive timed out
+        return comments, items < sent and not collapsed
+
+    def _thread(self, post: Post, size: int) -> tuple[list[Comment], int, bool]:
+        """The usable comments of a post's tree (parents first), how many items came back, and whether
+        any replies were left collapsed."""
         tree = self.get("/api/comments/tree", {"link_id": post.id, "limit": size})
         comments: list[Comment] = []
+        items = 0
         for d in _walk(tree):
+            items += 1
             body = d.get("body") or ""
             if not d.get("id") or body in _GONE or _removed(d):
                 continue
@@ -397,8 +487,7 @@ class ArcticShiftClient:
                 depth=int(d["depth"]) if isinstance(d.get("depth"), int) else 0,
                 permalink="https://www.reddit.com" + permalink,
             ))
-        comments.sort(key=lambda c: -1 if c.score is None else c.score, reverse=True)
-        return comments[:limit]
+        return comments, items, _collapsed(tree)
 
 
 def _walk(items: list, depth: int = 0):
@@ -413,6 +502,37 @@ def _walk(items: list, depth: int = 0):
         replies = d.get("replies")
         if isinstance(replies, dict):
             yield from _walk((replies.get("data") or {}).get("children"), d["depth"] + 1)
+
+
+def _collapsed(items: list) -> bool:
+    """True if a comment tree holds any "more" stubs (replies the archive didn't expand)."""
+    for item in items or ():
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") == "more" and ((item.get("data") or {}).get("children") or
+                                           (item.get("data") or {}).get("count")):
+            return True
+        replies = (item.get("data") or {}).get("replies")
+        if isinstance(replies, dict) and _collapsed((replies.get("data") or {}).get("children")):
+            return True
+    return False
+
+
+def _bucket_time(b) -> float | None:
+    """A date bucket's start in epoch seconds. The archive may give seconds, milliseconds or an ISO date."""
+    if not isinstance(b, dict):
+        return None
+    v = b.get("created_utc", b.get("key", b.get("date")))
+    if isinstance(v, (int, float)) or (isinstance(v, str) and v.replace(".", "", 1).isdigit()):
+        v = float(v)
+        return v / 1000 if v > 1e11 else v
+    if isinstance(v, str):
+        try:
+            when = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)).timestamp()
+    return None
 
 
 def _is_timeout(status: int, error: str) -> bool:

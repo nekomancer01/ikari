@@ -33,6 +33,13 @@ CREATE TABLE IF NOT EXISTS comment_fetches (
     post_id TEXT PRIMARY KEY,
     ok INTEGER, settled INTEGER, fetched_at REAL
 );
+-- Ranges whose whole content ikari has fetched: kind "posts" keys a UTC day (its start, in epoch
+-- seconds) and kind "comments" keys a post id. Used to show a day or thread as fully downloaded even
+-- when the archive's totals (which count removed items) are higher than what could be saved.
+CREATE TABLE IF NOT EXISTS complete (
+    kind TEXT NOT NULL, subreddit TEXT NOT NULL, key TEXT NOT NULL, fetched_at REAL,  -- subreddit lowercased
+    PRIMARY KEY (kind, subreddit, key)
+);
 CREATE INDEX IF NOT EXISTS posts_sub ON posts(subreddit COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS comments_sub ON comments(subreddit COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS comments_post ON comments(post_id);
@@ -82,6 +89,34 @@ class Store:
         self.db.execute("INSERT OR REPLACE INTO comment_fetches VALUES (?, ?, ?, ?)",
                         (post_id, int(ok), int(settled), time.time()))
 
+    def mark_complete(self, kind: str, subreddit: str, key: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO complete VALUES (?, ?, ?, ?)", (kind, subreddit.lower(), key, time.time()))
+
+    def complete_keys(self, kind: str, subreddit: str) -> set[str]:
+        return {r["key"] for r in self.db.execute(
+            "SELECT key FROM complete WHERE kind = ? AND subreddit = ?", (kind, subreddit.lower()))}
+
+    def posts_per_day(self, subreddit: str, after: float, before: float) -> dict[int, int]:
+        """Saved posts per UTC day in [after, before), as {day start: count}."""
+        rows = self.db.execute(
+            "SELECT CAST(created_utc / 86400 AS INTEGER) * 86400 d, COUNT(*) n FROM posts "
+            "WHERE subreddit = ? COLLATE NOCASE AND created_utc >= ? AND created_utc < ? GROUP BY d",
+            (subreddit, after, before))
+        return {r["d"]: r["n"] for r in rows}
+
+    def comment_coverage(self, subreddit: str, after: float, before: float) -> list[sqlite3.Row]:
+        """Saved posts created in [after, before), newest first, each with saved_comments (how many of
+        its comments are saved) beside the post's own num_comments."""
+        return self.db.execute(
+            "SELECT p.id, p.subreddit, p.title, p.num_comments, p.score, p.created_utc, p.permalink, "
+            "(SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS saved_comments "
+            "FROM posts p WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? "
+            "ORDER BY p.created_utc DESC", (subreddit, after, before)).fetchall()
+
+    def posts_by_ids(self, ids) -> list[sqlite3.Row]:
+        ids = list(ids)
+        return self.db.execute(f"SELECT * FROM posts WHERE id IN ({','.join('?' * len(ids))})", ids).fetchall()
+
     def commit(self) -> None:
         self.db.commit()
 
@@ -120,6 +155,7 @@ class Store:
         self.db.execute("DELETE FROM posts WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
         self.db.execute("DELETE FROM comments WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
         self.db.execute("DELETE FROM comment_fetches WHERE post_id NOT IN (SELECT id FROM posts)")
+        self.db.execute("DELETE FROM complete WHERE subreddit = ?", (subreddit.lower(),))
         self.db.commit()
         self._compact()
 
@@ -127,6 +163,7 @@ class Store:
         self.db.execute("DELETE FROM posts")
         self.db.execute("DELETE FROM comments")
         self.db.execute("DELETE FROM comment_fetches")
+        self.db.execute("DELETE FROM complete")
         self.db.commit()
         self._compact()
 
