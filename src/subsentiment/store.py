@@ -145,6 +145,18 @@ class Store:
             "SELECT * FROM posts WHERE subreddit = ? COLLATE NOCASE ORDER BY created_utc DESC",
             (subreddit,)).fetchall()
 
+    def posts_since(self, subreddit: str, ts: float) -> list[sqlite3.Row]:
+        """Posts saved at or after ``ts``, oldest first: what a running fetch has added."""
+        return self.db.execute(
+            "SELECT * FROM posts WHERE subreddit = ? COLLATE NOCASE AND fetched_at >= ? ORDER BY fetched_at",
+            (subreddit, ts)).fetchall()
+
+    def comments_since(self, subreddit: str, ts: float) -> list[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT c.*, p.title AS post_title FROM comments c LEFT JOIN posts p ON p.id = c.post_id "
+            "WHERE c.subreddit = ? COLLATE NOCASE AND c.fetched_at >= ? ORDER BY c.fetched_at",
+            (subreddit, ts)).fetchall()
+
     def comments(self, subreddit: str) -> list[sqlite3.Row]:
         return self.db.execute(
             "SELECT c.*, p.title AS post_title FROM comments c LEFT JOIN posts p ON p.id = c.post_id "
