@@ -204,3 +204,32 @@ def test_coverage_window_lists_days_and_downloads_through_the_fetch_job(make_win
     assert c.post_table.rowCount() == 1  # its one post, with 0 comments counted, so nothing to fetch
     assert not c.post_table.cellWidget(0, 2).findChild(mw.QPushButton).isEnabled()
     c.close()
+
+
+def test_archive_counts_arrive_on_the_gui_thread(make_window, monkeypatch):
+    import threading
+
+    from subsentiment.gui import coverage
+    seen = {}
+
+    class Counts(coverage.CountWorker):
+        def run(self):
+            self.finished.emit(self.args[0], {1_699_920_000: 5})
+    monkeypatch.setattr(coverage, "CountWorker", Counts)
+
+    class Totals(dict):  # notes which thread stores the counts
+        def setdefault(self, *a):
+            seen["thread"] = threading.current_thread()
+            return super().setdefault(*a)
+    w = make_window()
+    w.datasets.setCurrentRow(0)
+    c = coverage.CoverageWindow(w)
+    c.totals = Totals()
+    c.subreddit = "Python"
+    c._count(1_699_920_000, 1_699_920_000 + 86400)
+    c._count_thread.wait(5000)
+    for _ in range(20):
+        QApplication.processEvents()
+    assert seen["thread"] is threading.main_thread()
+    assert c.totals["python"] == {1_699_920_000: 5} and c._count_thread is None
+    c.close()

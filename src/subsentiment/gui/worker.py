@@ -49,7 +49,7 @@ class FetchWorker(QObject):
 
 class CountWorker(QObject):
     """Asks the archive how many posts each day in a range has (ArcticShiftClient.day_counts)."""
-    finished = Signal(object)  # {day start: count}
+    finished = Signal(str, object)  # subreddit, {day start: count}
     failed = Signal(str)
 
     def __init__(self, subreddit: str, after: float, before: float):
@@ -63,8 +63,8 @@ class CountWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            self.finished.emit(ArcticShiftClient(limiter=LIMITER).day_counts(*self.args,
-                                                                             should_stop=lambda: self._stop))
+            counts = ArcticShiftClient(limiter=LIMITER).day_counts(*self.args, should_stop=lambda: self._stop)
+            self.finished.emit(self.args[0], counts)
         except FetchError as e:
             self.failed.emit(str(e))
         except requests.RequestException as e:

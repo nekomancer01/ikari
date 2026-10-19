@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 
-from PySide6.QtCore import QRectF, QSize, Qt, QThread
+from PySide6.QtCore import QRectF, QSize, Qt, QThread, Slot
 from PySide6.QtGui import QColor, QGuiApplication, QLinearGradient, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton,
@@ -446,7 +446,8 @@ class CoverageWindow(QDialog):
         worker = CountWorker(sub, after, before)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finished.connect(lambda counts, s=sub: self._on_counts(s, counts))
+        # Bound methods, not lambdas, so the results are handled on the GUI thread.
+        worker.finished.connect(self._on_counts)
         worker.failed.connect(self._on_count_failed)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
@@ -454,6 +455,7 @@ class CoverageWindow(QDialog):
         self._count_thread, self._count_worker = thread, worker
         thread.start()
 
+    @Slot(str, object)
     def _on_counts(self, sub: str, counts: dict) -> None:
         self.totals.setdefault(sub.lower(), {}).update(counts)
         if not self.busy:
@@ -462,15 +464,17 @@ class CoverageWindow(QDialog):
             self.count_error = "Arctic Shift couldn't count these days."
             self.status.setText(self.count_error + " Press Recount to try again.")
 
+    @Slot(str)
     def _on_count_failed(self, message: str) -> None:
         self.count_error = message
         self.status.setText(f"Couldn't get totals from Arctic Shift: {message} Press Recount to try again.")
 
+    @Slot()
     def _on_count_done(self) -> None:
         self._count_thread.deleteLater()
         self._count_worker.deleteLater()
         self._count_thread = self._count_worker = None
-        if self.subreddit:
+        if self.subreddit and self.days:
             totals = self.totals.get(self.subreddit.lower(), {})
             if any(d not in totals for d in self.days) and not self.count_error:
                 # some days timed out; don't ask again in a loop
