@@ -38,6 +38,12 @@ _SARCASM_FRAME = re.compile(
     r"|(?:yay|hooray|woo+hoo+)\b)",
     re.IGNORECASE,
 )
+# Everyday mishaps VADER and the model read as neutral ("another update that breaks everything").
+_COMPLAINT = re.compile(
+    r"\b(?:break(?:s|ing)?|broke|broken|crash(?:es|ed|ing)?|bug(?:s|gy)?|glitch(?:es|y)?|lag(?:s|gy|ging)?"
+    r"|freez(?:es|ing)|froze|stuck|delay(?:s|ed)?|cancel(?:l)?ed|outage|overtime|traffic)\b",
+    re.IGNORECASE,
+)
 
 
 @lru_cache(maxsize=1)
@@ -88,6 +94,8 @@ def score_model(text: str) -> tuple[float, str] | None:
 
 
 def _negative(cleaned: str) -> bool:
+    if _COMPLAINT.search(cleaned):
+        return True
     if _analyzer().polarity_scores(cleaned)["compound"] <= NEGATIVE_THRESHOLD:
         return True
     model = sentiment_model.load()
@@ -101,10 +109,9 @@ def is_sarcastic(cleaned: str) -> bool:
     """True for obvious sarcasm in already-cleaned text (see the patterns above)."""
     if _SARCASM_MARKER.search(cleaned) or _EYEROLL.search(cleaned):
         return True
-    m = _SARCASM_FRAME.search(cleaned)
-    if m is None:
+    if not _SARCASM_FRAME.search(cleaned):
         return False
-    rest = f"{cleaned[:m.start()]} {cleaned[m.end():]}".strip(" ,.!?")
+    rest = _SARCASM_FRAME.sub(" ", cleaned).strip(" ,.!?")
     return bool(rest) and _negative(rest)
 
 
