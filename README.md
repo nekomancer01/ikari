@@ -102,14 +102,24 @@ app's former name so existing data and saved Reddit secrets carry over.
 
 ## Reddit access
 
-With no setup, the app uses Reddit's public JSON endpoints. These are slow (about one request every
-6 seconds) and Reddit often blocks them from cloud, VPN and datacenter IPs (HTTP 403).
+With no setup, the app reads from [Arctic Shift](https://github.com/ArthurHeitmann/arctic_shift), a
+free, community-run archive of Reddit posts and comments. It needs no account or key. Reddit stopped
+serving its public JSON endpoints to logged-out requests in 2026, so the app no longer uses them.
 
-For reliable access, create a **script** app at <https://www.reddit.com/prefs/apps> and enter its
-client id and secret under **File → Reddit API settings**. The app uses app-only OAuth (read-only, no
-Reddit password) and can make about 100 requests a minute. The secret goes into the system
-credential store (Windows Credential Manager, macOS Keychain, or Secret Service on Linux); only if
-none is available is it kept in the app's settings unencrypted.
+Things to know about the archive:
+
+- Results come in date order. **new**, **hot** and **rising** all mean newest first; **top** and
+  **controversial** take the newest posts in the chosen time range and rank them.
+- New posts appear quickly, but scores and comment counts only settle after about 36 hours.
+- It's a volunteer service with no uptime guarantee. The app sends at most one request a second.
+
+If Reddit has approved a **script** app of yours under its
+[Responsible Builder Policy](https://support.reddithelp.com/hc/en-us/articles/42728983564564-Responsible-Builder-Policy),
+enter its client id and secret under **File → Reddit API settings** and the app reads Reddit
+directly instead (app-only OAuth, read-only, about 100 requests a minute). Reddit has announced that
+this public API closes in March 2027. The secret goes into the system credential store (Windows
+Credential Manager, macOS Keychain, or Secret Service on Linux); only if none is available is it
+kept in the app's settings unencrypted.
 
 ## Design notes
 
@@ -139,6 +149,8 @@ Layout:
 | Path | Purpose |
 |---|---|
 | `src/subsentiment/reddit.py` | Reddit client: anonymous or OAuth, pagination, rate limiting, comment trees |
+| `src/subsentiment/arctic_shift.py` | Arctic Shift archive client (the default source) |
+| `src/subsentiment/sources.py` | Picks Reddit's API or Arctic Shift from the saved settings |
 | `src/subsentiment/sentiment.py` | Text cleanup + scoring (bundled model, VADER fallback) |
 | `src/subsentiment/sentiment_model.py` | Loads the bundled classifier and its feature code |
 | `src/subsentiment/store.py` | SQLite storage, CSV export, summary helpers |

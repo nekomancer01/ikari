@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from subsentiment import sentiment
-from subsentiment.reddit import RedditClient
+from subsentiment.sources import Source
 from subsentiment.store import Store
 
 
@@ -28,7 +28,7 @@ class FetchResult:
     stopped: bool
 
 
-def run(client: RedditClient, store: Store, req: FetchRequest,
+def run(client: Source, store: Store, req: FetchRequest,
         progress: Callable[[int, int, str], None] = lambda done, total, msg: None,
         should_stop: Callable[[], bool] = lambda: False) -> FetchResult:
     posts = client.fetch_posts(req.subreddit, req.sort, req.time_filter, req.limit, req.query,
