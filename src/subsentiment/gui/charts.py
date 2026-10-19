@@ -13,9 +13,9 @@ from PySide6.QtCharts import (
     QAreaSeries, QBarCategoryAxis, QBarSet, QCategoryAxis, QChart, QChartView, QLineSeries,
     QScatterSeries, QStackedBarSeries, QValueAxis,
 )
-from PySide6.QtCore import QMargins, QPointF, Qt
-from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QPainter, QPen
-from PySide6.QtWidgets import QApplication, QGraphicsSimpleTextItem, QToolTip
+from PySide6.QtCore import QMargins, QPointF, QRectF, Qt
+from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import QApplication, QGraphicsPathItem, QGraphicsSimpleTextItem, QToolTip
 
 from subsentiment.gui import theme
 
@@ -83,6 +83,7 @@ class DistributionChart(QChartView):
         self.setBackgroundBrush(Qt.GlobalColor.transparent)
         self.setMinimumHeight(260)
         self._labels: list[tuple[QGraphicsSimpleTextItem, QGraphicsSimpleTextItem, int, float]] = []
+        self._bars: list[tuple[QGraphicsPathItem, int, float]] = []
         self._series = None
         self.set_counts({"negative": 0, "neutral": 0, "positive": 0})
 
@@ -99,8 +100,10 @@ class DistributionChart(QChartView):
             values = [0.0] * len(self.CATEGORIES)
             values[i] = float(counts.get(cat, 0))
             s.append(values)
-            s.setColor(QColor(colors[cat]))
-            s.setBorderColor(QColor(colors[cat]))  # no outline: it read as a dark rim in dark mode
+            # QtCharts can't round bars, so its own bars are invisible (they still drive
+            # layout and hover) and rounded shapes are drawn over them in _place_labels.
+            s.setColor(Qt.GlobalColor.transparent)
+            s.setBorderColor(Qt.GlobalColor.transparent)
             series.append(s)
         series.hovered.connect(
             lambda state, index, barset: QToolTip.showText(
@@ -126,6 +129,14 @@ class DistributionChart(QChartView):
 
         # Value labels sit above each bar in the text color, so they stay readable on
         # every bar color in both themes (QtCharts can't put stacked labels outside).
+        self._bars = []
+        for i, cat in enumerate(self.CATEGORIES):
+            bar = QGraphicsPathItem(chart)
+            bar.setBrush(QColor(colors[cat]))
+            bar.setPen(QPen(Qt.PenStyle.NoPen))
+            bar.setAcceptHoverEvents(False)  # hover goes to the series' own bar underneath
+            bar.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._bars.append((bar, i, float(counts.get(cat, 0))))
         self._labels = []
         count_font, share_font = theme.display_font(10.5, 600), _ui_font(9)
         for i, cat in enumerate(self.CATEGORIES):
@@ -150,6 +161,11 @@ class DistributionChart(QChartView):
         chart = self.chart()
         if chart is None or self._series is None:
             return
+        half = self._series.barWidth() / 2
+        for bar, i, value in self._bars:
+            top_left = chart.mapToPosition(QPointF(i - half, value), self._series)
+            base_right = chart.mapToPosition(QPointF(i + half, 0), self._series)
+            bar.setPath(_rounded_bar(QRectF(top_left, base_right).normalized()))
         for count, share, i, value in self._labels:
             top = chart.mapToPosition(QPointF(i, value), self._series)
             c, sh = count.boundingRect(), share.boundingRect()
@@ -158,6 +174,25 @@ class DistributionChart(QChartView):
             base = top.y() - 4  # count and share share a baseline just above the bar
             count.setPos(left, base - c.height())
             share.setPos(left + c.width() + gap, base - c.height() + (c.height() - sh.height()) * 0.72)
+
+
+BAR_RADIUS = 9.0  # px at the top corners; the base stays square on the axis
+
+
+def _rounded_bar(r: QRectF) -> QPainterPath:
+    """A bar with rounded top corners, the radius shrinking for short or narrow bars."""
+    path = QPainterPath()
+    if r.height() <= 0 or r.width() <= 0:
+        return path
+    rad = min(BAR_RADIUS, r.width() / 2, r.height())
+    path.moveTo(r.left(), r.bottom())
+    path.lineTo(r.left(), r.top() + rad)
+    path.arcTo(QRectF(r.left(), r.top(), 2 * rad, 2 * rad), 180, -90)
+    path.lineTo(r.right() - rad, r.top())
+    path.arcTo(QRectF(r.right() - 2 * rad, r.top(), 2 * rad, 2 * rad), 90, -90)
+    path.lineTo(r.right(), r.bottom())
+    path.closeSubpath()
+    return path
 
 
 # Symmetric y ranges for the timeline: the smallest that fits the data, so day-to-day
