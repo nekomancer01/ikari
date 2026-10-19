@@ -25,7 +25,7 @@ DWMWA_SYSTEMBACKDROP_TYPE = 38
 DWMWA_COLOR_DEFAULT = 0xFFFFFFFF
 BACKDROPS = {"mica": 2, "acrylic": 3}
 
-APP_ID = "subsentiment.SubredditSentiment"
+APP_ID = "nekomancer01.ikari"
 
 
 def windows_build() -> int:

@@ -143,13 +143,13 @@ def test_process_name_replaces_python(fake_appkit, monkeypatch):
 
 
 def test_process_name_keeps_a_real_bundle_name(fake_appkit, monkeypatch):
-    info = {"CFBundleName": "Subreddit Sentiment"}
+    info = {"CFBundleName": "ikari"}
     foundation = ModuleType("Foundation")
     foundation.NSBundle = SimpleNamespace(mainBundle=lambda: SimpleNamespace(
         localizedInfoDictionary=lambda: None, infoDictionary=lambda: info))
     monkeypatch.setitem(sys.modules, "Foundation", foundation)
     macos.set_process_name()
-    assert info == {"CFBundleName": "Subreddit Sentiment"}
+    assert info == {"CFBundleName": "ikari"}
 
 
 def test_prepare_window_only_goes_full_size_for_vibrancy(monkeypatch, qapp):

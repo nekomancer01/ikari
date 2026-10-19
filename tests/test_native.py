@@ -119,7 +119,7 @@ def test_linux_identity(qapp, monkeypatch):
     from PySide6.QtGui import QGuiApplication
     monkeypatch.setattr(sys, "platform", "linux")
     native.setup_app_identity()
-    assert QGuiApplication.desktopFileName() == "io.github.subsentiment.SubredditSentiment"
+    assert QGuiApplication.desktopFileName() == "io.github.nekomancer01.ikari"
 
 
 def test_fallback_color_scheme_only_on_linux(monkeypatch):

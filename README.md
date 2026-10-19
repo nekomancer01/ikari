@@ -1,4 +1,4 @@
-# Subreddit Sentiment
+# ikari
 
 Pull a subreddit's posts and comments, score their sentiment, and explore the results in a
 desktop app. Built with Python and Qt for Windows, macOS and Linux.
@@ -34,10 +34,10 @@ Ready-made builds for Windows, macOS and Linux are attached to each
 
 | OS | Download | How to run |
 |---|---|---|
-| Windows 10/11 (x64) | `SubredditSentiment-Setup-<version>.exe` | Run the installer. Or unzip `SubredditSentiment-<version>-windows-x64.zip` and run `SubredditSentiment.exe`. |
-| macOS 11+ (Apple Silicon) | `SubredditSentiment-<version>-macos-arm64.dmg` | Open the .dmg and drag the app to Applications. |
-| macOS 11+ (Intel) | `SubredditSentiment-<version>-macos-x86_64.dmg` | As above. |
-| Linux (x86_64) | `SubredditSentiment-<version>-linux-x86_64.AppImage` | `chmod +x` it, then run it. Or unpack the `.tar.gz` and run `./install.sh` to add it to your app menu (`./install.sh --uninstall` removes it). |
+| Windows 10/11 (x64) | `ikari-Setup-<version>.exe` | Run the installer. Or unzip `ikari-<version>-windows-x64.zip` and run `ikari.exe`. |
+| macOS 11+ (Apple Silicon) | `ikari-<version>-macos-arm64.dmg` | Open the .dmg and drag the app to Applications. |
+| macOS 11+ (Intel) | `ikari-<version>-macos-x86_64.dmg` | As above. |
+| Linux (x86_64) | `ikari-<version>-linux-x86_64.AppImage` | `chmod +x` it, then run it. Or unpack the `.tar.gz` and run `./install.sh` to add it to your app menu (`./install.sh --uninstall` removes it). |
 
 The builds aren't code-signed, so the first launch shows a warning:
 
@@ -73,7 +73,8 @@ python packaging/build.py        # Linux: add --no-appimage to skip the AppImage
 On Windows you can instead double-click `packaging\build-windows.bat`. Everything lands in
 `dist/`: the zip and installer on Windows (the installer needs
 [Inno Setup 6](https://jrsoftware.org/isinfo.php)), the `.app` and `.dmg` on macOS, and the
-AppImage and `.tar.gz` on Linux.
+AppImage and `.tar.gz` on Linux. (The folder keeps the
+app's former name so existing data and saved Reddit secrets carry over.)
 
 The workflow in `.github/workflows/build.yml` builds and launch-checks all four targets on every
 push to `main` and every pull request. Pushing a `v*` tag also publishes a GitHub release with
@@ -85,7 +86,7 @@ the packages attached. The version comes from `__version__` in `src/subsentiment
 - **macOS:** the title bar's light or dark look follows the app's theme. Optional "macOS vibrancy"
   background (View → Window background) gives a real frosted blur; off by default, applies on next
   launch.
-- **Linux:** registers as `io.github.subsentiment.SubredditSentiment`, so docks and Wayland
+- **Linux:** registers as `io.github.nekomancer01.ikari`, so docks and Wayland
   compositors show the right icon and name.
 - **Linux:** "Match system theme" also works on desktops that don't report dark mode to Qt, by
   reading the GNOME/GTK setting.
@@ -96,7 +97,8 @@ the packages attached. The version comes from `__version__` in `src/subsentiment
 
 Data lives in the OS's app-data folder: `%APPDATA%\subsentiment\Subreddit Sentiment\` on
 Windows, `~/Library/Application Support/subsentiment/Subreddit Sentiment/` on macOS, and
-`~/.local/share/subsentiment/Subreddit Sentiment/` on Linux.
+`~/.local/share/subsentiment/Subreddit Sentiment/` on Linux. The folder keeps the
+app's former name so existing data and saved Reddit secrets carry over.
 
 ## Reddit access
 

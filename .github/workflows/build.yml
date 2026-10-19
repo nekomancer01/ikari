@@ -73,17 +73,17 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $p = Start-Process dist\SubredditSentiment\SubredditSentiment.exe -PassThru
+          $p = Start-Process dist\ikari\ikari.exe -PassThru
           Start-Sleep -Seconds 15
           if ($p.HasExited) { throw "App exited early with code $($p.ExitCode)" }
           Stop-Process -Id $p.Id
-          if (-not (Test-Path dist\SubredditSentiment-Setup-*.exe)) { throw "Installer missing" }
+          if (-not (Test-Path dist\ikari-Setup-*.exe)) { throw "Installer missing" }
 
       - name: Check the app starts (macOS)
         if: runner.os == 'macOS'
         run: |
-          hdiutil verify dist/SubredditSentiment-*.dmg
-          "dist/Subreddit Sentiment.app/Contents/MacOS/SubredditSentiment" &
+          hdiutil verify dist/ikari-*.dmg
+          "dist/ikari.app/Contents/MacOS/ikari" &
           pid=$!
           sleep 15
           kill -0 "$pid" || { wait "$pid"; echo "App exited early with code $?"; exit 1; }
@@ -94,16 +94,16 @@ jobs:
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
-          xvfb-run -a dist/SubredditSentiment-*.AppImage &
+          xvfb-run -a dist/ikari-*.AppImage &
           pid=$!
           sleep 15
           kill -0 "$pid" || { wait "$pid"; echo "App exited early with code $?"; exit 1; }
-          pkill -f lib/SubredditSentiment/SubredditSentiment || true
+          pkill -f lib/ikari/ikari || true
 
       - uses: actions/upload-artifact@v5
         with:
-          name: SubredditSentiment-${{ matrix.os }}
-          path: dist/SubredditSentiment-*
+          name: ikari-${{ matrix.os }}
+          path: dist/ikari-*
           if-no-files-found: error
 
   release:
@@ -124,4 +124,4 @@ jobs:
         run: |
           ls -l packages
           gh release create "$GITHUB_REF_NAME" packages/* --repo "$GITHUB_REPOSITORY" \
-            --title "Subreddit Sentiment ${GITHUB_REF_NAME#v}" --generate-notes
+            --title "ikari ${GITHUB_REF_NAME#v}" --generate-notes

@@ -11,7 +11,7 @@ import os
 import shutil
 import subprocess
 
-DESKTOP_FILE = "io.github.subsentiment.SubredditSentiment"
+DESKTOP_FILE = "io.github.nekomancer01.ikari"
 
 
 def set_desktop_file_name() -> None:

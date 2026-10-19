@@ -7,14 +7,14 @@
 - An optional "vibrancy" backdrop: an NSVisualEffectView behind the Qt
   content, through pyobjc (pyobjc-framework-Cocoa). Like Windows Mica, the
   window must have Qt.WA_TranslucentBackground set before it is first shown.
-- The app menu reads "Subreddit Sentiment" instead of "Python" when run from source.
+- The app menu reads "ikari" instead of "Python" when run from source.
 """
 from __future__ import annotations
 
 import sys
 
 IS_MACOS = sys.platform == "darwin"
-APP_NAME = "Subreddit Sentiment"
+APP_NAME = "ikari"
 BACKDROPS = ("vibrancy",)
 
 # AppKit constants, spelled out so nothing needs importing at module level.

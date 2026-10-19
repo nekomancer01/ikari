@@ -55,8 +55,8 @@ class Meter(QWidget):
         self.update()
 
     def _show_about(self) -> None:
-        QMessageBox.about(self, "About Subreddit Sentiment", (
-            f"<h3>Subreddit Sentiment {__version__}</h3>"
+        QMessageBox.about(self, "About ikari", (
+            f"<h3>ikari {__version__}</h3>"
             "<p>Gather subreddit posts and comments and score their sentiment with VADER.</p>"
             "<p>Fonts: Manrope and Sora, both under the SIL Open Font License 1.1.</p>"))
 
@@ -175,7 +175,7 @@ class TablePage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self, db_path: str):
         super().__init__()
-        self.setWindowTitle("Subreddit Sentiment")
+        self.setWindowTitle("ikari")
         self.resize(1320, 860)
         self.db_path = db_path
         self.store = Store(db_path)
@@ -254,7 +254,7 @@ class MainWindow(QMainWindow):
             bg_menu.setToolTipsVisible(True)
 
         help_menu = self.menuBar().addMenu("&Help")
-        help_menu.addAction(QAction("About Subreddit Sentiment", self, menuRole=QAction.MenuRole.AboutRole,
+        help_menu.addAction(QAction("About ikari", self, menuRole=QAction.MenuRole.AboutRole,
                                     triggered=self._show_about))
         help_menu.addAction(QAction("Check for updates…", self, triggered=lambda: self.updates.check()))
         auto = QAction("Check for updates at startup", self, checkable=True,
@@ -268,7 +268,7 @@ class MainWindow(QMainWindow):
 
         brand = QVBoxLayout()
         brand.setSpacing(2)
-        brand.addWidget(label("Subreddit Sentiment", "title"))
+        brand.addWidget(label("ikari", "title"))
         brand.addWidget(label("Gather posts and read the mood", "subtitle"))
         lay.addLayout(brand)
         lay.addSpacing(6)
@@ -486,7 +486,7 @@ class MainWindow(QMainWindow):
         creds = settings_dialog.load(self.settings)
         if creds["client_id"] and creds["client_secret"]:
             return "Connected with Reddit API credentials."
-        where = "Subreddit Sentiment → Settings" if native.platform_name() == "macos" else "File → Reddit API settings"
+        where = "ikari → Settings" if native.platform_name() == "macos" else "File → Reddit API settings"
         return f"Anonymous mode (slow). Add API credentials under {where} for faster, reliable fetching."
 
     def _set_busy(self, busy: bool) -> None:
@@ -654,8 +654,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(self._mode_text())
 
     def _show_about(self) -> None:
-        QMessageBox.about(self, "About Subreddit Sentiment", (
-            f"<h3>Subreddit Sentiment {__version__}</h3>"
+        QMessageBox.about(self, "About ikari", (
+            f"<h3>ikari {__version__}</h3>"
             "<p>Gather subreddit posts and comments and score their sentiment with VADER.</p>"
             "<p>Fonts: Manrope and Sora, both under the SIL Open Font License 1.1.</p>"))
 

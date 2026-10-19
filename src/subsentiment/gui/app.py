@@ -10,6 +10,12 @@ from subsentiment.gui import native, theme
 from subsentiment.gui.main_window import MainWindow
 
 
+# Storage identifiers predate the rename to "ikari". They stay as they were so the existing database
+# and QSettings keep working: the app-data folder and settings file are keyed on these two names.
+STORAGE_ORG = "subsentiment"
+STORAGE_APP = "Subreddit Sentiment"
+
+
 def default_db_path() -> str:
     base = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
     return str(base / "subsentiment.db")
@@ -18,8 +24,9 @@ def default_db_path() -> str:
 def main(argv: list[str] | None = None) -> int:
     native.setup_app_identity()  # before the app and any window, so taskbar/dock/menu use our name and icon
     app = QApplication(argv if argv is not None else sys.argv)
-    app.setOrganizationName("subsentiment")
-    app.setApplicationName("Subreddit Sentiment")
+    app.setOrganizationName(STORAGE_ORG)
+    app.setApplicationName(STORAGE_APP)  # drives storage paths only; the visible name is the display name
+    app.setApplicationDisplayName("ikari")
     settings = QSettings()
     theme.load_fonts(app)
     requested = settings.value("ui/theme", "system", str)

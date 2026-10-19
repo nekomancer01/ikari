@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=Subreddit Sentiment
+Name=ikari
 Comment=Gather subreddit posts and comments and analyse their sentiment
-Exec=SubredditSentiment
-Icon=io.github.subsentiment.SubredditSentiment
+Exec=ikari
+Icon=io.github.nekomancer01.ikari
 Categories=Network;Utility;
 Terminal=false

@@ -1,5 +1,5 @@
 @echo off
-rem Double-click to run Subreddit Sentiment from source on Windows.
+rem Double-click to run ikari from source on Windows.
 rem First run creates a private Python environment in .venv (takes a minute).
 rem Delete the .venv folder to reinstall from scratch.
 setlocal
@@ -7,7 +7,7 @@ cd /d "%~dp0"
 if exist ".venv\Scripts\pythonw.exe" goto :run
 
 where py >nul 2>nul && (set "PY=py -3") || (set "PY=python")
-echo First run: setting up Subreddit Sentiment...
+echo First run: setting up ikari...
 %PY% -m venv .venv
 if errorlevel 1 goto :nopython
 ".venv\Scripts\python.exe" -m pip install --upgrade pip

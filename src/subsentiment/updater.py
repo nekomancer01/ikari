@@ -69,7 +69,7 @@ def latest_release(session: requests.Session | None = None, platform: str = sys.
     try:
         r = s.get(API_URL, timeout=TIMEOUT, headers={
             "Accept": "application/vnd.github+json",
-            "User-Agent": f"SubredditSentiment/{__version__}",
+            "User-Agent": f"ikari/{__version__}",
         })
     except requests.RequestException as e:
         raise UpdateError(f"Could not reach GitHub: {e}") from e
@@ -107,7 +107,7 @@ def download(release: Release, dest_dir: Path,
     s = session or requests
     try:
         with s.get(release.asset_url, stream=True, timeout=TIMEOUT,
-                   headers={"User-Agent": f"SubredditSentiment/{__version__}"}) as r:
+                   headers={"User-Agent": f"ikari/{__version__}"}) as r:
             if not r.ok:
                 raise UpdateError(f"Download failed: HTTP {r.status_code}.")
             total = int(r.headers.get("Content-Length") or release.asset_size or 0)
