@@ -278,7 +278,8 @@ def test_a_big_download_reads_each_new_row_back_about_once(env, monkeypatch):
     assert saved > 60 and sum(read) < 4 * saved  # linear; it was about saved² / 2
 
 
-def test_a_busy_subreddit_that_times_out_still_fetches_with_narrower_queries(env):
+def test_a_busy_subreddit_that_times_out_still_fetches_with_narrower_queries(env, monkeypatch):
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.3)  # timeout back-offs, shortened further
     w = env.window()
     fetch(w, sub="askreddit", comments=False, limit=30, rng="day")
     timeouts = [r for r in env.archive.rejected if r[2] == 422]
@@ -286,7 +287,8 @@ def test_a_busy_subreddit_that_times_out_still_fetches_with_narrower_queries(env
     assert len(env.store().posts("askreddit")) >= 20
 
 
-def test_a_keyword_search_the_archive_cant_run_says_so_once(env):
+def test_a_keyword_search_the_archive_cant_run_says_so_once(env, monkeypatch):
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.3)  # timeout back-offs, shortened further
     w = env.window()
     w.query.setText("black holes")
     fetch(w, sub="askreddit", comments=False, limit=10, rng="day")
@@ -322,7 +324,8 @@ def open_coverage(w):
     return w.coverage
 
 
-def test_coverage_counts_a_busy_subreddit_without_downloading_anything(env):
+def test_coverage_counts_a_busy_subreddit_without_downloading_anything(env, monkeypatch):
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.3)  # timeout back-offs, shortened further
     w = env.window()
     fetch(w, sub="askreddit", comments=False, limit=5, rng="day")
     env.archive.clear()
