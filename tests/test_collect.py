@@ -197,3 +197,12 @@ def test_downloading_a_whole_day_marks_it_complete_only_when_the_archive_ran_out
                 collect.FetchRequest("python", after=T, before=T + 86400, limit=2, everything=True,
                                      include_comments=False))
     assert s2.complete_keys("posts", "python") == set()  # it may have had more than the 2 asked for
+
+
+def test_today_is_never_marked_complete(tmp_path):
+    import time
+    s = store_with(tmp_path, [])
+    start = time.time() // 86400 * 86400
+    collect.run(FakeClient(posts=[mk(1)]), s, collect.FetchRequest("python", after=start, before=start + 86400,
+                                                                  limit=50, everything=True, include_comments=False))
+    assert s.complete_keys("posts", "python") == set()

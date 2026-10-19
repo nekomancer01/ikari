@@ -8,6 +8,7 @@ it's recorded as complete and shown with a check mark instead.
 from __future__ import annotations
 
 import math
+import time
 from datetime import datetime, timezone
 
 from PySide6.QtCore import QRectF, QSize, Qt, QThread, Slot
@@ -53,6 +54,11 @@ def days_in(after: float, before: float) -> list[int]:
     first = int(after // DAY * DAY)
     last = int(math.ceil(before / DAY) * DAY) - DAY
     return list(range(last, first - 1, -DAY))
+
+
+def today() -> int:
+    """Start of the current UTC day, which the archive can't have a total for yet."""
+    return int(time.time() // DAY * DAY)
 
 
 def share_text(saved: int, total: int | None, complete: bool, noun: str) -> tuple[str, str, float | None, str]:
@@ -122,10 +128,22 @@ class Cell(QWidget):
         top.addWidget(self.side)
         lay.addLayout(top)
         self.bar = Bar()
+        keep = self.bar.sizePolicy()
+        keep.setRetainSizeWhenHidden(True)  # rows stay the same height with or without a bar
+        self.bar.setSizePolicy(keep)
         lay.addWidget(self.bar)
+
+    def set_open(self, saved: int) -> None:
+        """A day that isn't over: no total or share, just what's saved so far."""
+        self.main.setText(f"{saved:,} saved so far")
+        self.side.setText("Today")
+        self.bar.setVisible(False)  # an empty bar would read as 0%
+        self.setToolTip("Today isn't over, so there's no total yet. Download all fetches everything "
+                        "posted today so far.")
 
     def set(self, saved: int, total: int | None, complete: bool, noun: str) -> None:
         main, side, share, tip = share_text(saved, total, complete, noun)
+        self.bar.setVisible(True)
         self.main.setText(main)
         self.side.setText(side)
         self.bar.set(share, complete)
@@ -360,13 +378,20 @@ class CoverageWindow(QDialog):
             row = self.days.index(keep) if keep in self.days else 0
             t.selectRow(row)
         counting = self._count_thread is not None
+        current = today()
         for row, day in enumerate(self.days):
             n, total, done = saved.get(day, 0), totals.get(day), str(day) in complete
             cell: Cell = t.cellWidget(row, 1)
+            button: QPushButton = t.cellWidget(row, 2).findChild(QPushButton)
+            if day >= current:
+                cell.set_open(n)
+                button.setText("Download all")
+                button.setEnabled(not self.busy)
+                button.setToolTip("Fetch everything posted today so far")
+                continue
             cell.set(n, total, done, "post")
             if total is None and counting and not done:
                 cell.side.setText("counting…")
-            button: QPushButton = t.cellWidget(row, 2).findChild(QPushButton)
             full = done or (total is not None and 0 < total <= n)
             button.setText("Check again" if full else "Download all")
             button.setEnabled(not self.busy and not (total == 0 and not done and day < self.days[0]))
@@ -494,12 +519,16 @@ class CoverageWindow(QDialog):
             return
         total = self.totals.get(self.subreddit.lower(), {}).get(day)
         have = self.window_.store.posts_per_day(self.subreddit, day, day + DAY).get(day, 0)
-        limit = UNKNOWN_DAY_POSTS if total is None else max(total - have, 0) + SLACK
+        if day >= today():  # still going: no total to go by, so take everything there is so far
+            limit = MAX_DAY_POSTS
+        else:
+            limit = UNKNOWN_DAY_POSTS if total is None else max(total - have, 0) + SLACK
         comments, per_post = self.window_.comment_settings()
         req = collect.FetchRequest(subreddit=self.subreddit, after=day, before=day + DAY,
                                    limit=min(limit, MAX_DAY_POSTS), include_comments=comments,
                                    comments_per_post=per_post, everything=True)
-        self.window_.start_request(req, f"Downloading every post from {day_text(day)} in r/{self.subreddit}…")
+        what = "so far today" if day >= today() else f"from {day_text(day)}"
+        self.window_.start_request(req, f"Downloading every post {what} in r/{self.subreddit}…")
 
     def _download_comments(self, ids: list[str]) -> None:
         if not self.subreddit or not ids:

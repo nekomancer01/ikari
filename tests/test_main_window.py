@@ -233,3 +233,34 @@ def test_archive_counts_arrive_on_the_gui_thread(make_window, monkeypatch):
     assert seen["thread"] is threading.main_thread()
     assert c.totals["python"] == {1_699_920_000: 5} and c._count_thread is None
     c.close()
+
+
+def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypatch):
+    from subsentiment.gui import coverage
+
+    def count(self, after, before):  # the archive reports 0 for a day that has barely started
+        self._on_counts(self.subreddit, {d: 0 for d in range(int(after), int(before), 86400)})
+    monkeypatch.setattr(coverage.CoverageWindow, "_count", count)
+    w = make_window()
+    today = coverage.today()
+    s = w.store
+    s.save_post(Post("t1", "Python", "fresh", "", "a", None, None, None, today + 60, "https://r", ""), 0.0, "neutral")
+    s.commit()
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
+    w.range.setCurrentIndex(w.range.findData("week"))
+    started = []
+    monkeypatch.setattr(w, "_launch", lambda req, msg: started.append((req, msg)))
+    w._show_coverage()
+    c = w.coverage
+    c.refresh_saved()
+    row = c.days.index(today)
+    cell = c.day_table.cellWidget(row, 1)
+    assert (cell.main.text(), cell.side.text()) == ("1 saved so far", "Today")
+    assert "of" not in cell.main.text() and "%" not in cell.side.text()
+    button = c.day_table.cellWidget(row, 2).findChild(mw.QPushButton)
+    assert button.text() == "Download all" and button.isEnabled()
+    button.click()
+    req, msg = started[-1]
+    assert req.everything and req.after == today and req.limit == coverage.MAX_DAY_POSTS
+    assert "so far today" in msg
+    c.close()
