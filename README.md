@@ -91,7 +91,9 @@ On the GoEmotions test split:
 | Plain VADER | 65% | 14 points |
 
 Quoted text, code blocks and URLs are stripped before scoring. Plain VADER is the fallback if the
-model is missing. Reproduce the numbers with `tools/eval_sentiment.py`.
+model is missing. Obvious sarcasm (a trailing `/s`, 🙄, or "gotta love…" wrapped around
+something bad) flips a positive score to negative; subtler sarcasm is scored literally.
+Reproduce the numbers with `tools/eval_sentiment.py` (add `--sarcasm` for the sarcasm slice).
 
 ## How it works
 
