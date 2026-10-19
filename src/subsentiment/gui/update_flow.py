@@ -111,7 +111,14 @@ class UpdateFlow(QObject):
             if not self._cancel:
                 QMessageBox.warning(self.window, "Update failed", str(result))
             return
-        if updater.launch_installer(result):
+        try:
+            handed_off = updater.launch_installer(result)
+        except updater.UpdateError as e:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(result.parent)))
+            QMessageBox.warning(self.window, "Update failed",
+                                f"{e}\n\nDownloaded {result.name}. Extract it over this copy to update.")
+            return
+        if handed_off:
             QApplication.quit()
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(result.parent)))
