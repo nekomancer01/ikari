@@ -50,3 +50,12 @@ def test_sincere_text_is_not_flagged_as_sarcasm():
         assert not sentiment.is_sarcastic(sentiment.clean(text)), text
     # a /s inside quoted text is someone else's
     assert sentiment.score("> great stuff /s\n\nThanks, that helped a lot!")[1] == "positive"
+
+
+def test_sarcasm_with_two_frames_and_an_everyday_complaint():
+    # both frames are stripped, and "breaks" counts as a bad situation even though VADER reads it neutral
+    text = "Oh great, another update that breaks everything. Just what I needed."
+    assert sentiment.is_sarcastic(sentiment.clean(text))
+    assert sentiment.score(text)[1] == "negative"
+    assert sentiment.score("Gotta love how the game crashes every time I alt-tab")[1] == "negative"
+    assert not sentiment.is_sarcastic(sentiment.clean("Oh wow, my go-to for frozen fries"))
