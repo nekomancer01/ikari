@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS comments (
     sentiment REAL, label TEXT,
     fetched_at REAL
 );
+-- One row per post whose comments ikari has asked for: whether that worked, and whether the post's
+-- scores were settled at the time (if not, its comments are fetched again once they are).
+CREATE TABLE IF NOT EXISTS comment_fetches (
+    post_id TEXT PRIMARY KEY,
+    ok INTEGER, settled INTEGER, fetched_at REAL
+);
 CREATE INDEX IF NOT EXISTS posts_sub ON posts(subreddit COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS comments_sub ON comments(subreddit COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS comments_post ON comments(post_id);
@@ -63,12 +69,18 @@ class Store:
 
     def posts_between(self, subreddit: str, after: float | None = None,
                       before: float | None = None) -> list[sqlite3.Row]:
-        """Stored posts created in [after, before), each with a has_comments flag."""
+        """Stored posts created in [after, before), each with has_comments and, when ikari has asked for
+        its comments before, comments_ok and comments_settled."""
         return self.db.execute(
-            "SELECT p.*, EXISTS(SELECT 1 FROM comments c WHERE c.post_id = p.id) AS has_comments "
-            "FROM posts p WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ?",
+            "SELECT p.*, EXISTS(SELECT 1 FROM comments c WHERE c.post_id = p.id) AS has_comments, "
+            "f.ok AS comments_ok, f.settled AS comments_settled "
+            "FROM posts p LEFT JOIN comment_fetches f ON f.post_id = p.id WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ?",
             (subreddit, after if after is not None else float("-inf"),
              before if before is not None else float("inf"))).fetchall()
+
+    def mark_comments(self, post_id: str, ok: bool, settled: bool) -> None:
+        self.db.execute("INSERT OR REPLACE INTO comment_fetches VALUES (?, ?, ?, ?)",
+                        (post_id, int(ok), int(settled), time.time()))
 
     def commit(self) -> None:
         self.db.commit()
@@ -107,12 +119,14 @@ class Store:
     def delete_subreddit(self, subreddit: str) -> None:
         self.db.execute("DELETE FROM posts WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
         self.db.execute("DELETE FROM comments WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
+        self.db.execute("DELETE FROM comment_fetches WHERE post_id NOT IN (SELECT id FROM posts)")
         self.db.commit()
         self._compact()
 
     def delete_all(self) -> None:
         self.db.execute("DELETE FROM posts")
         self.db.execute("DELETE FROM comments")
+        self.db.execute("DELETE FROM comment_fetches")
         self.db.commit()
         self._compact()
 

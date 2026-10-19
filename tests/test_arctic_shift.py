@@ -259,7 +259,7 @@ def test_comments_come_from_the_tree_in_one_request_ranked_by_score():
     assert comments[-1].score is None
     url, params = c.session.calls[0]
     assert url == BASE_URL + "/api/comments/tree"
-    assert params == {"link_id": "p1", "limit": 100}
+    assert params == {"link_id": "p1", "limit": 500}  # the post's comment count isn't known yet
     assert len(c.session.calls) == 1
     assert comments[0].permalink == "https://www.reddit.com/r/Python/comments/p1/x/c2/"
 

@@ -81,7 +81,7 @@ class DistributionChart(QChartView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setStyleSheet("background: transparent; border: none;")
         self.setBackgroundBrush(Qt.GlobalColor.transparent)
-        self.setMinimumHeight(260)
+        self.setMinimumHeight(220)
         self._labels: list[tuple[QGraphicsSimpleTextItem, QGraphicsSimpleTextItem, int, float]] = []
         self._bars: list[tuple[QGraphicsPathItem, int, float]] = []
         self._series = None
@@ -225,18 +225,17 @@ class TimelineChart(QChartView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setStyleSheet("background: transparent; border: none;")
         self.setBackgroundBrush(Qt.GlobalColor.transparent)
-        self.setMinimumHeight(260)
+        self.setMinimumHeight(220)
         self.set_points([])
 
     def set_points(self, points: list[tuple[int, float, int]]) -> None:
         colors = palette()
         chart = _base_chart("Mean sentiment per day (UTC)", colors)
-        line = QLineSeries()
         pen = QPen(QColor(colors["line"]))
         pen.setWidthF(2.25)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        line.setPen(pen)
+        lines: list[QLineSeries] = []  # one per run of consecutive days, so a day with no data shows as a gap
         dots = QScatterSeries()
         dots.setMarkerSize(8)
         dots.setColor(QColor(colors["line"]))
@@ -245,9 +244,14 @@ class TimelineChart(QChartView):
         dots.setPen(ring)
         dots.setVisible(len(points) <= 45)  # past that, dots only clutter the line
         by_ms: dict[int, tuple[float, int]] = {}
+        prev = None
         for day, mean, n in points:
+            if prev is None or day - prev > 86400:
+                lines.append(QLineSeries())
+                lines[-1].setPen(pen)
+            prev = day
             ms = day * 1000
-            line.append(ms, mean)
+            lines[-1].append(ms, mean)
             dots.append(ms, mean)
             by_ms[ms] = (mean, n)
 
@@ -292,7 +296,8 @@ class TimelineChart(QChartView):
         zero.append(hi, 0)
         chart.addSeries(band)
         chart.addSeries(zero)
-        chart.addSeries(line)
+        for line in lines:
+            chart.addSeries(line)
         chart.addSeries(dots)
 
         # Dates sit exactly on day boundaries, stepped so they never crowd.
@@ -318,7 +323,7 @@ class TimelineChart(QChartView):
         y.setLineVisible(False)
         chart.addAxis(x, Qt.AlignmentFlag.AlignBottom)
         chart.addAxis(y, Qt.AlignmentFlag.AlignLeft)
-        for s in (band, zero, line, dots):
+        for s in (band, zero, *lines, dots):
             s.attachAxis(x)
             s.attachAxis(y)
         old = self.chart()

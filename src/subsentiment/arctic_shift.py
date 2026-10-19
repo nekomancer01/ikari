@@ -367,13 +367,17 @@ class ArcticShiftClient:
     # -- comments ---------------------------------------------------------------
 
     def fetch_comments(self, post: Post, limit: int = 100) -> list[Comment]:
-        """Up to ``limit`` comments on ``post``, highest score first (unscored ones last).
+        """The top ``limit`` comments on ``post`` by score, highest first (unscored ones last).
 
-        Uses the archive's comment tree, which returns a whole thread in one request. A thread with
-        more than TREE_LIMIT comments is cut short by the archive; the top ``limit`` come from what
-        was returned.
+        Uses the archive's comment tree, which returns a whole thread in one request but can't sort it,
+        so the thread is ranked here. A thread with more than TREE_LIMIT comments is cut short by the
+        archive and ranked from what came back. Comments the archive hasn't re-checked yet have no
+        score, so on a post from the last day or two the "top" ones are only a sample.
         """
-        size = min(TREE_LIMIT, max(limit, PAGE, (post.num_comments or 0) + 20))
+        # Ask for the whole thread when its size is known, so the top ones are really the top ones;
+        # half the cap while it isn't (the post's numbers haven't settled).
+        known = post.num_comments + 20 if post.num_comments is not None else TREE_LIMIT // 2
+        size = min(TREE_LIMIT, max(limit, PAGE, known))
         tree = self.get("/api/comments/tree", {"link_id": post.id, "limit": size})
         comments: list[Comment] = []
         for d in _walk(tree):

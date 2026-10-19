@@ -96,3 +96,24 @@ def test_posts_known_to_have_no_comments_are_not_looked_up(tmp_path):
     c = FakeClient(posts=[mk(1, num_comments=0), mk(2, score=None, num_comments=None)])
     collect.run(c, s, collect.FetchRequest("python"))
     assert [call[1] for call in c.calls if call[0] == "comments"] == ["p2"]
+
+
+def test_a_post_whose_comments_came_back_empty_isnt_asked_again(tmp_path):
+    s = store_with(tmp_path, [])
+
+    class Quiet(FakeClient):
+        def fetch_comments(self, post, limit):
+            self.calls.append(("comments", post.id))
+            return []
+    c = Quiet(posts=[mk(1, score=None, num_comments=None)])
+    collect.run(c, s, collect.FetchRequest("python"))
+    c2 = Quiet(posts=[mk(1, score=None, num_comments=None)])
+    collect.run(c2, s, collect.FetchRequest("python"))
+    assert [call for call in c2.calls if call[0] == "comments"] == []
+
+
+def test_saved_is_reported_after_each_batch(tmp_path):
+    s = store_with(tmp_path, [])
+    seen = []
+    collect.run(FakeClient(posts=[mk(1), mk(2)]), s, collect.FetchRequest("python"), saved=lambda: seen.append(1))
+    assert len(seen) == 3  # the posts, then each post's comments
