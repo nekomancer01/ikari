@@ -39,7 +39,10 @@ class FetchResult:
 
 def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         progress: Callable[[int, int, str], None] = lambda done, total, msg: None,
-        should_stop: Callable[[], bool] = lambda: False) -> FetchResult:
+        should_stop: Callable[[], bool] = lambda: False,
+        saved: Callable[[], None] = lambda: None) -> FetchResult:
+    """Run one fetch. ``saved`` is called after each batch of rows is committed, so a UI can show
+    them while the fetch goes on."""
     note = lambda msg: progress(0, 0, msg)  # noqa: E731
     limiter = getattr(client, "limiter", None)
     if limiter is not None:
@@ -58,6 +61,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
                 store.save_post(p, *sentiment.score(p.text))
                 updated.append(p)
         store.commit()
+        saved()
 
     # 2. New posts. An even sample skips everything already saved, so a repeat fetch adds new posts;
     #    top mode ranks everything, then keeps the ones that aren't saved yet.
@@ -68,16 +72,18 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     for p in new:
         store.save_post(p, *sentiment.score(p.text))
     store.commit()
+    saved()
     first = (new or updated or picked or [None])[0]
     subreddit = first.subreddit if first else name  # canonical capitalisation from Reddit
 
     # 3. Comments: for new posts, for saved ones whose scores just settled (their comment scores have
-    #    too), and for saved posts in the range that have none yet (say, an earlier fetch failed).
+    #    too), and for saved posts whose comments were never fetched or failed last time. A post whose
+    #    comments came back fine, even if there were none, isn't asked about again.
     n_comments = errors = 0
     if req.include_comments and not should_stop():
         refreshed = {p.id for p in updated}
         todo = new + updated + [_stored_post(r) for pid, r in stored.items()
-                                if pid not in refreshed and not r["has_comments"]]
+                                if pid not in refreshed and _comments_missing(r)]
         todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up
         failed_in_row = 0
         for i, p in enumerate(todo, 1):
@@ -87,6 +93,8 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
             try:
                 comments = client.fetch_comments(p, req.comments_per_post)
             except (FetchError, requests.RequestException):
+                store.mark_comments(p.id, ok=False, settled=False)
+                store.commit()
                 errors += 1
                 failed_in_row += 1
                 if failed_in_row >= GIVE_UP_AFTER:  # the archive is struggling; don't hammer it
@@ -97,11 +105,20 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
             for c in comments:
                 store.save_comment(c, *sentiment.score(c.body))
                 n_comments += 1
+            store.mark_comments(p.id, ok=True, settled=p.score is not None)
             store.commit()
+            if comments:
+                saved()
         if todo:
             progress(len(todo), len(todo), "Done")
     return FetchResult(subreddit, len(new), n_comments, should_stop(), updated=len(updated),
                        already=len(picked) - len(new), comment_errors=errors)
+
+
+def _comments_missing(r) -> bool:
+    if r["comments_ok"] is None:  # never asked (or saved by an older version, before this was tracked)
+        return not r["has_comments"]
+    return not r["comments_ok"]
 
 
 def _stored_post(r) -> Post:

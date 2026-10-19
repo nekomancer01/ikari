@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QDate, QEvent, QRectF, QSettings, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl
+from PySide6.QtCore import (
+    QDate, QEvent, QRectF, QSettings, QSize, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl,
+)
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence,
     QPainter,
@@ -10,7 +12,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QProgressBar, QPushButton, QSpinBox, QStackedWidget, QTableView, QTabBar,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTableView, QTabBar,
     QVBoxLayout, QWidget,
 )
 
@@ -33,6 +35,8 @@ RANGES = {"day": ("Past 24 hours", 1), "week": ("Past week", 7), "month": ("Past
 FETCH_DEFAULTS = {"subreddit": "", "query": "", "range": "week", "from": "", "to": "", "pick": "spread",
                   "limit": 100, "include_comments": True, "comments_per_post": 50}
 
+SCOPES = ["Posts and comments", "Posts only", "Comments only"]
+
 PICKS = {"spread": ("Spread across days",
                     "An equal share of posts from each part of the range. Fetching again adds posts you "
                     "don't have yet."),
@@ -40,9 +44,6 @@ PICKS = {"spread": ("Spread across days",
                  "The highest-scored posts from each part of the range. Scores only exist once the archive "
                  "re-checks a post (usually 36 hours after posting, sometimes up to a week), so the newest "
                  "posts can't be ranked yet.")}
-
-STATUS_TEXT = ("Posts and comments come from the free Arctic Shift archive of Reddit. Scores and comment "
-               "counts appear once the archive re-checks a post, usually 36 hours after posting.")
 
 
 def range_bounds(key: str, start: QDate, end: QDate, now: datetime | None = None) -> tuple[float, float | None]:
@@ -92,6 +93,14 @@ def human_size(n: int) -> str:
             return f"{n:,.0f}\u00a0{unit}" if unit == "bytes" else f"{n:,.1f}\u00a0{unit}"
         n /= 1024
     return ""
+
+
+def fit_to_screen(size: QSize, screen) -> QSize:
+    """``size``, shrunk to fit the screen's free area (a 1920x1200 screen at 150% has about 1280x750)."""
+    if screen is None:
+        return size
+    free = screen.availableGeometry()
+    return QSize(min(size.width(), int(free.width() * 0.94)), min(size.height(), int(free.height() * 0.92)))
 
 
 def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
@@ -249,16 +258,17 @@ class TablePage(QWidget):
         for sig in (self.proxy.rowsInserted, self.proxy.rowsRemoved, self.proxy.modelReset, self.proxy.layoutChanged):
             sig.connect(self._update_count)
 
-    def load(self, rows) -> None:
+    def load(self, rows, animate: bool = False) -> None:
         self._all_rows = rows
-        self._apply_label_filter(self.label_filter.currentText())
+        self._apply_label_filter(self.label_filter.currentText(), animate)
 
-    def _apply_label_filter(self, text: str) -> None:
+    def _apply_label_filter(self, text: str, animate: bool = False) -> None:
         rows = self._all_rows
         if text != "All labels":
             rows = [r for r in rows if r["label"] == text.lower()]
-        self.model.set_rows(rows)
-        self._fit_columns()
+        self.model.set_rows(rows, animate)
+        if not animate:
+            self._fit_columns()
         self._update_count()
 
     def _fit_columns(self) -> None:
@@ -287,7 +297,7 @@ class MainWindow(QMainWindow):
     def __init__(self, db_path: str):
         super().__init__()
         self.setWindowTitle("ikari")
-        self.resize(1320, 860)
+        self.resize(fit_to_screen(QSize(1320, 860), QGuiApplication.primaryScreen()))
         self.db_path = db_path
         self.store = Store(db_path)
         self.settings = QSettings()
@@ -296,6 +306,10 @@ class MainWindow(QMainWindow):
         self.worker: FetchWorker | None = None
         self.current: str | None = None
         self.request: collect.FetchRequest | None = None
+        self._live = QTimer(self)
+        self._live.setSingleShot(True)
+        self._live.setInterval(1000)
+        self._live.timeout.connect(self._live_refresh)
         self.posts: list = []
         self.comments: list = []
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
@@ -314,8 +328,10 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_content(), 1)
         self.setCentralWidget(backdrop)
         # Permanent, so temporary messages (exports, restarts) don't wipe the access-mode note.
-        self.mode_label = label(STATUS_TEXT, "status")
-        self.statusBar().addPermanentWidget(self.mode_label)
+        # The status bar only appears while it has something to say (an export, a deletion).
+        bar = self.statusBar()
+        bar.messageChanged.connect(lambda text: bar.setVisible(bool(text)))
+        bar.hide()
         QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _: self._apply_theme())
         self._refresh_datasets(select=self.settings.value("ui/last_dataset", "", str))
         self.tabbar.setCurrentIndex(self.settings.value("ui/tab", 0, int))
@@ -385,8 +401,20 @@ class MainWindow(QMainWindow):
         help_menu.addAction(auto)
 
     def _build_sidebar(self) -> QWidget:
-        side, lay = panel("true", margins=20, spacing=14)
+        side, outer = panel("true", margins=1, spacing=0)
         side.setFixedWidth(318)
+        # On a short window (a 1080p screen at 150% leaves about 700 px) the sidebar scrolls rather than
+        # squashing its fields.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(19, 19, 19, 19)
+        lay.setSpacing(14)
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
 
         brand = QVBoxLayout()
         brand.setSpacing(2)
@@ -495,6 +523,7 @@ class MainWindow(QMainWindow):
 
         self.heading = label("No data yet", "heading")
         self.subheading = label("Enter a subreddit on the left and press Fetch and analyse.", "subtitle")
+        self.subheading.setWordWrap(True)  # wraps on a narrow window instead of widening it
         titles = QVBoxLayout()
         titles.setSpacing(2)
         titles.addWidget(self.heading)
@@ -503,18 +532,26 @@ class MainWindow(QMainWindow):
         self.tabbar = QTabBar()
         self.tabbar.setDrawBase(False)
         self.tabbar.setExpanding(False)
+        self.tabbar.setUsesScrollButtons(False)  # all three tabs always show; the window is never narrower
         for t in ("Overview", "Posts", "Comments"):
             self.tabbar.addTab(t)
+        # What the whole Overview (tiles, charts, strongest lists, mood tint) counts.
         self.scope = QComboBox()
-        self.scope.addItems(["Posts and comments", "Posts only", "Comments only"])
-        self.scope.currentTextChanged.connect(lambda _: self._render_overview())
+        self.scope.addItems(SCOPES)
+        self.scope.setToolTip("Count posts, comments or both on the Overview")
+        saved = self.settings.value("ui/overview_scope", SCOPES[0], str)
+        self.scope.setCurrentIndex(max(self.scope.findText(saved), 0))
+        self.scope.currentTextChanged.connect(self._on_scope_changed)
         header = QHBoxLayout()
+        header.setSpacing(12)
         header.addLayout(titles, 1)
+        header.addWidget(self.scope, 0, Qt.AlignmentFlag.AlignBottom)
         header.addWidget(self.tabbar, 0, Qt.AlignmentFlag.AlignBottom)
         lay.addLayout(header)
 
         self.pages = QStackedWidget()
         self.tabbar.currentChanged.connect(self.pages.setCurrentIndex)
+        self.tabbar.currentChanged.connect(lambda i: self.scope.setVisible(i == 0))
         self.pages.addWidget(self._build_overview())
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
         self.comments_tab = TablePage(COMMENT_COLUMNS, stretch_col=2)
@@ -555,18 +592,16 @@ class MainWindow(QMainWindow):
             charts.addWidget(card, stretch)
         lay.addLayout(charts, 3)
 
-        scope_row = QHBoxLayout()
-        scope_row.addWidget(section("Strongest posts and comments"), 1)
-        scope_row.addWidget(label("Include", "muted"))
-        scope_row.addWidget(self.scope)
-        lay.addLayout(scope_row)
-
         self.most_positive = QListWidget()
         self.most_negative = QListWidget()
         extremes = QHBoxLayout()
         extremes.setSpacing(14)
         for title, lw in (("Most positive", self.most_positive), ("Most negative", self.most_negative)):
             lw.setFrameShape(QFrame.Shape.NoFrame)
+            # Long titles end in "…" (the tooltip has the rest) instead of adding a sideways scrollbar.
+            lw.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            lw.setTextElideMode(Qt.TextElideMode.ElideRight)
+            lw.setUniformItemSizes(True)
             lw.itemDoubleClicked.connect(
                 lambda item: QDesktopServices.openUrl(QUrl(item.data(Qt.ItemDataRole.UserRole))))
             card, inner = panel("solid", margins=14, spacing=6)
@@ -718,6 +753,7 @@ class MainWindow(QMainWindow):
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self._on_progress)
         self.worker.finished.connect(self._on_finished)
+        self.worker.saved.connect(self._on_saved)
         self.worker.failed.connect(self._on_failed)
         self.worker.finished.connect(self.thread.quit)
         self.worker.failed.connect(self.thread.quit)
@@ -738,9 +774,30 @@ class MainWindow(QMainWindow):
             self.progress.setValue(done)
         self.progress_msg.setText(msg)
 
+    def _on_saved(self) -> None:
+        # Rows arrive in bursts; redraw at most about once a second so big fetches stay smooth.
+        if not self._live.isActive():
+            self._live.start()
+
+    def _live_refresh(self) -> None:
+        if self.thread is None or self.request is None:
+            return
+        target = self.request.subreddit.lower()
+        showing = self.current is None or self.current.lower() == target
+        self._refresh_datasets(select=None if self.current else self.request.subreddit, reload=False)
+        if showing:
+            item = self.datasets.currentItem()
+            name = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if name and name.lower() == target:
+                self._show_dataset(name, animate=self.current is not None)
+
     def _on_finished(self, result: collect.FetchResult) -> None:
         self.progress_msg.setText(finish_text(result, self.request))
-        if result.posts or result.updated or result.comments:
+        self._live.stop()
+        if self.current and self.current.lower() == result.subreddit.lower():
+            self._refresh_datasets(reload=False)
+            self._show_dataset(self.current, animate=True)  # keeps the tables where they are
+        elif result.posts or result.updated or result.comments:
             self._refresh_datasets(select=result.subreddit)
 
     def _on_failed(self, message: str) -> None:
@@ -758,8 +815,9 @@ class MainWindow(QMainWindow):
 
     # -- datasets -------------------------------------------------------------
 
-    def _refresh_datasets(self, select: str | None = None) -> None:
-        """Reload the saved-data list, selecting select, else the current dataset, else the newest."""
+    def _refresh_datasets(self, select: str | None = None, reload: bool = True) -> None:
+        """Reload the saved-data list, selecting select, else the current dataset, else the newest.
+        With reload=False only the list and storage line change, not the dataset on screen."""
         sets = self.store.datasets()
         names = [d["name"] for d in sets]
         self.datasets.blockSignals(True)
@@ -776,7 +834,8 @@ class MainWindow(QMainWindow):
         if row is not None:
             self.datasets.setCurrentRow(row)
         self.datasets.blockSignals(False)
-        self._on_dataset_selected(self.datasets.currentItem())  # reload even when the selection is unchanged
+        if reload:
+            self._on_dataset_selected(self.datasets.currentItem())  # reload even when the selection is unchanged
         posts, comments = sum(d["posts"] for d in sets), sum(d["comments"] for d in sets)
         self.storage_info.setText(
             f"{plural(len(sets), 'subreddit')}, {plural(posts, 'post')}, {plural(comments, 'comment')} · "
@@ -790,12 +849,13 @@ class MainWindow(QMainWindow):
         if name:
             self.settings.setValue("ui/last_dataset", name)
 
-    def _show_dataset(self, name: str) -> None:
+    def _show_dataset(self, name: str, animate: bool = False) -> None:
+        """Show a saved subreddit. With animate (a fetch adding to it), new rows fade in."""
         self.current = name or None
         self.posts = self.store.posts(name) if name else []
         self.comments = self.store.comments(name) if name else []
-        self.posts_tab.load(self.posts)
-        self.comments_tab.load(self.comments)
+        self.posts_tab.load(self.posts, animate)
+        self.comments_tab.load(self.comments, animate)
         self.export_posts.setEnabled(bool(self.posts))
         self.export_comments.setEnabled(bool(self.comments))
         self._update_delete_enabled()
@@ -809,6 +869,10 @@ class MainWindow(QMainWindow):
         else:
             self.heading.setText("No data yet")
             self.subheading.setText("Enter a subreddit on the left and press Fetch and analyse.")
+        self._render_overview()
+
+    def _on_scope_changed(self, text: str) -> None:
+        self.settings.setValue("ui/overview_scope", text)
         self._render_overview()
 
     def _render_overview(self) -> None:

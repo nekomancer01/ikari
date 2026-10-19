@@ -137,3 +137,34 @@ def test_finish_text_says_what_the_fetch_did():
                     "3 top posts were already saved. Comments couldn't be fetched for 2 posts; "
                     "fetch again later to fill them in.")
     assert mw.finish_text(mw.collect.FetchResult("Python", 0, 0, False), req).startswith("No new posts found")
+
+
+def test_window_fits_a_150_percent_screen():
+    class Screen:
+        def availableGeometry(self):
+            from PySide6.QtCore import QRect
+            return QRect(0, 0, 1280, 768)  # 1920x1200 at 150%, less the taskbar
+    size = mw.fit_to_screen(mw.QSize(1320, 860), Screen())
+    assert size.width() <= 1280 and size.height() <= 710
+    assert mw.fit_to_screen(mw.QSize(1320, 860), None) == mw.QSize(1320, 860)
+
+
+def test_rows_added_during_a_fetch_are_appended_and_fade_in():
+    from subsentiment.gui.models import FADE_SECONDS, POST_COLUMNS, RowsModel
+    now = [0.0]
+    m = RowsModel(POST_COLUMNS, clock=lambda: now[0])
+    row = lambda i: {"id": f"p{i}", "sentiment": 0.1, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
+                     "score": 1, "num_comments": 1, "author": "a", "created_utc": 0.0}
+    m.set_rows([row(1)])
+    inserted = []
+    m.rowsInserted.connect(lambda parent, a, b: inserted.append((a, b)))
+    m.set_rows([row(2), row(1)], animate=True)
+    assert inserted == [(1, 1)] and [r["id"] for r in m.rows] == ["p1", "p2"]
+    fg = mw.Qt.ItemDataRole.ForegroundRole
+    assert m.data(m.index(0, 0), fg) is None  # the old row doesn't fade
+    assert m.data(m.index(1, 0), fg).alphaF() < 0.3
+    now[0] = FADE_SECONDS
+    m._tick()
+    assert m.data(m.index(1, 0), fg) is None
+    m.set_rows([row(3)], animate=True)  # not a superset (another dataset): plain reload
+    assert [r["id"] for r in m.rows] == ["p3"]

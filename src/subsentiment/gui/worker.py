@@ -14,6 +14,7 @@ class FetchWorker(QObject):
     progress = Signal(int, int, str)
     finished = Signal(object)  # collect.FetchResult
     failed = Signal(str)
+    saved = Signal()  # some rows were committed; the window can show them
 
     def __init__(self, request: collect.FetchRequest, db_path: str):
         super().__init__()
@@ -29,7 +30,8 @@ class FetchWorker(QObject):
         store = Store(self.db_path)  # sqlite connections can't cross threads
         try:
             result = collect.run(ArcticShiftClient(), store, self.request,
-                                 progress=self.progress.emit, should_stop=lambda: self._stop)
+                                 progress=self.progress.emit, should_stop=lambda: self._stop,
+                                 saved=self.saved.emit)
             self.finished.emit(result)
         except FetchError as e:
             self.failed.emit(str(e))
