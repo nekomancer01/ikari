@@ -5,7 +5,8 @@ import requests
 from PySide6.QtCore import QObject, Signal, Slot
 
 from subsentiment import collect
-from subsentiment.reddit import RedditClient, RedditError
+from subsentiment.reddit import RedditError
+from subsentiment.sources import make_client
 from subsentiment.store import Store
 
 
@@ -28,7 +29,7 @@ class FetchWorker(QObject):
     def run(self) -> None:
         store = Store(self.db_path)  # sqlite connections can't cross threads
         try:
-            client = RedditClient(**self.credentials)
+            client = make_client(self.credentials)
             result = collect.run(client, store, self.request,
                                  progress=self.progress.emit, should_stop=lambda: self._stop)
             self.finished.emit(result)

@@ -76,9 +76,12 @@ class SettingsDialog(QDialog):
         values = load(settings)
 
         intro = QLabel(
-            "Leave these empty to use Reddit's public endpoints (slow, and often blocked "
-            "from VPN or cloud IPs).<br><br>For reliable access, create a <b>script</b> app at "
-            "<a href='https://www.reddit.com/prefs/apps'>reddit.com/prefs/apps</a> and paste its "
+            "Leave these empty to fetch from the free "
+            "<a href='https://arctic-shift.photon-reddit.com'>Arctic Shift</a> archive of Reddit.<br><br>"
+            "To read Reddit directly instead, you need a <b>script</b> app from "
+            "<a href='https://www.reddit.com/prefs/apps'>reddit.com/prefs/apps</a> that Reddit has "
+            "approved under its <a href='https://support.reddithelp.com/hc/en-us/articles/"
+            "42728983564564-Responsible-Builder-Policy'>Responsible Builder Policy</a>. Paste its "
             "client id (under the app name) and secret here. Only read access is used.<br><br>"
             + ("<i>The secret is kept in your system's credential store "
                "(Windows Credential Manager on Windows).</i>" if _keyring() else

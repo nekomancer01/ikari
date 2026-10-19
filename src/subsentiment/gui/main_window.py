@@ -594,7 +594,8 @@ class MainWindow(QMainWindow):
         if creds["client_id"] and creds["client_secret"]:
             return "Connected with Reddit API credentials."
         where = "ikari → Settings" if native.platform_name() == "macos" else "File → Reddit API settings"
-        return f"Anonymous mode: Reddit now refuses most requests without API credentials. Add them under {where}."
+        return (f"Using the Arctic Shift archive (free, no account). Newest posts first; scores settle "
+                f"after about a day. Approved Reddit API keys can be added under {where}.")
 
     def _set_busy(self, busy: bool) -> None:
         # Called after self.thread is set (busy) or cleared (idle); the update helpers read it.
