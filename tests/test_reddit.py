@@ -214,11 +214,20 @@ def test_empty_page_with_an_after_token_does_not_loop_forever():
     assert len(c.session.calls) == 1
 
 
-@pytest.mark.parametrize("name", ["r/Python", "/r/Python", "/r/Python/", " Python ", "Python/"])
+@pytest.mark.parametrize("name", ["r/Python", "/r/Python", "/r/Python/", " Python ", "Python/", "R/Python",
+                                  "https://www.reddit.com/r/Python/", "old.reddit.com/r/Python/top/?t=week"])
 def test_subreddit_name_is_normalised(name):
     c = client([FakeResponse(200, listing([post(1)]))])
     c.fetch_posts(name, limit=1)
     assert c.session.calls[0][0] == "https://www.reddit.com/r/Python/hot.json"
+
+
+@pytest.mark.parametrize("name", ["python dev", "a", "py-thon", "x" * 22])
+def test_invalid_subreddit_names_are_rejected_before_any_request(name):
+    c = client([])
+    with pytest.raises(RedditError, match="isn't a valid subreddit name"):
+        c.fetch_posts(name)
+    assert c.session.calls == []
 
 
 def test_blank_subreddit_is_rejected_before_any_request():

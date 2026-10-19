@@ -35,7 +35,7 @@ class FakeClient:
 def run(monkeypatch, tmp_path):
     def _run(error=None, include_comments=False, stop=False):
         FakeClient.error = error
-        monkeypatch.setattr(worker_mod, "RedditClient", FakeClient)
+        monkeypatch.setattr(worker_mod, "make_client", lambda creds: FakeClient(**creds))
         w = worker_mod.FetchWorker({"client_id": "id"}, collect.FetchRequest("python", include_comments=include_comments),
                                    str(tmp_path / "w.db"))
         events = {"finished": [], "failed": [], "progress": []}
