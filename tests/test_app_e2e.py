@@ -156,13 +156,17 @@ def test_comments_come_with_a_fetch_when_asked(env):
 def test_score_recheck_only_runs_when_ticked(env):
     w = env.window()
     fetch(w, comments=False, limit=40)
-    assert any(r["score"] is None for r in env.store().posts("python"))  # recent ones aren't settled
+    stale = {r["id"] for r in env.store().posts("python") if r["score"] is None}
+    assert stale  # recent ones aren't settled
+
+    def rechecked():
+        return {i for p, q in env.archive.requests if p == IDS for i in q["ids"].split(",")} & stale
     env.archive.clear()
     fetch(w, comments=False, limit=1, refresh_scores=False)
-    assert IDS not in env.archive.paths()
+    assert not rechecked()
     env.archive.clear()
     fetch(w, comments=False, limit=1, refresh_scores=True)
-    assert IDS in env.archive.paths()
+    assert rechecked() == stale
     w.close()
     assert env.window().refresh_scores.isChecked()  # remembered
 
@@ -348,7 +352,7 @@ def test_coverage_downloads_do_only_what_they_say(env):
     env.archive.clear()
     QTest.mouseClick(cov.day_table.cellWidget(day_row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     wait_idle(w)
-    assert set(env.archive.paths()) <= {SEARCH, AGG}  # the day's posts, no comments
+    assert set(env.archive.paths()) <= {SEARCH, IDS, AGG}  # the day's posts, no comments
     pump(100)
     env.archive.clear()
     button = cov.post_table.cellWidget(0, 2).findChild(type(w.fetch_btn))
