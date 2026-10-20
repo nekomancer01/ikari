@@ -710,7 +710,25 @@ def test_stop_in_the_coverage_window_is_disabled_once_pressed(env):
     assert cov.stop_btn.isEnabled()
     QTest.mouseClick(cov.stop_btn, Qt.MouseButton.LeftButton)
     assert not cov.stop_btn.isEnabled() and not w.stop_btn.isEnabled()
+    w.coverage_act.trigger()  # bringing the window forward again while it stops
+    assert not cov.stop_btn.isEnabled()
     wait_idle(w)
+
+
+def test_coverage_closed_and_opened_again_mid_count_counts_again_without_an_error(env):
+    w = env.window()
+    fetch(w, comments=False, limit=20)
+    env.archive.delays[AGG] = 1.5
+    w.coverage_act.trigger()
+    pump(200)
+    w.coverage.close()  # stops the count; its answer comes back cut short
+    w.coverage_act.trigger()
+    end = time.monotonic() + 15
+    while ("python" not in w.coverage.totals or w.coverage._count_thread is not None) and time.monotonic() < end:
+        pump(20)
+    pump(100)
+    cov = w.coverage
+    assert cov.count_error == "" and all(d in cov.totals["python"] for d in cov.days)
 
 
 def test_choosing_days_never_downloads_and_a_fetch_only_adds_rows_from_chosen_days(env):
