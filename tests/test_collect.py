@@ -3,6 +3,7 @@ import threading
 import time
 
 from subsentiment import collect
+from subsentiment.arctic_shift import RateLimiter
 from subsentiment.reddit import Comment, FetchError, Post
 from subsentiment.store import Store
 
@@ -439,3 +440,30 @@ def test_stopping_after_a_day_keeps_its_comments(tmp_path):
                          should_stop=stop.is_set)
     assert result.stopped and len(c.windows) == 1
     assert {r["post_id"] for r in s.comments("python")} == {"d2p0", "d2p1", "d2p2"}
+
+
+class WaitingClient(FakeClient):
+    """Its post search has to wait out a pause the archive asked for, as a timeout or a 429 makes it."""
+
+    def __init__(self, posts):
+        super().__init__(posts)
+        self.limiter = RateLimiter(clock=lambda: 0.0, sleep=lambda secs: None)
+        self.seen = []
+
+    def fetch_posts(self, subreddit, after, before, limit, query, top=False, skip=(), progress=None, **kw):
+        progress("part 1 of 4")
+        self.limiter.hold(4.0, "Arctic Shift is slow right now")
+        self.limiter.wait()
+        self.seen.append(self.told[-1])  # on screen while the retried search is out
+        return super().fetch_posts(subreddit, after, before, limit, query, top, skip, progress, **kw)
+
+
+def test_the_progress_line_comes_back_once_a_wait_is_over(tmp_path):
+    c = WaitingClient([mk(1)])
+    c.told = []
+    s = store_with(tmp_path, [])
+    collect.run(c, s, collect.FetchRequest("python", after=T - 10, before=T + 10, limit=None),
+                progress=lambda done, total, msg: c.told.append(msg))
+    waited = c.told.index("Arctic Shift is slow right now. Waiting 4 s before the next request…")
+    assert c.told[waited + 1] == c.told[waited - 1] and c.told[waited - 1].startswith("Day 1 of 1")
+    assert c.seen == [c.told[waited - 1]]  # not the wait's line, while the search goes on
