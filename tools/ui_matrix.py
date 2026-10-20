@@ -294,6 +294,13 @@ def table_room(window) -> list[str]:
         text = page.view.horizontalHeader().sectionSize(page.stretch_col)
         if text < room * 0.3:
             problems.append(f"squashed, the {name} table's text column is {text}px of {room}")
+        # The columns as shown must be what the table works out for the viewport it has now: sharing from a
+        # stale width hid the Comments column at 1920x1200 150% though it fit.
+        header = page.view.horizontalHeader()
+        shown = [(header.isSectionHidden(c), header.sectionSize(c)) for c in range(header.count())]
+        page._share_width()
+        if shown != [(header.isSectionHidden(c), header.sectionSize(c)) for c in range(header.count())]:
+            problems.append(f"the {name} table's columns were shared out for another width")
     return problems
 
 

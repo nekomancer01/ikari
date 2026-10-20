@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from typing import Any, Callable
 
-from PySide6.QtCore import QAbstractTableModel, QItemSelectionModel, QModelIndex, QRectF, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRectF, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QHeaderView, QLineEdit, QStyle, QStyledItemDelegate,
@@ -387,6 +387,7 @@ class TablePage(QWidget):
         self.view.verticalHeader().setDefaultSectionSize(42)
         self.view.setWordWrap(False)
         self.view.setFrameShape(QFrame.Shape.NoFrame)
+        self.view.viewport().installEventFilter(self)
         self.stretch_col = stretch_col
         header = self.view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -565,9 +566,13 @@ class TablePage(QWidget):
             header.setSectionHidden(col, col in hidden)
             header.resizeSection(col, round(w - (w - least) * give) if keys[col] in self.SHRINKS else w)
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._share_width()
+    def eventFilter(self, obj, event) -> bool:
+        # The view's viewport, not this page: the page is resized before its layout resizes the view, and a
+        # scroll bar appearing narrows the viewport alone, so sharing on the page's resize used a stale width
+        # and hid columns that fit.
+        if event.type() == QEvent.Type.Resize:
+            self._share_width()
+        return False
 
     def _update_count(self, *args) -> None:
         self.count.setText(plural(self.model.rowCount(), "row"))
