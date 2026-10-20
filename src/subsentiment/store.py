@@ -5,6 +5,7 @@ import csv
 import json
 import os
 import sqlite3
+import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -145,8 +146,6 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")  # GUI reads while the fetch thread writes
         fresh = not self.db.execute("SELECT 1 FROM sqlite_master WHERE name = 'posts'").fetchone()
-        if fresh:  # lets pack_settled hand freed pages back without a whole VACUUM; only settable before any table
-            self.db.execute("PRAGMA auto_vacuum = INCREMENTAL")
         self.db.executescript(SCHEMA)
         for table in PACKED:
             if "packed" not in {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}:
@@ -162,21 +161,17 @@ class Store:
             self.db.commit()
         self._stamp = 0.0
         self._packs: OrderedDict = OrderedDict()  # (kind, subreddit, day) -> (packed_at, unpacked), recent ones
-        backups = [Path(str(self.path) + "-before-v1"), Path(str(self.path) + "-before-v2")]
+        backup = Path(str(self.path) + "-before-v1")
         if fresh:
             self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif (self.db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION
+        elif (self.db.execute("PRAGMA user_version").fetchone()[0] < 1
               and self.path.resolve() not in Store._migration_tried):
             Store._migration_tried.add(self.path.resolve())  # a failed one waits for the next start, not each fetch
-            if self.db.execute("PRAGMA user_version").fetchone()[0] < 1:
-                self._migrate(backups[0])
-            if self.db.execute("PRAGMA user_version").fetchone()[0] == 1:
-                self._pack_all(backups[1])
-        for backup in backups:
-            try:
-                backup.unlink(missing_ok=True)  # left by a migration that was cut short; the database was untouched
-            except OSError:  # another connection is mid-migration and has it open
-                pass
+            self._migrate(backup)
+        try:
+            backup.unlink(missing_ok=True)  # left by a migration that was cut short; the database was untouched
+        except OSError:  # another connection is mid-migration and has it open
+            pass
 
     _migration_tried: set[Path] = set()
 
@@ -220,71 +215,88 @@ class Store:
             return
         self._compact()
 
-    def _pack_all(self, backup: Path) -> None:
-        """Pack every settled day of a database saved before packs existed, keeping a copy of it until that's
-        done. Each day is its own transaction, checked before it's committed (see pack_settled), so anything
-        cut short leaves those days' rows as they were, to be packed next time."""
+    @classmethod
+    def upgrade(cls, path: str | Path, stop: threading.Event | None = None) -> None:
+        """Pack every settled day of a database saved before packs existed, on its own connection. It can
+        take seconds on a big one, so the app runs it on its own thread. A copy of the database is kept
+        until every settled day is packed, across starts if it's cut short: each day is its own
+        transaction, checked before it's committed (see pack_settled), so a day not reached is left as it
+        was and packed next time."""
+        self = cls(path)
+        backup = Path(str(self.path) + "-before-v2")
         try:
-            copy = sqlite3.connect(backup)
-            try:
-                self.db.backup(copy)
-            finally:
-                copy.close()
-            self.pack_settled(vacuum=False)
-            if self.db.execute(f"SELECT {' + '.join(f'(SELECT COUNT(*) FROM {t} WHERE packed = 0 AND created_utc < ?)' for t in PACKED)}",
-                               (self._settled_before(),) * len(PACKED)).fetchone()[0]:
-                return  # some day couldn't be packed: try again next start
+            if self.db.execute("PRAGMA user_version").fetchone()[0] != 1:
+                return
+            if not backup.exists():  # one from a start that was cut short holds the database before any packing
+                part = Path(str(backup) + "-part")
+                copy = sqlite3.connect(part)
+                try:
+                    self.db.backup(copy)
+                finally:
+                    copy.close()
+                os.replace(part, backup)
+            self.pack_settled(vacuum=False, stop=stop)
+            left = " + ".join(f"(SELECT COUNT(*) FROM {t} WHERE packed = 0 AND created_utc < ?)" for t in PACKED)
+            if self.db.execute(f"SELECT {left}", (self._settled_before(),) * len(PACKED)).fetchone()[0]:
+                return  # stopped, or some day couldn't be packed: carried on at the next start
             self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self.db.commit()
-            self.db.execute("PRAGMA auto_vacuum = INCREMENTAL")  # takes effect with the VACUUM below
-        except (sqlite3.Error, OSError):
-            return
-        self._compact()
+            self._compact()
+            backup.unlink()
+        except Exception:  # noqa: BLE001 - the database reads and saves as it is; the next start tries again
+            pass
+        finally:
+            self.close()
 
     @staticmethod
     def _settled_before(now: float | None = None) -> float:
         """The start of the first day too recent to pack."""
         return ((now if now is not None else time.time()) - SETTLE) // 86400 * 86400
 
-    def pack_settled(self, now: float | None = None, vacuum: bool = True) -> int:
+    def pack_settled(self, now: float | None = None, vacuum: bool = True, stop: threading.Event | None = None) -> int:
         """Pack the text of every settled day that has rows not packed yet: ones saved since the day was last
         packed, or never packed. Each day is one transaction: the new pack is checked to read back exactly the
         text it replaces before the rows' copies are cleared. Returns how many days were packed."""
         self.db.commit()
         before = self._settled_before(now)
-        days = [(kind, sub, day) for kind in PACKED for sub, day in self.db.execute(
-            f"SELECT DISTINCT lower(subreddit), CAST(created_utc / 86400 AS INTEGER) FROM {kind} "
-            "WHERE packed = 0 AND created_utc < ?", (before,))]
+        days: dict[tuple, list[str]] = {}  # (kind, subreddit, day) -> ids of its rows not packed yet
+        for kind in PACKED:
+            for i, sub, day in self.db.execute(
+                    f"SELECT id, lower(subreddit), CAST(created_utc / 86400 AS INTEGER) FROM {kind} "
+                    "WHERE packed = 0 AND created_utc < ?", (before,)):
+                days.setdefault((kind, sub, day), []).append(i)
         packer = zstandard.ZstdCompressor(level=_ZSTD_LEVEL)
         done = 0
-        for kind, sub, day in days:
+        for (kind, sub, day), ids in days.items():
+            if stop is not None and stop.is_set():
+                break
             cols = PACKED[kind]
-            where = f"WHERE subreddit = ? COLLATE NOCASE AND created_utc >= ? AND created_utc < ?"
-            span = (sub, day * 86400, day * 86400 + 86400)
             try:
                 self.db.execute("BEGIN IMMEDIATE")
                 try:
-                    rows = self.db.execute(f"SELECT id, packed, {', '.join(cols)} FROM {kind} {where}", span).fetchall()
-                    old = self._pack(kind, sub, day, cached=False) if any(r["packed"] for r in rows) else {}
-                    text = {r["id"]: old[r["id"]] if r["packed"] else [r[c] for c in cols] for r in rows}
+                    # Read inside the lock, so a row saved again since is packed with its new text; one another
+                    # connection packed meanwhile is skipped, its text being in the old pack read here.
+                    text = dict(self._pack(kind, sub, day, cached=False))
+                    for k in range(0, len(ids), 500):
+                        chunk = ids[k:k + 500]
+                        for r in self.db.execute(f"SELECT id, {', '.join(cols)} FROM {kind} WHERE packed = 0 AND "
+                                                 f"id IN ({', '.join('?' * len(chunk))})", chunk):
+                            text[r["id"]] = [r[c] for c in cols]
                     blob = packer.compress(json.dumps({"columns": cols, "rows": text}, ensure_ascii=False).encode())
                     if _unpack(blob) != {"columns": list(cols), "rows": text}:
                         raise sqlite3.DatabaseError(f"{kind} of r/{sub} on day {day} wouldn't read back the same")
                     self.db.execute("INSERT OR REPLACE INTO packs VALUES (?, ?, ?, ?, ?)", (kind, sub, day, time.time(), blob))
-                    self.db.execute(f"UPDATE {kind} SET packed = 1, {', '.join(c + ' = NULL' for c in cols)} "
-                                    f"{where} AND packed = 0", span)
+                    self.db.executemany(f"UPDATE {kind} SET packed = 1, {', '.join(c + ' = NULL' for c in cols)} "
+                                        "WHERE id = ? AND packed = 0", [(i,) for i in ids])
                     self.db.commit()
                     done += 1
                 except BaseException:
                     self.db.rollback()
                     raise
-            except (sqlite3.Error, KeyError):  # busy, or a packed row missing from its pack: leave the day as it is
+            except Exception:  # noqa: BLE001 - busy, or text JSON can't hold: leave the day as it is
                 continue
-        if done and vacuum:
-            try:
-                self.db.execute("PRAGMA incremental_vacuum")
-            except sqlite3.Error:
-                pass
+        if done and vacuum:  # the cleared text leaves its pages part empty, which only a VACUUM gives back
+            self._compact()
         return done
 
     def _pack(self, kind: str, sub: str, day: int, cached: bool = True) -> dict[str, list]:
@@ -301,7 +313,7 @@ class Store:
         rows = data["rows"] if data["columns"] == list(PACKED[kind]) else {  # packed with other columns
             i: [dict(zip(data["columns"], v)).get(c) for c in PACKED[kind]] for i, v in data["rows"].items()}
         self._packs[key] = (row[0], rows)
-        while len(self._packs) > 64:
+        while len(self._packs) > 512:  # about a year of days of a subreddit or two
             self._packs.popitem(last=False)
         return rows
 
@@ -309,14 +321,22 @@ class Store:
         """``rows`` as dicts, with the text of packed ones filled in from their day's pack, and for comments
         their post's title when that post is packed."""
         out = [dict(r) for r in rows]
+        packs: dict[tuple, dict] = {}  # each day's pack looked up once in this read
+        shown = [i for i, c in enumerate(PACKED[kind]) if out and c in out[0]]  # the packed columns read
+
+        def pack(k: str, sub: str, created: float) -> dict:
+            key = (k, sub.lower(), int(created // 86400))
+            if key not in packs:
+                packs[key] = self._pack(*key)
+            return packs[key]
         for r in out:
             if r.get("packed"):
-                pack = self._pack(kind, r["subreddit"].lower(), int(r["created_utc"] // 86400))
-                r.update((c, v) for c, v in zip(PACKED[kind], pack.get(r["id"], ())) if c in r)  # pack_settled
-                # checks no packed row is missing from its pack
+                text = pack(kind, r["subreddit"], r["created_utc"]).get(r["id"])  # pack_settled checks no
+                if text:  # packed row is missing from its pack
+                    for i in shown:
+                        r[PACKED[kind][i]] = text[i]
             if r.get("post_packed"):
-                pack = self._pack("posts", r["post_sub"].lower(), int(r["post_created"] // 86400))
-                post = dict(zip(PACKED["posts"], pack.get(r["post_id"], ())))
+                post = dict(zip(PACKED["posts"], pack("posts", r["post_sub"], r["post_created"]).get(r["post_id"], ())))
                 r["post_title"] = post.get("title")
                 if r["permalink"] is None and post.get("permalink") is not None:
                     r["permalink"] = post["permalink"] + r["id"] + "/"

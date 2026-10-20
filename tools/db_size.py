@@ -182,12 +182,15 @@ def migrate(path: Path) -> None:
     target.close()
     before, size = contents(copy), file_size(copy)
     t = time.time()
+    Store(copy).close()  # what opening the window does before showing it
+    opened = time.time() - t
+    Store.upgrade(copy)  # then on a thread of its own
+    took = time.time() - t - opened
     store = Store(copy)
-    took = time.time() - t
     version = store.db.execute("PRAGMA user_version").fetchone()[0]
     check = store.db.execute("PRAGMA integrity_check").fetchone()[0]
     store.close()
-    print(f"{size / MB:.1f} MB -> {file_size(copy) / MB:.1f} MB in {took:.1f} s; user_version {version}, "
+    print(f"{size / MB:.1f} MB -> {file_size(copy) / MB:.1f} MB; opening {opened:.1f} s, packing {took:.1f} s; user_version {version}, "
           f"integrity {check}, every row reads back the same: {contents(copy) == before}, "
           f"files left: {sorted(p.name for p in tmp.iterdir())}")
     shutil.rmtree(tmp)

@@ -1153,6 +1153,7 @@ def test_data_saved_by_an_older_ikari_opens_shrunk_and_still_links_each_comment(
     opened = []
     monkeypatch.setattr(tables.QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
     w = env.window()
+    w.upgrading.join()  # packed on its own thread while the window is up
     db = sqlite3.connect(env.db)
     assert db.execute("SELECT COUNT(*) FROM posts WHERE title IS NOT NULL").fetchone()[0] == 0
     assert db.execute("SELECT SUM(LENGTH(data)) FROM packs").fetchone()[0] < before * 0.6

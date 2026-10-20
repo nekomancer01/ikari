@@ -263,6 +263,7 @@ def test_a_database_from_an_older_ikari_is_shrunk_once_and_reads_back_the_same(t
     path = tmp_path / "subsentiment.db"
     shutil.copy(OLD_DB, path)
     before = _contents(path)
+    Store.upgrade(path)  # as the app's start does: Store(path) shrinks it, then its text is packed
     s = Store(path)
     assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert {"posts_sub", "comments_sub"}.isdisjoint(n for (n,) in s.db.execute("SELECT name FROM sqlite_master"))
@@ -305,7 +306,6 @@ def test_settled_days_are_packed_smaller_and_read_back_the_same(tmp_path):
     plain = s.size_bytes()
     assert s.pack_settled() == 10  # five days of posts and five of comments
     assert s.pack_settled() == 0  # nothing left to do
-    s._compact()
     assert s.size_bytes() < plain * 0.7  # the text is packed; ids, scores and indexes stay as rows
     strip = lambda rows: [{k: v for k, v in r.items() if k != "packed"} for r in rows]
     after = (s.posts("deltarune"), s.comments("deltarune"), s.posts_by_ids(["p7", "p8"]),
@@ -371,8 +371,48 @@ def test_a_migration_that_cant_finish_leaves_the_database_as_it_was_and_runs_at_
     assert s.db.execute("PRAGMA user_version").fetchone()[0] == 0  # not retried by every fetch's store
     s.close()
     Store._migration_tried.clear()  # the next start
+    Store.upgrade(path)
     s = Store(path)
     assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    s.close()
+    assert _contents(path) == before
+
+
+def test_packing_an_older_database_cut_short_keeps_its_backup_and_carries_on_at_the_next_start(tmp_path, monkeypatch):
+    import threading
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(OLD_DB, path)
+    before = _contents(path)
+    Store(path).close()  # the window's own store shrinks it first (version 1)
+    shrunk = _contents(path)
+    stop = threading.Event()
+    stop.set()  # the app is closed before any day is packed
+    Store.upgrade(path, stop)
+    backup = tmp_path / "subsentiment.db-before-v2"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [path.name, backup.name]
+    assert _contents(backup) == shrunk
+    real = store.json.dumps
+    days = []
+
+    def fails_once(obj, **kw):  # a day whose text can't be packed is left as it is; the others still are
+        days.append(obj)
+        if len(days) == 1:
+            raise TypeError("not JSON serializable")
+        return real(obj, **kw)
+    monkeypatch.setattr(store.json, "dumps", fails_once)
+    Store.upgrade(path)
+    monkeypatch.undo()
+    db = sqlite3.connect(path)
+    assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM packs").fetchone()[0] == len(days) - 1 > 0
+    db.close()
+    assert backup.exists() and _contents(backup) == shrunk  # still the copy from before any packing
+    assert _contents(path) == before
+    Store.upgrade(path)  # the next start
+    assert list(tmp_path.iterdir()) == [path]
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert s.db.execute("SELECT COUNT(*) FROM posts WHERE packed = 0").fetchone()[0] == 0
     s.close()
     assert _contents(path) == before
 
@@ -551,6 +591,7 @@ def test_import_brings_notes_keeping_the_one_saved_last(tmp_path, monkeypatch):
 def test_a_database_from_an_older_ikari_gets_notes_and_imports_without_them(tmp_path):
     path = tmp_path / "subsentiment.db"
     shutil.copy(OLD_DB, path)
+    Store.upgrade(path)
     s = Store(path)  # migrated, and given the notes table
     assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     s.save_note("python", 0, "X", "kept")
