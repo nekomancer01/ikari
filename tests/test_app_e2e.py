@@ -587,6 +587,32 @@ def test_coverage_stays_responsive_while_a_busy_day_downloads(env):
     assert t.cellWidget(1499, 2).findChild(type(w.fetch_btn)).isEnabled()
 
 
+def test_download_all_comments_on_new_posts_says_what_it_got_and_doesnt_offer_them_again(env):
+    # Posts under 36 hours old have no comment count yet. Download all comments fetched their threads,
+    # but the rows still read "not counted yet" and the button still offered the same posts, every time.
+    w = env.window()
+    fetch(w, comments=False, limit=100)
+    cov = open_coverage(w)
+    row = next(r for r, d in enumerate(cov.days)
+               if any(p["num_comments"] is None for p in w.store.comment_coverage("python", d, d + DAY)))
+    cov.day_table.selectRow(row)
+    pump(50)
+    n = cov.post_table.rowCount()
+    assert cov.all_comments.text() == f"Download all comments ({n} posts)"
+    QTest.mouseClick(cov.all_comments, Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    pump(100)
+    assert cov.all_comments.text() == "Download all comments" and not cov.all_comments.isEnabled()
+    for i in range(n):
+        cell, button = cov.post_table.cellWidget(i, 1), cov.post_table.cellWidget(i, 2).findChild(type(w.fetch_btn))
+        assert cell.side.text() == "all so far" and "36 hours" in cell.toolTip()
+        assert button.text() == "Check again" and button.isEnabled()
+    env.archive.clear()
+    QTest.mouseClick(cov.post_table.cellWidget(0, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    assert [p for p, _ in env.archive.requests if p == TREE] == [TREE]  # Check again still fetches it
+
+
 def test_coverage_downloads_do_only_what_they_say(env):
     w = env.window()
     fetch(w, comments=False, limit=3)

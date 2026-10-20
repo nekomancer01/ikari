@@ -235,8 +235,8 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
             store.save_comment(c, *sentiment.score(c.body))
             n_comments += 1
         store.mark_comments(p.id, ok=True, settled=p.score is not None)
-        if whole and p.score is not None:  # an unsettled thread may still be growing
-            store.mark_complete("comments", name, p.id)
+        if whole:  # an unsettled thread may still be growing: it has every comment so far, not all
+            store.mark_complete("comments" if p.score is not None else "comments_so_far", name, p.id)
         store.commit()
         saved()
     if gave_up.is_set():
