@@ -145,6 +145,20 @@ def test_background_mood_follows_the_dataset_and_can_be_turned_off(make_window):
     assert make_window().mood_act.isChecked() is False
 
 
+def test_background_mood_uses_the_chart_colors_in_both_themes(make_window):
+    from PySide6.QtGui import QColor
+    from subsentiment.gui import charts, theme
+    make_window()
+    try:
+        for mode in ("light", "dark"):
+            theme._mode = mode
+            for score, key in ((1.0, "positive"), (-1.0, "negative")):
+                wash, weight = theme.mood_color(score)
+                assert weight == 1.0 and wash.rgb() == QColor(charts.palette()[key]).rgb()
+    finally:
+        theme._mode = "light"
+
+
 def test_finish_text_says_what_the_fetch_did():
     req = mw.collect.FetchRequest("python")
     r = mw.collect.FetchResult("Python", 40, 900, False, updated=12, already=3, comment_errors=2)
