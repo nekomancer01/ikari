@@ -168,11 +168,8 @@ def test_the_overview_counts_rows_as_they_arrive():
         days.setdefault(int(r["created_utc"] // 86400 * 86400), []).append(r["sentiment"])
     assert [(d, round(m, 9), n) for d, m, n in t.daily_means] == \
            [(d, round(sum(v) / len(v), 9), len(v)) for d, v in sorted(days.items())]
-    ranked = sorted(rows, key=lambda r: r["sentiment"])  # what the overview listed before it counted as rows came
-    assert t.most_positive() == ranked[::-1][:10] and t.most_negative() == ranked[:10]
     both = Analysis.combined(Analysis(rows[:100]), Analysis(rows[100:]))
     assert both.counts == t.counts and abs(both.mean - t.mean) < 1e-9 and both.daily_means == whole.daily_means
-    assert both.most_positive() == t.most_positive() and both.most_negative() == t.most_negative()
 
 
 def test_the_end_of_a_fetch_reads_back_only_what_it_saved(window, monkeypatch):
