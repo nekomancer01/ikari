@@ -57,6 +57,7 @@ def window(tmp_path, monkeypatch):
 
     def make():
         w = mw.MainWindow(str(tmp_path / "t.db"))
+        motion.set_enabled(False)  # the window turns motion on from its saved setting
         w.resize(1280, 721)
         w.show()
         w._refresh_datasets(select="Python")

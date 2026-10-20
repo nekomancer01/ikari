@@ -33,13 +33,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SUBREDDIT = "riverton"  # a made-up city; see tools/sample_text.py
 USERS = ["tram_fan_88", "mill_st_local", "quietcommuter", "rivertonmum", "bikes_not_cars",
          "old_bridge_photos", "night_owl_42", "canal_road_res", "dumpling_hunter", "council_watcher"]
-SHOTS = [  # (file name, theme, tab index: 0 Overview, 1 Posts, 2 Comments)
-    ("overview-light.png", "light", 0),
-    ("overview-dark.png", "dark", 0),
-    ("posts-light.png", "light", 1),
-    ("posts-dark.png", "dark", 1),
-    ("comments-light.png", "light", 2),
-    ("comments-dark.png", "dark", 2),
+SHOTS = [  # (file name, theme, page)
+    ("overview-light.png", "light", "overview"),
+    ("overview-dark.png", "dark", "overview"),
+    ("posts-light.png", "light", "posts"),
+    ("posts-dark.png", "dark", "posts"),
+    ("comments-light.png", "light", "comments"),
+    ("comments-dark.png", "dark", "comments"),
 ]
 
 # Share of positive / negative / neutral posts in each phase of the made-up story.
@@ -118,15 +118,15 @@ def main(argv: list[str] | None = None) -> int:
     window._refresh_datasets(SUBREDDIT)
     window.fetch_form.subreddit.setText(SUBREDDIT)
     window.fetch_form.include_comments.setChecked(True)
-    window.tabbar.setFocus()  # no text cursor blinking in the subreddit box
+    window.rail.setFocus()  # no text cursor blinking in the subreddit box
     window.scope.setCurrentText("Posts only")  # comments are short and repeat; post titles don't
-    for page in (window.posts_tab, window.comments_tab):  # newest first shows a mix of labels
-        page.view.sortByColumn(6, Qt.SortOrder.DescendingOrder)
+    for table in (window.posts_tab, window.comments_tab):  # newest first shows a mix of labels
+        table.view.sortByColumn(6, Qt.SortOrder.DescendingOrder)
 
-    for name, mode, tab in SHOTS:
+    for name, mode, page in SHOTS:
         settings.setValue("ui/theme", mode)
         window._apply_theme()
-        window.tabbar.setCurrentIndex(tab)
+        window.show_page(page)
         for _ in range(5):  # let Qt lay out and repaint before grabbing
             app.processEvents()
             time.sleep(0.05)
