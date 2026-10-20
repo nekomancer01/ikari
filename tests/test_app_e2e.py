@@ -649,6 +649,107 @@ def test_coverage_keeps_its_place_while_a_download_runs(env):
     wait_idle(w)
 
 
+def test_coverage_counts_a_subreddit_picked_while_another_is_being_counted(env):
+    # The first count's end used to be taken for days that couldn't be counted: the new subreddit was
+    # never counted and every day read "total unknown", with no message, until Recount.
+    w = env.window()
+    fetch(w, comments=False, limit=20)
+    fetch(w, sub="rust", comments=False, limit=20)
+    w.datasets.setCurrentRow(next(i for i in range(w.datasets.count())
+                                  if w.datasets.item(i).data(Qt.ItemDataRole.UserRole).lower() == "python"))
+    env.archive.delays[AGG] = 1.0
+    w.coverage_act.trigger()
+    pump(200)
+    assert w.coverage._count_thread is not None  # python's count is still out
+    w.datasets.setCurrentRow(next(i for i in range(w.datasets.count())
+                                  if w.datasets.item(i).data(Qt.ItemDataRole.UserRole).lower() == "rust"))
+    end = time.monotonic() + 15
+    while ("rust" not in w.coverage.totals or w.coverage._count_thread is not None) and time.monotonic() < end:
+        pump(20)
+    cov = w.coverage
+    assert cov.subreddit.lower() == "rust" and cov.count_error == ""
+    assert all(d in cov.totals["rust"] for d in cov.days)
+
+
+def test_coverage_follows_a_change_of_date_range_in_the_sidebar(env):
+    w = env.window()
+    fetch(w, comments=False, limit=20)
+    cov = open_coverage(w)
+    assert len(cov.days) == 8
+    w.range.setCurrentIndex(w.range.findData("month"))
+    pump(500)
+    assert len(cov.days) == 31 and cov.day_table.rowCount() == 31
+    w.date_from.setDate(w.date_to.date().addDays(-2))  # typing a date: a custom range
+    pump(500)
+    assert len(cov.days) == 3
+
+
+def test_closing_coverage_while_a_count_is_out_doesnt_freeze_the_window(env):
+    w = env.window()
+    fetch(w, comments=False, limit=20)
+    env.archive.delays[AGG] = 3
+    w.coverage_act.trigger()
+    pump(200)
+    assert w.coverage._count_thread is not None
+    start = time.monotonic()
+    w.coverage.close()
+    assert time.monotonic() - start < 0.5  # it used to wait up to 3 s for the request
+    end = time.monotonic() + 10
+    while w.coverage._count_thread is not None and time.monotonic() < end:
+        pump(20)
+    assert w.coverage._count_thread is None  # the count still ends and is tidied up
+
+
+def test_a_fetch_ending_leaves_the_user_on_the_subreddit_they_switched_to(env):
+    w = env.window()
+    fetch(w, sub="rust", comments=False, limit=20)
+    fetch(w, comments=False, limit=3)
+    env.archive.delay = 0.15
+    w.subreddit.setText("python")
+    w.limit.setValue(40)
+    w.range.setCurrentIndex(w.range.findData("month"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    pump(600)
+    w.datasets.setCurrentRow(next(i for i in range(w.datasets.count())
+                                  if w.datasets.item(i).data(Qt.ItemDataRole.UserRole).lower() == "rust"))
+    pump(50)
+    assert w.thread is not None and w.current.lower() == "rust"
+    wait_idle(w, 60)
+    assert w.current.lower() == "rust" and w.datasets.currentItem().text().lower() == "r/rust"
+    assert "Added" in w.progress_msg.text()
+
+
+def test_stop_in_the_coverage_window_is_disabled_once_pressed(env):
+    w = env.window()
+    fetch(w, comments=False, limit=20)
+    cov = open_coverage(w)
+    env.archive.delay = 0.15
+    QTest.mouseClick(cov.day_table.cellWidget(1, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    pump(300)
+    assert cov.stop_btn.isEnabled()
+    QTest.mouseClick(cov.stop_btn, Qt.MouseButton.LeftButton)
+    assert not cov.stop_btn.isEnabled() and not w.stop_btn.isEnabled()
+    w.coverage_act.trigger()  # bringing the window forward again while it stops
+    assert not cov.stop_btn.isEnabled()
+    wait_idle(w)
+
+
+def test_coverage_closed_and_opened_again_mid_count_counts_again_without_an_error(env):
+    w = env.window()
+    fetch(w, comments=False, limit=20)
+    env.archive.delays[AGG] = 1.5
+    w.coverage_act.trigger()
+    pump(200)
+    w.coverage.close()  # stops the count; its answer comes back cut short
+    w.coverage_act.trigger()
+    end = time.monotonic() + 15
+    while ("python" not in w.coverage.totals or w.coverage._count_thread is not None) and time.monotonic() < end:
+        pump(20)
+    pump(100)
+    cov = w.coverage
+    assert cov.count_error == "" and all(d in cov.totals["python"] for d in cov.days)
+
+
 def test_choosing_days_never_downloads_and_a_fetch_only_adds_rows_from_chosen_days(env):
     w = env.window()
     fetch(w, comments=False, limit=10)
