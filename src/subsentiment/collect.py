@@ -29,7 +29,7 @@ class FetchRequest:
     limit: int | None = 100
     query: str = ""
     include_comments: bool = True
-    comments_per_post: int = 50
+    comments_per_post: int = 50  # 0: every comment on each post, as Download coverage's Download all comments
     top: bool = False  # highest-scored posts of each part of the range, instead of an even sample
     refresh_scores: bool = False  # also re-check saved posts whose scores hadn't settled
     # Every post in [after, before), with limit as a cap; when every part of the range was read to its
@@ -152,28 +152,38 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
 
     # 3. Comments: for new posts, for saved ones whose scores just settled (their comment scores have
     #    too), and for saved posts whose comments were never fetched or failed last time. A post whose
-    #    comments came back fine, even if there were none, isn't asked about again.
+    #    comments came back fine, even if there were none, isn't asked about again. Asked for all comments,
+    #    every saved post in the range is, until its whole thread is saved (as Download all comments does).
     n_comments = errors = 0
+    everything = not req.comments_per_post
     if req.include_comments and not should_stop():
         refreshed = {p.id for p in updated}
         repicked = {p.id for p in picked if p.id in stored}  # top mode can pick posts that are already saved
+        saved_whole = store.complete_keys("comments", name) if everything else set()
         todo = new + updated + [_stored_post(r) for pid, r in stored.items()
                                 if pid not in refreshed and (_comments_missing(r)
-                                                             or (pid in repicked and _never_asked(r)))]
+                                                             or (pid in repicked and _never_asked(r))
+                                                             or (everything and pid not in saved_whole))]
         todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up
 
-        def save(p: Post, comments) -> None:
+        def save(p: Post, got) -> None:
             nonlocal n_comments
+            comments, complete = got if everything else (got, False)
+            had = store.comment_ids(p.id)  # a thread asked for again: count only what's new
             for c in comments:
                 store.save_comment(c, *sentiment.score(c.body))
-                n_comments += 1
+                n_comments += c.id not in had
             store.mark_comments(p.id, ok=True, settled=p.score is not None)
+            if complete:  # an unsettled thread may still be growing, so it's whole only "so far"
+                store.mark_complete("comments" if p.score is not None else "comments_so_far", name, p.id)
             store.commit()
             if comments:
                 saved()
 
+        get = (client.fetch_all_comments if everything
+               else lambda p: client.fetch_comments(p, req.comments_per_post))
         errors, tried, gave_up = _each_thread(
-            todo, lambda p: client.fetch_comments(p, req.comments_per_post), save, "Comments for post",
+            todo, get, save, "All comments for post" if everything else "Comments for post",
             store, getattr(client, "workers", 1), progress, should_stop)
         if gave_up:
             rest = [p for p in todo if p.id not in tried]  # not tried this time: retried on the next fetch
@@ -208,9 +218,10 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
     def save(p: Post, got) -> None:
         nonlocal n_comments
         comments, whole = got
+        had = store.comment_ids(p.id)  # a thread fetched again: count only what's new
         for c in comments:
             store.save_comment(c, *sentiment.score(c.body))
-            n_comments += 1
+            n_comments += c.id not in had
         store.mark_comments(p.id, ok=True, settled=p.score is not None)
         if whole:  # an unsettled thread may still be growing: it has every comment so far, not all
             store.mark_complete("comments" if p.score is not None else "comments_so_far", name, p.id)
