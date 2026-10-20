@@ -1,11 +1,47 @@
-"""The Overview tab: four stat tiles, and the distribution and timeline charts."""
+"""The Overview page (four stat tiles, the timeline across the full width, the distribution under it) and
+the single-card pages beside it in the rail: Timeline and Words."""
 from __future__ import annotations
 
-from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from subsentiment.analysis import Analysis
 from subsentiment.gui.charts import DistributionChart, TimelineChart
 from subsentiment.gui.widgets import ElidedLabel, StatTile, VerticalScrollArea, label, panel
+
+
+def card(title: str, body: QWidget, extra: QWidget | None = None) -> QFrame:
+    """A titled card on a page; ``extra`` (the timeline's range buttons) sits at the right of the title, and
+    the title gives way to it on a narrow window."""
+    frame, inner = panel("tile", margins=14, spacing=4)
+    head = QHBoxLayout()
+    caption = ElidedLabel(title, "caption") if extra is not None else label(title, "caption")
+    head.addWidget(caption)
+    head.addStretch(1)
+    if extra is not None:
+        caption.setMinimumHeight(extra.sizeHint().height())
+        head.addWidget(extra)
+    inner.addLayout(head)
+    inner.addWidget(body, 1)
+    return frame
+
+
+class CardPage(QWidget):
+    """A page that is one titled card filling the content area, such as Timeline and Words."""
+
+    def __init__(self, title: str, body: QWidget, extra: QWidget | None = None):
+        super().__init__()
+        self.body = body
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(card(title, body, extra), 1)
+        self.cards = [body.parentWidget()]
+
+
+def coming_soon(text: str) -> QLabel:
+    note = label(text, "muted")
+    note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    return note
 
 
 class OverviewPage(VerticalScrollArea):
@@ -33,28 +69,22 @@ class OverviewPage(VerticalScrollArea):
             tiles.addWidget(t, 1)
         lay.addLayout(tiles)
 
-        self.distribution = DistributionChart()
         self.timeline = TimelineChart()
-        charts = QHBoxLayout()
-        charts.setSpacing(14)
-        for chart, title, stretch in ((self.distribution, "Sentiment distribution", 2),
-                                      (self.timeline, "Mean sentiment per day (UTC)", 3)):
-            card, inner = panel("tile", margins=14, spacing=4)
-            head = QHBoxLayout()
-            # The timeline's caption gives way to its range buttons on a narrow window.
-            caption = ElidedLabel(title, "caption") if chart is self.timeline else label(title, "caption")
-            caption.setMinimumHeight(self.timeline.toolbar.sizeHint().height())  # both charts start level
-            head.addWidget(caption)
-            head.addStretch(1)
-            if chart is self.timeline:
-                head.addWidget(chart.toolbar)  # the range buttons, by the caption as on SteamDB
-            inner.addLayout(head)
-            inner.addWidget(chart, 1)
-            charts.addWidget(card, stretch)
-        lay.addLayout(charts, 3)
+        self.distribution = DistributionChart()
+        # Shorter than on a page of their own, so the whole Overview fits a 1920x1200 150% window unscrolled.
+        self.timeline.setMinimumHeight(170)
+        self.distribution.setMinimumHeight(120)
+        self.words = coming_soon("The word cloud goes here.")
+        lay.addWidget(card("Mean sentiment per day (UTC)", self.timeline, self.timeline.toolbar), 5)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(14)
+        bottom.addWidget(card("Sentiment distribution", self.distribution), 2)
+        bottom.addWidget(card("Words", self.words), 3)
+        lay.addLayout(bottom, 4)
 
         # What fades in, one after another, when another subreddit is shown.
-        self.cards = [*self.tiles.values(), self.distribution.parentWidget(), self.timeline.parentWidget()]
+        self.cards = [*self.tiles.values(), self.timeline.parentWidget(), self.distribution.parentWidget(),
+                      self.words.parentWidget()]
         self.setWidget(page)
 
     def show_analysis(self, a: Analysis) -> None:

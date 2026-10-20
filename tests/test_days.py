@@ -128,7 +128,7 @@ def test_every_view_counts_only_the_chosen_days(window, tmp_path, monkeypatch):
     assert w.days_pick.currentText() == "2 of 3 days"
     assert w.overview.tiles["count"].value.text() == "8" and len(w.posts) == 4 and len(w.comments) == 4
     assert w.posts_tab.model.rowCount() == 4 and w.comments_tab.model.rowCount() == 4
-    assert w.tabbar.tabText(1) == "Posts  4" and w.tabbar.tabText(2) == "Comments  4"
+    assert w.subheading.full_text().endswith("· 4\xa0posts · 4\xa0comments")
     assert w.subheading.full_text().startswith("Last fetched ")  # the counts are on the tabs, checked above
     shown = []
     monkeypatch.setattr(w.overview.timeline, "set_points", shown.append)

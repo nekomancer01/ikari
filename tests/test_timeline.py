@@ -58,6 +58,7 @@ def window(tmp_path, monkeypatch):
 
     def make():
         w = mw.MainWindow(str(tmp_path / "t.db"))
+        motion.set_enabled(False)  # the window turns motion on from its saved setting
         w.resize(1280, 721)
         w.show()
         w._refresh_datasets(select="Python")
@@ -322,3 +323,19 @@ def test_clicking_a_week_zooms_in_to_its_days_and_shows_its_notes(window, monkey
     QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=dot(tl, SAVED[30]))
     assert w.findChild(charts.NoteDialog) is None
     assert tl.view == (week[0], week[1])
+
+
+def test_the_timeline_page_shows_the_same_notes_and_adds_them_too(window):
+    w = window()
+    w._save_note("Python", SAVED[10], "OV", "from the overview")
+    w.show_page("timeline")
+    pump(50)
+    tl = w.timeline_page.body
+    assert tl.notes == {SAVED[10]: ("OV", "from the overview")}
+    QTest.mouseClick(tl.presets["1m"], Qt.MouseButton.LeftButton)
+    QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=dot(tl, SAVED[-3]))
+    dialog = w.findChild(charts.NoteDialog)
+    QTest.keyClicks(dialog.tag, "TL")
+    QTest.mouseClick(dialog.save, Qt.MouseButton.LeftButton)
+    pump(50)
+    assert w.overview.timeline.notes == tl.notes == {SAVED[10]: ("OV", "from the overview"), SAVED[-3]: ("TL", "")}

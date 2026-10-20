@@ -13,8 +13,8 @@ area; the sweep drags the window from maximized down to its minimum size in a fe
 
 Checks on every size, for the main window and the Download coverage window: the window can't shrink to fit
 the screen; a label's text is cut off; a field or button is squashed below what its text needs; a widget
-sticks out of its parent or overlaps a neighbour; the sidebar fields, form labels, header, tiles and cards
-are out of line; the sidebar scrolls on a window tall enough not to need it. It also notes which scroll bars
+sticks out of its parent or overlaps a neighbour; the Fetch drawer's fields, form labels, header, tiles and cards
+are out of line; the Fetch drawer scrolls on a window tall enough not to need it. It also notes which scroll bars
 show (some are on purpose). Writes one PNG per size, report.md and report.json. Uses the same made-up sample
 data as tools/screenshot.py; your own data and settings are not touched.
 """
@@ -179,12 +179,12 @@ def _same(problems: list, what: str, values: dict) -> None:
         problems.append(f"out of line, {what}: " + ", ".join(f"{k} {v}" for k, v in values.items()))
 
 
-def alignment(window) -> list[str]:
-    """Main-window alignment rules: things that should share an edge or a centre do."""
+def fetch_drawer_alignment(window) -> list[str]:
+    """The Fetch drawer's form: fields, labels and the button share edges and centres, margins match."""
     from PySide6.QtWidgets import QFormLayout, QLabel
 
     problems = []
-    side = window.findChild(QFormLayout).parentWidget()  # the sidebar's scrolling body
+    side = window.findChild(QFormLayout).parentWidget()  # the drawer's scrolling body
     f = window.fetch_form
     fields = {"subreddit": f.subreddit, "search": f.query, "posted": f.range, "from": f.date_from, "to": f.date_to,
               "comments": f.comments_per_post.parentWidget()}
@@ -206,30 +206,42 @@ def alignment(window) -> list[str]:
             if dy > TOL:
                 problems.append(f"out of line, form label {text!r} is {dy}px off its field's centre")
     _same(problems, "form label left edges", labels)
-    # Equal margins left and right of the sidebar's contents (the scroll bar, when it shows, sits in the right one).
+    # Equal margins left and right of the drawer's contents (the scroll bar, when it shows, sits in the right one).
     left = _rect(form.itemAt(0, QFormLayout.ItemRole.LabelRole).widget(), side).left()
-    right = side.width() - 1 - max(_rect(w, side).right() for w in [*fields.values(), window.fetch_btn, window.stop_btn])
+    right = side.width() - 1 - max(_rect(w, side).right() for w in [*fields.values(), window.fetch_btn])
     if sidebar_scrolls(window):
         right += side.parentWidget().parentWidget().verticalScrollBar().width()
     _same(problems, "sidebar margins", {"left": left, "right": right})
-    _same(problems, "Fetch row button tops", {"fetch": _rect(window.fetch_btn, side).top(),
-                                               "stop": _rect(window.stop_btn, side).top()})
-    _same(problems, "Fetch row button heights", {"fetch": window.fetch_btn.height(), "stop": window.stop_btn.height()})
     title = next(lab for lab in side.findChildren(QLabel) if lab.property("role") == "title")
     _same(problems, "sidebar left edges", {"form labels": _rect(form.itemAt(0, QFormLayout.ItemRole.LabelRole)
                                                                  .widget(), side).left(),
                                             "title": _rect(title, side).left(),
-                                            "fetch button": _rect(window.fetch_btn, side).left(),
-                                            "saved list": _rect(window.datasets, side).left(),
-                                            "storage line": _rect(window.storage_info, side).left()})
+                                            "fetch button": _rect(window.fetch_btn, side).left()})
     _same(problems, "sidebar right edges", {"fields": max(_rect(w, side).right() for w in fields.values()),
-                                             "stop": _rect(window.stop_btn, side).right(),
-                                             "saved list": _rect(window.datasets, side).right(),
-                                             "delete all": _rect(window.delete_all_btn, side).right()})
+                                             "fetch button": _rect(window.fetch_btn, side).right()})
+    return problems
 
-    # The content column: heading, subtitle and the page below share a left edge; tabs end at its right.
+
+def alignment(window) -> list[str]:
+    """Main-window alignment rules: things that should share an edge or a centre do."""
+    from PySide6.QtWidgets import QLabel
+
+    problems = []
+    drawer = window._drawer_key()
+    if drawer == "fetch":
+        problems += fetch_drawer_alignment(window)
+    elif drawer == "saved":
+        side = window.datasets.parentWidget()
+        _same(problems, "saved drawer left edges", {"list": _rect(window.datasets, side).left(),
+                                                   "coverage": _rect(window.coverage_btn, side).left(),
+                                                   "storage line": _rect(window.storage_info, side).left()})
+        _same(problems, "saved drawer right edges", {"list": _rect(window.datasets, side).right(),
+                                                    "coverage": _rect(window.coverage_btn, side).right(),
+                                                    "delete all": _rect(window.delete_all_btn, side).right()})
+
+    # The content column: heading, subtitle and the page below share a left edge; the presets end at its right.
     page = window.pages.currentWidget()
-    if window.tabbar.currentIndex() == 0:
+    if page is window.overview:
         tiles = list(window.overview.tiles.values())
         body = [_rect(t, window) for t in tiles]
         _same(problems, "content left edges", {"heading": _rect(window.heading, window).left(),
@@ -238,35 +250,38 @@ def alignment(window) -> list[str]:
         _same(problems, "tile widths", {t.findChild(QLabel).text(): t.width() for t in tiles})
         _same(problems, "tile tops", {t.findChild(QLabel).text(): _rect(t, window).top() for t in tiles})
         o = window.overview
-        cards = [_rect(c.parentWidget(), window) for c in (o.distribution, o.timeline)]
-        _same(problems, "overview left edges", {"tiles": body[0].left(), "charts": cards[0].left()})
-        _same(problems, "overview right edges", {"tiles": body[-1].right(), "charts": cards[1].right()})
-        _same(problems, "chart card tops and heights", {"distribution top": cards[0].top(),
-                                                        "timeline top": cards[1].top()})
+        timeline, dist, words = (_rect(c.parentWidget(), window) for c in (o.timeline, o.distribution, o.words))
+        _same(problems, "overview left edges", {"tiles": body[0].left(), "timeline": timeline.left(),
+                                                 "distribution": dist.left()})
+        _same(problems, "overview right edges", {"tiles": body[-1].right(), "timeline": timeline.right(),
+                                                  "words": words.right()})
+        _same(problems, "bottom card tops", {"distribution": dist.top(), "words": words.top()})
+        _same(problems, "bottom card heights", {"distribution": dist.height(), "words": words.height()})
         content_right = body[-1].right()
     else:
         content_right = _rect(page, window).right()
         _same(problems, "content left edges", {"heading": _rect(window.heading, window).left(),
                                                 "subtitle": _rect(window.subheading, window).left(),
-                                                "table card": _rect(page, window).left()})
-    last = window.tabbar.count() - 1
-    tab_right = window.tabbar.mapTo(window, window.tabbar.tabRect(last).topRight()).x()
-    slack = 4 + TOL  # tabs carry a 4 px right margin in the stylesheet
+                                                "page": _rect(page, window).left()})
+    presets_right = _rect(window.presets, window).right()
+    slack = TOL
     bar = page.verticalScrollBar() if hasattr(page, "verticalScrollBar") else None
     if bar is not None and bar.isVisible():
         slack += bar.width()  # a scrolling overview gives its scroll bar the last few pixels
-    if abs(tab_right - content_right) > slack:
-        problems.append(f"out of line, tabs end at {tab_right} but the content ends at {content_right}")
+    if abs(presets_right - content_right) > slack:
+        problems.append(f"out of line, the presets end at {presets_right} but the content ends at {content_right}")
     # Header controls share a vertical centre with each other.
+    mids = {"presets": _rect(window.presets, window).center().y(), "days": _rect(window.days_pick, window).center().y()}
     if window.scope.isVisible():
-        selected = window.tabbar.tabRect(window.tabbar.currentIndex())
-        tab_mid = window.tabbar.mapTo(window, selected.center()).y()
-        scope_mid = _rect(window.scope, window).center().y()
-        if abs(tab_mid - scope_mid) > 2:
-            problems.append(f"out of line, scope picker centre {scope_mid} vs tabs {tab_mid}")
+        mids["scope"] = _rect(window.scope, window).center().y()
+    if max(mids.values()) - min(mids.values()) > 2:
+        problems.append(f"out of line, header control centres {mids}")
+    # The rail's buttons share a centre line and fit inside it.
+    rail = window.rail
+    _same(problems, "rail button centres", {k: _rect(b, rail).center().x() for k, b in rail.buttons.items()})
     # Short labels that should never wrap or end in "…".
     fm = window.storage_info.fontMetrics()
-    if fm.horizontalAdvance(window.storage_info.text()) > window.storage_info.width():
+    if window.storage_info.isVisible() and fm.horizontalAdvance(window.storage_info.text()) > window.storage_info.width():
         problems.append(f"wraps, storage line: {window.storage_info.text()!r}")
     if window.width() >= 1200 and window.subheading.text() != window.subheading.full_text():
         problems.append(f"ends in '…' on a {window.width()} px window: {window.subheading.full_text()!r}")
@@ -348,6 +363,7 @@ def child(spec: dict) -> int:
     from PySide6.QtWidgets import QApplication
 
     from subsentiment.gui import coverage, main_window, motion, native, theme, widgets
+    from subsentiment.gui.rail import PAGES
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import screenshot  # noqa: E402  (seeds the sample data)
@@ -362,7 +378,7 @@ def child(spec: dict) -> int:
     settings.clear()
     settings.setValue("updates/auto", False)
     settings.setValue("ui/theme", spec["theme"])
-    settings.setValue("ui/tab", 0)
+    settings.setValue("ui/page", "overview")
     settings.setValue("ui/last_dataset", screenshot.SUBREDDIT)
     if spec.get("subpixel"):  # the old look, for a before/after of the text rendering
         theme.smooth_text = lambda f: f
@@ -372,7 +388,7 @@ def child(spec: dict) -> int:
     window = main_window.MainWindow(spec["db"])
     motion.set_enabled(False)  # sizes and stills of the finished state, not mid-fade
     window.fetch_form.subreddit.setText(screenshot.SUBREDDIT)
-    window.tabbar.setFocus()
+    window.rail.setFocus()
 
     class Free:  # the screen's free area, for the app's own opening-size rule
         def __init__(self, w, h):
@@ -425,21 +441,28 @@ def child(spec: dict) -> int:
         return found
 
     results = []
+    # The window's smallest size is with a drawer open, so the sweep runs with the Fetch drawer showing.
+    window.set_drawer("fetch")
     minimum, sizes = sizes_for(window, widgets.fit_to_screen(QSize(1320, 860), Free(fw, fh)))
     for state, w, h in sizes:
-        for tab in ([0, 1, 2] if state in ("restored", "maximized") else [0]):
-            window.tabbar.setCurrentIndex(tab)
-            results.append(measure(window, w, h, state + ["", " posts", " comments"][tab], main_rules))
-    window.tabbar.setCurrentIndex(0)
+        views = [("", "fetch", "overview")]
+        if state in ("restored", "maximized"):
+            views += [(f" {page}", "", page) for page in PAGES] + [(" saved", "saved", "overview")]
+        for name, drawer, page in views:
+            window.set_drawer(drawer)
+            window.show_page(page)
+            results.append(measure(window, w, h, state + name, main_rules))
+    window.show_page("overview")
 
-    # A status line under Fetch, with and without the progress bar: the sidebar's fields must not move
+    # A status line under the header, with and without the progress bar: the drawer's fields must not move
     # and it must not start scrolling.
+    window.set_drawer("fetch")
     for state, w, h in sizes[:2]:
         window.resize(w, h)
         settle()
         idle = field_edges(window)
         for phase, busy in (("fetching", True), ("finished", False)):
-            window.progress.setVisible(busy)
+            window.fetch_strip.set_busy(busy)
             window.progress_msg.setText(STATUS)
 
             def status_rules():
@@ -449,7 +472,7 @@ def child(spec: dict) -> int:
                     found.append(f"out of line, sidebar fields move when a status line shows: {moved}")
                 return found
             results.append(measure(window, w, h, f"{state} {phase}", status_rules))
-        window.progress.setVisible(False)
+        window.fetch_strip.set_busy(False)
         window.progress_msg.setText("")
 
     # The Download coverage window, with made-up archive counts instead of asking the network.
