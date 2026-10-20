@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from datetime import datetime
 from functools import partial
@@ -137,6 +138,10 @@ class MainWindow(QMainWindow):
         self.resize(fit_to_screen(QSize(1320, 860), QGuiApplication.primaryScreen()))
         self.db_path = db_path
         self.store = Store(db_path)
+        # Packs the text of data saved before day packs existed, without holding up the window (store.PACKED).
+        self._upgrade_stop = threading.Event()
+        self.upgrading = threading.Thread(target=Store.upgrade, args=(db_path, self._upgrade_stop), daemon=True)
+        self.upgrading.start()
         self.settings = QSettings()
         self.updates = UpdateFlow(self, self.settings)
         self.fetch_job = BackgroundJob(self)
@@ -1196,6 +1201,8 @@ class MainWindow(QMainWindow):
             self.load_job.worker.failed.disconnect()
             self.load_job.qthread.quit()
             self.load_job.qthread.wait(3000)
+        self._upgrade_stop.set()  # it stops after the day it's packing
+        self.upgrading.join()
         self.store.close()
         super().closeEvent(event)
 
