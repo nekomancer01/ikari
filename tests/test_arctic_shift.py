@@ -1,8 +1,11 @@
+import threading
+import time
+
 import pytest
 import requests
 
 from subsentiment.arctic_shift import (
-    BASE_URL, SETTLE_SECONDS, ArcticShiftClient, QueryTimeout, RateLimiter, quotas, slices, slot_count,
+    BASE_URL, SETTLE_SECONDS, TOP_PAGES, ArcticShiftClient, QueryTimeout, RateLimiter, quotas, slices, slot_count,
 )
 from subsentiment.reddit import FetchError, Post
 
@@ -496,3 +499,123 @@ def test_a_post_right_on_a_slice_edge_is_found():
     items = [at(T0 + 6 * 3600, 1), at(T0 + 6 * 3600 + 5, 2)]  # the first sits exactly where slice two starts
     posts = archive(items).fetch_posts("python", after=T0, before=T0 + DAY, limit=4)
     assert [p.id for p in posts] == ["p1", "p2"]
+
+
+class SlowServer(ArchiveSession):
+    """Takes ``delay`` real seconds to answer, and records how many requests were in flight at once."""
+
+    def __init__(self, items, delay):
+        super().__init__(items)
+        self.delay, self.busy, self.most = delay, 0, 0
+        self._lock = threading.Lock()
+
+    def get(self, url, params=None, timeout=None):
+        with self._lock:
+            self.busy += 1
+            self.most = max(self.most, self.busy)
+        time.sleep(self.delay)
+        try:
+            return super().get(url, params, timeout)
+        finally:
+            with self._lock:
+                self.busy -= 1
+
+
+def test_slices_are_read_a_few_at_once_with_the_same_result():
+    items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(24)]
+    got = {}
+    for workers in (1, 4):
+        session = SlowServer(items, delay=0.05)
+        c = ArcticShiftClient(session=session, limiter=RateLimiter(0.0), workers=workers)
+        start = time.perf_counter()
+        seen_on = set()
+        posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28,
+                              on_posts=lambda batch: seen_on.add(threading.get_ident()))
+        got[workers] = ([p.id for p in posts], time.perf_counter() - start, session.most)
+        assert seen_on == {threading.get_ident()}  # results are handed over on the calling thread
+    assert got[1][0] == got[4][0]
+    assert got[4][2] == 4 and got[1][2] == 1
+    assert got[4][1] < got[1][1] / 2.5  # 28 slices of 50 ms: about 1.4 s one at a time, 0.35 s four at once
+
+
+def test_requests_still_start_no_faster_than_the_limiter_allows():
+    items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(24)]
+    starts = []
+    session = SlowServer(items, delay=0.05)
+    real_get = session.get
+    session.get = lambda *a, **k: (starts.append(time.perf_counter()), real_get(*a, **k))[1]
+    ArcticShiftClient(session=session, limiter=RateLimiter(0.02), workers=4).fetch_posts(
+        "python", after=T0, before=T0 + 7 * DAY, limit=28)
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    assert min(gaps) >= 0.018
+
+
+def test_an_error_in_one_slice_stops_the_fetch():
+    class Broken(ArchiveSession):
+        def get(self, url, params=None, timeout=None):
+            if params["after"] > T0 + 3 * DAY:
+                return FakeResponse(400, {"error": "bad param"})
+            return super().get(url, params, timeout)
+    items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(24)]
+    with pytest.raises(FetchError, match="bad param"):
+        archive([]).__class__(session=Broken(items), limiter=RateLimiter(0.0)).fetch_posts(
+            "python", after=T0, before=T0 + 7 * DAY, limit=28)
+
+
+def test_top_posts_show_as_each_day_is_ranked():
+    items = [at(T0 + d * DAY + 600 * k, d * 100 + k, score=(k * 37) % 101) for d in range(7) for k in range(100)]
+    batches, lines = [], []
+    posts = archive(items).fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=14, top=True,
+                                       on_posts=batches.append, progress=lines.append)
+    assert len(batches) == 7 and sum(map(len, batches)) == 14 == len(posts)
+    assert all(p.title for b in batches for p in b)  # full posts, not light copies
+    assert lines[0].endswith(", 2 so far")  # the count goes up as days are ranked, not "0 so far" throughout
+
+
+def test_stopping_top_mode_keeps_the_days_already_ranked():
+    items = [at(T0 + d * DAY + 600 * k, d * 100 + k, score=(k * 37) % 101) for d in range(7) for k in range(100)]
+    c = archive(items)
+    c.workers = 1
+    stop = lambda: sum(1 for u, _ in c.session.calls if u.endswith("/api/posts/search")) >= 3 * TOP_PAGES  # noqa: E731
+    posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=14, top=True, should_stop=stop)
+    assert len(posts) == 6 and all(p.title for p in posts)  # three days' picks, downloaded despite the Stop
+
+
+def test_concurrent_requests_stay_within_the_servers_remaining_budget():
+    # A server allowing 3 requests per 0.3 s window, and 4 threads asking as fast as the limiter lets them.
+    lock, window, used, refused = threading.Lock(), [time.monotonic()], [0], []
+
+    def answer():
+        with lock:
+            now = time.monotonic()
+            if now - window[0] >= 0.3:
+                window[0], used[0] = now, 0
+            used[0] += 1
+            if used[0] > 3:
+                refused.append(now)
+            return {"X-RateLimit-Remaining": str(3 - used[0]),
+                    "X-RateLimit-Reset": f"{0.3 - (now - window[0]) + 0.01:.3f}"}
+
+    limiter = RateLimiter(0.0)
+
+    def worker():
+        for _ in range(6):
+            limiter.wait()
+            time.sleep(0.02)  # the request is on the wire
+            limiter.observe(answer())
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert refused == [] and not any(t.is_alive() for t in threads)
+
+
+def test_a_request_that_never_got_an_answer_frees_its_slot():
+    limiter = RateLimiter(0.0)
+    limiter.wait()
+    limiter.done()
+    finished = threading.Event()
+    threading.Thread(target=lambda: (limiter.wait(), finished.set()), daemon=True).start()
+    assert finished.wait(0.5)

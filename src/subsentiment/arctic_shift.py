@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from datetime import datetime, timezone
 from typing import Callable, Collection, Iterable
@@ -47,6 +48,8 @@ TOP_PAGES = 4  # pages pulled per slice in top mode
 TOP_FIELDS = "id,created_utc,score,num_comments"
 TOP_SPARE = 0.25
 SLOT_PAGES = 10
+WORKERS = 4  # requests in flight at once. The limiter still spaces out when each one starts; this only
+             # overlaps the second or two each spends waiting on the archive
 TIMEOUT_TRIES = 3  # query timeouts on one request before the caller is asked to narrow it
 MIN_WINDOW = 600  # seconds; a timing-out window is halved down to this
 TREE_LIMIT = 300  # comments asked for per thread; big trees are slow for the archive and trip its limits
@@ -82,16 +85,49 @@ class RateLimiter:
         self._wall = wall
         self._next = 0.0  # earliest time the next request may go out
         self.on_wait: WaitFn | None = None  # told about long pauses, so the UI can say why it's idle
-        self._lock = threading.Lock()  # one limiter can be shared by jobs on several threads
+        self._lock = threading.Condition()  # one limiter can be shared by jobs on several threads
+        # With several requests in flight, "X-RateLimit-Remaining: 2" on one answer says nothing about
+        # the requests already sent. So the limiter counts what's in flight, keeps the remaining budget
+        # minus those, and sends one request at a time whenever it doesn't know the budget (before the
+        # first answer, and after a reset until the next answer says what the new window allows).
+        self._in_flight = 0
+        self._budget: float | None = None  # requests left in the server's current window, if known
+        self._budget_until = 0.0  # when that window resets
+        self._budget_known = False  # the server has sent X-RateLimit-Remaining at least once
+        self._answered = False  # any answer has arrived yet
 
     def wait(self) -> None:
+        """Block until a request may go out, and count it as in flight until ``observe`` or ``done``."""
         with self._lock:
-            delay = self._next - self._clock()
-            if delay > 0:
-                if delay >= 3 and self.on_wait:
-                    self.on_wait(delay, self._reason)
-                self._sleep(delay)
-            self._next = self._clock() + self.interval
+            while True:
+                now = self._clock()
+                if self._budget is not None and now >= self._budget_until:
+                    self._budget = None  # the window reset; the next answer gives the new budget
+                unknown = not self._answered or (self._budget_known and self._budget is None)
+                if unknown and self._in_flight:
+                    self._lock.wait(1.0)
+                    continue
+                if self._budget is not None and self._budget <= 0:
+                    self.hold(self._budget_until - now, "Arctic Shift's request limit was reached")
+                    self._budget = None
+                # Sleeping with the lock held keeps starts ``interval`` apart by the clock even when a
+                # sleep overshoots (Windows' timer is coarse); planning start times ahead doesn't.
+                delay = self._next - now
+                if delay > 0:
+                    if delay >= 3 and self.on_wait:
+                        self.on_wait(delay, self._reason)
+                    self._sleep(delay)
+                self._next = self._clock() + self.interval
+                self._in_flight += 1
+                if self._budget is not None:
+                    self._budget -= 1
+                return
+
+    def done(self) -> None:
+        """A request ``wait`` let out got no answer (a network error)."""
+        with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
+            self._lock.notify_all()
 
     def hold(self, seconds: float, reason: str = "Arctic Shift is busy") -> None:
         """Send nothing for the next ``seconds`` (capped at MAX_WAIT)."""
@@ -115,9 +151,19 @@ class RateLimiter:
         return default
 
     def observe(self, headers) -> None:
-        """Pause until the reset when a response says no requests are left."""
-        if _number(headers.get("X-RateLimit-Remaining"), 1.0) <= 0:
-            self.hold(self.reset_after(headers, 10.0), "Arctic Shift's request limit was reached")
+        """Note an answer's rate-limit headers, and pause until the reset when no requests are left."""
+        with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
+            self._answered = True
+            remaining = _number(headers.get("X-RateLimit-Remaining"), None)
+            if remaining is not None:
+                reset = self.reset_after(headers, 10.0)
+                self._budget_known = True
+                self._budget = remaining - self._in_flight
+                self._budget_until = self._clock() + max(reset, 0.0)
+                if remaining <= 0:
+                    self.hold(reset, "Arctic Shift's request limit was reached")
+            self._lock.notify_all()
 
     _reason = "Arctic Shift is busy"
 
@@ -186,7 +232,10 @@ def _light_rank(d: dict) -> tuple:
 
 
 class ArcticShiftClient:
-    def __init__(self, session: requests.Session | None = None, limiter: RateLimiter | None = None):
+    def __init__(self, session: requests.Session | None = None, limiter: RateLimiter | None = None,
+                 workers: int = WORKERS):
+        self.workers = workers
+        self._local = threading.local()  # per-thread state of get(), as several threads share a client
         self.session = session or requests.Session()
         self.session.headers["User-Agent"] = USER_AGENT
         self.limiter = limiter or RateLimiter()
@@ -202,7 +251,7 @@ class ArcticShiftClient:
         query timeout backs off and asks for smaller pages (unless ``shrink`` is False, for requests
         whose ``limit`` isn't a page size), raising QueryTimeout if that doesn't help."""
         params = dict(params)
-        self.last_params = params  # what was finally sent, after any shrinking
+        self._local.last_params = params  # what was finally sent, after any shrinking
         timeouts = 0
         for attempt in range(ATTEMPTS):
             backoff = min(5.0 * 2 ** attempt, MAX_WAIT)
@@ -210,10 +259,14 @@ class ArcticShiftClient:
             try:
                 resp = self.session.get(BASE_URL + path, params=params, timeout=60)
             except (requests.ConnectionError, requests.Timeout):
+                self.limiter.done()
                 if attempt == ATTEMPTS - 1:
                     raise
                 self.limiter.hold(backoff, "Couldn't reach Arctic Shift")
                 continue
+            except BaseException:
+                self.limiter.done()
+                raise
             self.limiter.observe(resp.headers)
             error = _error_text(resp)
             if resp.status_code == 200 and not error:
@@ -247,6 +300,11 @@ class ArcticShiftClient:
             raise FetchError(f"Arctic Shift returned HTTP {resp.status_code}" + (f": {error}" if error else "."))
         raise FetchError("Arctic Shift is busy or rate limiting. Try again in a few minutes.")
 
+    @property
+    def last_params(self) -> dict:
+        """The parameters this thread's last get() finally sent, after any shrinking."""
+        return getattr(self._local, "last_params", {})
+
     # -- posts ----------------------------------------------------------------
 
     def fetch_posts(
@@ -270,7 +328,7 @@ class ArcticShiftClient:
         ``top``, each slice's share is the highest-scored posts from a pool pulled from across the
         slice; only settled posts have scores, so in a range that is all recent posts, nothing ranks.
 
-        ``on_posts`` is given each batch of posts as soon as it is downloaded (every request, outside top
+        ``on_posts`` is given each batch of posts as soon as it is downloaded (each slice's, outside top
         mode, where posts can only be ranked at the end), so a caller can show them while the rest comes.
         """
         subreddit = normalize_subreddit(subreddit)
@@ -287,23 +345,41 @@ class ArcticShiftClient:
         n = slot_count(after, before, limit, top)
         windows = slices(after, before, n)
         picked: list[list[Post]] = [[] for _ in windows]
-        spare: list[list[Post]] = [[] for _ in windows]  # top mode: ranked candidates not picked yet
+        spare: list[list] = [[] for _ in windows]  # top mode: ranked candidates not picked yet, best first
         more = [True] * len(windows)  # the slice may hold posts we haven't read
         cursors = [lo for lo, _ in windows]
         what = "Ranking" if top else "Collecting"
-        for i, ((lo, hi), want) in enumerate(zip(windows, quotas(limit, len(windows)))):
+
+        def read_slice(job):
+            i, want = job
+            lo, hi = windows[i]
             if should_stop and should_stop():
-                break
+                return None
             if top:
                 ranked = sorted(self._top_pool(base, lo, hi, should_stop), key=_light_rank, reverse=True)
-                picked[i], spare[i] = ranked[:want], ranked[want:]
+                return self._take_top(ranked, want)
+            return self._earliest(base, lo, hi, want, skip, should_stop)
+
+        # Slices are independent, so a few are read at once. Results are taken here, on the calling
+        # thread, so on_posts can save them to a database that belongs to it.
+        done = 0
+        for (i, want), result, error in in_parallel(read_slice, enumerate(quotas(limit, len(windows))),
+                                                   self.workers):
+            if error:
+                raise error
+            done += 1
+            if result is None:
+                continue
+            if top:
+                picked[i], spare[i] = result
                 more[i] = False
             else:
-                picked[i], cursors[i], more[i] = self._earliest(base, lo, hi, want, skip, should_stop,
-                                                                on_posts)
+                picked[i], cursors[i], more[i] = result
+            if on_posts and picked[i]:
+                on_posts(picked[i])
             if progress:
                 got = sum(map(len, picked))
-                progress(f"{what} posts from r/{subreddit}: part {i + 1} of {len(windows)}, {got:,} so far")
+                progress(f"{what} posts from r/{subreddit}: part {done} of {len(windows)}, {got:,} so far")
 
         # Quiet slices (night hours, a slow week) leave the total short. Share what's missing among the
         # slices that had more to give, a few rounds at most.
@@ -315,23 +391,32 @@ class ArcticShiftClient:
                 open_ = [i for i, m in enumerate(more) if m]
             if short <= 0 or not open_ or (should_stop and should_stop()):
                 break
-            for i, want in zip(open_, quotas(short, len(open_))):
-                if want <= 0:
-                    continue
-                if top:
-                    picked[i] += spare[i][:want]
-                    spare[i] = spare[i][want:]
-                else:
-                    have = skip | {p.id for p in picked[i]}
-                    extra, cursors[i], more[i] = self._earliest(base, cursors[i], windows[i][1], want, have,
-                                                                should_stop, on_posts)
+            shares = [(i, want) for i, want in zip(open_, quotas(short, len(open_))) if want > 0]
+            if top:
+                for (i, _), (extra, rest), error in in_parallel(
+                        lambda job: self._take_top(spare[job[0]], job[1]), shares, self.workers):
+                    if error:
+                        raise error
                     picked[i] += extra
-        if top:
-            picked = self._hydrate(picked, spare, should_stop)
+                    spare[i] = rest
+                    if on_posts and extra:
+                        on_posts(extra)
+                continue
+
+            def read_more(job):
+                i, want = job
+                have = skip | {p.id for p in picked[i]}
+                return self._earliest(base, cursors[i], windows[i][1], want, have, should_stop)
+
+            for (i, _), result, error in in_parallel(read_more, shares, self.workers):
+                if error:
+                    raise error
+                extra, cursors[i], more[i] = result
+                picked[i] += extra
+                if on_posts and extra:
+                    on_posts(extra)
         posts = [p for group in picked for p in group]
         posts.sort(key=lambda p: p.created_utc)
-        if top and on_posts and posts:
-            on_posts(posts)
         return posts
 
     def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int, int]:
@@ -347,8 +432,7 @@ class ArcticShiftClient:
                     raise
                 hi = lo + (hi - lo) // 2
 
-    def _earliest(self, base, lo, hi, want, skip, should_stop,
-                  on_posts=None) -> tuple[list[Post], int, bool]:
+    def _earliest(self, base, lo, hi, want, skip, should_stop) -> tuple[list[Post], int, bool]:
         """The first ``want`` usable posts in [lo, hi) that aren't in ``skip``, where to carry on
         reading from, and whether the slice may hold more."""
         out: list[Post] = []
@@ -372,8 +456,6 @@ class ArcticShiftClient:
                     out.append(_post(d))
                     fresh.append(out[-1])
                     cursor = max(cursor, int(_number(d.get("created_utc"), 0)) - 1)
-            if fresh and on_posts:
-                on_posts(fresh)
             if len(out) >= want or (should_stop and should_stop()):
                 return out, cursor, True
             if end < hi and (len(page) < size or not new):  # only part of the window was searched
@@ -398,13 +480,19 @@ class ArcticShiftClient:
                     pool[d["id"]] = d
         return list(pool.values())
 
-    def _hydrate(self, picked: list[list[dict]], spare: list[list[dict]], should_stop) -> list[list[Post]]:
-        """Full copies of each slice's picks, in one batch by id. Picks that turn out to be removed are
-        replaced by that slice's next-best spares."""
-        want = [len(group) for group in picked]
-        ranked = [group + extra[:math.ceil(len(group) * TOP_SPARE)] for group, extra in zip(picked, spare)]
-        full = {p.id: p for p in self.fetch_posts_by_ids([d["id"] for group in ranked for d in group], should_stop)}
-        return [[full[d["id"]] for d in group if d["id"] in full][:n] for group, n in zip(ranked, want)]
+    def _take_top(self, ranked: list, want: int) -> tuple[list[Post], list]:
+        """The best ``want`` of a slice's ranked candidates as full posts, and the rest, best first.
+
+        Candidates are light copies (or full posts left over from an earlier call), so the picks plus a
+        few spares are downloaded by id in one request; picks that turn out to be removed are replaced by
+        the next best. Done per slice, so a slice's posts show as soon as it is ranked. Stop isn't
+        checked here: a slice that was ranked is kept, rather than thrown away for want of one request."""
+        head = ranked[:want + math.ceil(want * TOP_SPARE)]
+        light = [d["id"] for d in head if isinstance(d, dict)]
+        full = {p.id: p for p in self.fetch_posts_by_ids(light)} if light else {}
+        usable = [d if isinstance(d, Post) else full[d["id"]] for d in head
+                  if isinstance(d, Post) or d["id"] in full]
+        return usable[:want], usable[want:] + ranked[len(head):]
 
     def fetch_posts_by_ids(self, ids: Iterable[str], should_stop: StopFn | None = None) -> list[Post]:
         """Current copies of the given posts, IDS_BATCH per request; removed ones are left out."""
@@ -512,6 +600,27 @@ class ArcticShiftClient:
                 permalink="https://www.reddit.com" + permalink,
             ))
         return comments, items, _collapsed(tree)
+
+
+def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS):
+    """Run fn(item) for each item, up to ``workers`` at once, and yield (item, result, error) as each
+    finishes, on the calling thread. Stopping early (closing the generator) cancels what hasn't started."""
+    items = list(items)
+    if workers <= 1 or len(items) <= 1:
+        for item in items:
+            try:
+                yield item, fn(item), None
+            except Exception as e:  # noqa: BLE001 - handed to the caller, like the threaded path
+                yield item, None, e
+        return
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(items)))
+    try:
+        futures = {pool.submit(fn, item): item for item in items}
+        for f in as_completed(futures):
+            error = f.exception()
+            yield futures[f], None if error else f.result(), error
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _walk(items: list, depth: int = 0):
