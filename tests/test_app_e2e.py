@@ -58,8 +58,8 @@ def env(tmp_path, monkeypatch):
     # Time runs ten times faster than in the app: requests every 0.04 s against a server allowing 30 a
     # second, and pauses for timeouts and limits capped at 1.2 s (the app's MAX_WAIT is 120 s).
     monkeypatch.setattr(arctic_shift, "MAX_WAIT", 1.2)
-    monkeypatch.setattr(worker.LIMITER, "base", arctic_shift.BASE_INTERVAL / 10)
-    monkeypatch.setattr(worker.LIMITER, "interval", arctic_shift.BASE_INTERVAL / 10)
+    # A new limiter for each new server: the shared one remembers the last test's request budget.
+    monkeypatch.setattr(worker, "LIMITER", arctic_shift.RateLimiter(arctic_shift.BASE_INTERVAL / 10))
     archive.rate = (30, 1.0)
     warnings = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a[2] if len(a) > 2 else a))
