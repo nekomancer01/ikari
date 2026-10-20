@@ -4,6 +4,8 @@ Each test drives the real MainWindow offscreen and checks both halves: what's dr
 and what the window reports (text, counts, bar shares) is already the final state. With Reduce motion on,
 everything changes at once."""
 import os
+import subprocess
+import sys
 import time
 
 import pytest
@@ -121,16 +123,17 @@ def test_switching_subreddit_fades_and_counts_to_the_new_values(make_window):
     # The new values are there at once...
     assert w.overview.tiles["count"].value.text() == "30" and w.overview.tiles["negative"].value.text() == "83%"
     assert w.overview.tiles["negative"].meter.share == pytest.approx(25 / 30)
-    # ...the old view fades out over them, the cards fade in, and the numbers count down to them.
+    # ...the old view fades out over them and the numbers count down to them. The cards themselves stay
+    # opaque: fading them in under the fading still left the page blank mid-switch.
     assert snapshots(w.content)
-    assert any(isinstance(c.graphicsEffect(), QGraphicsOpacityEffect) for c in w.overview.cards)
+    assert all(c.graphicsEffect() is None for c in w.overview.cards)
     ease_to(motion.DATA_MS // 3, w.overview.tiles["count"].value._count, w.overview.distribution._grow)
     assert drawn(w.overview.tiles["count"].value) not in ("40", "30")
     heights = w.overview.distribution.shown_heights()
     assert 10 < heights[0] < 25 and 5 < heights[2] < 30  # negative growing, positive shrinking
     assert w.overview.distribution is chart  # updated in place, not rebuilt
 
-    pump(motion.DATA_MS + 6 * motion.STAGGER_MS + 300)
+    pump(motion.DATA_MS + 300)
     assert drawn(w.overview.tiles["count"].value) == "30" and drawn(w.overview.tiles["negative"].value) == "83%"
     assert w.overview.distribution.shown_heights() == [25.0, 0.0, 5.0]
     assert not snapshots(w.content)
@@ -150,13 +153,14 @@ def test_pages_crossfade(make_window):
 def test_new_data_while_shown_counts_up(make_window):
     w = make_window()
     pick(w, "Python")
-    pump(motion.DATA_MS + 6 * motion.STAGGER_MS + 300)
+    pump(motion.DATA_MS + 300)
     s = Store(w.db_path)
     save(s, "Python", 20, "negative", first=100, score=-0.9)  # the most negative yet
     s.close()
     shown = {r["id"] for r in w.posts_tab.all_rows}
     new = [r for r in w.store.posts("Python") if r["id"] not in shown]
-    w._add_rows("posts", w.posts_tab, new)  # what a running fetch does with the rows it saves
+    w._count_new("posts", new)  # what a running fetch does with the rows it saves: count them,
+    w._add_rows("posts", w.posts_tab, new)  # and drip them into the table
     w._render_overview()
     assert w.overview.tiles["count"].value.text() == "60"
     pump(motion.DATA_MS // 3)
@@ -239,3 +243,68 @@ def test_qt_effects_the_os_has_off_stay_off(make_window, monkeypatch):
     finally:
         for e, on in before.items():
             QApplication.setEffectEnabled(e, on)
+
+
+STILL_AT_150 = """
+import sys, time
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtWidgets import QApplication
+from subsentiment.gui import main_window as mw, motion
+app = QApplication([])
+app.setOrganizationName("subsentiment-test")
+app.setApplicationName("still-150")
+QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, sys.argv[2])
+QSettings().setValue("updates/auto", False)
+motion._os_allows = True
+motion.set_enabled(True)
+w = mw.MainWindow(sys.argv[1])
+w.resize(1281, 741)  # odd sizes, so panels start between device pixels
+w.show()
+def moved(a, b):
+    # Sampled pixels that differ by more than a few levels: a still a pixel off shows at every edge.
+    n = 0
+    for y in range(0, a.height(), 2):
+        for x in range(0, a.width(), 2):
+            p, q = a.pixel(x, y), b.pixel(x, y)
+            if max(abs((p >> s & 255) - (q >> s & 255)) for s in (0, 8, 16)) > 8:
+                n += 1
+    return n
+def pump(ms):
+    end = time.monotonic() + ms / 1000
+    while time.monotonic() < end:
+        app.processEvents()
+        time.sleep(0.005)
+pump(1500)  # the counts and the mood tint have eased in
+print("dpr", w.devicePixelRatioF())
+off = 0
+for target in (w.content, w.overview.timeline, w.centralWidget(), w.overview.distribution):
+    live = w.grab().toImage()
+    motion.crossfade(target)
+    snap = [c for c in target.children() if getattr(c, "objectName", lambda: "")() == "motion-snapshot"]
+    snap[-1].anim.pause()
+    snap[-1].anim.setCurrentTime(0)
+    n = moved(live, w.grab().toImage())
+    if n:
+        off += 1
+        print("offset still over", type(target).__name__, n, "pixels")
+    snap[-1].hide()
+    snap[-1].deleteLater()
+    pump(50)
+print("off", off)
+"""
+
+
+def test_a_fade_starts_exactly_on_the_window_it_covers_at_150_percent(make_window, tmp_path):
+    # At 150% a panel at x=105 starts at device pixel 157.5. The still a fade starts from was grabbed rounded
+    # to a whole pixel, so on every page, subreddit, drawer and filter switch everything under it jumped a
+    # pixel and slid back as it faded.
+    w = make_window()  # the database the fixture seeds
+    db = w.db_path
+    w.close()
+    run = subprocess.run([sys.executable, "-c", STILL_AT_150, db, str(tmp_path / "cfg150")],
+                         capture_output=True, text=True, timeout=120,
+                         env=dict(os.environ, QT_SCALE_FACTOR="1.5", QT_QPA_PLATFORM="offscreen"))
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert "dpr 1.5" in run.stdout, run.stdout
+    assert "off 0" in run.stdout, run.stdout

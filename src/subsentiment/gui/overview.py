@@ -82,12 +82,13 @@ class OverviewPage(VerticalScrollArea):
         bottom.addWidget(card("Words", self.words), 3)
         lay.addLayout(bottom, 4)
 
-        # What fades in, one after another, when another subreddit is shown.
+        # The page's cards.
         self.cards = [*self.tiles.values(), self.timeline.parentWidget(), self.distribution.parentWidget(),
                       self.words.parentWidget()]
         self.setWidget(page)
 
     def show_analysis(self, a: Analysis) -> None:
+        """The tiles and distribution for ``a``: the days the timeline shows, so they follow its zoom."""
         n = a.count
         pos, neg = a.share("positive"), a.share("negative")
         # From a number already shown, each tile counts to its new one rather than jumping.
@@ -100,4 +101,3 @@ class OverviewPage(VerticalScrollArea):
             for key in ("mean", "positive", "negative"):
                 self.tiles[key].set("–")
         self.distribution.set_counts(a.counts)
-        self.timeline.set_points(a.daily_means)
