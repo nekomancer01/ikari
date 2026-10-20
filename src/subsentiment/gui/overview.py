@@ -7,13 +7,21 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from subsentiment.analysis import Analysis
 from subsentiment.gui.charts import DistributionChart, TimelineChart
-from subsentiment.gui.widgets import StatTile, VerticalScrollArea, label, panel
+from subsentiment.gui.widgets import ElidedLabel, StatTile, VerticalScrollArea, label, panel
 
 
-def card(title: str, body: QWidget) -> QFrame:
-    """A titled card on a page."""
+def card(title: str, body: QWidget, extra: QWidget | None = None) -> QFrame:
+    """A titled card on a page; ``extra`` (the timeline's range buttons) sits at the right of the title, and
+    the title gives way to it on a narrow window."""
     frame, inner = panel("tile", margins=14, spacing=4)
-    inner.addWidget(label(title, "caption"))
+    head = QHBoxLayout()
+    caption = ElidedLabel(title, "caption") if extra is not None else label(title, "caption")
+    head.addWidget(caption)
+    head.addStretch(1)
+    if extra is not None:
+        caption.setMinimumHeight(extra.sizeHint().height())
+        head.addWidget(extra)
+    inner.addLayout(head)
     inner.addWidget(body, 1)
     return frame
 
@@ -21,12 +29,12 @@ def card(title: str, body: QWidget) -> QFrame:
 class CardPage(QWidget):
     """A page that is one titled card filling the content area, such as Timeline and Words."""
 
-    def __init__(self, title: str, body: QWidget):
+    def __init__(self, title: str, body: QWidget, extra: QWidget | None = None):
         super().__init__()
         self.body = body
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(card(title, body), 1)
+        lay.addWidget(card(title, body, extra), 1)
         self.cards = [body.parentWidget()]
 
 
@@ -64,10 +72,10 @@ class OverviewPage(VerticalScrollArea):
         self.timeline = TimelineChart()
         self.distribution = DistributionChart()
         # Shorter than on a page of their own, so the whole Overview fits a 1920x1200 150% window unscrolled.
-        self.timeline.setMinimumHeight(150)
+        self.timeline.setMinimumHeight(170)
         self.distribution.setMinimumHeight(120)
         self.words = coming_soon("The word cloud goes here.")
-        lay.addWidget(card("Mean sentiment per day (UTC)", self.timeline), 5)
+        lay.addWidget(card("Mean sentiment per day (UTC)", self.timeline, self.timeline.toolbar), 5)
         bottom = QHBoxLayout()
         bottom.setSpacing(14)
         bottom.addWidget(card("Sentiment distribution", self.distribution), 2)
