@@ -1,16 +1,15 @@
 name: UI matrix
 
 # Renders the main window on common screens and scalings with each OS's own font engine and uploads the
-# screenshots and report (tools/ui_matrix.py). Report only: it never blocks a merge.
+# screenshots and report (tools/ui_matrix.py), for looking at by hand. Run it from the Actions tab. The layout
+# checks themselves already run in the required "Windows tests" check (tests/test_layout.py).
 on:
-  pull_request:
-    paths:
-      - "src/subsentiment/gui/**"
-      - "tools/ui_matrix.py"
-      - "tools/screenshot.py"
-      - "tools/text_aa_check.py"
-      - ".github/workflows/ui-matrix.yml"
   workflow_dispatch:
+    inputs:
+      all_platforms:
+        description: "Also render on macOS (not supported for now, so off by default)"
+        type: boolean
+        default: false
 
 concurrency:
   group: ui-matrix-${{ github.ref }}
@@ -23,9 +22,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { name: Windows, os: windows-latest, screens: win- }
-          - { name: macOS, os: macos-15, screens: mac- }
+        include: >-
+          ${{ fromJSON(inputs.all_platforms && '[{"name": "Windows", "os": "windows-latest", "screens": "win-"}, {"name": "macOS", "os": "macos-15", "screens": "mac-"}]' || '[{"name": "Windows", "os": "windows-latest", "screens": "win-"}]') }}
     steps:
       - uses: actions/checkout@v5
 
@@ -45,13 +43,9 @@ jobs:
         run: |
           python tools/ui_matrix.py --out ui-matrix/dark --only ${{ matrix.screens }}
           python tools/ui_matrix.py --out ui-matrix/light --theme light --no-sweep --only ${{ matrix.screens }}
-          if [ "$RUNNER_OS" = Windows ]; then
-            # The text before the switch to grayscale edges, at the owner's 1920x1200 150%.
-            python tools/ui_matrix.py --out ui-matrix/cleartype --subpixel --no-sweep --only win-1920x1200-150
-          fi
           cat ui-matrix/dark/report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Text edges at a real 150%
+      - name: Text edges at a real 150%, with before/after shots of the whole window
         if: runner.os == 'Windows'
         shell: bash
         run: mkdir -p text-edges && python tools/text_aa_check.py --out text-edges | tee -a text-edges/table.md "$GITHUB_STEP_SUMMARY"
