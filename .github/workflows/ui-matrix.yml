@@ -54,7 +54,13 @@ jobs:
       - name: Text edges at a real 150%
         if: runner.os == 'Windows'
         shell: bash
-        run: python tools/text_aa_check.py --out ui-matrix/text-edges | tee -a "$GITHUB_STEP_SUMMARY"
+        run: mkdir -p text-edges && python tools/text_aa_check.py --out text-edges | tee -a text-edges/table.md "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && runner.os == 'Windows'
+        with:
+          name: text-edges
+          path: text-edges
 
       - uses: actions/upload-artifact@v4
         if: always()
