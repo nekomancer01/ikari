@@ -60,7 +60,8 @@ def test_fetch_form_and_viewed_dataset_are_restored(make_window):
     again = make_window()
     assert again.fetch_form.subreddit.text() == "r/AskScience" and again.fetch_form.query.text() == "black holes"
     assert again.fetch_form.range.currentData() == "custom"
-    assert (again.fetch_form.date_from.date(), again.fetch_form.date_to.date()) == (QDate(2026, 3, 1), QDate(2026, 3, 31))
+    form = again.fetch_form
+    assert (form.date_from.date(), form.date_to.date()) == (QDate(2026, 3, 1), QDate(2026, 3, 31))
     assert (again.fetch_form.include_comments.isChecked(), again.fetch_form.comments_per_post.value()) == (False, 20)
     assert not again.fetch_form.comments_per_post.isEnabled()
     assert again.fetch_form.refresh_scores.isChecked()

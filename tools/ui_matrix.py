@@ -177,15 +177,15 @@ def alignment(window) -> list[str]:
 
     problems = []
     side = window.findChild(QFormLayout).parentWidget()  # the sidebar's scrolling body
-    fields = {"subreddit": window.fetch_form.subreddit, "search": window.fetch_form.query, "posted": window.fetch_form.range,
-              "from": window.fetch_form.date_from, "to": window.fetch_form.date_to,
-              "comments": window.fetch_form.comments_per_post.parentWidget()}
+    f = window.fetch_form
+    fields = {"subreddit": f.subreddit, "search": f.query, "posted": f.range, "from": f.date_from, "to": f.date_to,
+              "comments": f.comments_per_post.parentWidget()}
     _same(problems, "sidebar field left edges", {k: _rect(w, side).left() for k, w in fields.items()})
     _same(problems, "sidebar field right edges", {k: _rect(w, side).right() for k, w in fields.items()})
     _same(problems, "sidebar field heights", {k: w.height() for k, w in fields.items() if k != "comments"})
     _same(problems, "sidebar checkbox left edges",
-          {"fetch": _rect(window.fetch_form.include_comments, side).left(), "scores": _rect(window.fetch_form.refresh_scores, side).left(),
-           "fields": _rect(window.fetch_form.subreddit, side).left()})
+          {"fetch": _rect(f.include_comments, side).left(), "scores": _rect(f.refresh_scores, side).left(),
+           "fields": _rect(f.subreddit, side).left()})
     form = window.findChild(QFormLayout)
     labels = {}
     for row in range(form.rowCount()):
@@ -295,8 +295,9 @@ def table_room(window) -> list[str]:
 def field_edges(window) -> dict:
     from PySide6.QtWidgets import QFormLayout
     side = window.findChild(QFormLayout).parentWidget()
+    f = window.fetch_form
     return {name: (_rect(w, side).left(), _rect(w, side).right(), _rect(w, window).top())
-            for name, w in (("subreddit", window.fetch_form.subreddit), ("to", window.fetch_form.date_to), ("posted", window.fetch_form.range))}
+            for name, w in (("subreddit", f.subreddit), ("to", f.date_to), ("posted", f.range))}
 
 
 # A status line as long as the app writes, during a fetch and after it.
