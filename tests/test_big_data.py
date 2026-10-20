@@ -145,7 +145,7 @@ def test_the_text_filter_ignores_case_and_line_breaks_and_applies_to_rows_a_fetc
            "sentiment": -0.2, "score": 1, "post_title": "t", "author": "x", "created_utc": 0.0, "fetched_at": 0.0}
     other = dict(new, id="new2", body="no")
     assert tab.add_rows([new, other]) == 2
-    assert tab.model.rowCount() == both + 1 and tab.count.text() == f"{both + 1:,} rows"
+    assert tab.model.rowCount() == both + 1 and tab.count.text() == mw.plural(both + 1, "row")
     tab.filter.setText("")
     tab.label_filter.setCurrentText("All labels")
     assert tab.model.rowCount() == COMMENTS + 2

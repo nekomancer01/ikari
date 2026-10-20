@@ -79,7 +79,8 @@ class RowsModel(QAbstractTableModel):
 
     def _key_of(self, column: int) -> Callable:
         key = self.columns[column][1]
-        missing = -1 if key in NUMERIC or key == "created_utc" else ""  # sorts alongside the real values
+        # Below every real number, so pending rows don't land among (and tie with) scores of -1.
+        missing = float("-inf") if key in NUMERIC or key == "created_utc" else ""
         return lambda row: missing if (v := row[key]) is None else v
 
     def _sorted(self, rows: list, keys: list | None = None) -> list:
