@@ -514,6 +514,7 @@ class TablePage(QWidget):
                 title = self.model.headerData(col, Qt.Orientation.Horizontal)
                 least = metrics.horizontalAdvance(title) + 16 + 24 + 8  # padding, sort arrow, slack
                 self._widths[col] = (max(self._values_width(col), least), least)
+        self._text_width = self._values_width(self.stretch_col)
         self._share_width()
 
     def _values_width(self, col: int) -> int:
@@ -541,13 +542,15 @@ class TablePage(QWidget):
         used to take so much that the comment itself showed as "T…".
 
         First the free-text columns (author, post title) give up width down to their titles and their
-        values end in "…"; if the text column still has under 40% of the width, the least needed columns
-        are hidden, author first."""
+        values end in "…"; if the text column still has less than it needs, the least needed columns are
+        hidden, author first. It needs its longest text, up to a third of the width and at least 30%: short
+        titles leave room for the Comments column."""
         widths = getattr(self, "_widths", None)
         if not widths:
             return
         keys = {col: self.model.columns[col][1] for col in widths}
         room = self.view.viewport().width()
+        need = max(room * 0.3, min(room / 3, getattr(self, "_text_width", room / 3)))
         hidden = set()
         for key in (None, *self.OPTIONAL):
             if key is not None:
@@ -556,10 +559,10 @@ class TablePage(QWidget):
             fixed = sum(w for col, (w, _) in shown.items() if keys[col] not in self.SHRINKS)
             loose = {col: wl for col, wl in shown.items() if keys[col] in self.SHRINKS}
             spare = sum(w - least for w, least in loose.values())
-            over = fixed + sum(w for w, _ in loose.values()) - room * 0.6
+            over = fixed + sum(w for w, _ in loose.values()) - (room - need)
             give = min(1.0, over / spare) if over > 0 and spare > 0 else (0.0 if over <= 0 else 1.0)
             used = fixed + sum(round(w - (w - least) * give) for w, least in loose.values())
-            if room - used >= room * 0.4 or key == self.OPTIONAL[-1]:
+            if room - used >= need or key == self.OPTIONAL[-1]:
                 break
         header = self.view.horizontalHeader()
         for col, (w, least) in widths.items():
