@@ -169,12 +169,13 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         def save(p: Post, got) -> None:
             nonlocal n_comments
             comments, complete = got if everything else (got, False)
+            had = store.comment_ids(p.id)  # a thread asked for again: count only what's new
             for c in comments:
                 store.save_comment(c, *sentiment.score(c.body))
-                n_comments += 1
+                n_comments += c.id not in had
             store.mark_comments(p.id, ok=True, settled=p.score is not None)
-            if complete and p.score is not None:  # an unsettled thread may still be growing
-                store.mark_complete("comments", name, p.id)
+            if complete:  # an unsettled thread may still be growing, so it's whole only "so far"
+                store.mark_complete("comments" if p.score is not None else "comments_so_far", name, p.id)
             store.commit()
             if comments:
                 saved()
@@ -217,9 +218,10 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
     def save(p: Post, got) -> None:
         nonlocal n_comments
         comments, whole = got
+        had = store.comment_ids(p.id)  # a thread fetched again: count only what's new
         for c in comments:
             store.save_comment(c, *sentiment.score(c.body))
-            n_comments += 1
+            n_comments += c.id not in had
         store.mark_comments(p.id, ok=True, settled=p.score is not None)
         if whole:  # an unsettled thread may still be growing: it has every comment so far, not all
             store.mark_complete("comments" if p.score is not None else "comments_so_far", name, p.id)

@@ -389,3 +389,16 @@ def test_all_comments_on_a_thread_cut_short_asks_again_next_time(tmp_path):
     c.calls.clear()
     collect.run(c, s, collect.FetchRequest("python", comments_per_post=0))
     assert [call[1] for call in c.calls if call[0] == "all"] == ["p1"]
+
+
+def test_all_comments_asks_again_for_threads_still_growing_and_counts_only_new_comments(tmp_path):
+    # Live on r/AskReddit: a repeat fetch re-read the unsettled threads and said "168 comments" when 5 were new.
+    s = store_with(tmp_path, [])
+    c = FullThreadClient(posts=[mk(1, score=None, num_comments=None)])
+    first = collect.run(c, s, collect.FetchRequest("python", comments_per_post=0))
+    assert first.comments == 3
+    assert s.complete_keys("comments_so_far", "python") == {"p1"} and s.complete_keys("comments", "python") == set()
+    c.calls.clear()
+    again = collect.run(c, s, collect.FetchRequest("python", comments_per_post=0))
+    assert [call[1] for call in c.calls if call[0] == "all"] == ["p1"]  # it may have grown, so it's asked again
+    assert again.comments == 0  # the same three comments came back: nothing new
