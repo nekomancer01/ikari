@@ -79,7 +79,10 @@ def test_coverage_counts_per_day_and_complete_marks_are_cleared_with_the_data(tm
     assert [(r["id"], r["saved_comments"], r["num_comments"]) for r in s.comment_coverage("python", day, day + 86400)] \
         == [("p1", 0, 4), ("p0", 1, 4)]
     assert s.complete_keys("posts", "PYTHON") == {str(day)}
+    s.save_removed("Python", {"r0": day + 5, "r1": day + 86400 + 9, "p0": day + 10})  # p0 was saved first
+    assert s.removed_per_day("python", day, day + 2 * 86400) == {day: 1, day + 86400: 1}
     s.delete_subreddit("python")
+    assert s.removed_per_day("python", day, day + 2 * 86400) == {}
     assert s.complete_keys("posts", "python") == set() and s.complete_keys("comments", "rust") == {"r1"}
     s.delete_all()
     assert s.complete_keys("comments", "rust") == set()
