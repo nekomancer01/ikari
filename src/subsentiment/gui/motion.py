@@ -91,6 +91,11 @@ def crossfade(target: QWidget, ms: int = VIEW_MS) -> None:
     """Call just before changing what target shows: its current look fades out over the new one."""
     if not enabled() or not target.isVisible() or target.width() <= 0 or target.height() <= 0:
         return
+    parent = target.parentWidget()
+    while parent is not None:
+        if fading(parent):  # a fade over a whole area already covers this part of it: don't grab again
+            return
+        parent = parent.parentWidget()
     for old in target.findChildren(_Snapshot, options=Qt.FindChildOption.FindDirectChildrenOnly):
         # A fade already running: start from what's on screen now, not from the picture before it.
         old.hide()
