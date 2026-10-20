@@ -675,7 +675,7 @@ def test_coverage_keeps_its_place_while_a_download_runs(env):
 
 def test_choosing_days_never_downloads_and_a_fetch_only_adds_rows_from_chosen_days(env):
     w = env.window()
-    fetch(w, comments=False, limit=10)
+    fetch(w, comments=False)  # the past week, so the month's fetch below adds more
     saved = w.store.day_counts("python")
     day = max(d for d, (posts, _) in saved.items() if posts)
     env.archive.clear()
@@ -696,7 +696,7 @@ def test_choosing_days_never_downloads_and_a_fetch_only_adds_rows_from_chosen_da
 
     env.archive.delay = 0.05
     w.subreddit.setText("python")
-    w.limit.setValue(60)
+    w.range.setCurrentIndex(w.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     seen = 0
     while w.thread is not None:  # rows from other days are saved but not shown while the fetch runs
