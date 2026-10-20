@@ -49,8 +49,7 @@ CREATE TABLE IF NOT EXISTS complete (
 CREATE TABLE IF NOT EXISTS removed_posts (
     id TEXT PRIMARY KEY, subreddit TEXT NOT NULL, created_utc REAL  -- subreddit lowercased
 );
-CREATE INDEX IF NOT EXISTS posts_sub ON posts(subreddit COLLATE NOCASE);
-CREATE INDEX IF NOT EXISTS comments_sub ON comments(subreddit COLLATE NOCASE);
+-- (Lookups by subreddit alone use the *_fetched indexes below, which start with it.)
 CREATE INDEX IF NOT EXISTS comments_post ON comments(post_id);
 -- A running fetch's new rows are read back by when they were saved.
 CREATE INDEX IF NOT EXISTS posts_fetched ON posts(subreddit COLLATE NOCASE, fetched_at);
@@ -61,6 +60,12 @@ POST_COLUMNS = ("id", "subreddit", "title", "selftext", "author", "score", "upvo
                 "num_comments", "created_utc", "permalink", "url", "sentiment", "label", "fetched_at")
 COMMENT_COLUMNS = ("id", "post_id", "subreddit", "parent_id", "author", "body", "score",
                    "created_utc", "depth", "permalink", "sentiment", "label", "fetched_at")
+# A comment's permalink is nearly always its post's with the comment's id added, and was the biggest thing
+# saved per comment, so it's stored as NULL then and rebuilt when read.
+_COMMENT_SELECT = "SELECT " + ", ".join(
+    "COALESCE(c.permalink, p.permalink || c.id || '/') AS permalink" if col == "permalink" else "c." + col
+    for col in COMMENT_COLUMNS) + ", p.title AS post_title FROM comments c LEFT JOIN posts p ON p.id = c.post_id"
+SCHEMA_VERSION = 1  # 1: derivable comment permalinks not stored, posts_sub and comments_sub indexes dropped
 
 
 # Comments on image posts are hidden along with the posts (``c`` is the comments table).
@@ -95,6 +100,7 @@ class Store:
         self.db = sqlite3.connect(self.path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")  # GUI reads while the fetch thread writes
+        fresh = not self.db.execute("SELECT 1 FROM sqlite_master WHERE name = 'posts'").fetchone()
         self.db.executescript(SCHEMA)
         # Image posts are kept as rows (so Download coverage counts them as checked and a refetch doesn't
         # download them again) but hidden from every read here and never given comments.
@@ -104,7 +110,60 @@ class Store:
                 (r["id"],) for r in self.db.execute("SELECT id, url, selftext FROM posts")
                 if is_image_post(r["url"], r["selftext"])])
             self.db.commit()
+        backup = Path(str(self.path) + "-before-v1")
+        if fresh:
+            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif (self.db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION
+              and self.path.resolve() not in Store._migration_tried):
+            Store._migration_tried.add(self.path.resolve())  # a failed one waits for the next start, not each fetch
+            self._migrate(backup)
+        try:
+            backup.unlink(missing_ok=True)  # left by a migration that was cut short; the database was untouched
+        except OSError:  # another connection is mid-migration and has it open
+            pass
         self._stamp = 0.0
+
+    _migration_tried: set[Path] = set()
+
+    def _migrate(self, backup: Path) -> None:
+        """Shrink a database saved by an older ikari, keeping a copy of it until that's done. It's one
+        transaction, checked row by row against what was there before it's committed, and skipped (to be
+        tried at the next start) if anything fails, since the older layout reads and saves just as well."""
+        try:
+            copy = sqlite3.connect(backup)
+            try:
+                self.db.backup(copy)
+            finally:
+                copy.close()
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                if self.db.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+                    self.db.rollback()  # another connection did it meanwhile
+                    return
+                # What the comments read as now, taken inside the lock so no other save can slip between.
+                self.db.execute("CREATE TEMP TABLE was AS SELECT id, permalink FROM comments")
+                self.db.execute(
+                    "UPDATE comments SET permalink = NULL WHERE permalink = "
+                    "(SELECT p.permalink FROM posts p WHERE p.id = comments.post_id) || id || '/'")
+                self.db.execute("DROP INDEX IF EXISTS posts_sub")
+                self.db.execute("DROP INDEX IF EXISTS comments_sub")
+                self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                before = self.db.execute("SELECT COUNT(*) FROM temp.was").fetchone()[0]
+                after = self.db.execute("SELECT COUNT(*) FROM main.comments").fetchone()[0]
+                changed = self.db.execute(
+                    f"SELECT COUNT(*) FROM temp.was o JOIN ({_COMMENT_SELECT}) n ON n.id = o.id "
+                    "WHERE n.permalink IS NOT o.permalink").fetchone()[0]
+                if before != after or changed:
+                    raise sqlite3.DatabaseError(f"{changed} of {before} comments would read back differently")
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
+            finally:
+                self.db.execute("DROP TABLE IF EXISTS temp.was")
+        except (sqlite3.Error, OSError):
+            return
+        self._compact()
 
     def _saved_at(self) -> float:
         """Now, as ``fetched_at``, later than every row this store saved before. Windows' clock moves in
@@ -127,14 +186,19 @@ class Store:
                   post.upvote_ratio, post.num_comments, post.created_utc, post.permalink, post.url,
                   sentiment, label, self._saved_at(), int(post.image))
         values = tuple(map(_storable, values))
+        # Comments whose permalink is rebuilt from this post's get their own copy if it's about to change.
+        self.db.execute("UPDATE comments SET permalink = (SELECT permalink FROM posts WHERE id = :id) || id || '/' "
+                        "WHERE post_id = :id AND permalink IS NULL "
+                        "AND (SELECT permalink FROM posts WHERE id = :id) IS NOT :link", {"id": values[0], "link": values[9]})
         self.db.execute(f"INSERT OR REPLACE INTO posts ({','.join(POST_COLUMNS)}, image) "
                         f"VALUES ({','.join('?' * len(values))})", values)
 
     def save_comment(self, c: Comment, sentiment: float, label: str) -> None:
         values = (c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score,
-                  c.created_utc, c.depth, c.permalink, sentiment, label, self._saved_at())
+                  c.created_utc, c.depth, c.permalink, c.post_id, c.id, sentiment, label, self._saved_at())
         values = tuple(map(_storable, values))
-        self.db.execute(f"INSERT OR REPLACE INTO comments VALUES ({','.join('?' * len(values))})", values)
+        self.db.execute("INSERT OR REPLACE INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                        "NULLIF(?, (SELECT permalink FROM posts WHERE id = ?) || ? || '/'), ?, ?, ?)", values)
 
     def comment_ids(self, post_id: str) -> set[str]:
         """The ids of the comments saved on one post."""
@@ -249,14 +313,12 @@ class Store:
 
     def comments_since(self, subreddit: str, ts: float) -> list[sqlite3.Row]:
         return self.db.execute(
-            "SELECT c.*, p.title AS post_title FROM comments c LEFT JOIN posts p ON p.id = c.post_id "
-            "WHERE c.subreddit = ? COLLATE NOCASE AND c.fetched_at >= ? AND " + NOT_IMAGE + " ORDER BY c.fetched_at",
+            _COMMENT_SELECT + " WHERE c.subreddit = ? COLLATE NOCASE AND c.fetched_at >= ? AND " + NOT_IMAGE + " ORDER BY c.fetched_at",
             (subreddit, ts)).fetchall()
 
     def comments(self, subreddit: str) -> list[sqlite3.Row]:
         return self.db.execute(
-            "SELECT c.*, p.title AS post_title FROM comments c LEFT JOIN posts p ON p.id = c.post_id "
-            "WHERE c.subreddit = ? COLLATE NOCASE AND " + NOT_IMAGE + " ORDER BY c.created_utc DESC",
+            _COMMENT_SELECT + " WHERE c.subreddit = ? COLLATE NOCASE AND " + NOT_IMAGE + " ORDER BY c.created_utc DESC",
             (subreddit,)).fetchall()
 
     def delete_subreddit(self, subreddit: str) -> None:

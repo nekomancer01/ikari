@@ -7,10 +7,11 @@ import os
 import time
 
 import pytest
+import shiboken6
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, Qt  # noqa: E402
+from PySide6.QtCore import QAbstractAnimation, QSettings, Qt, QVariantAnimation  # noqa: E402
 from PySide6.QtWidgets import QApplication, QGraphicsOpacityEffect, QLabel  # noqa: E402
 
 from subsentiment.gui import main_window as mw  # noqa: E402
@@ -29,13 +30,12 @@ def pump(ms: int) -> None:
         time.sleep(0.005)
 
 
-def pump_eased(tween: motion.Tween, ms: int) -> None:
-    """Pump until the tween's own clock reaches ms. A busy runner can stall the first frame for longer than
-    a wall-clock wait, and Qt's animation clock only starts on that frame."""
-    end = time.monotonic() + 5
-    while tween._anim.currentTime() < ms and time.monotonic() < end:
-        QApplication.processEvents()
-        time.sleep(0.005)
+def ease_to(ms: int, *tweens: motion.Tween) -> None:
+    """Move running tweens to ms into their ease. Waiting for it by the clock failed on a busy runner,
+    whose frames stalled past a third of the ease, and once past all of it."""
+    for tween in tweens:
+        assert tween.running()
+        tween._anim.setCurrentTime(ms)
 
 
 def snapshots(widget) -> list:
@@ -46,6 +46,21 @@ def snapshots(widget) -> list:
 def drawn(label: QLabel) -> str:
     """What a counting label paints now (its text() is the final value)."""
     return QLabel.text(label)
+
+
+def pump_through(anim: QAbstractAnimation) -> None:
+    """Pump until a fade has run to its end on its own clock, then for what it cleans up when done. Waiting
+    its length by the wall clock failed on a busy Windows runner, whose frames stalled past it."""
+    end = time.monotonic() + 5
+    while shiboken6.isValid(anim) and anim.currentTime() < anim.duration() and time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.005)
+    pump(50)  # the deleteLater it ends with
+
+
+def fade_of(widget) -> QVariantAnimation:
+    """The fade-in running on widget (its opacity effect's animation)."""
+    return widget.graphicsEffect().findChild(QVariantAnimation)
 
 
 def save(store: Store, sub: str, n: int, label: str, first: int = 0, score: float | None = None) -> None:
@@ -109,7 +124,7 @@ def test_switching_subreddit_fades_and_counts_to_the_new_values(make_window):
     # ...the old view fades out over them, the cards fade in, and the numbers count down to them.
     assert snapshots(w.content)
     assert any(isinstance(c.graphicsEffect(), QGraphicsOpacityEffect) for c in w.overview.cards)
-    pump_eased(w.overview.tiles["count"].value._count, motion.DATA_MS // 3)
+    ease_to(motion.DATA_MS // 3, w.overview.tiles["count"].value._count, w.overview.distribution._grow)
     assert drawn(w.overview.tiles["count"].value) not in ("40", "30")
     heights = w.overview.distribution.shown_heights()
     assert 10 < heights[0] < 25 and 5 < heights[2] < 30  # negative growing, positive shrinking
@@ -128,7 +143,7 @@ def test_tabs_crossfade(make_window):
     pump(motion.VIEW_MS + 100)
     w.tabbar.setCurrentIndex(1)
     assert w.pages.currentIndex() == 1 and snapshots(w.content)
-    pump(motion.VIEW_MS + 150)
+    pump_through(snapshots(w.content)[0].anim)
     assert not snapshots(w.content)
 
 
@@ -184,7 +199,7 @@ def test_a_status_line_fades_in_when_it_appears(make_window):
     w._start_fetch()  # refused before anything is requested
     assert "valid subreddit" in w.progress_msg.text()
     assert isinstance(w.progress_msg.graphicsEffect(), QGraphicsOpacityEffect)
-    pump(motion.APPEAR_MS + 150)
+    pump_through(fade_of(w.progress_msg))
     assert w.progress_msg.graphicsEffect() is None
 
 
@@ -193,7 +208,7 @@ def test_the_status_bar_fades_in_once_not_on_every_message(make_window):
     bar = w.statusBar()
     bar.showMessage("Exported 40 posts")
     assert isinstance(bar.graphicsEffect(), QGraphicsOpacityEffect)
-    pump(motion.APPEAR_MS + 150)
+    pump_through(fade_of(bar))
     bar.showMessage("Deleted r/rust")  # already showing: no flash back to transparent
     assert bar.graphicsEffect() is None
 
@@ -204,7 +219,7 @@ def test_behind_a_native_backdrop_the_new_look_fades_in_instead(make_window):
     w.tabbar.setCurrentIndex(1)
     assert not snapshots(w.content)  # no still of see-through glass laid over the glass
     assert isinstance(w.content.graphicsEffect(), QGraphicsOpacityEffect)
-    pump(motion.VIEW_MS + 150)
+    pump_through(fade_of(w.content))
     assert w.content.graphicsEffect() is None
 
 

@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, QObject, QPointF, QRectF, Qt, QVariantAnimation
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QLinearGradient, QPainter, QPalette
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QLinearGradient, QPainter, QPalette, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from subsentiment.gui import native
@@ -94,7 +94,8 @@ def smooth_text(f: QFont) -> QFont:
 
 
 def display_font(point_size: float, weight: int = 600) -> QFont:
-    f = QFont(DISPLAY_FAMILY)
+    f = QFont(QGuiApplication.font())  # the app font's features (tabular figures), so it measures as it paints
+    f.setFamily(DISPLAY_FAMILY)
     f.setPointSizeF(point_size)
     f.setWeight(QFont.Weight(weight))
     return smooth_text(f)
@@ -141,6 +142,8 @@ def _icons(t: dict) -> Path:
     files = {
         "down": chevron.format(d="2.5 4.5 L6 8 L9.5 4.5", c=t["muted"]),
         "up": chevron.format(d="2.5 7.5 L6 4 L9.5 7.5", c=t["muted"]),
+        "left": chevron.format(d="7.5 2.5 L4 6 L7.5 9.5", c=t["text"]),
+        "right": chevron.format(d="4.5 2.5 L8 6 L4.5 9.5", c=t["text"]),
         "check": chevron.format(d="2.5 6.2 L5 8.6 L9.6 3.6", c=t["on_accent"]),
     }
     for name, svg in files.items():
@@ -184,10 +187,20 @@ QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled, QDateEdit:disabled {{
 QComboBox::drop-down, QDateEdit::drop-down {{ border: none; width: 26px; background: transparent; }}
 QComboBox::down-arrow, QDateEdit::down-arrow {{ image: url("{icons}/{_mode}-down.svg"); width: 12px; height: 12px; }}
 QDateEdit {{ padding-right: 26px; }}
-QCalendarWidget QWidget {{ background: {t['menu']}; color: {t['text']}; alternate-background-color: {t['menu']}; }}
-QCalendarWidget QAbstractItemView {{ selection-background-color: {t['accent']}; selection-color: {t['on_accent']}; }}
-QCalendarWidget QAbstractItemView:disabled {{ color: {t['faint']}; }}
-QCalendarWidget QToolButton {{ background: transparent; color: {t['text']}; border: none; padding: 4px 8px; font-weight: 600; }}
+/* The date fields' calendar (widgets.Calendar paints the card and the days) */
+QCalendarWidget QWidget {{ background: transparent; color: {t['text']}; }}
+QCalendarWidget QAbstractItemView {{ background: transparent; border: none; selection-background-color: transparent; }}
+QCalendarWidget QAbstractItemView::item {{ border: none; padding: 0; }}
+QCalendarWidget QToolButton {{
+    background: transparent; color: {t['text']}; border: 1px solid transparent; border-radius: 8px;
+    padding: 4px 6px; font-family: {display}; font-size: 11pt; font-weight: 600;
+}}
+QCalendarWidget QToolButton:hover {{ background: {soft}; }}
+QCalendarWidget QToolButton:disabled {{ color: {t['faint']}; }}
+QCalendarWidget QToolButton::menu-indicator {{ image: none; width: 0; }}
+QCalendarWidget QToolButton#qt_calendar_prevmonth {{ qproperty-icon: url("{icons}/{_mode}-left.svg"); }}
+QCalendarWidget QToolButton#qt_calendar_nextmonth {{ qproperty-icon: url("{icons}/{_mode}-right.svg"); }}
+QCalendarWidget QSpinBox {{ font-family: {display}; font-size: 11pt; font-weight: 600; }}
 QComboBox QAbstractItemView {{
     background: {t['menu']}; border: 1px solid {edge}; border-radius: 10px; padding: 4px;
     selection-background-color: {soft}; selection-color: {t['text']}; outline: 0;
@@ -376,6 +389,24 @@ class MoodTint(QObject):
     def _step(self, value: QPointF) -> None:
         self.state = QPointF(value)
         self._window.update()
+
+
+def paint_popup(widget: QWidget, shadow: int) -> None:
+    """A popup's card: the menu color in a rounded hairline outline, inset by ``shadow`` px for a soft shadow
+    around it. The popup window needs WA_TranslucentBackground so the corners and shadow show through."""
+    t = tokens()
+    p = QPainter(widget)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    card = QRectF(widget.rect()).adjusted(shadow, shadow, -shadow, -shadow)
+    color = QColor(*t["shadow"][:3])
+    for i in range(shadow, 0, -2):  # darker near the card and a little lower
+        color.setAlpha(int(t["shadow"][3] * 0.16 * (1 - i / shadow) ** 1.5) + 1)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawRoundedRect(card.adjusted(-i, -i + 3, i, i + 3), 14 + i, 14 + i)
+    p.setBrush(QColor(t["menu"]))
+    p.setPen(QPen(QColor(*t["edge"][:3], min(255, t["edge"][3] * 2)), 1))
+    p.drawRoundedRect(card.adjusted(0.5, 0.5, -0.5, -0.5), 14, 14)
 
 
 def paint_backdrop(widget: QWidget, over_native: bool = False, mood: QPointF | None = None) -> None:

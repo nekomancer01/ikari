@@ -230,18 +230,25 @@ def test_today_is_never_marked_complete(tmp_path):
 
 
 class SlowClient(FakeClient):
-    """Fetches comments for up to ``workers`` posts at once, each taking a moment, like the real client."""
+    """Fetches comments for up to ``workers`` posts at once, each taking a moment, like the real client.
+
+    The first calls wait (up to 5 s) for ``workers`` of them to be running together. A fixed 30 ms nap let a
+    busy Windows runner start the later threads after the first had finished, so only 2 ever overlapped."""
     workers = 4
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.busy = self.most = 0
-        self.lock = threading.Lock()
+        self.waited = False  # the 5 s ran out once: the rest don't wait
+        self.lock = threading.Condition()
 
     def fetch_comments(self, post, limit):
         with self.lock:
             self.busy += 1
             self.most = max(self.most, self.busy)
+            self.lock.notify_all()
+            if not self.lock.wait_for(lambda: self.most >= self.workers or self.waited, timeout=5):
+                self.waited = True
         time.sleep(0.03)
         try:
             return super().fetch_comments(post, limit)
