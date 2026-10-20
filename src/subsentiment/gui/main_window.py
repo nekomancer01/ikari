@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from datetime import datetime
+from functools import partial
 
 from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QFontMetrics, QGuiApplication, QIcon, QKeySequence
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
 from subsentiment import __version__, collect
 from subsentiment.analysis import Analysis
 from subsentiment.gui import days, motion, native, theme
+from subsentiment.gui.charts import NoteDialog
 from subsentiment.gui.coverage import CoverageWindow
 from subsentiment.gui.fetch_form import FetchForm
 from subsentiment.gui.overview import OverviewPage
@@ -363,6 +365,7 @@ class MainWindow(QMainWindow):
         self.tabbar.currentChanged.connect(self.pages.setCurrentIndex)
         self.tabbar.currentChanged.connect(lambda i: self.scope.setVisible(i == 0))
         self.overview = OverviewPage()
+        self.overview.timeline.note_requested.connect(self._edit_note)
         self.pages.addWidget(self.overview)
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
         self.comments_tab = TablePage(COMMENT_COLUMNS, stretch_col=2)
@@ -761,6 +764,7 @@ class MainWindow(QMainWindow):
                            "comments": self.store.comments(name) if name else []}
             self._refresh_days()
         self._apply_days()
+        self._show_notes()
         self._update_delete_enabled()
         self.coverage_act.setEnabled(bool(self.current))
         if switching and self.pages.currentIndex() == 0:
@@ -815,13 +819,29 @@ class MainWindow(QMainWindow):
         self.overview.show_analysis(a)
         self.mood.set_counts(a.counts["positive"], a.counts["negative"], a.count)
 
+    def _show_notes(self) -> None:
+        self.overview.timeline.set_notes(self.store.notes(self.current) if self.current else {})
+
+    def _edit_note(self, day: int) -> None:
+        """Add, change or remove the note on a day the timeline's dot was clicked on."""
+        if not self.current:
+            return
+        dialog = NoteDialog(day, *self.store.notes(self.current).get(day, ("", "")), parent=self)
+        dialog.chosen.connect(partial(self._save_note, self.current, day))
+        dialog.open()
+
+    def _save_note(self, subreddit: str, day: int, tag: str, text: str) -> None:
+        self.store.save_note(subreddit, day, tag, text)
+        self._show_notes()
+
     def _delete_dataset(self) -> None:
         if not self.current or self.fetch_job.busy:
             return
         if QMessageBox.question(
                 self, "Delete saved data",
                 f"Delete the {len(self._saved['posts']):,} posts and {len(self._saved['comments']):,} comments saved for "
-                f"r/{self.current}? This can't be undone.") != QMessageBox.StandardButton.Yes:
+                f"r/{self.current}{', and its timeline notes' if self.store.notes(self.current) else ''}? "
+                "This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_subreddit(self.current)
         self.settings.remove(days.settings_key(self.current))

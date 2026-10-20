@@ -1,5 +1,6 @@
 """The Overview's timeline chart, driven in the real main window: a dated axis, the range buttons, zooming by
-dragging, the wheel and the navigator strip, the hover box, and how it keeps up with the Days picker."""
+dragging, the wheel and the navigator strip, the hover box, notes on days, and how it keeps up with the Days
+picker."""
 import os
 import time
 from datetime import date, datetime, timezone
@@ -245,3 +246,79 @@ def test_zooming_eases_unless_motion_is_reduced(window, monkeypatch):
     motion.set_enabled(False)  # View > Reduce motion
     QTest.mouseClick(tl.presets["All"], Qt.MouseButton.LeftButton)
     assert not tl._zoom.running() and tl._screen[:2] == (FIRST, LAST_END)
+
+
+def dot(tl, day: float) -> QPoint:
+    """Where the point holding ``day`` is drawn."""
+    plot, _ = tl._areas()
+    lo, hi, _ = tl._screen
+    point = next(g for g in tl.groups(lo, hi, plot.width())[1] if g[0] <= day < g[1])
+    return tl._spot(point, plot).toPoint()
+
+
+def test_clicking_a_days_dot_adds_a_note_shown_on_the_chart_and_in_its_hover_box(window):
+    w = window()
+    tl = w.overview.timeline
+    QTest.mouseClick(tl.presets["1m"], Qt.MouseButton.LeftButton)
+    day = SAVED[-5]
+    QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=dot(tl, day))
+    dialog = w.findChild(charts.NoteDialog)
+    assert dialog.isVisible() and not dialog.save.isEnabled() and tl.view is not None  # no zoom either
+    QTest.keyClicks(dialog.tag, "ABC")
+    QTest.keyClicks(dialog.text, "The big announcement")
+    assert dialog.tag.text() == "AB" and dialog.save.isEnabled()  # two characters at most
+    QTest.mouseClick(dialog.save, Qt.MouseButton.LeftButton)
+    pump(50)
+    assert w.store.notes("python") == {day: ("AB", "The big announcement")}
+    assert tl.notes == {day: ("AB", "The big announcement")}
+    tl.repaint()
+    assert [point[0] for _, point in tl._pills] == [day]  # its label is on the chart
+    QTest.mouseMove(tl, dot(tl, day))
+    assert tl._hover[1] == day and tl.notes_in(*tl._hover[1:3]) == [("AB", "The big announcement")]
+
+    # The label is clickable too, and opens the note as it was; Remove takes it off.
+    pill = tl._pills[0][0]
+    QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=pill.center().toPoint())
+    dialog = w.findChild(charts.NoteDialog)
+    assert (dialog.tag.text(), dialog.text.toPlainText()) == ("AB", "The big announcement")
+    QTest.keyClicks(dialog.text, ", delayed")
+    QTest.mouseClick(dialog.save, Qt.MouseButton.LeftButton)
+    pump(50)
+    assert w.store.notes("python") == {day: ("AB", "The big announcement, delayed")}
+
+    # Kept between sessions, for this subreddit only.
+    w.close()
+    w = window()
+    tl = w.overview.timeline
+    assert tl.notes == {day: ("AB", "The big announcement, delayed")}
+    w._refresh_datasets(select="rust")
+    assert tl.notes == {}
+    w._refresh_datasets(select="Python")
+    QTest.mouseClick(tl.presets["1m"], Qt.MouseButton.LeftButton)
+    QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=dot(tl, day))
+    dialog = w.findChild(charts.NoteDialog)
+    QTest.mouseClick(next(b for b in dialog.findChildren(charts.QPushButton) if b.text() == "Remove"),
+                     Qt.MouseButton.LeftButton)
+    pump(50)
+    assert w.store.notes("python") == {} and tl.notes == {}
+
+
+def test_clicking_a_week_zooms_in_to_its_days_and_shows_its_notes(window, monkeypatch):
+    w = window()
+    tl = w.overview.timeline
+    plot, _ = tl._areas()
+    # A narrower plot's worth of grouping, in font-independent terms: a day under GROUP_PX apart.
+    monkeypatch.setattr(charts, "GROUP_PX", plot.width() / N + 1)
+    tl._grouped.clear()
+    tl._apply(False)
+    unit, weeks = tl.groups(FIRST, LAST_END, plot.width())
+    assert unit == "week"
+    w._save_note("Python", SAVED[30], "A", "first")
+    w._save_note("Python", SAVED[31], "B", "second")
+    week = next(g for g in weeks if g[0] <= SAVED[30] < g[1])
+    assert week[0] <= SAVED[31] < week[1] and tl.notes_in(week[0], week[1]) == [("A", "first"), ("B", "second")]
+    tl.repaint()
+    assert len(tl._pills) == 1  # one label on the week's point
+    QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=dot(tl, SAVED[30]))
+    assert w.findChild(charts.NoteDialog) is None
+    assert tl.view == (week[0], week[1])

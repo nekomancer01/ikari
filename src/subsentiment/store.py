@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS complete (
 CREATE TABLE IF NOT EXISTS removed_posts (
     id TEXT PRIMARY KEY, subreddit TEXT NOT NULL, created_utc REAL  -- subreddit lowercased
 );
+-- The user's notes on the timeline, one per subreddit and UTC day (its start, in epoch seconds): a label of
+-- up to two characters drawn on the chart, and a description shown on hover.
+CREATE TABLE IF NOT EXISTS notes (
+    subreddit TEXT NOT NULL, day INTEGER NOT NULL, label TEXT NOT NULL, text TEXT, saved_at REAL,  -- subreddit lowercased
+    PRIMARY KEY (subreddit, day)
+) WITHOUT ROWID;
 -- (Lookups by subreddit alone use the *_fetched indexes below, which start with it.)
 CREATE INDEX IF NOT EXISTS comments_post ON comments(post_id);
 -- A running fetch's new rows are read back by when they were saved.
@@ -321,12 +327,27 @@ class Store:
             _COMMENT_SELECT + " WHERE c.subreddit = ? COLLATE NOCASE AND " + NOT_IMAGE + " ORDER BY c.created_utc DESC",
             (subreddit,)).fetchall()
 
+    def notes(self, subreddit: str) -> dict[int, tuple[str, str]]:
+        """A subreddit's timeline notes, as {day start: (label, description)}."""
+        return {r["day"]: (r["label"], r["text"] or "") for r in self.db.execute(
+            "SELECT day, label, text FROM notes WHERE subreddit = ?", (subreddit.lower(),))}
+
+    def save_note(self, subreddit: str, day: int, label: str, text: str) -> None:
+        """Set the note on a day, or remove it when the label and description are both empty."""
+        if label or text:
+            self.db.execute("INSERT OR REPLACE INTO notes VALUES (?, ?, ?, ?, ?)",
+                            tuple(map(_storable, (subreddit.lower(), int(day), label, text, time.time()))))
+        else:
+            self.db.execute("DELETE FROM notes WHERE subreddit = ? AND day = ?", (subreddit.lower(), int(day)))
+        self.db.commit()
+
     def delete_subreddit(self, subreddit: str) -> None:
         self.db.execute("DELETE FROM posts WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
         self.db.execute("DELETE FROM comments WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
         self.db.execute("DELETE FROM comment_fetches WHERE post_id NOT IN (SELECT id FROM posts)")
         self.db.execute("DELETE FROM complete WHERE subreddit = ?", (subreddit.lower(),))
         self.db.execute("DELETE FROM removed_posts WHERE subreddit = ?", (subreddit.lower(),))
+        self.db.execute("DELETE FROM notes WHERE subreddit = ?", (subreddit.lower(),))
         self.db.commit()
         self._compact()
 
@@ -336,12 +357,13 @@ class Store:
         self.db.execute("DELETE FROM comment_fetches")
         self.db.execute("DELETE FROM complete")
         self.db.execute("DELETE FROM removed_posts")
+        self.db.execute("DELETE FROM notes")
         self.db.commit()
         self._compact()
 
     def import_from(self, path: str | Path) -> tuple[int, int]:
         """Merge another ikari database into this one: rows this one lacks are added, and a row both have
-        keeps the copy fetched last. Nothing is removed from either file. Returns (new posts, new comments),
+        keeps the copy fetched (or, for a timeline note, saved) last. Nothing is removed from either file. Returns (new posts, new comments),
         image posts and their comments left out as they are everywhere.
         Raises sqlite3.DatabaseError if path isn't an ikari database, ValueError if it is this one,
         FileNotFoundError if there's no file there."""
@@ -372,6 +394,12 @@ class Store:
                         f"INSERT OR REPLACE INTO main.{table} ({cols}) SELECT {cols} FROM other.{table} o "
                         f"WHERE NOT EXISTS (SELECT 1 FROM main.{table} m WHERE m.{key} = o.{key} "
                         f"AND COALESCE(m.fetched_at, 0) >= COALESCE(o.fetched_at, 0))")
+            if "notes" in tables:  # a note on a day both have keeps the one saved last
+                self.db.execute(
+                    "INSERT OR REPLACE INTO main.notes (subreddit, day, label, text, saved_at) "
+                    "SELECT subreddit, day, label, text, saved_at FROM other.notes o WHERE NOT EXISTS (SELECT 1 FROM "
+                    "main.notes m WHERE m.subreddit = o.subreddit AND m.day = o.day "
+                    "AND COALESCE(m.saved_at, 0) >= COALESCE(o.saved_at, 0))")
             for i in range(0, len(imported), 500):
                 ids = imported[i:i + 500]
                 self.db.executemany("UPDATE posts SET image = 1 WHERE id = ?", [

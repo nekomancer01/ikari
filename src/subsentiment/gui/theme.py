@@ -184,6 +184,12 @@ QComboBox[pill="true"] {{ border-radius: 15px; padding: 5px 10px 5px 12px; font-
 QLineEdit:hover, QSpinBox:hover, QComboBox:hover, QDateEdit:hover {{ border-color: {t['faint']}; }}
 QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QComboBox:on, QDateEdit:focus {{ border: 1px solid {t['accent']}; }}
 QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled, QDateEdit:disabled {{ color: {t['faint']}; background: {soft}; }}
+QPlainTextEdit {{
+    background: {panel}; border: 1px solid {edge}; border-radius: 8px; padding: 4px 6px;
+    selection-background-color: {t['accent']}; selection-color: {t['on_accent']};
+}}
+QPlainTextEdit:hover {{ border-color: {t['faint']}; }}
+QPlainTextEdit:focus {{ border: 1px solid {t['accent']}; }}
 QComboBox::drop-down, QDateEdit::drop-down {{ border: none; width: 26px; background: transparent; }}
 QComboBox::down-arrow, QDateEdit::down-arrow {{ image: url("{icons}/{_mode}-down.svg"); width: 12px; height: 12px; }}
 QDateEdit {{ padding-right: 26px; }}
