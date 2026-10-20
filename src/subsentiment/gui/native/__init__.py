@@ -97,3 +97,8 @@ def set_appearance(requested: str) -> None:
 def fallback_color_scheme() -> str | None:
     """"dark"/"light" from desktop settings when Qt can't tell, else None."""
     return linux.color_scheme() if platform_name() == "linux" else None
+
+
+def animations_on() -> bool:
+    """False when the OS asks apps to cut motion (Windows' Animation effects off)."""
+    return windows.animations_on() if platform_name() == "windows" else True

@@ -6,6 +6,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QListWidget, QListWidgetItem, QVBoxLayout, QWidget
 
 from subsentiment.analysis import Analysis
+from subsentiment.gui import motion
 from subsentiment.gui.charts import DistributionChart, TimelineChart
 from subsentiment.gui.widgets import QuietScrollBars, StatTile, VerticalScrollArea, label, panel
 
@@ -63,23 +64,37 @@ class OverviewPage(VerticalScrollArea):
             inner.addWidget(lw)
             extremes.addWidget(card)
         lay.addLayout(extremes, 2)
+        # What fades in, one after another, when another subreddit is shown.
+        self.cards = [*self.tiles.values(), *(self.distribution.parentWidget(), self.timeline.parentWidget()),
+                      *(lw.parentWidget() for lw in (self.most_positive, self.most_negative))]
         self.setWidget(page)
 
     def show_analysis(self, a: Analysis) -> None:
         n = a.count
         pos, neg = a.share("positive"), a.share("negative")
-        self.tiles["count"].set(f"{n:,}")
-        self.tiles["mean"].set(f"{a.mean:+.3f}" if n else "–")
-        self.tiles["positive"].set(f"{100 * pos:.0f}%" if n else "–", pos)
-        self.tiles["negative"].set(f"{100 * neg:.0f}%" if n else "–", neg)
+        # From a number already shown, each tile counts to its new one rather than jumping.
+        self.tiles["count"].set_number(n, lambda v: f"{round(v):,}")
+        if n:
+            self.tiles["mean"].set_number(a.mean, lambda v: f"{v:+.3f}")
+            self.tiles["positive"].set_number(100 * pos, lambda v: f"{v:.0f}%", pos)
+            self.tiles["negative"].set_number(100 * neg, lambda v: f"{v:.0f}%", neg)
+        else:
+            for key in ("mean", "positive", "negative"):
+                self.tiles[key].set("–")
         self.distribution.set_counts(a.counts)
         self.timeline.set_points(a.daily_means)
         for widget, rows in ((self.most_positive, a.most_positive()), (self.most_negative, a.most_negative())):
-            widget.clear()
+            entries = []
             for r in rows:
                 text = r["title"] if "title" in r.keys() else r["body"]
                 text = " ".join((text or "").split())
-                item = QListWidgetItem(f"{r['sentiment']:+.2f}    {text[:140]}")
-                item.setToolTip(text[:1000])
-                item.setData(Qt.ItemDataRole.UserRole, r["permalink"])
+                entries.append((f"{r['sentiment']:+.2f}    {text[:140]}", text[:1000], r["permalink"]))
+            if [e[0] for e in entries] == [widget.item(i).text() for i in range(widget.count())]:
+                continue  # the same items: nothing to redo (a running fetch asks once a second)
+            motion.crossfade(widget.viewport())
+            widget.clear()
+            for shown, tip, link in entries:
+                item = QListWidgetItem(shown)
+                item.setToolTip(tip)
+                item.setData(Qt.ItemDataRole.UserRole, link)
                 widget.addItem(item)

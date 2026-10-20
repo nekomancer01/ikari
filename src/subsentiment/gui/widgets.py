@@ -4,13 +4,15 @@ Nothing here knows about ikari's data; the windows put these together.
 """
 from __future__ import annotations
 
+from typing import Callable
+
 from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QLinearGradient, QPainter
 from PySide6.QtWidgets import (
     QAbstractScrollArea, QComboBox, QFrame, QLabel, QScrollArea, QVBoxLayout, QWidget,
 )
 
-from subsentiment.gui import theme
+from subsentiment.gui import motion, theme
 from subsentiment.gui.charts import palette
 from subsentiment.gui.theme import mark
 
@@ -98,8 +100,11 @@ class StatusLabel(ElidedLabel):
         self.setVisible(False)
 
     def setText(self, text: str) -> None:
+        appearing = bool(text) and not self.isVisible()
         super().setText(text)
         self.setVisible(bool(text))
+        if appearing:
+            motion.fade_in(self)
 
     def text(self) -> str:
         return self.full_text()
@@ -162,12 +167,14 @@ class ShareBar(QWidget):
         self.color_key = color_key
         self.share: float | None = None
         self.complete = False
+        self._drawn = motion.Tween(lambda _: self.update(), self)  # the share on screen, easing to self.share
         self.setFixedHeight(6)
 
-    def set(self, share: float | None, complete: bool = False) -> None:
+    def set(self, share: float | None, complete: bool = False, animate: bool = False) -> None:
+        """With animate, the bar grows or shrinks to its new length instead of jumping there."""
         self.share = None if share is None else max(0.0, min(1.0, share))
         self.complete = complete
-        self.update()
+        self._drawn.set(self.share or 0.0, animate)
 
     def paintEvent(self, event) -> None:
         p = QPainter(self)
@@ -179,9 +186,10 @@ class ShareBar(QWidget):
         track.setAlpha(40)
         p.setBrush(track)
         p.drawRoundedRect(r, 3, 3)
-        if not self.share:
+        share = self._drawn.value
+        if not share:
             return
-        fill = QRectF(r.x(), r.y(), max(r.height(), r.width() * self.share), r.height())
+        fill = QRectF(r.x(), r.y(), max(r.height(), r.width() * share), r.height())
         if self.complete or self.color_key:
             p.setBrush(QColor(palette()["positive" if self.complete else self.color_key]))
         else:
@@ -192,6 +200,41 @@ class ShareBar(QWidget):
         p.drawRoundedRect(fill, 3, 3)
 
 
+class CountingLabel(QLabel):
+    """A number that counts up or down to each new value instead of jumping. text() is the new value at
+    once; only what's drawn counts."""
+
+    def __init__(self, text: str, role: str):
+        super().__init__(text)
+        self.setProperty("role", role)
+        self._final = text
+        self._fmt: Callable[[float], str] = str
+        self._count = motion.Tween(self._draw, self)
+
+    def setText(self, text: str) -> None:
+        """Show text as it is (a dash, a word); the next number starts from there without counting."""
+        self._count.stop()
+        self._count.value = None
+        self._final = text
+        super().setText(text)
+
+    def set_number(self, value: float, fmt: Callable[[float], str]) -> None:
+        self._fmt = fmt
+        self._final = fmt(value)
+        if self._count.value is None:  # was showing text, not a number: no number to count from
+            super().setText(self._final)
+            self._count.value = value
+            self._count.target = value
+            return
+        self._count.set(value)
+
+    def text(self) -> str:
+        return self._final
+
+    def _draw(self, value: float) -> None:
+        super().setText(self._final if value == self._count.target else self._fmt(value))
+
+
 class StatTile(QFrame):
     def __init__(self, caption: str, meter: str | None = None):
         super().__init__()
@@ -199,7 +242,7 @@ class StatTile(QFrame):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 14, 16, 14)
         lay.setSpacing(4)
-        self.value = label("–", "value")
+        self.value = CountingLabel("–", "value")
         lay.addWidget(label(caption.upper(), "section"))
         lay.addWidget(self.value)
         # Tiles without a meter keep an empty slot its size, so every caption and value lines up.
@@ -215,4 +258,10 @@ class StatTile(QFrame):
     def set(self, text: str, share: float | None = None) -> None:
         self.value.setText(text)
         if self.meter is not None:
-            self.meter.set(share or 0.0)
+            self.meter.set(share or 0.0, animate=True)
+
+    def set_number(self, value: float, fmt: Callable[[float], str], share: float | None = None) -> None:
+        """Show a number; from a number already shown it counts to the new one and the meter eases along."""
+        self.value.set_number(value, fmt)
+        if self.meter is not None:
+            self.meter.set(share or 0.0, animate=True)
