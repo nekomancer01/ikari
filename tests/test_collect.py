@@ -294,15 +294,16 @@ D0 = int(T // 86400 * 86400)  # a UTC midnight, long past
 class DayClient(FakeClient):
     """Posts spread over several UTC days; each fetch_posts call returns the ones in its window."""
 
-    def __init__(self, per_day=3, days=4, stop_after=None):
-        super().__init__([Post(f"d{d}p{k}", "Python", "t", "", "a", 5, 0.9, 0, D0 + d * 86400 + 3600 * (k + 1),
-                               "x", "") for d in range(days) for k in range(per_day)])
+    def __init__(self, per_day=3, days=4, stop_after=None, num_comments=0):
+        super().__init__([Post(f"d{d}p{k}", "Python", "t", "", "a", 5, 0.9, num_comments,
+                               D0 + d * 86400 + 3600 * (k + 1), "x", "") for d in range(days) for k in range(per_day)])
         self.windows = []
         self.stop_after = stop_after
 
     def fetch_posts(self, subreddit, after, before, limit, query, top=False, skip=(), progress=None,
                     should_stop=None, on_posts=None, exhaust=False):
         self.windows.append((after, before, limit, exhaust))
+        self.calls.append(("posts", after))
         if progress:
             progress("Collecting posts")
         got = [p for p in self.posts if after <= p.created_utc < before and p.id not in skip][:limit]
@@ -402,3 +403,32 @@ def test_all_comments_asks_again_for_threads_still_growing_and_counts_only_new_c
     again = collect.run(c, s, collect.FetchRequest("python", comments_per_post=0))
     assert [call[1] for call in c.calls if call[0] == "all"] == ["p1"]  # it may have grown, so it's asked again
     assert again.comments == 0  # the same three comments came back: nothing new
+
+
+def test_a_whole_range_gets_each_days_comments_before_the_next_days_posts(tmp_path):
+    # Live on r/AskReddit: a week's fetch read ~31k posts before asking for one comment, so Stop in the first
+    # minutes left none. Now each day's comments follow its posts, newest day first.
+    s = store_with(tmp_path, [])
+    c = DayClient(days=3, num_comments=2)
+    collect.run(c, s, collect.FetchRequest("python", after=D0, before=D0 + 3 * 86400, limit=None))
+    steps = [("posts", (call[1] - D0) // 86400) if call[0] == "posts" else ("comments", int(call[1][1]))
+             for call in c.calls if call[0] in ("posts", "comments")]
+    assert steps == [step for d in (2, 1, 0) for step in [("posts", d)] + [("comments", d)] * 3]
+
+
+def test_stopping_after_a_day_keeps_its_comments(tmp_path):
+    s = store_with(tmp_path, [])
+    c = DayClient(days=3, num_comments=2)
+    stop = threading.Event()
+    real = c.fetch_comments
+
+    def fetch_comments(post, limit):
+        got = real(post, limit)
+        if post.id == "d2p2":  # the newest day's last post: Stop pressed as its comments come in
+            stop.set()
+        return got
+    c.fetch_comments = fetch_comments
+    result = collect.run(c, s, collect.FetchRequest("python", after=D0, before=D0 + 3 * 86400, limit=None),
+                         should_stop=stop.is_set)
+    assert result.stopped and len(c.windows) == 1
+    assert {r["post_id"] for r in s.comments("python")} == {"d2p0", "d2p1", "d2p2"}
