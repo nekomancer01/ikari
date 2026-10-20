@@ -234,6 +234,17 @@ def test_removed_posts_are_skipped_and_removed_bodies_blanked():
     assert set(c.removed) == {"p1", "p3"}  # noted, so coverage can count them as checked
 
 
+def test_image_posts_are_skipped_without_using_up_the_limit_and_noted():
+    items = [post(1, url="https://i.redd.it/a.jpeg", post_hint="image"), post(2, url="https://www.reddit.com/gallery/g", is_gallery=True),
+             post(3, url="https://i.redd.it/b.jpeg", selftext="my desk, details below"), post(4), post(5)]
+    c = archive(items)
+    posts = c.fetch_posts("python", after=NOW - DAY, before=NOW + 1, limit=3)
+    assert sorted(p.id for p in posts) == ["p3", "p4", "p5"]  # the two image posts didn't count toward 3
+    assert sorted(p.id for p in c.take_images()) == ["p1", "p2"] and c.take_images() == []
+    c.fetch_posts("python", after=NOW - DAY, before=NOW + 1, limit=10, skip={"p1", "p2"})
+    assert c.take_images() == []  # already saved image posts aren't noted again
+
+
 def test_posts_by_id_are_fetched_in_batches_of_500():
     items = [at(T0 + i, i) for i in range(1200)]
     c = archive(items)
