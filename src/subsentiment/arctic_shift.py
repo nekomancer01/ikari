@@ -53,6 +53,7 @@ WORKERS = 4  # requests in flight at once. The limiter still spaces out when eac
              # overlaps the second or two each spends waiting on the archive
 TIMEOUT_TRIES = 3  # query timeouts on one request before the caller is asked to narrow it
 MIN_WINDOW = 600  # seconds; a timing-out window is halved down to this
+MAX_SKIPS = 2  # windows that still time out at MIN_WINDOW skipped in a row before the fetch gives up
 TREE_LIMIT = 300  # comments asked for per thread; big trees are slow for the archive and trip its limits
 TREE_MAX = 25000  # the most comments the tree endpoint returns in one request
 UNKNOWN_THREAD = 1000  # what fetch_all_comments asks for when a post's comment count isn't known yet
@@ -472,6 +473,7 @@ class ArcticShiftClient:
         out: list[Post] = []
         seen: set[str] = set()
         cursor = lo - 1  # `after` is exclusive; this way a post right on the slice's start isn't lost
+        skipped = 0  # windows skipped in a row
         for _ in range(SLOT_PAGES):
             # A few spare for removed posts; a full page when saved posts may need skipping. Once the
             # archive has timed out on a big page, this fetch keeps to the smaller size that worked.
@@ -480,12 +482,18 @@ class ArcticShiftClient:
                 page, end, sent = self._page(base, cursor, hi, size)
             except Stopped:
                 return out, cursor, True
-            except QueryTimeout:  # even the narrowest window: skip it, and say the range wasn't all read
+            except QueryTimeout:
+                # Even the narrowest window: skip it and say the range wasn't all read. Not for a keyword
+                # search, which times out whatever the window, nor when nothing near it answers either.
+                skipped += 1
+                if "query" in base or skipped > MAX_SKIPS:
+                    raise
                 self.timed_out = True
                 cursor += MIN_WINDOW
                 if cursor >= hi - 1:
                     return out, cursor, False
                 continue
+            skipped = 0
             if sent < size:
                 self._page_cap = sent
             size = sent  # a page shrunk after a timeout is full at this size, not at the size asked for
