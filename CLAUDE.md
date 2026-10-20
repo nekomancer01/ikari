@@ -37,5 +37,5 @@ archive and scores sentiment offline. The owner runs current `main` from source 
 ## Repo facts
 - Commit author: `nekomancer01 <5332082+nekomancer01@users.noreply.github.com>`.
 - Never rename storage identifiers (data folder, QSettings names); users' data depends on them.
-- Windows-only CI; Mac/Linux jobs stay behind the manual `all_platforms` input with their code intact.
+- CI and releases cover Windows and Linux ("Windows tests" is the only required check; "Linux tests" is not); macOS jobs stay behind the manual `all_platforms` input with their code intact.
 - Releases: bump `__version__` in a PR, then tag `v<version>` on `main`.

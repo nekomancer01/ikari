@@ -114,9 +114,86 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
             store.mark_complete("posts", name, str(int(after)))
         return got
 
+    # 3. Comments: for new posts, for saved ones whose scores just settled (their comment scores have
+    #    too), and for saved posts whose comments were never fetched or failed last time. A post whose
+    #    comments came back fine, even if there were none, isn't asked about again. Asked for all comments,
+    #    every saved post in the range is, until its whole thread is saved (as Download all comments does).
+    n_comments = errors = 0
+    everything = not req.comments_per_post
+    saved_whole = store.complete_keys("comments", name) if everything and req.include_comments else set()
+    gave_up = False  # the archive kept failing comment requests; the rest are left for the next fetch
+
+    def comments(picked: list[Post], updated: list[Post], in_part: Callable[[str], bool], report) -> None:
+        """Comments for one part of the fetch: its new and re-checked posts, and its saved posts as above.
+        ``in_part`` says whether a saved post's id belongs to this part."""
+        nonlocal n_comments, errors, gave_up
+        if not req.include_comments or should_stop():
+            return
+        refreshed = {p.id for p in updated}
+        repicked = {p.id for p in picked if p.id in stored}  # top mode can pick posts that are already saved
+        todo = [p for p in picked if p.id not in stored] + updated + [
+            _stored_post(r) for pid, r in stored.items()
+            if in_part(pid) and pid not in refreshed and (
+                _comments_missing(r) or (pid in repicked and _never_asked(r))
+                or (everything and pid not in saved_whole))]
+        todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up
+        if gave_up:
+            tried: set[str] = set()
+        else:
+            def save(p: Post, got) -> None:
+                nonlocal n_comments
+                comments, complete = got if everything else (got, False)
+                had = store.comment_ids(p.id)  # a thread asked for again: count only what's new
+                for c in comments:
+                    store.save_comment(c, *sentiment.score(c.body))
+                    n_comments += c.id not in had
+                store.mark_comments(p.id, ok=True, settled=p.score is not None)
+                if complete:  # an unsettled thread may still be growing, so it's whole only "so far"
+                    store.mark_complete("comments" if p.score is not None else "comments_so_far", name, p.id)
+                store.commit()
+                if comments:
+                    saved()
+
+            get = (client.fetch_all_comments if everything
+                   else lambda p: client.fetch_comments(p, req.comments_per_post))
+            failed, tried, gave_up = _each_thread(
+                todo, get, save, "All comments for post" if everything else "Comments for post",
+                store, getattr(client, "workers", 1), report, should_stop)
+            errors += failed
+        if gave_up:
+            rest = [p for p in todo if p.id not in tried]  # not tried this time: retried on the next fetch
+            errors += len(rest)
+            for p in rest:
+                store.mark_comments(p.id, ok=False, settled=False)
+            store.commit()
+        if todo:
+            report(len(todo), len(todo), "Done")
+
+    def settle(picked: list[Post]) -> tuple[list[Post], list[Post]]:
+        """Saves what a part's read picked that the stream didn't, and returns (new, settled): top mode can
+        pick a saved post whose score has come in since, and that settled copy is kept (it used to be dropped,
+        leaving the score blank unless "Update saved posts" was ticked)."""
+        new = [p for p in picked if p.id not in stored]
+        for p in new:
+            if p.id not in streamed:
+                store.save_post(p, *sentiment.score(p.text))
+        settled = [p for p in picked if p.id in stored and p.id not in rechecked
+                   and stored[p.id]["score"] is None and p.score is not None]
+        for p in settled:
+            store.save_post(p, *sentiment.score(p.text))
+        store.commit()
+        saved()
+        return new, settled
+
+    rechecked = {p.id for p in updated}
+    picked: list[Post] = []
+    new: list[Post] = []
+    settled: list[Post] = []
     if req.limit is None:
-        picked = []
+        # A day at a time, newest first: each day's posts, then their comments, so a long fetch fills in as
+        # it goes and Stop keeps whole days.
         days = _days(name, store, req.after, req.before)
+        seen: set[str] = set()  # saved posts on the days read, whose comments those days took care of
         for k, (lo, hi) in enumerate(days):
             if should_stop():
                 break
@@ -126,73 +203,31 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
             def say(_msg, k=k, when=when):
                 # Short, as the window shows one line: the bar counts days, this says which and how many.
                 progress(k, len(days), f"Day {k + 1} of {len(days)}, {when}: {len(streamed):,} new posts")
+
+            def report(done, total, _msg, k=k, when=when):
+                progress(k, len(days), f"Day {k + 1} of {len(days)}, {when}: comments on {done:,} of "
+                                       f"{total:,} posts")
             say("")
-            saved_that_day = [pid for pid, r in stored.items() if lo <= (r["created_utc"] or 0) < hi]
-            picked += read(lo, hi, MAX_DAY_POSTS, True, say, whole_day=whole, skip=saved_that_day)
+            in_day = {pid for pid, r in stored.items() if lo <= (r["created_utc"] or 0) < hi}
+            seen |= in_day
+            got = read(lo, hi, MAX_DAY_POSTS, True, say, whole_day=whole, skip=in_day)
+            day_new, day_settled = settle(got)
+            picked += got
+            new += day_new
+            settled += day_settled
+            day_updated = [p for p in updated if lo <= p.created_utc < hi] + day_settled
+            comments(got, day_updated, in_day.__contains__, report)
+        # Days already downloaded in full aren't read again, but their saved posts can still be owed comments.
+        comments([], [p for p in updated if p.id not in seen], lambda pid: pid not in seen, progress)
         if days:
             progress(len(days), len(days), f"{len(streamed):,} new posts from r/{name}")
     else:
         picked = read(req.after, req.before, req.limit, req.everything, note)
-    new = [p for p in picked if p.id not in stored]
-    for p in new:
-        if p.id not in streamed:
-            store.save_post(p, *sentiment.score(p.text))
-    # Top mode can pick a saved post whose score has come in since: it downloaded the settled copy, so
-    # keep it (it used to be dropped, leaving the score blank unless "Update saved posts" was ticked).
-    rechecked = {p.id for p in updated}
-    settled = [p for p in picked if p.id in stored and p.id not in rechecked
-               and stored[p.id]["score"] is None and p.score is not None]
-    for p in settled:
-        store.save_post(p, *sentiment.score(p.text))
+        new, settled = settle(picked)
+        comments(picked, updated + settled, lambda pid: True, progress)
     updated += settled
-    store.commit()
-    saved()
     first = (new or updated or picked or [None])[0]
     subreddit = first.subreddit if first else name  # canonical capitalisation from Reddit
-
-    # 3. Comments: for new posts, for saved ones whose scores just settled (their comment scores have
-    #    too), and for saved posts whose comments were never fetched or failed last time. A post whose
-    #    comments came back fine, even if there were none, isn't asked about again. Asked for all comments,
-    #    every saved post in the range is, until its whole thread is saved (as Download all comments does).
-    n_comments = errors = 0
-    everything = not req.comments_per_post
-    if req.include_comments and not should_stop():
-        refreshed = {p.id for p in updated}
-        repicked = {p.id for p in picked if p.id in stored}  # top mode can pick posts that are already saved
-        saved_whole = store.complete_keys("comments", name) if everything else set()
-        todo = new + updated + [_stored_post(r) for pid, r in stored.items()
-                                if pid not in refreshed and (_comments_missing(r)
-                                                             or (pid in repicked and _never_asked(r))
-                                                             or (everything and pid not in saved_whole))]
-        todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up
-
-        def save(p: Post, got) -> None:
-            nonlocal n_comments
-            comments, complete = got if everything else (got, False)
-            had = store.comment_ids(p.id)  # a thread asked for again: count only what's new
-            for c in comments:
-                store.save_comment(c, *sentiment.score(c.body))
-                n_comments += c.id not in had
-            store.mark_comments(p.id, ok=True, settled=p.score is not None)
-            if complete:  # an unsettled thread may still be growing, so it's whole only "so far"
-                store.mark_complete("comments" if p.score is not None else "comments_so_far", name, p.id)
-            store.commit()
-            if comments:
-                saved()
-
-        get = (client.fetch_all_comments if everything
-               else lambda p: client.fetch_comments(p, req.comments_per_post))
-        errors, tried, gave_up = _each_thread(
-            todo, get, save, "All comments for post" if everything else "Comments for post",
-            store, getattr(client, "workers", 1), progress, should_stop)
-        if gave_up:
-            rest = [p for p in todo if p.id not in tried]  # not tried this time: retried on the next fetch
-            errors += len(rest)
-            for p in rest:
-                store.mark_comments(p.id, ok=False, settled=False)
-            store.commit()
-        if todo:
-            progress(len(todo), len(todo), "Done")
     return FetchResult(subreddit, len(new), n_comments, should_stop(), updated=len(updated),
                        already=len(picked) - len(new) - len(settled), comment_errors=errors,
                        timed_out=bool(getattr(client, "timed_out", False)))
@@ -267,6 +302,8 @@ def _each_thread(posts: list[Post], get: Callable, save: Callable, what: str, st
 
     tried: set[str] = set()
     errors = 0
+    if posts:  # say what it's waiting on now, not only once the first thread is in
+        progress(0, len(posts), f"{what} 0/{len(posts)}")
     for p, got, error in in_parallel(fetch, posts, workers, should_stop):
         if got is None and error is None:
             continue
