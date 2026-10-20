@@ -31,8 +31,8 @@ UNKNOWN_DAY_POSTS = 2000  # what a day's "Download all" asks for when the archiv
 SLACK = 25  # extra posts asked for beyond the count, in case it lags the archive
 
 NOTE = ("Totals come from Arctic Shift and include posts and comments later removed from Reddit, which ikari "
-        "skips, so some days and threads stop short of 100%. A check mark means everything the archive still "
-        "has is saved. Days are UTC. A day's Download all fetches its posts only; comments download only from the "
+        "can't save. A day's share counts the removed posts ikari has seen as checked, and a thread can stop short "
+        "of 100%. A check mark means everything the archive still has is saved. Days are UTC. A day's Download all fetches its posts only; comments download only from the "
         "buttons on the right.")
 
 
@@ -74,13 +74,22 @@ def no_total(day: int, saved: int, total: int | None, complete: bool) -> bool:
     return not complete and total is not None and total < saved
 
 
-def share_text(saved: int, total: int | None, complete: bool, noun: str) -> tuple[str, str, float | None, str]:
-    """(main text, side text, share 0..1 or None, tooltip) for one coverage cell."""
+def share_text(saved: int, total: int | None, complete: bool, noun: str,
+               removed: int = 0) -> tuple[str, str, float | None, str]:
+    """(main text, side text, share 0..1 or None, tooltip) for one coverage cell. ``removed`` is how many
+    of the archive's items ikari has seen were removed from Reddit: the archive's count includes them but
+    they can't be saved, so they count as checked."""
     if complete:
         tip = f"All {plural(saved, noun)} the archive still has are saved."
         if total is not None and total > saved:
             tip += f" Its count of {total:,} includes ones removed from Reddit."
         return f"{saved:,} saved", "✓ Complete", 1.0, tip
+    if removed and total:
+        checked = saved + removed
+        share = min(1.0, checked / total)
+        tip = (f"Arctic Shift counts {plural(total, noun)} here. ikari has checked {min(checked, total):,} of "
+               f"them: {saved:,} saved and {removed:,} removed from Reddit, which can't be saved.")
+        return f"{saved:,} saved", f"{100 * share:.0f}%", share, tip
     if total is None:
         return f"{saved:,} saved", "total unknown", None, "The archive hasn't counted these yet."
     if total == 0 and saved == 0:
@@ -172,8 +181,8 @@ class Cell(QWidget):
                         "Arctic Shift's count for this day is still filling in, so there's no total yet. "
                         "Download all fetches everything posted that day.")
 
-    def set(self, saved: int, total: int | None, complete: bool, noun: str) -> None:
-        main, side, share, tip = share_text(saved, total, complete, noun)
+    def set(self, saved: int, total: int | None, complete: bool, noun: str, removed: int = 0) -> None:
+        main, side, share, tip = share_text(saved, total, complete, noun, removed)
         self.bar.setVisible(True)
         self.note.setVisible(False)
         self._pad(open_day=False)
@@ -418,6 +427,7 @@ class CoverageWindow(QDialog):
     def _fill_days(self, totals: dict[int, int], rebuild: bool) -> None:
         store = self.window_.store
         saved = store.posts_per_day(self.subreddit, self.days[-1], self.days[0] + DAY)
+        removed = store.removed_per_day(self.subreddit, self.days[-1], self.days[0] + DAY)
         complete = store.complete_keys("posts", self.subreddit)
         t = self.day_table
         if rebuild or self._day_rows != self.days:
@@ -448,15 +458,17 @@ class CoverageWindow(QDialog):
                 button.setToolTip("Fetch everything posted today so far" if day >= current
                                   else f"Fetch every post from {day_text(day)}")
                 continue
-            cell.set(n, total, done, "post")
+            gone = removed.get(day, 0)
+            cell.set(n, total, done, "post", gone)
             if total is None and counting and not done:
                 cell.side.setText("counting…")
-            full = done or (total is not None and 0 < total <= n)
+            full = done or (total is not None and 0 < total <= n + gone)
             button.setText("Check again" if full else "Download all")
             button.setEnabled(not self.busy and not (total == 0 and not done and day < self.days[0]))
             button.setToolTip(
                 "Look for posts the archive has added since" if full else
-                f"Fetch every post from {day_text(day)}" + (f" ({total - n:,} more)" if total and total > n else ""))
+                f"Fetch every post from {day_text(day)}"
+                + (f" (up to {total - n - gone:,} more)" if total and total > n + gone else ""))
 
     def _selected_day(self) -> int | None:
         rows = self.day_table.selectionModel().selectedRows() if self.day_table.selectionModel() else []
@@ -582,11 +594,13 @@ class CoverageWindow(QDialog):
         if not self.subreddit:
             return
         total = self.totals.get(self.subreddit.lower(), {}).get(day)
-        have = self.window_.store.posts_per_day(self.subreddit, day, day + DAY).get(day, 0)
+        store = self.window_.store
+        have = store.posts_per_day(self.subreddit, day, day + DAY).get(day, 0)
+        gone = store.removed_per_day(self.subreddit, day, day + DAY).get(day, 0)
         if no_total(day, have, total, False):  # no total to go by, so take everything there is
             limit = MAX_DAY_POSTS
         else:
-            limit = UNKNOWN_DAY_POSTS if total is None else max(total - have, 0) + SLACK
+            limit = UNKNOWN_DAY_POSTS if total is None else max(total - have - gone, 0) + SLACK
         # Posts only: comments are fetched from the posts list, one post or one day at a time, when asked.
         req = collect.FetchRequest(subreddit=self.subreddit, after=day, before=day + DAY,
                                    limit=min(limit, MAX_DAY_POSTS), include_comments=False, everything=True)

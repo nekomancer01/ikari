@@ -224,8 +224,10 @@ def test_query_is_passed_through():
 def test_removed_posts_are_skipped_and_removed_bodies_blanked():
     items = [post(1, removed_by_category="moderator"), post(2, selftext="[removed]"),
              post(3, _meta={"retrieved_2nd_on": NOW, "removal_type": "moderator", "was_deleted_later": True})]
-    posts = archive(items).fetch_posts("python", after=NOW - DAY, before=NOW + 1)
+    c = archive(items)
+    posts = c.fetch_posts("python", after=NOW - DAY, before=NOW + 1)
     assert [p.id for p in posts] == ["p2"] and posts[0].selftext == ""
+    assert set(c.removed) == {"p1", "p3"}  # noted, so coverage can count them as checked
 
 
 def test_posts_by_id_are_fetched_in_batches_of_500():

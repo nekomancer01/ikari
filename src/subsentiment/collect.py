@@ -89,6 +89,10 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     picked = client.fetch_posts(name, req.after, req.before, req.limit, req.query, top=req.top,
                                 skip=() if req.top else stored.keys(),
                                 progress=note, should_stop=should_stop, on_posts=save_streamed)
+    removed = getattr(client, "removed", None)
+    if removed:  # the archive's daily counts include these, so Download coverage counts them as checked
+        store.save_removed(name, removed)
+        removed.clear()
     new = [p for p in picked if p.id not in stored]
     for p in new:
         if p.id not in streamed:
