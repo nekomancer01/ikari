@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -22,6 +23,7 @@ from subsentiment.gui import coverage  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import worker  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
+from subsentiment import store as store_mod  # noqa: E402
 
 from fake_archive import DAY, FakeArchive, make_posts  # noqa: E402
 
@@ -102,7 +104,7 @@ def in_range(env, w, sub="Python") -> int:
                 and not p.get("removed_by_category")])
 
 
-def fetch(w, sub="python", comments=True, rng="week", **extra):
+def fetch(w, sub="python", comments=True, rng="week", timeout: float = 30, **extra):
     """A fetch from the sidebar, which downloads every post in the range."""
     w.fetch_form.subreddit.setText(sub)
     w.fetch_form.include_comments.setChecked(comments)
@@ -110,7 +112,7 @@ def fetch(w, sub="python", comments=True, rng="week", **extra):
     for key, value in extra.items():
         getattr(w.fetch_form, key).setChecked(value)
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
-    wait_idle(w)
+    wait_idle(w, timeout)
 
 
 def test_starting_and_browsing_never_downloads_anything(env):
@@ -408,7 +410,12 @@ def test_closing_mid_fetch_leaves_the_fetch_alone(env, monkeypatch):
     env.archive.delays[IDS] = 4
     # The sidebar no longer ranks posts; the client still can, so the ranked fetch is started directly.
     w.start_request(mw.collect.FetchRequest("python", top=True), "Ranking posts…")
-    pump(1500)
+    # Close once that download is out: a fixed wait could close before it on a busy runner, and then Stop
+    # had nothing left to wait for.
+    end = time.monotonic() + 20
+    while IDS not in env.archive.paths():
+        assert time.monotonic() < end, "the ranked picks were never asked for"
+        pump(20)
     w.close()
     assert w.running_threads(), "app.main ends the process instead of destroying this thread"
     end = time.monotonic() + 20
@@ -585,6 +592,9 @@ def test_rows_keep_fading_in_while_comments_are_saved_quickly(env):
 def test_a_big_download_reads_each_new_row_back_about_once(env, monkeypatch):
     # Every saved row used to re-read all of the fetch's rows so far, which froze the window on a day's
     # Download all (thousands of posts and comments).
+    # Saved on a clock that moves in 15.6 ms steps, as Windows' does: a thread's comments saved together
+    # shared one time, and each read got the whole batch back again (failed on Windows CI).
+    monkeypatch.setattr(store_mod, "time", types.SimpleNamespace(time=lambda: int(time.time() * 64) / 64))
     w = env.window()
     fetch(w, comments=False)
     read = []
@@ -728,7 +738,9 @@ def test_coverage_stays_responsive_while_a_busy_day_downloads(env):
     # A day with 1,500 posts used to rebuild 4,500 widgets on every refresh: 2-3 s frozen each time.
     day = busy_day(env, "bigday", 1500)
     w = env.window()
-    fetch(w, sub="bigday", comments=False)
+    # Saving the 1,500 posts first takes about 3 s here and went past 30 s once on a loaded Windows runner;
+    # this test times the Download all below, not this.
+    fetch(w, sub="bigday", comments=False, timeout=120)
     cov = open_coverage(w)
     row = cov.days.index(day)
     cov.day_table.selectRow(row)

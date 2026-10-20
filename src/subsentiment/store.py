@@ -104,6 +104,14 @@ class Store:
                 (r["id"],) for r in self.db.execute("SELECT id, url, selftext FROM posts")
                 if is_image_post(r["url"], r["selftext"])])
             self.db.commit()
+        self._stamp = 0.0
+
+    def _saved_at(self) -> float:
+        """Now, as ``fetched_at``, later than every row this store saved before. Windows' clock moves in
+        15.6 ms steps, so a thread's comments saved together all had one time, and every read of what a
+        fetch added since the last row (``posts_since``) got the whole batch back again."""
+        self._stamp = max(time.time(), self._stamp + 1e-6)
+        return self._stamp
 
     def close(self) -> None:
         # Copy what's committed into the main file now, so a process ended right after (see gui.app.end_now)
@@ -117,14 +125,14 @@ class Store:
     def save_post(self, post: Post, sentiment: float, label: str) -> None:
         values = (post.id, post.subreddit, post.title, post.selftext, post.author, post.score,
                   post.upvote_ratio, post.num_comments, post.created_utc, post.permalink, post.url,
-                  sentiment, label, time.time(), int(post.image))
+                  sentiment, label, self._saved_at(), int(post.image))
         values = tuple(map(_storable, values))
         self.db.execute(f"INSERT OR REPLACE INTO posts ({','.join(POST_COLUMNS)}, image) "
                         f"VALUES ({','.join('?' * len(values))})", values)
 
     def save_comment(self, c: Comment, sentiment: float, label: str) -> None:
         values = (c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score,
-                  c.created_utc, c.depth, c.permalink, sentiment, label, time.time())
+                  c.created_utc, c.depth, c.permalink, sentiment, label, self._saved_at())
         values = tuple(map(_storable, values))
         self.db.execute(f"INSERT OR REPLACE INTO comments VALUES ({','.join('?' * len(values))})", values)
 
