@@ -175,9 +175,10 @@ def test_the_fetch_drawer_closes_as_a_fetch_starts_and_the_header_follows_it(env
     assert not w.fetch_strip.isVisible()
 
 
-def test_the_strip_says_what_the_fetch_is_doing_again_once_a_wait_for_arctic_shift_is_over(env, monkeypatch):
-    # The archive times a search out twice, so ikari waits 4 s (announced), then asks again and the answer
-    # takes a while. The strip used to say "Waiting 4 s" all that time, until a whole slice of the day was in.
+def test_the_strip_keeps_saying_what_the_fetch_is_doing_while_a_search_waits_out_timeouts(env, monkeypatch):
+    # The archive times a search out twice, then answers slowly. Each timeout used to hold back every request
+    # and put "Arctic Shift is slow right now. Waiting 4 s…" in the strip, over and over, while nothing saved.
+    # Now only the search that timed out waits, so the strip goes on saying which day is downloading.
     monkeypatch.setattr(arctic_shift, "MAX_WAIT", 5.0)
     w = env.window()
     env.archive.fail(SEARCH, *[SLOW_DOWN] * 8)
@@ -187,17 +188,16 @@ def test_the_strip_says_what_the_fetch_is_doing_again_once_a_wait_for_arctic_shi
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("day"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     end = time.monotonic() + 30
-    while "Waiting 4 s" not in w.progress_msg.text():
-        assert w.fetch_job.busy and time.monotonic() < end, "no announced wait"
+    said = set()
+    while len(env.archive.faults[SEARCH]) > 0 or len(env.archive.paths()) < 10:  # the timeouts, then answers
+        assert w.fetch_job.busy and time.monotonic() < end, "the timeouts were never waited out"
+        said.add(w.progress_msg.text())
         pump(5)
-    asked = len(env.archive.paths())
-    while len(env.archive.paths()) == asked:  # every search waits on the same pause: the next one ends it
-        assert time.monotonic() < end, "the wait never ended"
-        pump(5)
-    pump(300)  # the search asked again is still out (1.5 s)
+    pump(300)  # a search asked again is still out (1.5 s)
+    said.add(w.progress_msg.text())
+    assert not [m for m in said if "Waiting" in m or "slow" in m], said
     assert w.progress_msg.text().startswith("Day "), w.progress_msg.text()
     env.archive.delays.clear()
-    env.archive.faults.clear()
     wait_idle(w)
     assert "Added" in w.progress_msg.text()
 
