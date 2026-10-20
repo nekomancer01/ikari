@@ -385,6 +385,42 @@ def test_bundled_fonts_are_weights_of_the_families_the_theme_asks_for():
         assert wanted in families, f"{path.name} registers as {families}, not as a weight of {wanted}"
 
 
+@pytest.mark.parametrize("counts", [(65_432, 412_837, 98_765), (1_234_567, 7_654_321, 2_345_678)])
+def test_the_distribution_shows_big_counts_whole(counts):
+    """The count column must fit the count as painted. It was sized from the display font alone, but
+    painting adds the app font's tabular figures, which are wider, so "4,137" was drawn as ",137"."""
+    from PySide6.QtGui import QColor, QFontMetricsF, QPainter
+
+    from subsentiment.gui import motion, theme
+    from subsentiment.gui.charts import DistributionChart
+    app = QApplication.instance() or QApplication([])
+    before = app.font()
+    theme.load_fonts(app)
+    theme.apply(app, "light")
+    motion.set_enabled(False)
+    try:
+        chart = DistributionChart()
+        chart.resize(520, 330)
+        chart.set_counts(dict(zip(DistributionChart.CATEGORIES, counts)))
+        image = chart.grab().toImage()
+        dpr = image.devicePixelRatio()
+        p = QPainter(image)
+        p.setFont(theme.display_font(chart.font().pointSizeF() + 0.5, 600))
+        metrics = QFontMetricsF(p.fontMetrics())
+        p.end()
+        _, rows = chart._layout()
+        for n, row in zip(counts, rows):
+            # Count ink is the near-black gray right of the middle: names are on the left, shares muted, bars colored.
+            ys = range(int(row.top() * dpr) + 2, int(row.bottom() * dpr) - 2)
+            ink = [x for x in range(image.width() // 2, image.width())
+                   if any((c := QColor.fromRgba(image.pixel(x, y))).alpha() > 200 and c.lightness() < 80 and c.hslSaturation() < 40 for y in ys)]
+            assert ink, f"{n:,} not drawn"
+            assert (ink[-1] - ink[0] + 1) / dpr >= metrics.horizontalAdvance(f"{n:,}") - 4, f"{n:,} is cut off"
+    finally:
+        motion.set_enabled(True)
+        app.setFont(before)
+
+
 def test_date_popup_shows_whole_month_and_picks_a_day(make_window):
     """The From field's calendar pops up as a card holding all six weeks (the stock one cut the last row
     off), and clicking a day picks it and switches to custom dates."""
