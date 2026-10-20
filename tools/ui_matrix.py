@@ -222,15 +222,15 @@ def alignment(window) -> list[str]:
     # The content column: heading, subtitle and the page below share a left edge; tabs end at its right.
     page = window.pages.currentWidget()
     if window.tabbar.currentIndex() == 0:
-        tiles = list(window.tiles.values())
+        tiles = list(window.overview.tiles.values())
         body = [_rect(t, window) for t in tiles]
         _same(problems, "content left edges", {"heading": _rect(window.heading, window).left(),
                                                 "subtitle": _rect(window.subheading, window).left(),
                                                 "first tile": body[0].left()})
         _same(problems, "tile widths", {t.findChild(QLabel).text(): t.width() for t in tiles})
         _same(problems, "tile tops", {t.findChild(QLabel).text(): _rect(t, window).top() for t in tiles})
-        cards = [_rect(c.parentWidget(), window) for c in (window.distribution, window.timeline,
-                                                         window.most_positive, window.most_negative)]
+        o = window.overview
+        cards = [_rect(c.parentWidget(), window) for c in (o.distribution, o.timeline, o.most_positive, o.most_negative)]
         _same(problems, "overview left edges", {"tiles": body[0].left(), "charts": cards[0].left(),
                                                  "lists": cards[2].left()})
         _same(problems, "overview right edges", {"tiles": body[-1].right(), "charts": cards[1].right(),
@@ -334,7 +334,7 @@ def child(spec: dict) -> int:
     from PySide6.QtCore import QRect, QSettings, QSize
     from PySide6.QtWidgets import QApplication
 
-    from subsentiment.gui import coverage, main_window, native, theme
+    from subsentiment.gui import coverage, main_window, native, theme, widgets
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import screenshot  # noqa: E402  (seeds the sample data)
@@ -411,7 +411,7 @@ def child(spec: dict) -> int:
         return found
 
     results = []
-    minimum, sizes = sizes_for(window, main_window.fit_to_screen(QSize(1320, 860), Free(fw, fh)))
+    minimum, sizes = sizes_for(window, widgets.fit_to_screen(QSize(1320, 860), Free(fw, fh)))
     for state, w, h in sizes:
         for tab in ([0, 1, 2] if state in ("restored", "maximized") else [0]):
             window.tabbar.setCurrentIndex(tab)
@@ -450,7 +450,7 @@ def child(spec: dict) -> int:
                         "problems": ["the Download coverage window didn't open"]})
     else:
         dialog.day_table.selectRow(0)
-        cov_min, cov_sizes = sizes_for(dialog, main_window.fit_to_screen(QSize(1120, 720), Free(fw, fh)))
+        cov_min, cov_sizes = sizes_for(dialog, widgets.fit_to_screen(QSize(1120, 720), Free(fw, fh)))
         for state, w, h in cov_sizes:
             results.append(measure(dialog, w, h, f"coverage {state}", lambda: coverage_alignment(dialog)))
         dialog.close()

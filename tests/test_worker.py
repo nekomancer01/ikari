@@ -93,3 +93,39 @@ def test_a_database_that_cant_be_opened_fails_the_fetch_instead_of_hanging_it(tm
     w.failed.connect(events["failed"].append)
     w.run()
     assert events["finished"] == [] and len(events["failed"]) == 1
+
+
+def test_a_background_job_runs_its_worker_off_the_gui_thread_and_tidies_up():
+    import threading
+    import time
+    from PySide6.QtCore import QObject, Signal, Slot
+    from PySide6.QtWidgets import QApplication
+
+    # A QApplication, not a QCoreApplication: the first app made in a process is the one every later test
+    # gets, and a window built on a QCoreApplication aborts the whole test run.
+    app = QApplication.instance() or QApplication([])
+
+    class Worker(QObject):
+        finished = Signal(object)
+        failed = Signal(str)
+        ran_on = None
+
+        @Slot()
+        def run(self):
+            Worker.ran_on = threading.current_thread()
+            self.finished.emit(None)
+
+        def stop(self):
+            pass
+
+    job = worker_mod.BackgroundJob()
+    ended = []
+    job.ended.connect(lambda: ended.append(True))
+    job.start(Worker())
+    assert job.busy
+    end = time.monotonic() + 5
+    while not ended and time.monotonic() < end:
+        app.processEvents()
+        time.sleep(0.01)
+    assert ended and not job.busy and not job.running()
+    assert Worker.ran_on is not threading.main_thread()

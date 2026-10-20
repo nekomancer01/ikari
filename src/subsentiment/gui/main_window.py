@@ -1,31 +1,34 @@
 from __future__ import annotations
 
+import heapq
 import time
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import (
-    QDate, QEvent, QObject, QRectF, QSettings, QSize, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl,
-)
+from PySide6.QtCore import QDate, QItemSelectionModel, QSettings, QSize, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import (
-    QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence,
-    QPainter,
+    QAction, QActionGroup, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QAbstractScrollArea, QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog, QFormLayout,
-    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog, QFormLayout,
+    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStackedWidget, QTableView, QTabBar,
     QVBoxLayout, QWidget,
 )
 
 from subsentiment import __version__, collect
+from subsentiment.analysis import Analysis
 from subsentiment.gui import days, native, theme
-from subsentiment.gui.charts import DistributionChart, TimelineChart, palette
-from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, RowsModel
+from subsentiment.gui.coverage import CoverageWindow
+from subsentiment.gui.models import COMMENT_COLUMNS, PENDING, POST_COLUMNS, RowsModel
+from subsentiment.gui.overview import OverviewPage
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
-from subsentiment.gui.worker import FetchWorker
+from subsentiment.gui.widgets import (
+    ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatusLabel, fit_to_screen, label, panel, plural, section,
+)
+from subsentiment.gui.worker import BackgroundJob, FetchWorker
 from subsentiment.reddit import normalize_subreddit, subreddit_error
-from subsentiment.store import Store, daily_means, summarize
+from subsentiment.store import Store
 
 
 # Date ranges the fetch form offers: key -> (label, days back from now). "custom" uses the From/To dates.
@@ -96,14 +99,6 @@ def human_size(n: int) -> str:
     return ""
 
 
-def fit_to_screen(size: QSize, screen) -> QSize:
-    """``size``, shrunk to fit the screen's free area (a 1920x1200 screen at 150% has about 1280x750)."""
-    if screen is None:
-        return size
-    free = screen.availableGeometry()
-    return QSize(min(size.width(), int(free.width() * 0.94)), min(size.height(), int(free.height() * 0.92)))
-
-
 def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
     """What a finished fetch did, for the line under the progress bar."""
     if req.comment_posts:
@@ -118,6 +113,8 @@ def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
     if not (result.posts or result.updated or result.already):
         if result.stopped:
             return "Stopped before any posts were fetched."
+        if result.timed_out:
+            return f"Arctic Shift timed out on r/{result.subreddit} in this range; try again in a few minutes."
         matching = f" matching \u201c{req.query}\u201d" if req.query else ""
         return f"No new posts found in r/{result.subreddit}{matching} in this date range."
     parts = [f"Added {plural(result.posts, 'new post')}"
@@ -128,6 +125,9 @@ def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
     if result.already:
         parts.append(f"{plural(result.already, 'top post')} {'was' if result.already == 1 else 'were'} "
                      "already saved.")
+    if result.timed_out:
+        parts.append("Arctic Shift timed out on part of the range, so some posts were skipped; "
+                     "fetch again later to fill them in.")
     if result.comment_errors:
         parts.append(f"Comments couldn't be fetched for {plural(result.comment_errors, 'post')}; "
                      "fetch again later to fill them in.")
@@ -136,186 +136,8 @@ def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
     return " ".join(parts)
 
 
-def plural(n: int, noun: str) -> str:
-    return f"{n:,}\u00a0{noun}{'' if n == 1 else 's'}"  # no-break space keeps a number with its noun
-
-
 def when_text(ts: float | None) -> str:
     return datetime.fromtimestamp(ts).strftime("%d %b %Y, %H:%M") if ts else "never"
-
-
-def panel(kind: str = "true", margins: int = 18, spacing: int = 12) -> tuple[QFrame, QVBoxLayout]:
-    """A rounded panel: kind "true" is glass, "tile" a brighter glass card, "solid" a near-opaque data surface."""
-    frame = mark(QFrame(), "glass", kind)
-    lay = QVBoxLayout(frame)
-    lay.setContentsMargins(margins, margins, margins, margins)
-    lay.setSpacing(spacing)
-    return frame, lay
-
-
-def label(text: str, role: str) -> QLabel:
-    return mark(QLabel(text), "role", role)
-
-
-def section(text: str) -> QLabel:
-    return label(text.upper(), "section")
-
-
-class ElidedLabel(QLabel):
-    """One line that ends in "…" when there isn't room (the tooltip has it all), instead of wrapping.
-
-    A wrapped label in the main window's layout gets no extra height for its second line, so it was
-    cut off on narrow windows; and an unwrapped one would hold the window wider than small screens."""
-
-    def __init__(self, text: str, role: str):
-        super().__init__()
-        self.setProperty("role", role)
-        self._full = ""
-        self.setText(text)
-
-    def setText(self, text: str) -> None:
-        self._full = text
-        self._elide()
-
-    def full_text(self) -> str:
-        return self._full
-
-    def minimumSizeHint(self) -> QSize:
-        return QSize(0, super().minimumSizeHint().height())
-
-    def sizeHint(self) -> QSize:
-        return QSize(self.fontMetrics().horizontalAdvance(self._full) + 2, super().sizeHint().height())
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._elide()
-
-    def changeEvent(self, event) -> None:
-        super().changeEvent(event)
-        if event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange):
-            self._elide()
-
-    def _elide(self) -> None:
-        shown = self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, max(self.width(), 1))
-        super().setText(shown)
-        self.setToolTip(self._full if shown != self._full else "")
-
-
-class VerticalScrollArea(QScrollArea):
-    """Scrolls up and down only, and keeps the window at least as wide as its contents need."""
-
-    def __init__(self):
-        super().__init__()
-        self.setWidgetResizable(True)
-        self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
-    def minimumSizeHint(self) -> QSize:
-        inner = self.widget().minimumSizeHint() if self.widget() else QSize(0, 0)
-        return QSize(inner.width() + self.verticalScrollBar().sizeHint().width(), 200)
-
-
-class ShrinkingComboBox(QComboBox):
-    """Full width when there's room; on a narrow window it gives up width (its text ends in "…")."""
-
-    def minimumSizeHint(self) -> QSize:
-        full = super().minimumSizeHint()
-        return QSize(min(full.width(), 120), full.height())
-
-
-class StatusLabel(ElidedLabel):
-    """The muted line under Fetch: one line that ends in "…" (the tooltip has it all), no room while empty.
-
-    It used to wrap, and a long "Added … Updated …" message took three lines, which pushed the sidebar
-    into scrolling and shifted its fields."""
-
-    def __init__(self):
-        super().__init__("", "muted")
-        self.setVisible(False)
-
-    def setText(self, text: str) -> None:
-        super().setText(text)
-        self.setVisible(bool(text))
-
-    def text(self) -> str:
-        return self.full_text()
-
-
-class QuietScrollBars(QObject):
-    """Shows a list's scroll bar handle only while the pointer is over the list, like macOS overlay bars.
-
-    The bar keeps its place, so text doesn't shift when it appears."""
-
-    def __init__(self, area: QAbstractScrollArea):
-        super().__init__(area)
-        self._bar = area.verticalScrollBar()
-        self._bar.setProperty("quiet", True)
-        self._show(False)
-        area.installEventFilter(self)
-
-    def eventFilter(self, obj, event) -> bool:
-        if event.type() in (QEvent.Type.Enter, QEvent.Type.Leave):
-            self._show(event.type() == QEvent.Type.Enter)
-        return False
-
-    def _show(self, on: bool) -> None:
-        self._bar.setProperty("hot", on)
-        self._bar.style().unpolish(self._bar)
-        self._bar.style().polish(self._bar)
-        self._bar.update()
-
-
-class Meter(QWidget):
-    """Thin rounded bar showing a share from 0 to 1."""
-
-    def __init__(self, color_key: str):
-        super().__init__()
-        self.color_key = color_key
-        self.share = 0.0
-        self.setFixedHeight(6)
-
-    def set_share(self, share: float) -> None:
-        self.share = max(0.0, min(1.0, share))
-        self.update()
-
-    def paintEvent(self, event) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
-        r = QRectF(self.rect())
-        track = QColor(*theme.tokens()["edge"][:3])
-        track.setAlpha(40)
-        p.setBrush(track)
-        p.drawRoundedRect(r, 3, 3)
-        if self.share > 0:
-            p.setBrush(QColor(palette()[self.color_key]))
-            p.drawRoundedRect(QRectF(r.x(), r.y(), max(r.height(), r.width() * self.share), r.height()), 3, 3)
-
-
-class StatTile(QFrame):
-    def __init__(self, caption: str, meter: str | None = None):
-        super().__init__()
-        mark(self, "glass", "tile")
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(4)
-        self.value = label("–", "value")
-        lay.addWidget(label(caption.upper(), "section"))
-        lay.addWidget(self.value)
-        # Tiles without a meter keep an empty slot its size, so every caption and value lines up.
-        self.meter = Meter(meter) if meter else None
-        lay.addSpacing(4)
-        if self.meter:
-            lay.addWidget(self.meter)
-        else:
-            slot = QWidget()
-            slot.setFixedHeight(6)
-            lay.addWidget(slot)
-
-    def set(self, text: str, share: float | None = None) -> None:
-        self.value.setText(text)
-        if self.meter is not None:
-            self.meter.set_share(share or 0.0)
 
 
 class TablePage(QWidget):
@@ -323,28 +145,27 @@ class TablePage(QWidget):
 
     SHRINKS = ("author", "post_title")  # free text that can end in "…" to leave room for the main text
     OPTIONAL = ("author", "post_title", "num_comments")  # hidden in this order when there's still no room
+    FIXED = ("sentiment", "created_utc")  # written in a fixed format: "+0.123", "2026-10-20 03:54"
 
     def __init__(self, columns, stretch_col: int):
         super().__init__()
         self.model = RowsModel(columns)
         self._all_rows: list = []
-        self.proxy = QSortFilterProxyModel()
-        self.proxy.setSourceModel(self.model)
-        self.proxy.setSortRole(SORT_ROLE)
-        self.proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.proxy.setFilterKeyColumn(stretch_col)
+        self._ids: set[str] = set()
+        self._text_key = columns[stretch_col][1]
+        self._haystacks: dict[str, str] = {}  # row id -> its text lowercased on one line, once filtered by
 
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("Filter by text…")
         self.filter.setClearButtonEnabled(True)
-        self.filter.textChanged.connect(self.proxy.setFilterFixedString)
+        self.filter.textChanged.connect(lambda _: self._apply_filters())
         self.label_filter = QComboBox()
         self.label_filter.addItems(["All labels", "Positive", "Neutral", "Negative"])
-        self.label_filter.currentTextChanged.connect(self._apply_label_filter)
+        self.label_filter.currentTextChanged.connect(lambda _: self._apply_filters())
         self.count = label("", "muted")
 
         self.view = QTableView()
-        self.view.setModel(self.proxy)
+        self.view.setModel(self.model)
         self.view.setSortingEnabled(True)
         self.view.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -375,30 +196,90 @@ class TablePage(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(card)
-        for sig in (self.proxy.rowsInserted, self.proxy.rowsRemoved, self.proxy.modelReset, self.proxy.layoutChanged):
+        for sig in (self.model.rowsInserted, self.model.rowsRemoved, self.model.modelReset):
             sig.connect(self._update_count)
 
-    def load(self, rows, animate: bool = False) -> None:
+    @property
+    def all_rows(self) -> list:
+        """Every row loaded or added, whatever the filters show."""
+        return self._all_rows
+
+    def load(self, rows) -> None:
         self._all_rows = rows
-        self._apply_label_filter(self.label_filter.currentText(), animate)
+        self._ids = {r["id"] for r in rows}
+        self._haystacks = {}
+        self._apply_filters()
 
     def add_rows(self, rows) -> int:
-        """Append rows a running fetch has just saved; they fade in. Returns how many were new."""
-        have = {r["id"] for r in self._all_rows}
-        new = [r for r in rows if r["id"] not in have]
-        label = self.label_filter.currentText()
+        """Add rows a running fetch has just saved; they fade in. Returns how many were new."""
+        new = [r for r in rows if r["id"] not in self._ids]
+        self._ids.update(r["id"] for r in new)
         self._all_rows.extend(new)
-        shown = new if label == "All labels" else [r for r in new if r["label"] == label.lower()]
-        self.model.append_rows(shown)
-        self._update_count()
+        shows = self._matcher()
+        self.model.append_rows([r for r in new if shows is None or shows(r)])
         return len(new)
 
-    def _apply_label_filter(self, text: str, animate: bool = False) -> None:
-        rows = self._all_rows
-        if text != "All labels":
-            rows = [r for r in rows if r["label"] == text.lower()]
-        self.model.set_rows(rows, animate)
-        if not animate:
+    def update_rows(self, rows) -> int:
+        """Bring in rows a finished fetch saved: ones saved again (new scores) replace the rows shown, the
+        rest are added and fade in. Returns how many shown rows changed."""
+        where = {r["id"]: i for i, r in enumerate(self._all_rows)}
+        new, changed = [], []
+        for r in rows:
+            i = where.get(r["id"])
+            if i is None:
+                new.append(r)
+            elif self._all_rows[i] != r:  # most were dripped in as they were saved, and are unchanged
+                self._all_rows[i] = r
+                self._haystacks.pop(r["id"], None)
+                changed.append(r)
+        self._ids.update(r["id"] for r in new)
+        self._all_rows.extend(new)
+        shows = self._matcher()
+        if shows is None:
+            self.model.update_rows(changed + new)
+        else:  # a rescored row can change its label
+            self.model.set_rows(list(filter(shows, self._all_rows)), animate=True)
+        self._update_count()
+        return len(changed)
+
+    def _matcher(self):
+        """Whether a row passes the label and text filters, or None when nothing is filtered."""
+        label = self.label_filter.currentText().lower()
+        needle = " ".join(self.filter.text().lower().split())
+        if label == "all labels" and not needle:
+            return None
+        key, hays = self._text_key, self._haystacks
+
+        def shows(row) -> bool:
+            if label != "all labels" and row["label"] != label:
+                return False
+            if not needle:
+                return True
+            hay = hays.get(row["id"])
+            if hay is None:  # the text on one line, lowercased, kept for the next keystroke
+                hay = hays[row["id"]] = " ".join((row[key] or "").lower().split())
+            return needle in hay
+        return shows
+
+    def _apply_filters(self) -> None:
+        shows = self._matcher()
+        if not self.filter.text():
+            self._haystacks = {}  # a copy of every row's text; only needed while there is a filter
+        chosen = self.view.selectionModel().selectedRows()
+        selected = {self.model.row_at(i.row())["id"] for i in chosen}
+        current = self.view.currentIndex()
+        current_id = self.model.row_at(current.row())["id"] if current.isValid() else None
+        self.model.set_rows(self._all_rows if shows is None else list(filter(shows, self._all_rows)))
+        if current_id or 0 < len(selected) <= 1000:  # rows picked before still are, if the filters show them
+            for i, r in enumerate(self.model.rows):
+                if r["id"] == current_id:
+                    self.view.selectionModel().setCurrentIndex(
+                        self.model.index(i, current.column()), QItemSelectionModel.SelectionFlag.NoUpdate)
+                if r["id"] in selected:
+                    self.view.selectionModel().select(
+                        self.model.index(i, 0),
+                        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        if not self.filter.text():  # typing a filter keeps the columns as they are
             self._fit_columns()
         self._update_count()
 
@@ -406,6 +287,7 @@ class TablePage(QWidget):
         """Size each column to its values and its full header title, leaving the rest to the text column.
 
         Qt's own sizing leaves out room for the sort arrow, so a sorted column's title got cut short."""
+        self.view.ensurePolished()  # the stylesheet's font and padding, before the window first shows
         header = self.view.horizontalHeader()
         font = header_font(self.view.font())
         header.setFont(font)  # Qt elides header titles using the widget's font, not the stylesheet's
@@ -415,8 +297,28 @@ class TablePage(QWidget):
             if col != self.stretch_col:
                 title = self.model.headerData(col, Qt.Orientation.Horizontal)
                 least = metrics.horizontalAdvance(title) + 16 + 24 + 8  # padding, sort arrow, slack
-                self._widths[col] = (max(self.view.sizeHintForColumn(col), least), least)
+                self._widths[col] = (max(self._values_width(col), least), least)
         self._share_width()
+
+    def _values_width(self, col: int) -> int:
+        """How wide the column's widest value draws. Qt's sizeHintForColumn measured up to 1,000 rows
+        through Python calls per column; this measures one cell for the padding (and the label's swatch)
+        and the text of the column's longest distinct values."""
+        rows = self.model.rows
+        if not rows:
+            return 0
+        _, key, fmt = self.model.columns[col]
+        if key in self.FIXED:  # every value is written the same length: sample both ends of the sort order,
+            values = {r[key] for r in rows[:150] + rows[-150:]}  # so both signs and many digits are measured
+        else:
+            values = {r[key] for r in rows}
+            if len(values) > 300:  # numbers, names, titles: the widest are among the longest written ones
+                values = heapq.nlargest(300, values, key=lambda v: len(str(v)) if v is not None else 1)
+        texts = [fmt(v) if v is not None else ("–" if key in PENDING else "") for v in values]
+        metrics = QFontMetrics(self.view.font())
+        cell = self.view.sizeHintForIndex(self.model.index(0, col)).width()
+        padding = cell - metrics.horizontalAdvance(self.model.data(self.model.index(0, col)) or "")
+        return padding + max(metrics.horizontalAdvance(t) for t in texts)
 
     def _share_width(self) -> None:
         """Keep room for the text column (the title, the comment). A comment's post title and the author
@@ -453,10 +355,10 @@ class TablePage(QWidget):
         self._share_width()
 
     def _update_count(self, *args) -> None:
-        self.count.setText(plural(self.proxy.rowCount(), "row"))
+        self.count.setText(plural(self.model.rowCount(), "row"))
 
     def _open(self, index) -> None:
-        row = self.model.row_at(self.proxy.mapToSource(index).row())
+        row = self.model.row_at(index.row())
         QDesktopServices.openUrl(QUrl(row["permalink"]))
 
 
@@ -469,8 +371,8 @@ class MainWindow(QMainWindow):
         self.store = Store(db_path)
         self.settings = QSettings()
         self.updates = UpdateFlow(self, self.settings)
-        self.thread: QThread | None = None
-        self.worker: FetchWorker | None = None
+        self.fetch_job = BackgroundJob(self)
+        self.fetch_job.ended.connect(self._on_fetch_ended)
         self._stopping = False  # Stop was pressed on the running fetch
         self.current: str | None = None
         self.request: collect.FetchRequest | None = None
@@ -493,9 +395,13 @@ class MainWindow(QMainWindow):
         self._follow = False  # show the subreddit being fetched, until the user picks another one
         self.posts: list = []  # what the analysis counts: the saved rows from the chosen days
         self.comments: list = []
+        self._analysis = {"posts": Analysis(), "comments": Analysis()}  # what the overview counts, kept up as rows arrive
+        self._last_fetched: float | None = None  # newest fetched_at among self.posts
         self._saved: dict[str, list] = {"posts": [], "comments": []}  # every saved row of the subreddit shown
         self._day_counts: dict[int, tuple[int, int]] = {}
         self.chosen_days: set[int] | None = None  # None: every day
+        self._known: dict[str, set[str]] = {}  # ids already in _day_counts, once a running fetch is counted in
+        self._days_changed = False  # _day_counts has days the day picker hasn't been given yet
         self.coverage = None  # the Download coverage window, once opened
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
         # A native material (Mica/Acrylic/vibrancy) needs a translucent window from the start,
@@ -769,7 +675,8 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.tabbar.currentChanged.connect(self.pages.setCurrentIndex)
         self.tabbar.currentChanged.connect(lambda i: self.scope.setVisible(i == 0))
-        self.pages.addWidget(self._build_overview())
+        self.overview = OverviewPage()
+        self.pages.addWidget(self.overview)
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
         self.comments_tab = TablePage(COMMENT_COLUMNS, stretch_col=2)
         # The post title would otherwise size to its text and squeeze the comment column.
@@ -780,60 +687,6 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.comments_tab)
         lay.addWidget(self.pages, 1)
         return content
-
-    def _build_overview(self) -> QWidget:
-        page = QWidget()
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(14)
-
-        self.tiles = {
-            "count": StatTile("Items analysed"),
-            "mean": StatTile("Mean sentiment"),
-            "positive": StatTile("Positive", meter="positive"),
-            "negative": StatTile("Negative", meter="negative"),
-        }
-        tiles = QHBoxLayout()
-        tiles.setSpacing(14)
-        widest = max(t.minimumSizeHint().width() for t in self.tiles.values())
-        for t in self.tiles.values():
-            t.setMinimumWidth(widest)  # equal widths, whatever the caption length, down to the narrowest window
-            tiles.addWidget(t, 1)
-        lay.addLayout(tiles)
-
-        self.distribution = DistributionChart()
-        self.timeline = TimelineChart()
-        charts = QHBoxLayout()
-        charts.setSpacing(14)
-        for chart, stretch in ((self.distribution, 2), (self.timeline, 3)):
-            card, inner = panel("true", margins=10)
-            inner.addWidget(chart)
-            charts.addWidget(card, stretch)
-        lay.addLayout(charts, 3)
-
-        self.most_positive = QListWidget()
-        self.most_negative = QListWidget()
-        extremes = QHBoxLayout()
-        extremes.setSpacing(14)
-        for title, lw in (("Most positive", self.most_positive), ("Most negative", self.most_negative)):
-            lw.setFrameShape(QFrame.Shape.NoFrame)
-            # Long titles end in "…" (the tooltip has the rest) instead of adding a sideways scrollbar.
-            lw.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            lw.setTextElideMode(Qt.TextElideMode.ElideRight)
-            lw.setUniformItemSizes(True)
-            QuietScrollBars(lw)
-            lw.itemDoubleClicked.connect(
-                lambda item: QDesktopServices.openUrl(QUrl(item.data(Qt.ItemDataRole.UserRole))))
-            card, inner = panel("solid", margins=14, spacing=6)
-            inner.addWidget(label(title, "muted"))
-            inner.addWidget(lw)
-            extremes.addWidget(card)
-        lay.addLayout(extremes, 2)
-        # On a short window (1366x768 or 1280x800 at 125%) the overview scrolls rather than holding the
-        # window taller than the screen or squeezing the charts.
-        scroll = VerticalScrollArea()
-        scroll.setWidget(page)
-        return scroll
 
     # -- theme ----------------------------------------------------------------
 
@@ -877,7 +730,9 @@ class MainWindow(QMainWindow):
         theme.apply(QApplication.instance(), requested, self.settings.value("ui/reduce_transparency", False, bool))
         self.update()
         self._style_native_frame()
-        self._show_dataset(self.current or "")  # re-pick chart and swatch colors
+        for tab in (self.posts_tab, self.comments_tab):  # re-pick swatch and chart colours
+            tab.model.restyle()
+        self._render_overview()
 
     # -- control state --------------------------------------------------------
 
@@ -911,7 +766,7 @@ class MainWindow(QMainWindow):
             self.coverage.refresh_saved()
 
     def _update_comments_enabled(self) -> None:
-        self.comments_per_post.setEnabled(self.thread is None and self.include_comments.isChecked())
+        self.comments_per_post.setEnabled(not self.fetch_job.busy and self.include_comments.isChecked())
 
     def _restore_fetch_settings(self) -> None:
         v = {k: self.settings.value(f"fetch/{k}", d, type(d)) for k, d in FETCH_DEFAULTS.items()}
@@ -946,7 +801,7 @@ class MainWindow(QMainWindow):
             self.settings.setValue(f"fetch/{k}", v)
 
     def _set_busy(self, busy: bool) -> None:
-        # Called after self.thread is set (busy) or cleared (idle); the update helpers read it.
+        # Called after the fetch job starts (busy) or ends (idle); the update helpers read it.
         self.fetch_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
         self.progress.setVisible(busy)
@@ -961,7 +816,7 @@ class MainWindow(QMainWindow):
             self.coverage.set_busy(busy)
 
     def _update_delete_enabled(self) -> None:
-        idle = self.thread is None
+        idle = not self.fetch_job.busy
         self.delete_btn.setEnabled(idle and bool(self.current))
         self.delete_act.setEnabled(idle and bool(self.current))
         self.delete_all_btn.setEnabled(idle and self.datasets.count() > 0)
@@ -970,7 +825,7 @@ class MainWindow(QMainWindow):
     # -- fetching -------------------------------------------------------------
 
     def _start_fetch(self) -> None:
-        if self.thread is not None:
+        if self.fetch_job.busy:
             return
         name = normalize_subreddit(self.subreddit.text())
         if error := subreddit_error(name):
@@ -990,7 +845,7 @@ class MainWindow(QMainWindow):
 
     def start_request(self, req: collect.FetchRequest, message: str) -> bool:
         """Run a fetch the coverage panel asked for; False if one is already running."""
-        if self.thread is not None:
+        if self.fetch_job.busy:
             return False
         self._launch(req, message)
         return True
@@ -1002,25 +857,19 @@ class MainWindow(QMainWindow):
         self._flush_rows()
         self._follow = True
         self._open_fetched()  # if it's already saved, show it now; otherwise with its first rows
-        self.thread = QThread(self)
-        self.worker = FetchWorker(req, self.db_path)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.finished.connect(self._on_finished)
-        self.worker.saved.connect(self._on_saved)
-        self.worker.failed.connect(self._on_failed)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.finished.connect(self._on_thread_done)
+        worker = FetchWorker(req, self.db_path)
+        worker.progress.connect(self._on_progress)
+        worker.finished.connect(self._on_finished)
+        worker.saved.connect(self._on_saved)
+        worker.failed.connect(self._on_failed)
+        self.fetch_job.start(worker)
         self._set_busy(True)
         self._stopping = False
         self.progress_msg.setText(message)
-        self.thread.start()
 
     def _stop_fetch(self) -> None:
-        if self.worker:
-            self.worker.stop()
+        if self.fetch_job.busy:
+            self.fetch_job.stop()
             self._stopping = True
             self.progress_msg.setText("Stopping…")
             if self.coverage is not None:
@@ -1063,13 +912,14 @@ class MainWindow(QMainWindow):
         return bool(self.request and self.current and self.current.lower() == self.request.subreddit.lower())
 
     def _queue_new_rows(self) -> None:
-        if self.thread is None or not self._showing_fetch():
+        if not self.fetch_job.busy or not self._showing_fetch():
             return
         name = self.current
         for kind, read in (("posts", self.store.posts_since), ("comments", self.store.comments_since)):
             rows = read(name, self._read_to[kind])
             if rows:  # rows saved in the same instant as the last one read come back too; the ids catch them
                 self._read_to[kind] = rows[-1]["fetched_at"]
+                self._count_days(kind, rows)
             for r in days.keep(rows, self.chosen_days):
                 if r["id"] not in self._queued_ids:
                     self._queued_ids.add(r["id"])
@@ -1077,22 +927,47 @@ class MainWindow(QMainWindow):
         if any(self._queued.values()) and not self._drip.isActive():  # start() would restart it, and
             self._drip.start()  # comments saved every few ms would then hold every row back
 
+    def _count_days(self, kind: str, rows) -> None:
+        """Count rows the running fetch saved into the day picker's days, so the picker needn't count every
+        saved row again each second (70 ms for 100,000 comments). Rows saved before, saved again with new
+        scores, aren't counted twice."""
+        known = self._known.get(kind)
+        if known is None:
+            known = self._known[kind] = {r["id"] for r in self._saved[kind]}
+        slot = 0 if kind == "posts" else 1
+        for r in rows:
+            if r["id"] not in known and r["created_utc"] is not None:
+                known.add(r["id"])
+                day = days.day_of(r["created_utc"])
+                counts = list(self._day_counts.get(day, (0, 0)))
+                counts[slot] += 1
+                self._day_counts[day] = tuple(counts)
+                self._days_changed = True
+
     def _release_rows(self) -> None:
         """Show the next few queued rows; a long backlog is released faster so it never lags far behind."""
         for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
             queue = self._queued[kind]
             batch, self._queued[kind] = queue[:max(1, len(queue) // 25)], queue[max(1, len(queue) // 25):]
             if batch:
-                tab.add_rows(batch)
+                self._add_rows(kind, tab, batch)
         if not any(self._queued.values()):
             self._drip.stop()
         self._update_dataset_labels()
+
+    def _add_rows(self, kind: str, tab: TablePage, rows) -> None:
+        before = len(tab.all_rows)
+        tab.add_rows(rows)
+        new = tab.all_rows[before:]
+        self._analysis[kind].add(new)
+        if kind == "posts" and new:
+            self._last_fetched = max([self._last_fetched or 0.0] + [r["fetched_at"] for r in new])
 
     def _flush_rows(self) -> None:
         self._drip.stop()
         for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
             if self._queued[kind]:
-                tab.add_rows(self._queued[kind])
+                self._add_rows(kind, tab, self._queued[kind])
             self._queued[kind] = []
         self._queued_ids.clear()
 
@@ -1106,21 +981,21 @@ class MainWindow(QMainWindow):
             self.subheading.setText("Enter a subreddit on the left and press Fetch and analyse.")
             return
         self.heading.setText(f"r/{self.current}")
-        fetched = max(max((r["fetched_at"] for r in rows), default=0)
-                      for rows in (self._saved["posts"], self.posts)) or None
         on = ""
         if self.chosen_days is not None:
             n = len(self.chosen_days & set(self._day_counts))
             on = f" on {plural(n, 'chosen day')}"
         self.subheading.setText(f"{plural(len(self.posts), 'post')} and {plural(len(self.comments), 'comment')}{on} · "
-                                f"last fetched {when_text(fetched)}")
+                                f"last fetched {when_text(self._last_fetched)}")
 
     def _live_refresh(self) -> None:
-        if self.thread is None or self.request is None:
+        if not self.fetch_job.busy or self.request is None:
             return
         if self._showing_fetch():
             self._refresh_datasets(reload=False)
-            self._refresh_days()
+            if self._days_changed:
+                self._days_changed = False
+                self.days_pick.set_days(self._day_counts, self.chosen_days)
             self._render_overview()
         elif self._follow:
             self._open_fetched()
@@ -1137,11 +1012,35 @@ class MainWindow(QMainWindow):
         self._flush_rows()
         if self.current and self.current.lower() == result.subreddit.lower():
             self._refresh_datasets(reload=False)
-            self._show_dataset(self.current, animate=True)  # keeps the tables where they are
+            self._merge_fetched()  # keeps the tables where they are
         elif self._follow and (result.posts or result.updated or result.comments):
             self._refresh_datasets(select=result.subreddit)
         elif not self._follow:  # the user went to look at another subreddit meanwhile: stay there
             self._refresh_datasets(reload=False)
+
+    def _merge_fetched(self) -> None:
+        """Bring what the finished fetch saved into the dataset on screen: rows it saved again (new scores)
+        and any not dripped in yet. Reading back only these, not every saved row, keeps a big subreddit
+        from freezing the window for seconds as the fetch ends."""
+        for kind, read, tab in (("posts", self.store.posts_since, self.posts_tab),
+                                ("comments", self.store.comments_since, self.comments_tab)):
+            rows = read(self.current, self._since)
+            saved = self._saved[kind]
+            where = {r["id"]: i for i, r in enumerate(saved)}
+            for r in rows:
+                if r["id"] in where:
+                    saved[where[r["id"]]] = r
+                else:
+                    saved.append(r)
+            before = len(tab.all_rows)
+            if tab.update_rows(days.keep(rows, self.chosen_days)):
+                self._analysis[kind] = Analysis(tab.all_rows)  # a rescored row changes the totals
+            else:
+                self._analysis[kind].add(tab.all_rows[before:])
+        self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
+        self._refresh_days()
+        self._update_dataset_labels()
+        self._render_overview()
 
     def _on_failed(self, message: str) -> None:
         self._live.stop()
@@ -1153,10 +1052,7 @@ class MainWindow(QMainWindow):
                                   else "Fetch failed.")
         QMessageBox.warning(self, "Fetch failed", message)
 
-    def _on_thread_done(self) -> None:
-        self.thread.deleteLater()
-        self.worker.deleteLater()
-        self.thread = self.worker = None
+    def _on_fetch_ended(self) -> None:
         self._set_busy(False)
         if self.coverage is not None:
             self.coverage.refresh_saved()
@@ -1192,14 +1088,14 @@ class MainWindow(QMainWindow):
 
     def _on_dataset_selected(self, item: QListWidgetItem | None) -> None:
         name = item.data(Qt.ItemDataRole.UserRole) if item else ""
-        if self.thread is not None and self.request and name.lower() != self.request.subreddit.lower():
+        if self.fetch_job.busy and self.request and name.lower() != self.request.subreddit.lower():
             self._follow = False  # the user chose to look at something else while it runs
         self._show_dataset(name)
         if name:
             self.settings.setValue("ui/last_dataset", name)
 
-    def _show_dataset(self, name: str, animate: bool = False) -> None:
-        """Show a saved subreddit. With animate (a fetch adding to it), new rows fade in."""
+    def _show_dataset(self, name: str) -> None:
+        """Show a saved subreddit."""
         # Rows still queued from a running fetch belong to whatever was shown before; the tables are
         # about to be reloaded from the store, which has them anyway.
         self._drip.stop()
@@ -1209,7 +1105,7 @@ class MainWindow(QMainWindow):
                        "comments": self.store.comments(name) if name else []}
         self.chosen_days = days.load_choice(self.settings, name) if name else None
         self._refresh_days()
-        self._apply_days(animate)
+        self._apply_days()
         self._update_delete_enabled()
         self.coverage_act.setEnabled(bool(self.current))
         if self.coverage is not None:
@@ -1218,14 +1114,18 @@ class MainWindow(QMainWindow):
     def _refresh_days(self) -> None:
         """Re-read which days have saved data, for the day picker."""
         self._day_counts = self.store.day_counts(self.current) if self.current else {}
+        self._known = {}
+        self._days_changed = False
         self.days_pick.set_days(self._day_counts, self.chosen_days)
 
-    def _apply_days(self, animate: bool = False) -> None:
+    def _apply_days(self) -> None:
         """Point every view at the saved rows from the chosen days."""
         self.posts = days.keep(self._saved["posts"], self.chosen_days)
         self.comments = days.keep(self._saved["comments"], self.chosen_days)
-        self.posts_tab.load(self.posts, animate)
-        self.comments_tab.load(self.comments, animate)
+        self.posts_tab.load(self.posts)
+        self.comments_tab.load(self.comments)
+        self._analysis = {"posts": Analysis(self.posts), "comments": Analysis(self.comments)}
+        self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
         self._update_dataset_labels()
         self._render_overview()
 
@@ -1233,7 +1133,7 @@ class MainWindow(QMainWindow):
         if not self.current:
             return
         self.chosen_days = days.save_choice(self.settings, self.current, chosen, self._day_counts)
-        if self.thread is not None and self._showing_fetch():
+        if self.fetch_job.busy and self._showing_fetch():
             # A running fetch has added rows since the subreddit was loaded: read them all again.
             self._flush_rows()
             self._show_dataset(self.current)
@@ -1248,36 +1148,13 @@ class MainWindow(QMainWindow):
 
     def _render_overview(self) -> None:
         scope = self.scope.currentText()
-        rows = (list(self.posts) if scope != "Comments only" else []) + \
-               (list(self.comments) if scope != "Posts only" else [])
-        s = summarize(rows)
-        n = s["count"]
-        pos, neg = (s["counts"]["positive"] / n, s["counts"]["negative"] / n) if n else (0.0, 0.0)
-        self.tiles["count"].set(f"{n:,}")
-        self.tiles["mean"].set(f"{s['mean']:+.3f}" if n else "–")
-        self.tiles["positive"].set(f"{100 * pos:.0f}%" if n else "–", pos)
-        self.tiles["negative"].set(f"{100 * neg:.0f}%" if n else "–", neg)
-        self.mood.set_counts(s["counts"]["positive"], s["counts"]["negative"], n)
-        self.distribution.set_counts(s["counts"])
-        self.timeline.set_points(daily_means(rows))
-
-        ranked = sorted(rows, key=lambda r: r["sentiment"])
-        self._fill_extremes(self.most_positive, list(reversed(ranked[-10:])))
-        self._fill_extremes(self.most_negative, ranked[:10])
-
-    @staticmethod
-    def _fill_extremes(widget: QListWidget, rows) -> None:
-        widget.clear()
-        for r in rows:
-            text = r["title"] if "title" in r.keys() else r["body"]
-            text = " ".join((text or "").split())
-            item = QListWidgetItem(f"{r['sentiment']:+.2f}    {text[:140]}")
-            item.setToolTip(text[:1000])
-            item.setData(Qt.ItemDataRole.UserRole, r["permalink"])
-            widget.addItem(item)
+        a = Analysis.combined(*[self._analysis[k] for k, skip in (("posts", "Comments only"), ("comments", "Posts only"))
+                                if scope != skip])
+        self.overview.show_analysis(a)
+        self.mood.set_counts(a.counts["positive"], a.counts["negative"], a.count)
 
     def _delete_dataset(self) -> None:
-        if not self.current or self.thread is not None:
+        if not self.current or self.fetch_job.busy:
             return
         if QMessageBox.question(
                 self, "Delete saved data",
@@ -1291,7 +1168,7 @@ class MainWindow(QMainWindow):
         self._refresh_datasets()
 
     def _delete_all(self) -> None:
-        if self.thread is not None or not self.datasets.count():
+        if self.fetch_job.busy or not self.datasets.count():
             return
         if QMessageBox.question(
                 self, "Delete all saved data",
@@ -1330,10 +1207,9 @@ class MainWindow(QMainWindow):
         if not self.current:
             return
         if self.coverage is None:
-            from subsentiment.gui.coverage import CoverageWindow  # it imports this module's helpers
             self.coverage = CoverageWindow(self)
         self.coverage.set_subreddit(self.current)
-        self.coverage.set_busy(self.thread is not None)
+        self.coverage.set_busy(self.fetch_job.busy)
         self.coverage.show()
         self.coverage.raise_()
         self.coverage.activateWindow()
@@ -1353,9 +1229,9 @@ class MainWindow(QMainWindow):
         if self.coverage is not None:
             self.coverage.close()
         self.settings.sync()  # app.main may end the process without Qt's usual clean-up
-        if self.worker:
+        if self.fetch_job.busy:
             # A fetch ending after this must not touch the closed store, so nothing it sends is handled.
-            thread, worker = self.thread, self.worker
+            thread, worker = self.fetch_job.qthread, self.fetch_job.worker
             worker.stop()
             for sig in (worker.progress, worker.finished, worker.failed, worker.saved, thread.finished):
                 sig.disconnect()
@@ -1369,5 +1245,5 @@ class MainWindow(QMainWindow):
     def running_threads(self) -> list[QThread]:
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
-        threads = [self.thread, self.coverage and self.coverage._count_thread]
-        return [t for t in threads if t is not None and t.isRunning()]
+        jobs = [self.fetch_job, self.coverage and self.coverage.count_job]
+        return [j.qthread for j in jobs if j and j.running()]

@@ -12,8 +12,8 @@ import time
 from datetime import datetime, timezone
 
 import shiboken6
-from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QThread, Slot
-from PySide6.QtGui import QColor, QGuiApplication, QLinearGradient, QPainter
+from PySide6.QtCore import QEvent, QSize, Qt, Slot
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton,
     QTableWidget, QVBoxLayout, QWidget,
@@ -21,10 +21,9 @@ from PySide6.QtWidgets import (
 
 from subsentiment import collect
 from subsentiment.gui import theme
-from subsentiment.gui.charts import palette
-from subsentiment.gui.main_window import fit_to_screen, label, panel, plural, section
+from subsentiment.gui.widgets import ElidedLabel, ShareBar, fit_to_screen, label, panel, plural, section
 from subsentiment.gui.theme import paint_backdrop
-from subsentiment.gui.worker import CountWorker
+from subsentiment.gui.worker import BackgroundJob, CountWorker
 
 DAY = 86400
 MAX_DAY_POSTS = 10000  # cap on one day's "Download all"
@@ -94,41 +93,6 @@ def share_text(saved: int, total: int | None, complete: bool, noun: str,
     return f"{saved:,} of {total:,}", f"{100 * share:.0f}%", share, ""
 
 
-class Bar(QWidget):
-    """Thin rounded bar in the accent gradient; green once complete."""
-
-    def __init__(self):
-        super().__init__()
-        self.share: float | None = None
-        self.complete = False
-        self.setFixedHeight(6)
-
-    def set(self, share: float | None, complete: bool) -> None:
-        self.share, self.complete = share, complete
-        self.update()
-
-    def paintEvent(self, event) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
-        r = QRectF(self.rect())
-        track = QColor(*theme.tokens()["edge"][:3])
-        track.setAlpha(40)
-        p.setBrush(track)
-        p.drawRoundedRect(r, 3, 3)
-        if self.share:
-            t = theme.tokens()
-            fill = QRectF(r.x(), r.y(), max(r.height(), r.width() * self.share), r.height())
-            if self.complete:
-                p.setBrush(QColor(palette()["positive"]))
-            else:
-                g = QLinearGradient(fill.topLeft(), fill.topRight())
-                g.setColorAt(0, QColor(t["accent"]))
-                g.setColorAt(1, QColor(t["accent2"]))
-                p.setBrush(g)
-            p.drawRoundedRect(fill, 3, 3)
-
-
 class Cell(QWidget):
     """"12 of 340 ........ 4%" over a bar."""
 
@@ -144,7 +108,7 @@ class Cell(QWidget):
         top.addStretch(1)
         top.addWidget(self.side)
         lay.addLayout(top)
-        self.bar = Bar()
+        self.bar = ShareBar()
         keep = self.bar.sizePolicy()
         keep.setRetainSizeWhenHidden(True)  # rows stay the same height with or without a bar
         self.bar.setSizePolicy(keep)
@@ -203,35 +167,6 @@ class Cell(QWidget):
         self.side.setVisible(bool(self.side.text()) and need <= room)
 
 
-class ElidedLabel(QLabel):
-    """One line of text that ends in "…" when it doesn't fit; the tooltip has all of it."""
-
-    def __init__(self, text: str = ""):
-        super().__init__()
-        self.setMinimumWidth(40)
-        self.set_full(text)
-
-    def set_full(self, text: str) -> None:
-        self.full = text
-        self.setToolTip(text)
-        self._elide()
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._elide()
-
-    def _elide(self) -> None:
-        margins = self.contentsMargins()
-        width = self.width() - margins.left() - margins.right()
-        super().setText(self.fontMetrics().elidedText(self.full, Qt.TextElideMode.ElideRight, max(20, width)))
-
-    def minimumSizeHint(self) -> QSize:
-        return QSize(40, super().minimumSizeHint().height())
-
-    def sizeHint(self) -> QSize:
-        return QSize(40, super().sizeHint().height())
-
-
 def small_button(text: str) -> QPushButton:
     b = QPushButton(text)
     b.setStyleSheet("padding: 5px 12px;")
@@ -281,14 +216,15 @@ class CoverageWindow(QDialog):
         self.days: list[int] = []
         self.totals: dict[str, dict[int, int]] = {}  # subreddit (lowercase) -> day -> archive count
         self.count_error = ""
-        self._count_thread: QThread | None = None
+        self.count_job = BackgroundJob(self)
+        self.count_job.ended.connect(self._on_count_done)
         self._counting: tuple[str, float, float] = ("", 0.0, 0.0)  # what the running count asked for
         self._count_stopped = False  # the window closed while it ran, so its answer may be cut short
-        self._count_worker: CountWorker | None = None
         self._post_rows: list = []
         self._post_ids: list[str] = []
         self._built: dict[int, tuple] = {}  # post rows with widgets, and what they last showed
         self._comments_done: set[str] = set()
+        self._comments_so_far: set[str] = set()
         self._day_rows: list[int] = []
 
         root = QVBoxLayout(self)
@@ -424,7 +360,7 @@ class CoverageWindow(QDialog):
                               f"{plural(len(days), 'day')}")
         totals = self.totals.get(self.subreddit.lower(), {})
         missing = [d for d in days if d not in totals]
-        if missing and self._count_thread is None and not self.count_error:
+        if missing and not self.count_job.busy and not self.count_error:
             self._count(min(missing), max(missing) + DAY)
         self._fill_days(totals, rebuild)
         self._load_posts()
@@ -450,7 +386,7 @@ class CoverageWindow(QDialog):
             self._day_rows = list(self.days)
             row = self.days.index(keep) if keep in self.days else 0
             t.selectRow(row)
-        counting = self._count_thread is not None
+        counting = self.count_job.busy
         current = today()
         for row, day in enumerate(self.days):
             n, total, done = saved.get(day, 0), totals.get(day), str(day) in complete
@@ -503,6 +439,7 @@ class CoverageWindow(QDialog):
         store = self.window_.store
         rows = store.comment_coverage(self.subreddit, day, day + DAY)
         complete = store.complete_keys("comments", self.subreddit)
+        so_far = store.complete_keys("comments_so_far", self.subreddit)
         self.posts_title.setText(f"POSTS ON {day_text(day).upper()} · {len(rows):,}")
         ids = [r["id"] for r in rows]
         if ids != self._post_ids:
@@ -514,11 +451,14 @@ class CoverageWindow(QDialog):
             self._post_ids, self._built = ids, {}
             t.verticalScrollBar().setValue(keep)
         self._post_rows = rows
-        self._comments_done = complete
+        self._comments_done, self._comments_so_far = complete, so_far
+        # Not offered again: threads saved whole, or saved whole before the archive counted them (until it
+        # has, there's nothing to say more came; once it has, a count above what's saved brings them back).
         todo = []
         for r in rows:
             total = r["num_comments"]
-            if total != 0 and not (r["id"] in complete or (bool(total) and r["saved_comments"] >= total)):
+            if total != 0 and not (r["id"] in complete or (total is None and r["id"] in so_far)
+                                   or (bool(total) and r["saved_comments"] >= total)):
                 todo.append(r["id"])
         self._fill_visible()
         self._todo_comments = todo
@@ -546,7 +486,8 @@ class CoverageWindow(QDialog):
     def _fill_post_row(self, i: int) -> None:
         t, r = self.post_table, self._post_rows[i]
         done = r["id"] in self._comments_done
-        state = (r["title"], r["saved_comments"], r["num_comments"], done, self.busy)
+        so_far = r["num_comments"] is None and r["id"] in self._comments_so_far
+        state = (r["title"], r["saved_comments"], r["num_comments"], done, so_far, self.busy)
         if self._built.get(i) == state:
             return
         if i not in self._built:
@@ -559,14 +500,20 @@ class CoverageWindow(QDialog):
             t.setCellWidget(i, 2, centred(button))
         self._built[i] = state
         total = r["num_comments"]
-        t.cellWidget(i, 0).set_full(" ".join((r["title"] or "").split()))
+        t.cellWidget(i, 0).setText(" ".join((r["title"] or "").split()))
         cell: Cell = t.cellWidget(i, 1)
         cell.set(r["saved_comments"], total, done, "comment")
-        if total is None and not done:
+        if so_far and not done:
+            cell.side.setText("all so far")
+            cell.bar.set(1.0, False)  # full, but not the green of a thread that can't grow any more
+            cell.setToolTip("Every comment the archive had on this post when it was downloaded is saved. Arctic "
+                            "Shift counts a post's comments when it re-checks the post, usually about 36 hours "
+                            "after posting; Check again fetches any that came since.")
+        elif total is None and not done:
             cell.side.setText("not counted yet")
             cell.setToolTip("Arctic Shift counts a post's comments when it re-checks the post, usually "
                             "about 36 hours after posting. Downloading still fetches what's there now.")
-        full = done or (bool(total) and r["saved_comments"] >= total)
+        full = done or so_far or (bool(total) and r["saved_comments"] >= total)
         button: QPushButton = t.cellWidget(i, 2).findChild(QPushButton)
         button.setText("Check again" if full else "Download all")
         button.setEnabled(not self.busy and (total != 0 or done))
@@ -582,20 +529,13 @@ class CoverageWindow(QDialog):
     def _count(self, after: float, before: float) -> None:
         sub = self.subreddit
         self.status.setText(f"Asking Arctic Shift how many posts r/{sub} has each day…")
-        thread = QThread(self)
         worker = CountWorker(sub, after, before)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
         # Bound methods, not lambdas, so the results are handled on the GUI thread.
         worker.finished.connect(self._on_counts)
         worker.failed.connect(self._on_count_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(self._on_count_done)
-        self._count_thread, self._count_worker = thread, worker
         self._counting = (sub.lower(), after, before)
         self._count_stopped = False
-        thread.start()
+        self.count_job.start(worker)
 
     @Slot(str, object)
     def _on_counts(self, sub: str, counts: dict) -> None:
@@ -620,9 +560,6 @@ class CoverageWindow(QDialog):
 
     @Slot()
     def _on_count_done(self) -> None:
-        self._count_thread.deleteLater()
-        self._count_worker.deleteLater()
-        self._count_thread = self._count_worker = None
         if not (self.subreddit and self.days and self.isVisible()):
             return  # closed meanwhile (the store may be too); showing it again counts what's missing
         sub, after, before = self._counting
@@ -641,7 +578,7 @@ class CoverageWindow(QDialog):
         self._fill_days(totals, rebuild=False)
 
     def _recount(self) -> None:
-        if self.subreddit and self._count_thread is None:
+        if self.subreddit and not self.count_job.busy:
             self.totals.pop(self.subreddit.lower(), None)
             self.count_error = ""
             self.refresh_saved()
@@ -674,10 +611,10 @@ class CoverageWindow(QDialog):
         paint_backdrop(self)
 
     def closeEvent(self, event) -> None:
-        if self._count_worker:
+        if self.count_job.busy:
             # Not waited for: a request still out held the window (and the app's own close) for up to
             # 3 s. It ends by itself; app.main ends the process if it still runs when the app quits.
-            self._count_worker.stop()
+            self.count_job.stop()
             self._count_stopped = True
         super().closeEvent(event)
 

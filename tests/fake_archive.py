@@ -121,6 +121,7 @@ class FakeArchive:
         self.posts = posts
         self.rate, self.window_start, self.used = rate, time.perf_counter(), 0
         self.busy = {b.lower() for b in busy}
+        self.stuck: list[float] = []  # a search window holding any of these times always times out
         self.rejected: list[tuple[str, dict, int, str]] = []  # every 4xx sent: path, params, status, error
         self.requests: list[tuple[str, dict]] = []
         self.faults: dict[str, list[tuple[int, dict]]] = {}  # path -> responses to give before real ones
@@ -247,6 +248,8 @@ class FakeArchive:
         if q.get("subreddit", "").lower() in self.busy:
             if q.get("query") or q.get("title") or q.get("selftext"):
                 raise Rejected(200, "Query timed out")
+        if any((after or 0) < t < (before or float("inf")) for t in self.stuck):
+            raise Rejected(*SLOW_DOWN[:1], SLOW_DOWN[1]["error"])
         rows = self._matching(q)
         if q.get("subreddit", "").lower() in self.busy and len(rows) > BUSY_PAGE:
             raise Rejected(*SLOW_DOWN[:1], SLOW_DOWN[1]["error"])
@@ -266,10 +269,15 @@ class FakeArchive:
         after, before = _date(q, "after") or 0, _date(q, "before") or time.time()
         if q.get("subreddit", "").lower() in self.busy and before - after > BUSY_AGG_DAYS * DAY:
             raise Rejected(*SLOW_DOWN[:1], SLOW_DOWN[1]["error"])
+        # Like the real archive, the buckets are laid out from `after`'s own second, the first one starting
+        # on it (so a post made right at `after` is counted). Buckets that don't start on a UTC midnight came
+        # back holding 0 posts when checked live, so they do here too.
+        start = int(after)
         counts: dict[int, int] = {}
-        for p in self._matching(q):
-            day = int(p["created_utc"] // DAY * DAY)
-            counts[day] = counts.get(day, 0) + 1
+        for p in self.posts:
+            if p["subreddit"].lower() == q.get("subreddit", "").lower() and start <= p["created_utc"] < before:
+                day = start + int((p["created_utc"] - start) // DAY * DAY)
+                counts[day] = counts.get(day, 0) + (0 if start % DAY else 1)
         # Keyed the way the archive keys them: at its own midnight, UTC+2, so 22:00Z the day before. The
         # bucket still holds the UTC day.
         return [{"created_utc": (day - 7200) * 1000, "count": n} for day, n in sorted(counts.items())]

@@ -408,6 +408,35 @@ def test_a_timing_out_window_is_narrowed_and_the_rest_still_read():
     assert max(widths) == 5401 and min(widths) <= 1800  # gave up on 90 minutes (from a second early), read narrower windows
 
 
+class StuckArchive(ArchiveSession):
+    """Times out on any search window holding ``stuck``, however narrow."""
+
+    def __init__(self, items, stuck):
+        super().__init__(items)
+        self.stuck = stuck
+
+    def get(self, url, params=None, timeout=None):
+        if url.endswith("/api/posts/search") and params["after"] < self.stuck < params["before"]:
+            self.calls.append((url, dict(params)))
+            return FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
+        return super().get(url, params, timeout)
+
+
+def test_a_window_that_times_out_however_narrow_leaves_the_rest_of_the_range_read():
+    # Live on Sat 17 Oct, one narrowed window kept timing out and the whole Download all failed with
+    # an error box at 69%. The rest of the day can still be read; the day just can't be called whole.
+    items = [at(T0 + 100 + i * 600, i) for i in range(140)]  # a post every 10 minutes for a day
+    clock = FakeClock()
+    c = ArcticShiftClient(session=StuckArchive(items, stuck=T0 + 3 * 3600 + 50),
+                          limiter=RateLimiter(0.0, clock, clock.sleep))
+    posts = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True)
+    got = {p.created_utc for p in posts}
+    assert all(T0 + h * 3600 + 100 in got for h in (0, 2, 7, 12, 20))  # every other part of the day was read
+    assert len(posts) >= 100 and not c.exhausted and c.timed_out
+    c.fetch_posts("python", after=T0 + 12 * 3600, before=T0 + DAY, limit=10000, exhaust=True)
+    assert c.exhausted and not c.timed_out  # a fetch that doesn't touch it is unaffected
+
+
 def test_other_errors_are_reported():
     with pytest.raises(FetchError, match="HTTP 400: bad param"):
         client([FakeResponse(400, {"error": "bad param"})]).get(*SEARCH)
@@ -441,7 +470,7 @@ def test_day_counts_read_each_bucket_format_and_fill_empty_days():
     url, params = c.session.calls[0]
     assert url == BASE_URL + "/api/posts/search/aggregate"
     assert params == {"subreddit": "Python", "aggregate": "created_utc", "frequency": "day",
-                      "after": D0 - 1, "before": D0 + 4 * DAY, "limit": 5}  # `after` is exclusive
+                      "after": D0, "before": D0 + 4 * DAY, "limit": 5}
 
 
 def test_a_timing_out_count_is_split_and_a_day_that_still_times_out_is_left_out():
@@ -451,7 +480,7 @@ def test_a_timing_out_count_is_split_and_a_day_that_still_times_out_is_left_out(
     c = client([slow] * 3 + [ok([{"created_utc": D0, "count": 4}])] + [slow] * 6)
     assert c.day_counts("Python", D0, D0 + 2 * DAY) == {D0: 4}
     assert [p["limit"] for _, p in c.session.calls] == [3, 3, 3] + [2] * 7  # never shrunk like a page
-    assert [p["after"] for _, p in c.session.calls[-6:]] == [D0 + DAY - 1] * 6
+    assert [p["after"] for _, p in c.session.calls[-6:]] == [D0 + DAY] * 6
 
 
 def test_a_day_whose_count_timed_out_gets_a_second_go():
