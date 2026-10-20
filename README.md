@@ -258,7 +258,7 @@ Manager, macOS Keychain or Secret Service) under "Subreddit Sentiment", and you 
 
 ```bash
 python tools/check.py                # the whole suite, exactly as the required PR check runs it
-git config core.hooksPath .githooks  # optional: run it before every git push
+git config core.hooksPath .githooks  # run it before every git push (coding agents get this automatically)
 ```
 
 `tools/check.py` first stops if the branch is behind `origin/main` (merge it in, then run it again),
