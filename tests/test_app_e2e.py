@@ -13,11 +13,12 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from subsentiment import arctic_shift  # noqa: E402
+from subsentiment.gui import coverage  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import worker  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
-from fake_archive import FakeArchive, make_posts  # noqa: E402
+from fake_archive import DAY, FakeArchive, make_posts  # noqa: E402
 
 NOW = time.time()
 SEARCH, TREE, IDS, AGG = "/api/posts/search", "/api/comments/tree", "/api/posts/ids", "/api/posts/search/aggregate"
@@ -363,6 +364,31 @@ def test_coverage_counts_a_busy_subreddit_without_downloading_anything(env, monk
     QTest.keyClick(cov.post_table, Qt.Key.Key_Return)
     pump(500)
     assert set(env.archive.paths()) == {AGG} and w.thread is None
+
+
+def test_coverage_counts_posts_removed_from_reddit_as_checked(env):
+    # Every fifth post in the fake archive was removed. A day's count includes them, so once Download all
+    # has been through a day, it reads complete, and before that its share counts the removed ones seen.
+    w = env.window()
+    fetch(w, comments=False, limit=40)
+    cov = open_coverage(w)
+    removed = w.store.removed_per_day("python", cov.days[-1], cov.days[0] + DAY)
+    assert sum(removed.values()) > 0
+    row, day = next((r, d) for r, d in enumerate(cov.days) if removed.get(d) and not no_total_day(cov, d))
+    cell = cov.day_table.cellWidget(row, 1)
+    saved = w.store.posts_per_day("python", day, day + DAY)[day]
+    total = cov.totals["python"][day]
+    assert cell.main.text() == f"{saved} saved"
+    assert cell.side.text() == f"{100 * min(1, (saved + removed[day]) / total):.0f}%"
+    assert f"{removed[day]} removed from Reddit" in cell.toolTip()
+    QTest.mouseClick(cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    pump(100)
+    assert cov.day_table.cellWidget(row, 1).side.text() == "✓ Complete"
+
+
+def no_total_day(cov, day):
+    return day >= coverage.today() - coverage.COUNT_LAG_DAYS * DAY
 
 
 def test_coverage_downloads_do_only_what_they_say(env):

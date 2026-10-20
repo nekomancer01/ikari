@@ -240,6 +240,9 @@ class ArcticShiftClient:
         self.session.headers["User-Agent"] = USER_AGENT
         self.limiter = limiter or RateLimiter()
         self._page_cap = PAGE  # largest page the archive has answered without timing out in this fetch
+        # Posts the archive returned that were removed on Reddit, id -> created_utc: fetching skips them,
+        # but the archive's daily counts include them, so Download coverage counts them as checked.
+        self.removed: dict[str, float] = {}
 
     # -- HTTP ---------------------------------------------------------------
 
@@ -447,7 +450,9 @@ class ArcticShiftClient:
             fresh: list[Post] = []
             for d in new:
                 seen.add(d["id"])
-                if d["id"] not in skip and not _removed(d) and len(out) < want:
+                if _removed(d):
+                    self._note_removed(d)
+                elif d["id"] not in skip and len(out) < want:
                     out.append(_post(d))
                     fresh.append(out[-1])
                     cursor = max(cursor, int(_number(d.get("created_utc"), 0)) - 1)
@@ -496,9 +501,19 @@ class ArcticShiftClient:
         for i in range(0, len(ids), IDS_BATCH):
             if should_stop and should_stop():
                 break
-            out.extend(_post(d) for d in self.get("/api/posts/ids", {"ids": ",".join(ids[i:i + IDS_BATCH])})
-                       if d.get("id") and not _removed(d))
+            for d in self.get("/api/posts/ids", {"ids": ",".join(ids[i:i + IDS_BATCH])}):
+                if not d.get("id"):
+                    continue
+                if _removed(d):
+                    self._note_removed(d)
+                else:
+                    out.append(_post(d))
         return out
+
+    def _note_removed(self, d: dict) -> None:
+        created = _number(d.get("created_utc"), None)
+        if created is not None:
+            self.removed[d["id"]] = float(created)
 
     def day_counts(self, subreddit: str, after: float, before: float,
                    should_stop: StopFn | None = None) -> dict[int, int]:
