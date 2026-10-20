@@ -10,6 +10,7 @@ from PySide6.QtGui import QColor, QIcon, QPixmap
 
 from subsentiment.gui.charts import palette
 
+SORT_ROLE = Qt.ItemDataRole.UserRole + 1  # the value a column sorts by (the model sorts by it itself)
 NUMERIC = ("sentiment", "score", "num_comments")
 PENDING = ("score", "num_comments")  # None until Arctic Shift re-fetches the item, about 36 hours in
 PENDING_TIP = "Arctic Shift fills this in about 36 hours after posting. Fetch this range again later with Update saved posts ticked."
@@ -246,6 +247,8 @@ class RowsModel(QAbstractTableModel):
             if value is None:
                 return "–" if key in PENDING else ""
             return fmt(value)
+        if role == SORT_ROLE:
+            return self._key_of(index.column())(row)
         if role == Qt.ItemDataRole.DecorationRole and key == "label":
             return self._icons.get(value)
         if role == Qt.ItemDataRole.ToolTipRole and key in PENDING and value is None:
