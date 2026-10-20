@@ -53,6 +53,9 @@ def end_now(code: int) -> None:
     if sys.platform == "win32":
         # os._exit still runs Qt's DLL clean-up, which crashes (an access violation) with a thread running.
         import ctypes
+        from ctypes import wintypes
         kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE  # a 64-bit handle, not ctypes' default int
+        kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
         kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
     os._exit(code)
