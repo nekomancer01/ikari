@@ -182,6 +182,30 @@ def test_removed_posts_are_not_saved(env):
     assert saved and not saved & removed
 
 
+def test_all_comments_fetches_each_whole_thread_and_is_remembered(env):
+    w = env.window()
+    w.comments_per_post.setValue(0)
+    assert w.comments_per_post.text() == "All"
+    w.comments_per_post.setValue(50)
+    for _ in range(5):  # 40, 30, 20, 10, then All
+        QTest.keyClick(w.comments_per_post, Qt.Key.Key_Down)
+    assert w.comments_per_post.value() == 0 and w.comments_per_post.text() == "All"  # spinning down past 1
+    fetch(w, comments=True)
+    s = env.store()
+    posts = {r["id"]: r for r in s.posts("python")}
+    trees = [q for p, q in env.archive.requests if p == TREE]
+    # Every thread asked for in full (its known size plus room), not the top 50.
+    assert trees and all(int(q["limit"]) >= 100 for q in trees)
+    settled = {pid for pid, r in posts.items() if r["score"] is not None and r["num_comments"]}
+    assert settled and s.complete_keys("comments", "python") == settled  # Download coverage shows them done
+    env.archive.clear()
+    fetch(w, comments=True)
+    asked = {q["link_id"] for p, q in env.archive.requests if p == TREE}
+    assert asked and not asked & settled  # only the threads that can still grow are asked again
+    w.close()
+    assert env.window().comments_per_post.value() == 0  # remembered
+
+
 def test_comments_come_with_a_fetch_when_asked(env):
     w = env.window()
     fetch(w, comments=True)

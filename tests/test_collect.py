@@ -362,3 +362,30 @@ def test_stopping_a_whole_range_keeps_what_was_saved_and_asks_for_no_more_days(t
     assert len(s.posts("python")) == 3  # the newest day's posts, all saved before the fetch wound down
     assert s.complete_keys("posts", "python") == set()  # stopped, so not known to be complete
     assert not any(call[0] == "comments" for call in c.calls)
+
+
+def test_all_comments_on_a_fetch_get_every_thread_in_the_range_until_it_is_whole(tmp_path):
+    # p1 was saved with its top comments only, p2's whole thread is already saved, p3 is new.
+    s = store_with(tmp_path, [mk(1), mk(2)], comments_for=["p1", "p2"])
+    s.mark_comments("p1", ok=True, settled=True)
+    s.mark_comments("p2", ok=True, settled=True)
+    s.mark_complete("comments", "python", "p2")
+    s.commit()
+    c = FullThreadClient(posts=[mk(1), mk(2), mk(3)])
+    result = collect.run(c, s, collect.FetchRequest("python", comments_per_post=0))
+    assert sorted(call[1] for call in c.calls if call[0] == "all") == ["p1", "p3"]
+    assert not any(call[0] == "comments" for call in c.calls)  # no top-N requests
+    assert result.comments == 6 and s.complete_keys("comments", "python") == {"p1", "p2", "p3"}
+    c.calls.clear()
+    collect.run(c, s, collect.FetchRequest("python", comments_per_post=0))
+    assert not any(call[0] in ("all", "comments") for call in c.calls)  # every thread is whole now
+
+
+def test_all_comments_on_a_thread_cut_short_asks_again_next_time(tmp_path):
+    s = store_with(tmp_path, [])
+    c = FullThreadClient(whole=False, posts=[mk(1)])
+    collect.run(c, s, collect.FetchRequest("python", comments_per_post=0))
+    assert s.complete_keys("comments", "python") == set()
+    c.calls.clear()
+    collect.run(c, s, collect.FetchRequest("python", comments_per_post=0))
+    assert [call[1] for call in c.calls if call[0] == "all"] == ["p1"]
