@@ -80,7 +80,7 @@ import inspect  # noqa: E402
 from subsentiment.gui import coverage as cov  # noqa: E402
 
 WORKAROUNDS = []
-if "open_day" not in inspect.signature(cov.Cell._fit).parameters:
+if "_fit(open_day" in inspect.getsource(cov.Cell) and "open_day" not in inspect.signature(cov.Cell._fit).parameters:
     # main at d2c8c28 has two Cell._fit methods (two PRs merged together), so the window crashes on open.
     # Put both back under one name so the rest of the window can still be walked through.
     _side_fit = cov.Cell._fit
