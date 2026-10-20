@@ -302,7 +302,7 @@ QMenu::item:selected {{ background: {soft}; }}
 QMenu::item:disabled {{ color: {t['faint']}; }}
 QMenu::separator {{ height: 1px; background: {edge}; margin: 5px 8px; }}
 QMenu::indicator {{ width: 14px; height: 14px; }}
-QStatusBar {{ background: transparent; color: {t['muted']}; }}
+QStatusBar {{ background: transparent; color: {t['text']}; }}
 QStatusBar::item {{ border: none; }}
 QMessageBox, QFileDialog {{ background: {t['menu']}; }}
 """
