@@ -24,7 +24,7 @@ def fit_to_screen(size: QSize, screen) -> QSize:
 
 
 def plural(n: int, noun: str) -> str:
-    return f"{n:,} {noun}{'' if n == 1 else 's'}"  # no-break space keeps a number with its noun
+    return f"{n:,}\u00a0{noun}{'' if n == 1 else 's'}"  # no-break space keeps a number with its noun
 
 
 def panel(kind: str = "true", margins: int = 18, spacing: int = 12) -> tuple[QFrame, QVBoxLayout]:
