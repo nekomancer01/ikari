@@ -318,3 +318,36 @@ def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypat
     cell = c.day_table.cellWidget(c.days.index(older + 86400), 1)
     assert (cell.main.text(), cell.side.text()) == ("0 of 9", "0%")  # a settled day keeps its total
     c.close()
+
+
+def test_one_row_is_counted_as_one_row(make_window):
+    w = make_window()
+    assert w.posts_tab.count.text() == "1 row"
+
+
+def test_posts_without_a_score_yet_sort_below_every_real_score(make_window):
+    from subsentiment.gui.models import POST_COLUMNS, RowsModel, SORT_ROLE
+    model = RowsModel(POST_COLUMNS)
+    col = next(i for i, c in enumerate(POST_COLUMNS) if c[1] == "score")
+    rows = [{"id": i, "score": s, "title": "t", "selftext": "", "label": "neutral"}
+            for i, s in enumerate((-5, None, -1, 0))]
+    model.set_rows(rows)
+    keys = [model.data(model.index(r, col), SORT_ROLE) for r in range(4)]
+    assert sorted(range(4), key=lambda r: keys[r]) == [1, 0, 2, 3]  # pending first, then -5, -1, 0
+
+
+def test_an_export_that_cant_be_saved_says_so(make_window, monkeypatch, tmp_path):
+    # On Windows the usual cause is the CSV still being open in Excel. The error used to escape the slot:
+    # no message at all, and in the packaged app no console to show it either.
+    w = make_window()
+    target = tmp_path / "out.csv"
+    monkeypatch.setattr(mw.QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), ""))
+
+    def locked(*a, **k):
+        raise PermissionError(13, "Permission denied", str(target))
+    monkeypatch.setattr(w.store, "export_csv", locked)
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a[1:3]))
+    w._export("posts")
+    assert warned and warned[0][0] == "Export failed"
+    assert "close it and try again" in warned[0][1]

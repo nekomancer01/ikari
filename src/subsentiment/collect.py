@@ -100,10 +100,11 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
                                  skip=() if req.top else skip,
                                  progress=say, should_stop=should_stop, on_posts=save_streamed,
                                  exhaust=everything)
-        removed = getattr(client, "removed", None)
+        # Taken, not read and cleared: after Stop, slice threads still running may be adding to it.
+        take = getattr(client, "take_removed", None)
+        removed = take() if take else {}
         if removed:  # the archive's daily counts include these, so Download coverage counts them as checked
             store.save_removed(name, removed)
-            removed.clear()
         # Complete only when every part of the day was read to its end: a fetch that stopped at the limit, or
         # was stopped, may have missed posts. A day that isn't over yet can still get posts, so it never is,
         # and a keyword search only reads the posts that match.
@@ -135,6 +136,14 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     for p in new:
         if p.id not in streamed:
             store.save_post(p, *sentiment.score(p.text))
+    # Top mode can pick a saved post whose score has come in since: it downloaded the settled copy, so
+    # keep it (it used to be dropped, leaving the score blank unless "Update saved posts" was ticked).
+    rechecked = {p.id for p in updated}
+    settled = [p for p in picked if p.id in stored and p.id not in rechecked
+               and stored[p.id]["score"] is None and p.score is not None]
+    for p in settled:
+        store.save_post(p, *sentiment.score(p.text))
+    updated += settled
     store.commit()
     saved()
     first = (new or updated or picked or [None])[0]
@@ -174,7 +183,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         if todo:
             progress(len(todo), len(todo), "Done")
     return FetchResult(subreddit, len(new), n_comments, should_stop(), updated=len(updated),
-                       already=len(picked) - len(new), comment_errors=errors)
+                       already=len(picked) - len(new) - len(settled), comment_errors=errors)
 
 
 def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, progress, should_stop,
