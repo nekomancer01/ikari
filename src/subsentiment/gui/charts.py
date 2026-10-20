@@ -13,7 +13,7 @@ import math
 from functools import partial
 
 from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QFontMetricsF, QPainter, QPen, QTextCursor
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QFontMetricsF, QPainter, QPen, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QToolTip, QVBoxLayout, QWidget,
 )
@@ -238,6 +238,10 @@ class TimelineChart(QWidget):
         self.notes: dict[int, tuple[str, str]] = {}  # {day start: (label, description)}
         self._note_days: list[int] = []
         self._pills: list[tuple[QRectF, tuple]] = []  # each note label as painted, and the point it is on
+        self._version = 0  # counts changes to the points and notes, which the picture of the chart shows
+        self._drawn: QPixmap | None = None
+        self._drawn_for = None
+        self._painted_for = None  # what the last paint showed
 
         self.toolbar = QWidget()
         bar = QHBoxLayout(self.toolbar)
@@ -261,9 +265,8 @@ class TimelineChart(QWidget):
         if points == self.points:
             return  # nothing new (a running fetch asks four times a second)
         old_end = self.domain()[1]
-        if self.points and self._drag is None:
-            motion.crossfade(self)  # new days or new means: the old line fades into the new one
         self.points = list(points)
+        self._version += 1
         self._days = [d for d, _, _ in self.points]
         self._grouped.clear()
         if self.view is not None and self.view[1] >= old_end:
@@ -274,6 +277,7 @@ class TimelineChart(QWidget):
     def set_notes(self, notes: dict[int, tuple[str, str]]) -> None:
         self.notes = dict(notes)
         self._note_days = sorted(self.notes)
+        self._version += 1
         self.update()
 
     def notes_in(self, start: float, end: float) -> list[tuple[str, str]]:
@@ -466,8 +470,49 @@ class TimelineChart(QWidget):
     # -- painting ---------------------------------------------------------------------------------------
 
     def paintEvent(self, event) -> None:
+        """The chart as it was last drawn for this span, size and data, kept as a picture, so hovering, a drag
+        band, a crossfade or the window's tint repaint only what's on top: the band, the crosshair and its box."""
         colors, t = palette(), theme.tokens()
+        dpr = self.devicePixelRatioF()
+        key = (self.size(), dpr, self._screen, self._version, tuple(colors.values()), t["accent"], t["soft"])
         p = QPainter(self)
+        if key == self._drawn_for:
+            p.drawPixmap(0, 0, self._drawn)
+        elif key == self._painted_for:  # painted like this once already, so it holds still: keep a picture
+            self._drawn = QPixmap(self.size() * dpr)
+            self._drawn.setDevicePixelRatio(dpr)
+            self._drawn.fill(Qt.GlobalColor.transparent)
+            under = QPainter(self._drawn)
+            self._paint_chart(under, colors, t)
+            under.end()
+            self._drawn_for = key
+            p.drawPixmap(0, 0, self._drawn)
+        else:  # each frame of a zoom or a drag differs: straight onto the widget
+            self._paint_chart(p, colors, t)
+            p.setFont(_ui_font(9))
+        self._painted_for = key
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        plot, _ = self._areas()
+        lo, hi, bound = self._screen
+        if self._select:
+            a, b = sorted(self._select)
+            sel = QColor(t["accent"])
+            sel.setAlpha(36)
+            p.fillRect(QRectF(a, plot.top(), b - a, plot.height()), sel)
+        elif self._hover:
+            unit, start, end, mean, n = self._hover
+            x = self._x((start + end) / 2, lo, hi, plot)
+            y = plot.center().y() - mean / bound * plot.height() / 2
+            if plot.left() - 1 <= x <= plot.right() + 1:
+                p.setPen(QPen(QColor(colors["muted"]), 1))
+                p.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+                p.setPen(QPen(QColor(colors["surface"]), 2))
+                p.setBrush(QColor(colors["line"]))
+                p.drawEllipse(QPointF(x, y), 5.5, 5.5)
+                p.setFont(_ui_font(9))
+                self._paint_box(p, plot, x, self._hover)
+
+    def _paint_chart(self, p: QPainter, colors: dict, t: dict) -> None:
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         font = _ui_font(9)
         p.setFont(font)
@@ -522,11 +567,15 @@ class TimelineChart(QWidget):
             bar.setAlpha(55 if theme.mode() == "dark" else 70)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(bar)
+            bars = []
             for start, end, _, n in shown:
                 h = max(1.0, n / most * plot.height() * VOLUME)
                 x0, x1 = x_of(start), x_of(end)
                 bw = max(1.0, min((x1 - x0) * 0.6, 14))
-                p.drawRect(QRectF((x0 + x1 - bw) / 2, plot.bottom() - h, bw, h))
+                bars.append(QRectF((x0 + x1 - bw) / 2, plot.bottom() - h, bw, h))
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, False)  # square bars need none, and it's slow
+            p.drawRects(bars)  # in one call: a call a bar took most of a frame for a few years of days
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
         self._draw_line(p, shown, x_of, y_of, QPen(line, 2.25, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         ring = QPen(QColor(colors["surface"]), 1.5)
         if len(shown) <= DOTS:
@@ -534,25 +583,8 @@ class TimelineChart(QWidget):
             p.setBrush(line)
             for start, end, mean, _ in shown:
                 p.drawEllipse(QPointF(x_of((start + end) / 2), y_of(mean)), 4, 4)
-        if self._select:
-            a, b = sorted(self._select)
-            sel = QColor(t["accent"])
-            sel.setAlpha(36)
-            p.fillRect(QRectF(a, plot.top(), b - a, plot.height()), sel)
         p.restore()
         self._paint_notes(p, plot, shown, ring)
-
-        if self._hover and not self._select:
-            unit, start, end, mean, n = self._hover
-            x, y = x_of((start + end) / 2), y_of(mean)
-            if plot.left() - 1 <= x <= plot.right() + 1:
-                p.setPen(QPen(muted, 1))
-                p.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
-                ring.setWidthF(2)
-                p.setPen(ring)
-                p.setBrush(line)
-                p.drawEllipse(QPointF(x, y), 5.5, 5.5)
-                self._paint_box(p, plot, x, self._hover)
         self._paint_navigator(p, nav, colors, t)
 
     def _paint_notes(self, p: QPainter, plot: QRectF, shown: list, ring: QPen) -> None:
