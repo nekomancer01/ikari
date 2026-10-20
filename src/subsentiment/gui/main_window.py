@@ -19,7 +19,8 @@ from subsentiment.gui import days, motion, native, theme
 from subsentiment.gui.coverage import CoveragePage
 from subsentiment.gui.fetch_form import FetchForm
 from subsentiment.gui.charts import NoteDialog, TimelineChart
-from subsentiment.gui.overview import CardPage, OverviewPage, coming_soon
+from subsentiment.gui.overview import CardPage, OverviewPage
+from subsentiment.gui.words import KINDS, WordCloud, WordTally
 from subsentiment.gui.rail import DRAWERS, PAGES, NavRail
 from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
 from subsentiment.gui.theme import mark, paint_backdrop
@@ -415,8 +416,9 @@ class MainWindow(QMainWindow):
         for chart in self.timelines:
             chart.note_requested.connect(self._edit_note)
             chart.view_changed.connect(partial(self._on_view_changed, chart))
-        self.words_page = CardPage("Words", coming_soon(
-            "The word cloud goes here: the words, phrases and authors that come up most."))
+        self.words_page = CardPage("Words used most", WordCloud())
+        self.word_tally = WordTally(self)
+        self.word_tally.changed.connect(self._render_words)
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
         self.comments_tab = TablePage(COMMENT_COLUMNS, stretch_col=2)
         # The post title would otherwise size to its text and squeeze the comment column.
@@ -444,10 +446,12 @@ class MainWindow(QMainWindow):
             motion.crossfade(self.content)  # first: the old page's look
         self.rail.set_page(key)
         self.pages.setCurrentWidget(self.page_widgets[key])
-        self.scope.setVisible(key in ("overview", "timeline"))
+        self.scope.setVisible(key in ("overview", "timeline", "words"))
         self.settings.setValue("ui/page", key)
         if key == "timeline":  # kept up only while it shows
             self._show_span(self.timeline_page.body)
+        elif key == "words":
+            self._render_words()
 
     def set_drawer(self, key: str) -> None:
         """Open the Fetch or Saved drawer, or close the open one with ""."""
@@ -691,6 +695,7 @@ class MainWindow(QMainWindow):
             known.update(r["id"] for r in new)
             self._saved[kind].extend(new)
             self._analysis[kind].add(new)
+            self.word_tally.add(kind, days.keep(new, self._table_days))
             if not self._shown_live.isActive():
                 self._shown_live.start()
 
@@ -774,6 +779,7 @@ class MainWindow(QMainWindow):
                 else:
                     saved.append(r)
             self._analysis[kind] = Analysis(saved)  # a rescored row changes the totals
+            self.word_tally.add(kind, days.keep(rows, self._table_days))  # by id: rows saved again replace their words
             tab.update_rows(days.keep(rows, self._table_days))
         self._known = {}
         self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
@@ -891,6 +897,7 @@ class MainWindow(QMainWindow):
         self.comments = days.keep(self._saved["comments"], whole)
         self.posts_tab.load(self.posts)
         self.comments_tab.load(self.comments)
+        self.word_tally.count(self.posts, self.comments)
         self._update_dataset_labels()
 
     def _on_scope_changed(self, text: str) -> None:
@@ -925,6 +932,18 @@ class MainWindow(QMainWindow):
         a = self._counted.between(days.whole(self.span))
         self.overview.show_analysis(a)
         self.mood.set_counts(a.counts["positive"], a.counts["negative"], a.count)
+        self._render_words()
+
+    def _render_words(self) -> None:
+        """The word clouds of the span's items the scope counts: 50 words in the Overview's card, 150 on the
+        page. They follow the span once it settles, as the tables do."""
+        scope = self.scope.currentText()
+        kinds = [k for k, skip in zip(KINDS, ("Comments only", "Posts only")) if scope != skip]
+        busy = not self.word_tally.ready
+        words = [] if busy else self.word_tally.top(kinds, 150)
+        self.overview.words.set_words(words[:50], busy)
+        if self.words_page.isVisible():
+            self.words_page.body.set_words(words, busy)
 
     def _show_notes(self) -> None:
         notes = self.store.notes(self.current) if self.current else {}
