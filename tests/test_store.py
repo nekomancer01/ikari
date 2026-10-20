@@ -1,5 +1,7 @@
 import csv
 
+import pytest
+
 from subsentiment import collect
 from subsentiment.reddit import Comment, Post
 from subsentiment.store import Store, daily_means, summarize
@@ -98,3 +100,51 @@ def test_posts_and_comments_since_return_only_what_a_fetch_just_saved(tmp_path):
     s.save_post(Post("b", "Python", "t", "", "u", 1, None, 1, 2.0, "p", ""), 0.0, "neutral")
     assert [r["id"] for r in s.posts_since("python", cut)] == ["b"]
     assert s.comments_since("python", cut) == []
+
+
+def test_text_sqlite_cant_store_is_saved_with_a_replacement_instead_of_failing(tmp_path):
+    # The archive's JSON can hold half an emoji ("\ud83d", a title cut short); SQLite refuses it, which
+    # failed the whole fetch with UnicodeEncodeError and saved nothing.
+    s = Store(tmp_path / "x.db")
+    s.save_post(Post("p1", "Python", "cut short \ud83d", "body \udc00", "a", 1, 0.9, 1, 1_700_000_000.0,
+                     "https://r/1", ""), 0.1, "neutral")
+    s.save_comment(Comment("c1", "p1", "Python", "t3_p1", "b", "hi \ud83d", 1, 1_700_000_100, 0, "u"),
+                   0.0, "neutral")
+    s.commit()
+    assert s.posts("Python")[0]["title"] == "cut short ?"
+    assert s.comments("Python")[0]["body"] == "hi ?"
+    s.save_post(make_post(2), 0.5, "positive")  # ordinary text is stored as it is
+    assert s.posts_by_ids(["p2"])[0]["title"] == "title 2"
+
+
+def test_csv_opens_in_excel_as_utf8_and_cells_dont_run_as_formulas(tmp_path):
+    s = Store(tmp_path / "x.db")
+    s.save_post(Post("p1", "Python", '=HYPERLINK("http://x","y")', "", "a", -3, 0.9, 1, 1_700_000_000.0,
+                     "https://r/1", ""), 0.1, "neutral")
+    s.save_post(Post("p2", "Python", "café 😀, \"quoted\"\nnext line", "", "a", 2, 0.9, 1, 1_700_000_001.0,
+                     "https://r/2", ""), 0.1, "neutral")
+    s.commit()
+    out = tmp_path / "p.csv"
+    assert s.export_csv("Python", "posts", out) == 2
+    raw = out.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")  # Excel on Windows reads it as UTF-8, not cp1252
+    rows = {r["id"]: r for r in csv.DictReader(open(out, encoding="utf-8-sig", newline=""))}
+    assert rows["p1"]["title"] == '\'=HYPERLINK("http://x","y")'
+    assert rows["p1"]["score"] == "-3"  # numbers are left alone
+    assert rows["p2"]["title"] == "café 😀, \"quoted\"\nnext line"
+
+
+def test_a_failed_export_leaves_the_old_file_as_it_was(tmp_path, monkeypatch):
+    s = Store(tmp_path / "x.db")
+    s.save_post(make_post(1), 0.5, "positive")
+    s.commit()
+    out = tmp_path / "p.csv"
+    out.write_text("earlier export")
+
+    def refuse(src, dst):
+        raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+    monkeypatch.setattr("subsentiment.store.os.replace", refuse)
+    with pytest.raises(PermissionError):
+        s.export_csv("Python", "posts", out)
+    assert out.read_text() == "earlier export"
+    assert list(tmp_path.glob("*.part")) == []

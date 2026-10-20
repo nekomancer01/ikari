@@ -1254,7 +1254,13 @@ class MainWindow(QMainWindow):
             return
         path, _ = QFileDialog.getSaveFileName(self, f"Export {kind}", f"{self.current}_{kind}.csv", "CSV files (*.csv)")
         if path:
-            n = self.store.export_csv(self.current, kind, path)
+            try:
+                n = self.store.export_csv(self.current, kind, path)
+            except OSError as e:  # on Windows, usually the file is still open in Excel
+                QMessageBox.warning(self, "Export failed",
+                                    f"Couldn't save {path}.\n\n{e.strerror or e}\n\n"
+                                    "If the file is open in another program, close it and try again.")
+                return
             self.statusBar().showMessage(f"Exported {n} {kind} to {path}", 8000)
 
     def fetch_range(self) -> tuple[float, float]:
