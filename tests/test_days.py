@@ -138,7 +138,7 @@ def test_every_view_counts_only_the_chosen_days(window, tmp_path, monkeypatch):
     out = tmp_path / "posts.csv"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(out), ""))
     w._export("posts")
-    assert sorted(r["id"] for r in csv.DictReader(open(out, encoding="utf-8"))) == ["p0", "p1", "p3", "p4"]
+    assert sorted(r["id"] for r in csv.DictReader(open(out, encoding="utf-8-sig"))) == ["p0", "p1", "p3", "p4"]
     assert "from 2 chosen days" in w.statusBar().currentMessage()
 
     w._refresh_datasets(select="rust")  # another subreddit has its own choice: every day

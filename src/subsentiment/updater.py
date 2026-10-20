@@ -117,7 +117,12 @@ def latest_release(session: requests.Session | None = None, platform: str = sys.
         raise UpdateError("GitHub rate limit reached. Try again later.")
     if not r.ok:
         raise UpdateError(f"GitHub returned HTTP {r.status_code}.")
-    data = r.json()
+    try:
+        data = r.json()
+    except ValueError as e:  # a captive portal or proxy answering with a web page
+        raise UpdateError("GitHub sent an answer that couldn't be read. Try again later.") from e
+    if not isinstance(data, dict):
+        raise UpdateError("GitHub sent an answer that couldn't be read. Try again later.")
     tag = data.get("tag_name") or ""
     try:
         parse_version(tag)

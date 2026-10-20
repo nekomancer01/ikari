@@ -80,3 +80,16 @@ def test_connection_is_closed_even_on_failure(run, monkeypatch):
     monkeypatch.setattr(worker_mod.Store, "close", lambda self: (closed.append(1), real_close(self)))
     run(error=FetchError("x"))
     assert closed == [1]
+
+
+def test_a_database_that_cant_be_opened_fails_the_fetch_instead_of_hanging_it(tmp_path):
+    # Opening the store sat outside the try: neither finished nor failed was sent, the thread never quit
+    # and the window stayed "fetching" with Stop doing nothing.
+    blocker = tmp_path / "not-a-folder"
+    blocker.write_text("")
+    w = worker_mod.FetchWorker(collect.FetchRequest("python"), str(blocker / "w.db"))
+    events = {"finished": [], "failed": []}
+    w.finished.connect(events["finished"].append)
+    w.failed.connect(events["failed"].append)
+    w.run()
+    assert events["finished"] == [] and len(events["failed"]) == 1
