@@ -569,6 +569,55 @@ def test_import_database_adds_its_subreddits_to_the_list(make_window, tmp_path, 
     assert len(warnings) == 1 and w.datasets.count() == 3
 
 
+def test_score_filter_hides_low_posts_and_their_comments_everywhere_and_is_remembered(make_window, tmp_path):
+    from subsentiment.reddit import Comment
+    s = Store(tmp_path / "w.db")
+    ts = 1_700_000_000.0
+    for pid, score in (("low", 3), ("mid", 40), ("high", 900), ("pending", None)):
+        s.save_post(Post(pid, "Python", pid, "", "a", score, 0.9, 1, ts, f"https://r/{pid}/", ""), 0.5, "positive")
+        s.save_comment(Comment(f"c-{pid}", pid, "Python", f"t3_{pid}", "b", "hi", 1, ts, 0, ""), -0.5, "negative")
+    s.commit()
+    s.close()
+    w = make_window()
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
+    assert w.score_pick.currentText() == "Any score" and len(w.posts) == 5 and len(w.comments) == 4
+    w.score_pick.setCurrentIndex(w.score_pick.findText("Score 10+"))
+    # p0 (score 1) and "low" go, with low's comment; a score the archive hasn't filled in yet isn't held against it.
+    assert sorted(r["id"] for r in w.posts) == ["high", "mid", "pending"]
+    assert sorted(r["id"] for r in w.comments) == ["c-high", "c-mid", "c-pending"]
+    assert w.posts_tab.model.rowCount() == 3 and w.comments_tab.model.rowCount() == 3
+    assert w._counted.count == 6  # the Overview and Timeline count what the tables show
+    assert "3\xa0posts" in w.subheading.text()
+    out = tmp_path / "p.csv"
+    assert w.store.export_csv("Python", "comments", out, min_score=w.min_score) == 3
+
+    # A running fetch's rows go through the same filter as they arrive.
+    w.fetch_job.qthread = object()
+    w.request, w._since = mw.collect.FetchRequest("Python"), time.time()
+    w._read_to = {"posts": w._since, "comments": w._since}
+    w.store.save_post(Post("new-low", "Python", "n", "", "a", 2, 0.9, 1, ts, "https://r/n/", ""), 0.5, "positive")
+    w.store.save_post(Post("new-high", "Python", "n", "", "a", 50, 0.9, 1, ts, "https://r/h/", ""), 0.5, "positive")
+    w.store.save_comment(Comment("c-new-low", "new-low", "Python", "t3_new-low", "b", "x", 1, ts, 0, ""), 0.1, "neutral")
+    w.store.commit()
+    w._queue_new_rows()
+    w._flush_rows()
+    w.fetch_job.qthread = None
+    assert sorted(r["id"] for r in w.posts_tab.all_rows) == ["high", "mid", "new-high", "pending"]
+    assert "c-new-low" not in {r["id"] for r in w.comments_tab.all_rows}
+    # The finished fetch rescored "high" below the filter: it leaves every page, and so does its comment.
+    w.store.save_post(Post("high", "Python", "high", "", "a", 4, 0.9, 1, ts, "https://r/high/", ""), 0.5, "positive")
+    w.store.commit()
+    w._merge_fetched()
+    assert "high" not in {r["id"] for r in w.posts_tab.all_rows} and "high" not in {r["id"] for r in w.posts}
+    assert "c-high" not in {r["id"] for r in w.comments_tab.all_rows}
+    w.close()
+
+    again = make_window()
+    assert again.score_pick.currentText() == "Score 10+" and len(again.posts) == 3
+    again.score_pick.setCurrentIndex(again.score_pick.findText("Any score"))
+    assert len(again.posts) == 7 and len(again.comments) == 5
+
+
 def test_download_coverage_is_a_page_in_the_rail(make_window, monkeypatch):
     from subsentiment.gui import coverage
     monkeypatch.setattr(coverage.CoveragePage, "_count", lambda self, after, before: None)  # no network
