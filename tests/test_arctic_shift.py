@@ -577,3 +577,43 @@ def test_stopping_top_mode_keeps_the_days_already_ranked():
     stop = lambda: sum(1 for u, _ in c.session.calls if u.endswith("/api/posts/search")) >= 3 * TOP_PAGES  # noqa: E731
     posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=14, top=True, should_stop=stop)
     assert len(posts) == 6 and all(p.title for p in posts)  # three days' picks, downloaded despite the Stop
+
+
+def test_concurrent_requests_stay_within_the_servers_remaining_budget():
+    # A server allowing 3 requests per 0.3 s window, and 4 threads asking as fast as the limiter lets them.
+    lock, window, used, refused = threading.Lock(), [time.monotonic()], [0], []
+
+    def answer():
+        with lock:
+            now = time.monotonic()
+            if now - window[0] >= 0.3:
+                window[0], used[0] = now, 0
+            used[0] += 1
+            if used[0] > 3:
+                refused.append(now)
+            return {"X-RateLimit-Remaining": str(3 - used[0]),
+                    "X-RateLimit-Reset": f"{0.3 - (now - window[0]) + 0.01:.3f}"}
+
+    limiter = RateLimiter(0.0)
+
+    def worker():
+        for _ in range(6):
+            limiter.wait()
+            time.sleep(0.02)  # the request is on the wire
+            limiter.observe(answer())
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert refused == [] and not any(t.is_alive() for t in threads)
+
+
+def test_a_request_that_never_got_an_answer_frees_its_slot():
+    limiter = RateLimiter(0.0)
+    limiter.wait()
+    limiter.done()
+    finished = threading.Event()
+    threading.Thread(target=lambda: (limiter.wait(), finished.set()), daemon=True).start()
+    assert finished.wait(0.5)

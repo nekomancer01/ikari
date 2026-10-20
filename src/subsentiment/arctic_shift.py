@@ -85,16 +85,48 @@ class RateLimiter:
         self._wall = wall
         self._next = 0.0  # earliest time the next request may go out
         self.on_wait: WaitFn | None = None  # told about long pauses, so the UI can say why it's idle
-        self._lock = threading.Lock()  # one limiter can be shared by jobs on several threads
+        self._lock = threading.Condition()  # one limiter can be shared by jobs on several threads
+        # With several requests in flight, "X-RateLimit-Remaining: 2" on one answer says nothing about
+        # the requests already sent. So the limiter counts what's in flight, keeps the remaining budget
+        # minus those, and sends one request at a time whenever it doesn't know the budget (before the
+        # first answer, and after a reset until the next answer says what the new window allows).
+        self._in_flight = 0
+        self._budget: float | None = None  # requests left in the server's current window, if known
+        self._budget_until = 0.0  # when that window resets
+        self._budget_known = False  # the server has sent X-RateLimit-Remaining at least once
+        self._answered = False  # any answer has arrived yet
 
     def wait(self) -> None:
+        """Block until a request may go out, and count it as in flight until ``observe`` or ``done``."""
         with self._lock:
-            delay = self._next - self._clock()
-            if delay > 0:
-                if delay >= 3 and self.on_wait:
-                    self.on_wait(delay, self._reason)
-                self._sleep(delay)
-            self._next = self._clock() + self.interval
+            while True:
+                now = self._clock()
+                if self._budget is not None and now >= self._budget_until:
+                    self._budget = None  # the window reset; the next answer gives the new budget
+                unknown = not self._answered or (self._budget_known and self._budget is None)
+                if unknown and self._in_flight:
+                    self._lock.wait(1.0)
+                    continue
+                if self._budget is not None and self._budget <= 0:
+                    self.hold(self._budget_until - now, "Arctic Shift's request limit was reached")
+                    self._budget = None
+                start = max(now, self._next)
+                self._next = start + self.interval
+                self._in_flight += 1
+                if self._budget is not None:
+                    self._budget -= 1
+                delay, reason = start - now, self._reason
+                break
+        if delay > 0:
+            if delay >= 3 and self.on_wait:
+                self.on_wait(delay, reason)
+            self._sleep(delay)
+
+    def done(self) -> None:
+        """A request ``wait`` let out got no answer (a network error)."""
+        with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
+            self._lock.notify_all()
 
     def hold(self, seconds: float, reason: str = "Arctic Shift is busy") -> None:
         """Send nothing for the next ``seconds`` (capped at MAX_WAIT)."""
@@ -118,9 +150,19 @@ class RateLimiter:
         return default
 
     def observe(self, headers) -> None:
-        """Pause until the reset when a response says no requests are left."""
-        if _number(headers.get("X-RateLimit-Remaining"), 1.0) <= 0:
-            self.hold(self.reset_after(headers, 10.0), "Arctic Shift's request limit was reached")
+        """Note an answer's rate-limit headers, and pause until the reset when no requests are left."""
+        with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
+            self._answered = True
+            remaining = _number(headers.get("X-RateLimit-Remaining"), None)
+            if remaining is not None:
+                reset = self.reset_after(headers, 10.0)
+                self._budget_known = True
+                self._budget = remaining - self._in_flight
+                self._budget_until = self._clock() + max(reset, 0.0)
+                if remaining <= 0:
+                    self.hold(reset, "Arctic Shift's request limit was reached")
+            self._lock.notify_all()
 
     _reason = "Arctic Shift is busy"
 
@@ -213,10 +255,14 @@ class ArcticShiftClient:
             try:
                 resp = self.session.get(BASE_URL + path, params=params, timeout=60)
             except (requests.ConnectionError, requests.Timeout):
+                self.limiter.done()
                 if attempt == ATTEMPTS - 1:
                     raise
                 self.limiter.hold(backoff, "Couldn't reach Arctic Shift")
                 continue
+            except BaseException:
+                self.limiter.done()
+                raise
             self.limiter.observe(resp.headers)
             error = _error_text(resp)
             if resp.status_code == 200 and not error:
