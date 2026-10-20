@@ -257,8 +257,13 @@ Manager, macOS Keychain or Secret Service) under "Subreddit Sentiment", and you 
 ## Development
 
 ```bash
-.venv/bin/pytest
+python tools/check.py                # the whole suite, exactly as the required PR check runs it
+git config core.hooksPath .githooks  # optional: run it before every git push
 ```
+
+`tools/check.py` first stops if the branch is behind `origin/main` (merge it in, then run it again),
+since `main` only takes branches that are up to date. Extra arguments go to pytest
+(`python tools/check.py tests/test_store.py -x`).
 
 Layout:
 
