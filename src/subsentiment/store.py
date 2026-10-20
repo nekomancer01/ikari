@@ -113,6 +113,10 @@ class Store:
         values = tuple(map(_storable, values))
         self.db.execute(f"INSERT OR REPLACE INTO comments VALUES ({','.join('?' * len(values))})", values)
 
+    def comment_ids(self, post_id: str) -> set[str]:
+        """The ids of the comments saved on one post."""
+        return {r[0] for r in self.db.execute("SELECT id FROM comments WHERE post_id = ?", (post_id,))}
+
     def posts_between(self, subreddit: str, after: float | None = None,
                       before: float | None = None) -> list[sqlite3.Row]:
         """Stored posts created in [after, before), each with has_comments and, when ikari has asked for

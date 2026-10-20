@@ -69,13 +69,17 @@ class FetchForm(QObject):
         for edit in (self.date_from, self.date_to):
             edit.userDateChanged.connect(self._on_date_edited)
         self.include_comments = QCheckBox("Fetch")
+        # 0 is "All": every comment on each post, as Download coverage's Download all comments fetches.
         self.comments_per_post = QSpinBox()
-        self.comments_per_post.setRange(1, 500)
+        self.comments_per_post.setRange(0, 500)
         self.comments_per_post.setSingleStep(10)
         self.comments_per_post.setValue(FETCH_DEFAULTS["comments_per_post"])
         self.comments_per_post.setSuffix(" per post")
         # The stylesheet's horizontal padding doesn't reach a spin box's inner editor; match the other inputs.
         self.comments_per_post.findChild(QLineEdit).setTextMargins(8, 0, 0, 0)
+        self.comments_per_post.setSpecialValueText("All")
+        self.comments_per_post.setToolTip("The highest-scored comments on each post. Go below 1 for All: "
+                                          "every comment on each post.")
         self.comments_per_post.setMinimumWidth(100)  # its size hint would squeeze the form's labels
         self.include_comments.toggled.connect(lambda _: self._update_comments_enabled())
         self.refresh_scores = QCheckBox("Update saved posts")
