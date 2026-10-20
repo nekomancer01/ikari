@@ -6,7 +6,7 @@
     python tools/ui_matrix.py --no-shots --strict     # checks only; exit status 1 on any problem (tests use this)
 
 Each screen runs in its own Qt process on the offscreen platform, configured with that screen's size and
-device pixel ratio, and with the font DPI the real OS uses (Windows 96, macOS 72, which makes the same
+device pixel ratio, and with the font DPI the real OS uses (Windows and Linux 96, macOS 72, which makes the same
 point size smaller on a Mac). The taskbar, Dock, menu bar and title bar are taken off the free area by
 hand, since the offscreen platform has none. Restored is the size the app opens at; maximized is the free
 area; the sweep drags the window from maximized down to its minimum size in a few steps.
@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # Logical (point) sizes the taskbar and title bars take up.
 WIN_TASKBAR, WIN_CAPTION = 48, 31  # Windows 11
+LINUX_PANEL, LINUX_TITLE = 32, 37  # GNOME's top bar and a client-side title bar
 MAC_MENU, MAC_MENU_NOTCH, MAC_TITLE, MAC_DOCK = 25, 37, 28, 70  # Dock shown at the bottom, default size
 
 # (id, os, physical width, physical height, scalings). Windows: scaling is the display setting.
@@ -52,6 +53,11 @@ SCREENS = [
     ("win-2880x1800", "win", 2880, 1800, [150, 175, 200]),
     ("win-3840x2160", "win", 3840, 2160, [150, 175, 200, 225]),
     ("win-3840x2400", "win", 3840, 2400, [200, 225, 250]),
+    ("linux-1366x768", "linux", 1366, 768, [100]),
+    ("linux-1920x1080", "linux", 1920, 1080, [100, 125]),
+    ("linux-1920x1200", "linux", 1920, 1200, [100, 150]),
+    ("linux-2560x1440", "linux", 2560, 1440, [100, 150]),
+    ("linux-3840x2160", "linux", 3840, 2160, [200]),
     ("mac-1280x800", "mac", 2560, 1600, [200]),   # 13" MacBook Air/Pro (Intel)
     ("mac-1440x900", "mac", 2880, 1800, [200]),   # 13" MacBook Air M1, 15" Pro
     ("mac-1470x956", "mac", 2940, 1912, [200]),   # 13" MacBook Air M2+ (notch)
@@ -69,6 +75,8 @@ def free_area(screen: str, os_name: str, w: float, h: float) -> tuple[int, int]:
     """Logical size a maximized (Windows) or zoomed (macOS) window's contents get."""
     if os_name == "win":
         return int(w), int(h - WIN_TASKBAR - WIN_CAPTION)
+    if os_name == "linux":
+        return int(w), int(h - LINUX_PANEL - LINUX_TITLE)
     menu = MAC_MENU_NOTCH if screen in NOTCHED else MAC_MENU
     return int(w), int(h - menu - MAC_TITLE - MAC_DOCK)
 
@@ -364,7 +372,7 @@ def child(spec: dict) -> int:
 
     class Free:  # the screen's free area, for the app's own opening-size rule
         def __init__(self, w, h):
-            self.rect = QRect(0, 0, w, h + (WIN_CAPTION if spec["os"] == "win" else MAC_TITLE))
+            self.rect = QRect(0, 0, w, h + {"win": WIN_CAPTION, "linux": LINUX_TITLE}.get(spec["os"], MAC_TITLE))
 
         def availableGeometry(self):
             return self.rect
@@ -475,7 +483,7 @@ def run_one(row, db: Path, tmp: Path, out: Path, args) -> dict | str:
     tag, os_name, pw, ph, scale = row
     dpr = scale / 100
     lw, lh = pw / dpr, ph / dpr
-    dpi = 96 if os_name == "win" else 72
+    dpi = 72 if os_name == "mac" else 96
     config = tmp / f"{tag}.json"
     # Qt takes the scaling from logical DPI over base DPI, as it does from Windows' display setting.
     config.write_text(json.dumps({"screens": [{
