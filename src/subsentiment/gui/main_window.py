@@ -466,6 +466,7 @@ class TablePage(QWidget):
         """Size each column to its values and its full header title, leaving the rest to the text column.
 
         Qt's own sizing leaves out room for the sort arrow, so a sorted column's title got cut short."""
+        self.view.ensurePolished()  # the stylesheet's font and padding, before the window first shows
         header = self.view.horizontalHeader()
         font = header_font(self.view.font())
         header.setFont(font)  # Qt elides header titles using the widget's font, not the stylesheet's
