@@ -41,9 +41,9 @@ def main() -> int:
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(ROOT / "src"), env.get("PYTHONPATH")]))
     if sys.platform.startswith("linux") and "QT_QPA_PLATFORM" not in env:
         env["QT_QPA_PLATFORM"] = "offscreen"
-    # One worker per core; each test file stays on one worker, so the layout matrix (one long render) runs
-    # alongside the e2e files instead of before them.
-    cmd = [sys.executable, "-m", "pytest", "-q", "-n", "auto", "--dist", "loadfile", *sys.argv[1:]]
+    # One worker per core, tests spread one by one so the long e2e file doesn't sit on a single worker. The
+    # layout matrix (one long render shared by its tests) is grouped onto one worker by its xdist_group mark.
+    cmd = [sys.executable, "-m", "pytest", "-q", "-n", "auto", "--dist", "loadgroup", *sys.argv[1:]]
     return subprocess.run(cmd, cwd=ROOT, env=env).returncode
 
 

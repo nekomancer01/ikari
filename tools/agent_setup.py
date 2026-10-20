@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # Installed as plain packages, not `pip install -e .`: check.py imports this checkout's src directly, so an
 # editable install pointing at another checkout can't swap in someone else's code.
 NEEDED = {"PySide6": "PySide6>=6.7", "requests": "requests>=2.31", "vaderSentiment": "vaderSentiment>=3.3.2",
-          "pytest": "pytest>=8", "xdist": "pytest-xdist>=3"}
+          "pytest": "pytest>=8", "xdist": "pytest-xdist>=3",
+          "PyInstaller": "pyinstaller"}  # tests/test_packaging.py reads what the spec bundles
 QT_LIBRARIES = ["libegl1", "libgl1", "libxkbcommon0", "libfontconfig1", "libdbus-1-3"]
 
 
