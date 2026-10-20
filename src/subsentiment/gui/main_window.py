@@ -1089,7 +1089,8 @@ class MainWindow(QMainWindow):
             self.subheading.setText("Enter a subreddit on the left and press Fetch and analyse.")
             return
         self.heading.setText(f"r/{self.current}")
-        fetched = max((r["fetched_at"] for r in self._saved["posts"] + self.posts), default=None)
+        fetched = max(max((r["fetched_at"] for r in rows), default=0)
+                      for rows in (self._saved["posts"], self.posts)) or None
         on = ""
         if self.chosen_days is not None:
             n = len(self.chosen_days & set(self._day_counts))
@@ -1290,7 +1291,8 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, f"Export {kind}", f"{self.current}_{kind}.csv", "CSV files (*.csv)")
         if path:
             n = self.store.export_csv(self.current, kind, path, days=self.chosen_days)
-            on = "" if self.chosen_days is None else f" from {plural(len(self.chosen_days), 'chosen day')}"
+            n_days = len(self.chosen_days & set(self._day_counts)) if self.chosen_days is not None else 0
+            on = "" if self.chosen_days is None else f" from {plural(n_days, 'chosen day')}"
             self.statusBar().showMessage(f"Exported {n:,} {kind}{on} to {path}", 8000)
 
     def fetch_range(self) -> tuple[float, float]:

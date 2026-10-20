@@ -232,7 +232,7 @@ class Store:
         starts) when given. Returns how many rows were written."""
         rows = self.posts(subreddit) if kind == "posts" else self.comments(subreddit)
         if days is not None:
-            rows = [r for r in rows if int(r["created_utc"] // 86400 * 86400) in days]
+            rows = [r for r in rows if r["created_utc"] is not None and int(r["created_utc"] // 86400 * 86400) in days]
         columns = POST_COLUMNS if kind == "posts" else COMMENT_COLUMNS + ("post_title",)
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)

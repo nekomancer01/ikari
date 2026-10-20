@@ -230,3 +230,20 @@ def test_deleting_a_subreddit_forgets_its_days(window, monkeypatch):
     w._delete_all()
     assert not w.settings.childGroups() or days.SETTINGS_GROUP not in w.settings.childGroups()
     assert not w.days_pick.isEnabled()  # nothing saved: nothing to pick
+
+
+def test_a_refresh_while_the_calendar_is_open_keeps_the_users_pick(window):
+    w = window()
+    w.days_pick.showPopup()
+    click(w, D2)  # still settling when a running fetch's once-a-second refresh arrives
+    w._refresh_days()
+    assert w.days_pick.picker.chosen() == {D1, D3} and w.days_pick.currentText() == "2 of 3 days"
+    w.days_pick.hidePopup()
+    assert w.chosen_days == {D1, D3}
+
+
+def test_rows_without_a_date_are_left_out_of_a_narrower_choice():
+    assert days.keep([{"created_utc": None}, {"created_utc": D1}], {D1}) == [{"created_utc": D1}]
+    assert days.choice_text({days.from_date(date(2025, 12, 31)), days.from_date(date(2026, 1, 1))},
+                            {days.from_date(date(2025, 12, 31)), days.from_date(date(2026, 1, 1)), D1}) == \
+        "31 Dec 2025 – 1 Jan 2026"

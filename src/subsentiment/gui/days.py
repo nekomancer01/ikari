@@ -41,10 +41,11 @@ def from_date(d: date) -> int:
 
 
 def keep(rows, chosen: set[int] | None) -> list:
-    """The rows created on a chosen day; all of them when every day is chosen (None)."""
+    """The rows created on a chosen day; all of them when every day is chosen (None). Always a new list: the
+    tables extend the list they were given with a running fetch's rows."""
     if chosen is None:
         return list(rows)
-    return [r for r in rows if day_of(r["created_utc"]) in chosen]
+    return [r for r in rows if r["created_utc"] is not None and day_of(r["created_utc"]) in chosen]
 
 
 def settings_key(subreddit: str) -> str:
@@ -94,8 +95,9 @@ def choice_text(chosen: set[int] | None, available) -> str:
     run = picked[-1] - picked[0] == (len(picked) - 1) * DAY  # a whole run of calendar days
     if run:
         a, b = as_date(picked[0]), as_date(picked[-1])
-        return f"{a.day} – {b.day} {b:%b}" if (a.year, a.month) == (b.year, b.month) else \
-            f"{a.day} {a:%b} – {b.day} {b:%b}"
+        if a.year != b.year:
+            return f"{a.day} {a:%b %Y} – {b.day} {b:%b %Y}"
+        return f"{a.day} – {b.day} {b:%b}" if a.month == b.month else f"{a.day} {a:%b} – {b.day} {b:%b}"
     return f"{len(picked)} of {len(available)} days"
 
 
@@ -337,6 +339,8 @@ class DayPicker(QFrame):
         super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
                          | Qt.WindowType.NoDropShadowWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # A click on the picker's own box closes the calendar; without this Qt replays it and reopens it.
+        self.setAttribute(Qt.WidgetAttribute.WA_NoMouseReplay)
         self.months: list[tuple[int, int]] = []
         lay = QVBoxLayout(self)
         s = self.SHADOW
@@ -519,17 +523,20 @@ class DaysCombo(QComboBox):
     def sizeHint(self) -> QSize:
         # Wide enough for the longest label it shows, so it doesn't jump as days are picked.
         hint = super().sizeHint()
-        widest = max(QFontMetrics(self.font()).horizontalAdvance(s) for s in ("All days", "88 of 888 days", "No days"))
+        widest = max(QFontMetrics(self.font()).horizontalAdvance(s)
+                     for s in ("All days", "88 of 888 days", "28 Sep – 30 Sep", "No days"))
         return QSize(max(hint.width(), widest + 48), hint.height())
 
     def set_days(self, counts: dict[int, tuple[int, int]], chosen: set[int] | None) -> None:
+        """The subreddit's saved days and its stored choice. While the calendar is open or a pick is still
+        settling, only the days are updated (a running fetch adds some): the user's own pick stands."""
         self.counts = dict(counts)
-        self._chosen = chosen
-        self._settle.stop()
-        self.setItemText(0, choice_text(chosen, counts))
-        self.setEnabled(bool(counts))
+        if not (self.picker.isVisible() or self._settle.isActive()):
+            self._chosen = chosen
         if self.picker.isVisible():
-            self.picker.set_days(counts, chosen)
+            self.picker.set_days(counts, self._chosen)
+        self.setItemText(0, choice_text(self._chosen, counts))
+        self.setEnabled(bool(counts))
 
     def chosen(self) -> set[int] | None:
         return self._chosen
