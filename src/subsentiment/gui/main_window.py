@@ -463,6 +463,7 @@ class MainWindow(QMainWindow):
         self.rail.set_page(key)
         self.pages.setCurrentWidget(self.page_widgets[key])
         self.scope.setVisible(key in ("overview", "timeline", "words"))
+        self.score_pick.setVisible(key != "coverage")  # Download coverage counts every saved post
         self.settings.setValue("ui/page", key)
         if key == "timeline":  # kept up only while it shows
             self._show_span(self.timeline_page.body)
