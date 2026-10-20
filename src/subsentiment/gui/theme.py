@@ -377,9 +377,18 @@ class MoodTint(QObject):
         self._anim = QVariantAnimation(self, duration=900, easingCurve=QEasingCurve.Type.InOutCubic)
         self._anim.valueChanged.connect(self._step)
 
-    def set_counts(self, positive: int, negative: int, total: int) -> None:
-        self._target = QPointF(mood_score(positive, negative, total), 1.0 if total else 0.0)
-        self._go()
+    def set_counts(self, positive: int, negative: int, total: int, ease: bool = False) -> None:
+        """Tint for these counts. Only ``ease`` (another subreddit) eases there: every step repaints the whole
+        window, which a span or a running fetch changing the counts again and again would keep doing."""
+        target = QPointF(mood_score(positive, negative, total), 1.0 if total else 0.0)
+        if abs(target.x() - self._target.x()) < 0.01 and target.y() == self._target.y():
+            return  # too small a change to see
+        self._target = target
+        if ease:
+            self._go()
+        else:
+            self._anim.stop()
+            self._step(target if self.enabled else QPointF(self.state.x(), 0.0))
 
     def set_enabled(self, on: bool) -> None:
         self.enabled = on

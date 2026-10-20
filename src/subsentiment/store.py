@@ -160,7 +160,6 @@ class Store:
                 if is_image_post(r["url"], r["selftext"])])
             self.db.commit()
         self._stamp = 0.0
-        self._packs: OrderedDict = OrderedDict()  # (kind, subreddit, day) -> (packed_at, unpacked), recent ones
         backup = Path(str(self.path) + "-before-v1")
         if fresh:
             self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -174,6 +173,10 @@ class Store:
             pass
 
     _migration_tried: set[Path] = set()
+    # Recently read packs, shared by every connection (the window's loads each open their own), as
+    # (path, kind, subreddit, day) -> (packed_at, unpacked); a pack replaced since has a new packed_at.
+    _packs: OrderedDict = OrderedDict()
+    _packs_lock = threading.Lock()
 
     def _migrate(self, backup: Path) -> None:
         """Shrink a database saved by an older ikari, keeping a copy of it until that's done. It's one
@@ -305,16 +308,18 @@ class Store:
         row = self.db.execute("SELECT packed_at FROM packs WHERE kind = ? AND subreddit = ? AND day = ?", key).fetchone()
         if row is None:
             return {}
-        hit = self._packs.get(key)
-        if cached and hit and hit[0] == row[0]:
-            self._packs.move_to_end(key)
-            return hit[1]
+        with Store._packs_lock:
+            hit = Store._packs.get((self.path, *key))
+            if cached and hit and hit[0] == row[0]:
+                Store._packs.move_to_end((self.path, *key))
+                return hit[1]
         data = _unpack(self.db.execute("SELECT data FROM packs WHERE kind = ? AND subreddit = ? AND day = ?", key).fetchone()[0])
         rows = data["rows"] if data["columns"] == list(PACKED[kind]) else {  # packed with other columns
             i: [dict(zip(data["columns"], v)).get(c) for c in PACKED[kind]] for i, v in data["rows"].items()}
-        self._packs[key] = (row[0], rows)
-        while len(self._packs) > 512:  # about a year of days of a subreddit or two
-            self._packs.popitem(last=False)
+        with Store._packs_lock:
+            Store._packs[self.path, *key] = (row[0], rows)
+            while len(Store._packs) > 512:  # about a year of days of a subreddit or two
+                Store._packs.popitem(last=False)
         return rows
 
     def _unpacked(self, kind: str, rows) -> list[dict]:

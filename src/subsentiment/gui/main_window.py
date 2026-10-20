@@ -29,7 +29,7 @@ from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.widgets import (
     ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatusLabel, fit_to_screen, label, panel, plural, section,
 )
-from subsentiment.gui.worker import BackgroundJob, FetchWorker
+from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, scoring_at_least
 
@@ -130,6 +130,8 @@ def when_text(ts: float | None) -> str:
 
 
 class MainWindow(QMainWindow):
+    LOAD_THREAD_FROM = 10_000  # saved posts and comments; a subreddit this big is read on a thread
+
     def __init__(self, db_path: str):
         super().__init__()
         self.setWindowTitle("ikari")
@@ -144,6 +146,9 @@ class MainWindow(QMainWindow):
         self.updates = UpdateFlow(self, self.settings)
         self.fetch_job = BackgroundJob(self)
         self.fetch_job.ended.connect(self._on_fetch_ended)
+        self.load_job = BackgroundJob(self)  # reads a big saved subreddit
+        self.load_job.ended.connect(self._load_wanted)
+        self._wanted: tuple | None = None  # (name, score filter) being read on load_job's thread, to show then
         self._stopping = False  # Stop was pressed on the running fetch
         self.current: str | None = None
         self.request: collect.FetchRequest | None = None
@@ -168,7 +173,8 @@ class MainWindow(QMainWindow):
         self._span_settled = QTimer(self)
         self._span_settled.setSingleShot(True)
         self._span_settled.setInterval(300)
-        self._span_settled.timeout.connect(self._apply_span)
+        self._span_settled.timeout.connect(self._span_settle)
+        self._span_slices = Slices(self)
         self._queued: dict[str, list] = {"posts": [], "comments": []}
         self._queued_ids: set[str] = set()
         self._since = 0.0  # rows saved since this moment belong to the running fetch
@@ -189,6 +195,10 @@ class MainWindow(QMainWindow):
         self._table_days: tuple[int, int] | None = None  # the whole days the tables were filtered to
         self._following = False  # the timelines are being given new days
         self._known: dict[str, set[str]] = {}  # ids already in _saved and _analysis, once a running fetch is counted in
+        # The last few subreddits shown, (_saved, _analysis) by (name, score filter), with what the saved-data list
+        # said of each then (posts, comments, last fetched): switching back to one needn't read and count it again.
+        self._loaded: dict[tuple, tuple] = {}
+        self._stats: dict[str, tuple] = {}
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
         # A native material (Mica/Acrylic/vibrancy) needs a translucent window from the start,
         # so a change applies on next launch.
@@ -776,6 +786,7 @@ class MainWindow(QMainWindow):
         self.coverage.refresh_saved()
 
     def _on_finished(self, result: collect.FetchResult) -> None:
+        self._loaded.clear()  # what it saved (scores too) is read again, not shown from memory
         self.progress_msg.setText(finish_text(result, self.request))
         self._live.stop()
         self._flush_rows()
@@ -791,6 +802,8 @@ class MainWindow(QMainWindow):
         """Bring what the finished fetch saved into the dataset on screen: rows it saved again (new scores)
         and any not dripped in yet. Reading back only these, not every saved row, keeps a big subreddit
         from freezing the window for seconds as the fetch ends."""
+        if self._span_slices.running():  # the tables are mid-way to a new span: finish it with the rows as they are
+            self._apply_span()
         dropped: set[str] = set()
         for kind, read, tab in (("posts", self.store.posts_since, self.posts_tab),
                                 ("comments", self.store.comments_since, self.comments_tab)):
@@ -817,6 +830,7 @@ class MainWindow(QMainWindow):
         self._render_overview()
 
     def _on_failed(self, message: str) -> None:
+        self._loaded.clear()
         self._live.stop()
         self._flush_rows()
         # Show anything stored before the error, unless the user went to look at another subreddit.
@@ -835,6 +849,7 @@ class MainWindow(QMainWindow):
         """Reload the saved-data list, selecting select, else the current dataset, else the newest.
         With reload=False only the list and storage line change, not the dataset on screen."""
         sets = self.store.datasets()
+        self._stats = {d["name"].lower(): (d["posts"], d["comments"], d["last_fetched"]) for d in sets}
         names = [d["name"] for d in sets]
         if names != [self.datasets.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.datasets.count())]:
             motion.crossfade(self.datasets.viewport())
@@ -868,8 +883,21 @@ class MainWindow(QMainWindow):
         if name:
             self.settings.setValue("ui/last_dataset", name)
 
-    def _show_dataset(self, name: str) -> None:
-        """Show a saved subreddit."""
+    def _show_dataset(self, name: str, wait: bool = False) -> None:
+        """Show a saved subreddit. One shown lately is shown from memory; a big one not in memory is read on a
+        thread (unless ``wait``, or the window isn't up yet) and shown once it's in, the window carrying on."""
+        key, stats = (name.lower(), self.min_score), self._stats.get(name.lower())
+        fetching = bool(self.fetch_job.busy and self.request and name.lower() == self.request.subreddit.lower())
+        loaded = self._loaded.pop(key, None)
+        if loaded is not None and (loaded[0] != stats or fetching):
+            loaded = None
+        if (loaded is None and not wait and not fetching and self.isVisible() and stats
+                and stats[0] + stats[1] >= self.LOAD_THREAD_FROM):  # (before the window shows, nothing waits)
+            self._wanted = key
+            self.subheading.setText(f"Opening r/{name}…")
+            self._load_wanted()
+            return
+        self._wanted = None
         # Rows still queued from a running fetch belong to whatever was shown before; the tables are
         # about to be reloaded from the store, which has them anyway.
         self._drip.stop()
@@ -878,19 +906,56 @@ class MainWindow(QMainWindow):
         if switching:  # the old subreddit fades out over the new one
             motion.crossfade(self.content)
         self.current = name or None
-        with self.store.snapshot():
-            self._saved = {"posts": scoring_at_least(self.store.posts(name) if name else [], self.min_score),
-                           "comments": scoring_at_least(self.store.comments(name) if name else [], self.min_score)}
+        if loaded is None:
+            with self.store.snapshot():
+                saved = {"posts": scoring_at_least(self.store.posts(name) if name else [], self.min_score),
+                         "comments": scoring_at_least(self.store.comments(name) if name else [], self.min_score)}
+            loaded = (stats, saved, {k: Analysis(rows) for k, rows in saved.items()})
+        self._loaded[key] = loaded  # the newest last; a running fetch's rows go into these as they're counted
+        while len(self._loaded) > 4:
+            del self._loaded[next(iter(self._loaded))]
+        _, self._saved, self._analysis = loaded
         self._known = {}
-        self._analysis = {k: Analysis(rows) for k, rows in self._saved.items()}
         self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
         # The span remembered for it, shown on the timelines once they have its days.
         self.span, self._preset = days.load_range(self.settings, name)
         self._render_overview(restore=True)
-        self._apply_span(reload=True)
+        if self.isVisible() and sum(map(len, self._saved.values())) >= self.LOAD_THREAD_FROM:
+            self._span_settled.stop()  # a big one's tables and words fill in over the next few frames
+            self._span_slices.start(self._span_steps(reload=True), lambda: None)
+        else:
+            self._apply_span(reload=True)
         self._show_notes()
         self._update_delete_enabled()
         self.coverage.set_subreddit(self.current)
+
+    def _load_wanted(self) -> None:
+        """Read the subreddit last asked for on load_job's thread, once the one before is in."""
+        if self._wanted is None or self.load_job.busy:
+            return
+        name, min_score = key = self._wanted
+        worker = LoadWorker(self.db_path, name, min_score, (key, self._stats.get(name)))
+        worker.finished.connect(self._on_loaded)
+        worker.failed.connect(self._on_load_failed)
+        self.load_job.start(worker)
+
+    def _on_loaded(self, read: tuple) -> None:
+        (key, stats), saved, analysis = read
+        self._loaded[key] = (stats, saved, analysis)
+        if self._wanted == key:
+            self._show_dataset(self._name_of(key[0]))
+
+    def _on_load_failed(self, message: str) -> None:
+        if self._wanted is not None:  # read it here instead, where an error shows as it always has
+            self._show_dataset(self._name_of(self._wanted[0]), wait=True)
+
+    def _name_of(self, lowered: str) -> str:
+        """A saved subreddit's name as the list writes it."""
+        for i in range(self.datasets.count()):
+            name = self.datasets.item(i).data(Qt.ItemDataRole.UserRole)
+            if name.lower() == lowered:
+                return name
+        return lowered
 
     def _on_view_changed(self, chart: TimelineChart) -> None:
         """A timeline was zoomed, dragged or set to a range button: every page now counts its span."""
@@ -902,7 +967,7 @@ class MainWindow(QMainWindow):
         self.span, self._preset = chart.view, chart.preset
         if self.current and not self._following:  # a fetch or the scope moved it, not the user
             days.save_range(self.settings, self.current, self.span, self._preset)
-        self._render_span()
+        self._render_span(moving=True)
         self._span_settled.start()
 
     def _show_span(self, chart: TimelineChart, like: TimelineChart | None = None) -> None:
@@ -913,9 +978,24 @@ class MainWindow(QMainWindow):
         chart.show_span(*((like.view, like.preset) if like else (self.span, self._preset)))
         chart.blockSignals(False)
 
+    def _span_settle(self) -> None:
+        """The span stopped moving: what follows it at its own pace catches up, a step a frame."""
+        self._render_span()
+        self._span_settled.stop()
+        # Steps left over from a span before this one: the tables may still show it, so go through them all.
+        self._span_slices.start(self._span_steps(reload=self._span_slices.running()), lambda: None)
+
     def _apply_span(self, reload: bool = False) -> None:
         """Point the tables (and so export) at the saved rows from the days in the span, if those changed."""
         self._span_settled.stop()
+        reload = reload or self._span_slices.running()
+        self._span_slices.stop()
+        for _ in self._span_steps(reload):
+            pass
+
+    def _span_steps(self, reload: bool = False):
+        """_apply_span's work, yielding between the steps that take a while. Each table takes its rows from
+        _saved in its own step, so rows a running fetch adds in between are in them."""
         whole = days.whole(self.span)
         if whole == self._table_days and not reload:
             return
@@ -924,11 +1004,13 @@ class MainWindow(QMainWindow):
         self._drip.stop()
         self._queued = {"posts": [], "comments": []}
         self.posts = days.keep(self._saved["posts"], whole)
-        self.comments = days.keep(self._saved["comments"], whole)
         self.posts_tab.load(self.posts)
+        yield
+        self.comments = days.keep(self._saved["comments"], whole)
         self.comments_tab.load(self.comments)
-        self.word_tally.count(self.posts, self.comments)
         self._update_dataset_labels()
+        yield
+        self.word_tally.count(self.posts, self.comments, fresh=reload)
 
     @property
     def min_score(self) -> int | None:
@@ -948,6 +1030,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("ui/overview_scope", text)
         motion.crossfade(self.pages)
         self._render_overview()
+        self._render_words()
 
     def _render_overview(self, restore: bool = False) -> None:
         """Show every saved day on the timelines, and the span's days on the tiles and distribution. With
@@ -966,17 +1049,20 @@ class MainWindow(QMainWindow):
                     self._following = False
         if restore:
             self.span, self._preset = self.overview.timeline.view, self.overview.timeline.preset
-        self._render_span()
+        self._render_span(ease=restore)
 
     def _kept_up(self) -> list[TimelineChart]:
         """The Overview's timeline, and the Timeline page's while it shows."""
         return [c for c in self.timelines if c is self.overview.timeline or c.isVisible()]
 
-    def _render_span(self) -> None:
+    def _render_span(self, moving: bool = False, ease: bool = False) -> None:
+        """The tiles and distribution for the span's days. The background's tint (eased to another subreddit's)
+        and the word clouds follow too, unless the span is being moved: they catch up once it settles."""
         a = self._counted.between(days.whole(self.span))
         self.overview.show_analysis(a)
-        self.mood.set_counts(a.counts["positive"], a.counts["negative"], a.count)
-        self._render_words()
+        if not moving:
+            self.mood.set_counts(a.counts["positive"], a.counts["negative"], a.count, ease)
+            self._render_words()
 
     def _render_words(self) -> None:
         """The word clouds of the span's items the scope counts: 50 words in the Overview's card, 150 on the
@@ -1016,6 +1102,7 @@ class MainWindow(QMainWindow):
                 "This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_subreddit(self.current)
+        self._loaded.clear()
         for key in days.settings_keys(self.current):
             self.settings.remove(key)
         self.statusBar().showMessage(f"Deleted the saved data for r/{self.current}.", 8000)
@@ -1031,6 +1118,7 @@ class MainWindow(QMainWindow):
                 "This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_all()
+        self._loaded.clear()
         self.settings.remove("ui/last_dataset")
         self.settings.remove(days.SETTINGS_GROUP)
         self.settings.remove(days.RANGE_GROUP)
@@ -1069,6 +1157,7 @@ class MainWindow(QMainWindow):
             return
         try:
             posts, comments = self.store.import_from(path)
+            self._loaded.clear()
         except (sqlite3.DatabaseError, OSError, ValueError) as e:
             QMessageBox.warning(self, "Import failed", f"Couldn't import {path}.\n\n{e}")
             return
@@ -1105,6 +1194,13 @@ class MainWindow(QMainWindow):
         self._drip.stop()
         self._shown_live.stop()
         self._span_settled.stop()
+        self._span_slices.stop()
+        self._wanted = None
+        if self.load_job.busy:  # what it read is let go; its thread is waited for, as it uses the file
+            self.load_job.worker.finished.disconnect()
+            self.load_job.worker.failed.disconnect()
+            self.load_job.qthread.quit()
+            self.load_job.qthread.wait(3000)
         self._upgrade_stop.set()  # it stops after the day it's packing
         self.upgrading.join()
         self.store.close()
@@ -1113,4 +1209,4 @@ class MainWindow(QMainWindow):
     def running_threads(self) -> list[QThread]:
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
-        return [j.qthread for j in (self.fetch_job, self.coverage.count_job) if j.running()]
+        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.load_job) if j.running()]
