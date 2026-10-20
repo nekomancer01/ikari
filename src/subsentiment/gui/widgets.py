@@ -6,10 +6,11 @@ from __future__ import annotations
 
 from typing import Callable
 
-from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtCore import QDate, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath
 from PySide6.QtWidgets import (
-    QAbstractScrollArea, QComboBox, QFrame, QLabel, QScrollArea, QVBoxLayout, QWidget,
+    QAbstractScrollArea, QCalendarWidget, QComboBox, QDateEdit, QFrame, QLabel, QScrollArea, QTableView,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 from subsentiment.gui import motion, theme
@@ -260,3 +261,121 @@ class StatTile(QFrame):
         self.value.set_number(value, fmt)
         if self.meter is not None:
             self.meter.set(share or 0.0, animate=True)
+
+
+WEEKDAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+
+
+class Calendar(QCalendarWidget):
+    """A date field's popup calendar, drawn like the header's day picker: a rounded card with a soft shadow,
+    weekday initials, rounded day cells with the chosen day filled, today in the accent, and days of other
+    months or out of range faint."""
+
+    SHADOW = 12  # px around the card for its shadow, as the day picker
+    CELL = QSize(44, 40)  # a 40x36 day with a 4 px gap
+    HEAD = 22  # weekday initials
+
+    def __init__(self):
+        super().__init__()
+        self.setGridVisible(False)
+        self.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        self.setHorizontalHeaderFormat(QCalendarWidget.HorizontalHeaderFormat.NoHorizontalHeader)
+        self._hover = QPoint(-1, -1)
+        self.view = self.findChild(QTableView, "qt_calendar_calendarview")
+        self.view.setFixedSize(7 * self.CELL.width(), 6 * self.CELL.height())
+        self.view.viewport().setMouseTracking(True)
+        self.view.viewport().setAutoFillBackground(False)
+        self.setAutoFillBackground(False)  # paintEvent draws the card
+        self.findChild(QWidget, "qt_calendar_navigationbar").setAutoFillBackground(False)
+        self.view.viewport().installEventFilter(self)
+        for name in ("qt_calendar_prevmonth", "qt_calendar_nextmonth"):
+            button = self.findChild(QToolButton, name)
+            button.setFixedSize(30, 30)
+            button.setIconSize(QSize(12, 12))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay = self.layout()
+        s = self.SHADOW
+        lay.setContentsMargins(s + 10, s + 10, s + 10, s + 10)
+        lay.setSpacing(6)
+        lay.insertSpacing(1, self.HEAD)  # paintEvent writes the weekday initials here
+        self.setFixedSize(lay.sizeHint())
+
+    def sizeHint(self) -> QSize:
+        return self.size()
+
+    def minimumSizeHint(self) -> QSize:
+        return self.size()
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.MouseMove:
+            self._hover = event.position().toPoint()
+            self.view.viewport().update()
+        elif event.type() == QEvent.Type.Leave:
+            self._hover = QPoint(-1, -1)
+            self.view.viewport().update()
+        return False
+
+    def showEvent(self, event) -> None:
+        # The date field places its popup's corner under its own; line the card up with the field instead.
+        super().showEvent(event)
+        popup, edit = self.window(), self.window().parentWidget()
+        if popup is not self and edit is not None:
+            above = popup.y() < edit.mapToGlobal(QPoint(0, 0)).y()
+            s = self.SHADOW
+            popup.move(popup.x() - s, popup.y() + (s - 4 if above else 4 - s))
+
+    def paintEvent(self, event) -> None:
+        theme.paint_popup(self, self.SHADOW)
+        p = QPainter(self)
+        small = QFont(self.font())
+        small.setPointSizeF(8.5)
+        small.setWeight(QFont.Weight.DemiBold)
+        p.setFont(small)
+        p.setPen(QColor(theme.tokens()["muted"]))
+        start = self.firstDayOfWeek().value - 1
+        top = self.view.y() - self.HEAD - self.layout().spacing()
+        for col in range(7):
+            r = QRect(self.view.x() + col * self.CELL.width(), top, self.CELL.width(), self.HEAD)
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, WEEKDAYS[(start + col) % 7])
+
+    def paintCell(self, p: QPainter, rect: QRect, day: QDate) -> None:
+        t = theme.tokens()
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(rect).adjusted(2.5, 2.5, -2.5, -2.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, 9, 9)
+        allowed = self.minimumDate() <= day <= self.maximumDate()
+        chosen = day == self.selectedDate()
+        hover = allowed and rect.contains(self._hover)
+        if chosen:
+            p.fillPath(path, QColor(t["button"]))
+            if hover:
+                p.fillPath(path, QColor(255, 255, 255, 30))
+        elif hover:
+            p.fillPath(path, QColor(t["soft"]))
+        this_month = (day.year(), day.month()) == (self.yearShown(), self.monthShown())
+        if chosen:
+            color = t["on_accent"]
+        elif not (allowed and this_month):
+            color = t["faint"]
+        else:
+            color = t["accent"] if day == QDate.currentDate() else t["text"]
+        number = QFont(self.font())
+        number.setWeight(QFont.Weight.DemiBold)
+        p.setFont(number)
+        p.setPen(QColor(color))
+        p.drawText(r, Qt.AlignmentFlag.AlignCenter, str(day.day()))
+        p.restore()
+
+
+class DateEdit(QDateEdit):
+    """A date field whose calendar pops up as a Calendar card."""
+
+    def __init__(self):
+        super().__init__()
+        self.setCalendarPopup(True)
+        self.setCalendarWidget(Calendar())
+        popup = self.calendarWidget().window()  # the popup window exists now; it is first shown later
+        popup.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint)
+        popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)

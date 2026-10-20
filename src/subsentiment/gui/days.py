@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from subsentiment.gui import theme
+from subsentiment.gui.widgets import WEEKDAYS
 
 DAY = 86400
 SETTINGS_GROUP = "analysis_days"  # QSettings: analysis_days/<subreddit, lowercased> = "2026-10-17,2026-10-18"
@@ -262,11 +263,10 @@ class DayCalendar(QWidget):
         small.setWeight(QFont.Weight.DemiBold)
         p.setFont(small)
         p.setPen(QColor(t["muted"]))
-        names = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
         start = first_weekday()
         for col in range(7):
             r = QRect(col * (self.CELL.width() + self.GAP), 0, self.CELL.width(), self.HEAD - 4)
-            p.drawText(r, Qt.AlignmentFlag.AlignCenter, names[(start + col) % 7])
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, WEEKDAYS[(start + col) % 7])
 
         busiest = max((a + b for a, b in self.counts.values()), default=0)
         number = QFont(self.font())
@@ -470,20 +470,7 @@ class DayPicker(QFrame):
         self.move(x, y)
 
     def paintEvent(self, event) -> None:
-        t = theme.tokens()
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        s = self.SHADOW
-        card = QRectF(self.rect()).adjusted(s, s, -s, -s)
-        shadow = QColor(*t["shadow"][:3])
-        for i in range(s, 0, -2):  # soft shadow, darker near the card and a little lower
-            shadow.setAlpha(int(t["shadow"][3] * 0.16 * (1 - i / s) ** 1.5) + 1)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(shadow)
-            p.drawRoundedRect(card.adjusted(-i, -i + 3, i, i + 3), 14 + i, 14 + i)
-        p.setBrush(QColor(t["menu"]))
-        p.setPen(QPen(QColor(*t["edge"][:3], min(255, t["edge"][3] * 2)), 1))
-        p.drawRoundedRect(card.adjusted(0.5, 0.5, -0.5, -0.5), 14, 14)
+        theme.paint_popup(self, self.SHADOW)
 
     def hideEvent(self, event) -> None:
         super().hideEvent(event)
