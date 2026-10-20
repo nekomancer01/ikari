@@ -156,7 +156,8 @@ def test_new_data_while_shown_counts_up(make_window):
     s.close()
     shown = {r["id"] for r in w.posts_tab.all_rows}
     new = [r for r in w.store.posts("Python") if r["id"] not in shown]
-    w._add_rows("posts", w.posts_tab, new)  # what a running fetch does with the rows it saves
+    w._count_new("posts", new)  # what a running fetch does with the rows it saves: count them,
+    w._add_rows("posts", w.posts_tab, new)  # and drip them into the table
     w._render_overview()
     assert w.overview.tiles["count"].value.text() == "60"
     pump(motion.DATA_MS // 3)

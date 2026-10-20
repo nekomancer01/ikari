@@ -441,7 +441,7 @@ def test_the_drawer_floats_over_the_page_on_a_narrow_window(make_window):
     assert root.indexOf(w.drawer) >= 0
 
 
-def test_range_presets_keep_the_newest_saved_days(make_window, tmp_path):
+def test_the_timelines_range_buttons_keep_the_newest_saved_days_on_every_page(make_window, tmp_path):
     s = Store(tmp_path / "w.db")
     newest = 1_700_000_000.0
     for d in range(40):  # one post a day for 40 days, the newest on the saved post's day
@@ -451,18 +451,22 @@ def test_range_presets_keep_the_newest_saved_days(make_window, tmp_path):
     s.close()
     w = make_window()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
-    assert w.presets.current() == "all" and len(w.posts) == 41
-    w.presets.buttons["week"].click()
-    assert len(w.chosen_days) == 7 and len(w.posts) == 8  # the newest day has two posts
-    assert w.presets.current() == "week" and w.days_pick.currentText() != "All days"
-    w.presets.buttons["month"].click()
-    assert len(w.chosen_days) == 30 and w.presets.current() == "month"
-    w.presets.buttons["all"].click()
-    assert w.chosen_days is None and len(w.posts) == 41 and w.days_pick.currentText() == "All days"
-    w.presets.buttons["week"].click()
+    buttons = w.overview.timeline.presets
+    assert buttons["All"].isChecked() and len(w.posts) == 41
+    buttons["1w"].click()
+    w._apply_span()  # what the tables do once the span settles
+    assert len(w.posts) == 8 and w.overview.tiles["count"].value.text() == "8"  # the newest day has two posts
+    assert w._preset == "1w" and buttons["1w"].isChecked()
+    buttons["1m"].click()
+    w._apply_span()
+    assert len(w.posts) == 31 and w._preset == "1m"
+    buttons["All"].click()
+    w._apply_span()
+    assert w.span is None and len(w.posts) == 41
+    buttons["1w"].click()
     w.close()
-    again = make_window()  # the choice is kept with the subreddit, as the day picker's is
-    assert again.current == "Python" and len(again.posts) == 8 and again.presets.current() == "week"
+    again = make_window()  # the span is kept with the subreddit
+    assert again.current == "Python" and len(again.posts) == 8 and again.overview.timeline.presets["1w"].isChecked()
 
 
 @pytest.mark.parametrize("counts", [(65_432, 412_837, 98_765), (1_234_567, 7_654_321, 2_345_678)])

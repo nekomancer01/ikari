@@ -1,6 +1,6 @@
 """The Overview's timeline chart, driven in the real main window: a dated axis, the range buttons, zooming by
-dragging, the wheel and the navigator strip, the hover box, notes on days, and how it keeps up with the Days
-picker."""
+dragging, the wheel and the navigator strip, the hover box, notes on days, and how it keeps up with the
+subreddit shown."""
 import os
 import time
 from datetime import date, datetime, timezone
@@ -222,18 +222,15 @@ def test_days_a_running_fetch_adds_keep_a_zoom_on_the_latest_days(window):
     assert tl.view == fixed  # looking at earlier days: they stay in view
 
 
-def test_choosing_other_days_shows_every_day_again(window):
+def test_each_subreddit_shows_its_own_span(window):
     w = window()
     tl = w.overview.timeline
     QTest.mouseClick(tl.presets["1w"], Qt.MouseButton.LeftButton)
-    w.days_pick.showPopup()
-    w.days_pick.picker.none_btn.click()
-    w.days_pick.picker._choose(set(SAVED[:30]))
-    w.days_pick.hidePopup()
-    assert [d for d, _, _ in tl.points] == SAVED[:30] and tl.view is None and tl.presets["All"].isChecked()
-    QTest.mouseClick(tl.presets["1w"], Qt.MouseButton.LeftButton)
     w._refresh_datasets(select="rust")
     assert tl.view is None and len(tl.points) == 1 and not tl.presets["1w"].isEnabled()
+    w._refresh_datasets(select="Python")
+    assert tl.view == (LAST_END - 7 * DAY, LAST_END) and tl.presets["1w"].isChecked()
+    assert [d for d, _, _ in tl.points] == SAVED  # every day, with the week in view
 
 
 def test_zooming_eases_unless_motion_is_reduced(window, monkeypatch):
