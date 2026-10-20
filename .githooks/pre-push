@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs the same checks as the required PR check before anything is pushed.
+# Turn on with: git config core.hooksPath .githooks   (skip once with: git push --no-verify)
+exec python tools/check.py
