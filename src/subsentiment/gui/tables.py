@@ -137,7 +137,7 @@ class ChipDelegate(QStyledItemDelegate):
 def column(rows: list, key: str):
     """Every row's ``key``, quickly: a saved row (sqlite3.Row) finds a column by name by comparing it with each
     name in turn, so it's read by position instead."""
-    if rows and isinstance(rows[0], sqlite3.Row):
+    if rows and set(map(type, rows)) == {sqlite3.Row}:  # rows a fetch adds can be dicts
         return map(itemgetter(rows[0].keys().index(key)), rows)
     return map(itemgetter(key), rows)
 
