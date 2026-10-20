@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from PySide6.QtCore import QDate, QSettings, QSize, Qt, QThread, QTimer
+from PySide6.QtCore import QSettings, QSize, Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QFontMetrics, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
-    QHeaderView, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QSizePolicy, QSpinBox, QStackedWidget, QTabBar, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QListWidget, QListWidgetItem,
+    QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QTabBar,
+    QVBoxLayout, QWidget,
 )
 
 from subsentiment import __version__, collect
 from subsentiment.analysis import Analysis
 from subsentiment.gui import days, motion, native, theme
 from subsentiment.gui.coverage import CoverageWindow
+from subsentiment.gui.fetch_form import FetchForm
 from subsentiment.gui.overview import OverviewPage
 from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
 from subsentiment.gui.theme import mark, paint_backdrop
@@ -27,49 +28,7 @@ from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store
 
 
-# Date ranges the fetch form offers: key -> (label, days back from now). "custom" uses the From/To dates.
-RANGES = {"day": ("Past 24 hours", 1), "week": ("Past week", 7), "month": ("Past 30 days", 30),
-          "quarter": ("Past 3 months", 91), "year": ("Past year", 365), "custom": ("Custom dates", None)}
-
-# Last-used fetch form, restored at startup. Keys live under "fetch/" in QSettings.
-# A fetch downloads every post in the range, so the old "fetch/pick" and "fetch/limit" keys are no longer read.
-FETCH_DEFAULTS = {"subreddit": "", "query": "", "range": "week", "from": "", "to": "",
-                  "include_comments": True, "comments_per_post": 50, "refresh_scores": False}
-
 SCOPES = ["Posts and comments", "Posts only", "Comments only"]
-
-
-def range_bounds(key: str, start: QDate, end: QDate, now: datetime | None = None) -> tuple[float, float | None]:
-    """(after, before) in epoch seconds for a range key; before is None for "up to now"."""
-    now = now or datetime.now()
-    days = RANGES[key][1]
-    if days is not None:
-        return (now - timedelta(days=days)).timestamp(), None
-    lo, hi = sorted((start, end))
-    first = datetime(lo.year(), lo.month(), lo.day())
-    last = datetime(hi.year(), hi.month(), hi.day()) + timedelta(days=1)  # "to" includes that whole day
-    return first.timestamp(), last.timestamp()
-
-
-def date_edit() -> QDateEdit:
-    edit = QDateEdit()
-    edit.setCalendarPopup(True)
-    edit.setDisplayFormat("d MMM yyyy")
-    edit.setMinimumDate(QDate(2005, 6, 1))  # Reddit's first month
-    edit.setMaximumDate(QDate.currentDate())
-    edit.setMinimumWidth(110)  # its size hint is wide enough to squeeze the form's labels
-    return edit
-
-
-def spin_box(lo: int, hi: int, step: int, value: int, suffix: str = "") -> QSpinBox:
-    spin = QSpinBox()
-    spin.setRange(lo, hi)
-    spin.setSingleStep(step)
-    spin.setValue(value)
-    spin.setSuffix(suffix)
-    # The stylesheet's horizontal padding doesn't reach a spin box's inner editor; match the other inputs.
-    spin.findChild(QLineEdit).setTextMargins(8, 0, 0, 0)
-    return spin
 
 
 def human_size(n: int) -> str:
@@ -287,57 +246,12 @@ class MainWindow(QMainWindow):
         brand.addWidget(label("Gather posts and read the mood", "subtitle"))
         lay.addLayout(brand)
 
-        self.subreddit = QLineEdit()
-        self.subreddit.setPlaceholderText("e.g. python")
-        self.subreddit.setToolTip("A subreddit name; r/name and reddit.com links work too.")
-        self.subreddit.returnPressed.connect(self._start_fetch)
-        self.query = QLineEdit()
-        self.query.setPlaceholderText("Optional keywords")
-        self.query.setClearButtonEnabled(True)
-        self.query.returnPressed.connect(self._start_fetch)
-        self.range = QComboBox()
-        for key, (text, _) in RANGES.items():
-            self.range.addItem(text, key)
-        self.range.currentIndexChanged.connect(self._on_range_changed)
-        self.date_from = date_edit()
-        self.date_to = date_edit()
-        for edit in (self.date_from, self.date_to):
-            edit.userDateChanged.connect(self._on_date_edited)
-        self.include_comments = QCheckBox("Fetch")
-        self.comments_per_post = spin_box(1, 500, 10, FETCH_DEFAULTS["comments_per_post"], " per post")
-        self.comments_per_post.setMinimumWidth(100)  # its size hint would squeeze the form's labels
-        self.include_comments.toggled.connect(lambda _: self._update_comments_enabled())
-        self.refresh_scores = QCheckBox("Update saved posts")
-        self.refresh_scores.setToolTip("Also re-check saved posts in this range whose scores and comment counts "
-                                       "hadn't come in yet. Takes extra requests, so it's off by default.")
-        comments_row = QWidget()
-        row = QHBoxLayout(comments_row)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)  # Windows' wider text needs the "50 per post" box this little bit wider
-        row.addWidget(self.include_comments)
-        row.addWidget(self.comments_per_post, 1)
-        self._restore_fetch_settings()
-
+        self.fetch_form = FetchForm(self.settings, self)
+        self.fetch_form.submitted.connect(self._start_fetch)
+        self.fetch_form.range_moved.connect(self._range_moved)
         lay.addWidget(section("Fetch"))
-        form = QFormLayout()
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(8)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        form.addRow(label("Subreddit", "muted"), self.subreddit)
-        form.addRow(label("Search", "muted"), self.query)
-        form.addRow(label("Posted", "muted"), self.range)
-        form.addRow(label("From", "muted"), self.date_from)
-        form.addRow(label("To", "muted"), self.date_to)
-        form.addRow(label("Comments", "muted"), comments_row)
-        form.addRow(label("Scores", "muted"), self.refresh_scores)
-        lay.addLayout(form)
-        # Each label as tall as its field and centred in it: QFormLayout top-aligns a short label, which put
-        # labels a few pixels above their fields' centres where the text is small (macOS).
-        for row in range(form.rowCount()):
-            name = form.itemAt(row, QFormLayout.ItemRole.LabelRole).widget()
-            field = form.itemAt(row, QFormLayout.ItemRole.FieldRole)
-            name.setMinimumHeight(field.sizeHint().height())
-            name.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        lay.addLayout(self.fetch_form.layout)
+        self.fetch_form.align_labels()
 
         self.fetch_btn = mark(QPushButton("Fetch and analyse"), "primary", True)
         self.fetch_btn.setDefault(True)
@@ -508,25 +422,6 @@ class MainWindow(QMainWindow):
 
     # -- control state --------------------------------------------------------
 
-    def _on_range_changed(self) -> None:
-        """A preset fills in the dates it covers, so the From and To boxes always show the range."""
-        days = RANGES[self.range.currentData()][1]
-        if days is not None:
-            today = QDate.currentDate()
-            for edit, date in ((self.date_from, today.addDays(-days)), (self.date_to, today)):
-                edit.blockSignals(True)
-                edit.setMaximumDate(today)
-                edit.setDate(date)
-                edit.blockSignals(False)
-        self._range_moved()
-
-    def _on_date_edited(self) -> None:
-        """Typing or picking a date means a custom range."""
-        self.range.blockSignals(True)
-        self.range.setCurrentIndex(self.range.findData("custom"))
-        self.range.blockSignals(False)
-        self._range_moved()
-
     def _range_moved(self) -> None:
         """The Download coverage window lists the sidebar's range, so it follows a change: shortly after
         it, so holding an arrow key on a date doesn't rebuild the window (and ask for counts) per step."""
@@ -537,37 +432,6 @@ class MainWindow(QMainWindow):
         if self.coverage is not None and self.coverage.isVisible():
             self.coverage.refresh_saved()
 
-    def _update_comments_enabled(self) -> None:
-        self.comments_per_post.setEnabled(not self.fetch_job.busy and self.include_comments.isChecked())
-
-    def _restore_fetch_settings(self) -> None:
-        v = {k: self.settings.value(f"fetch/{k}", d, type(d)) for k, d in FETCH_DEFAULTS.items()}
-        self.subreddit.setText(v["subreddit"])
-        self.query.setText(v["query"])
-        self.range.setCurrentIndex(max(self.range.findData(v["range"]), 0))
-        self._on_range_changed()
-        if self.range.currentData() == "custom":
-            for edit, text in ((self.date_from, v["from"]), (self.date_to, v["to"])):
-                date = QDate.fromString(text, Qt.DateFormat.ISODate)
-                if date.isValid():
-                    edit.blockSignals(True)
-                    edit.setDate(date)
-                    edit.blockSignals(False)
-        self.include_comments.setChecked(v["include_comments"])
-        self.refresh_scores.setChecked(v["refresh_scores"])
-        self.comments_per_post.setValue(v["comments_per_post"])
-        self._update_comments_enabled()
-
-    def _save_fetch_settings(self) -> None:
-        for k, v in {"subreddit": self.subreddit.text().strip(), "query": self.query.text().strip(),
-                     "range": self.range.currentData(),
-                     "from": self.date_from.date().toString(Qt.DateFormat.ISODate),
-                     "to": self.date_to.date().toString(Qt.DateFormat.ISODate),
-                     "include_comments": self.include_comments.isChecked(),
-                     "refresh_scores": self.refresh_scores.isChecked(),
-                     "comments_per_post": self.comments_per_post.value()}.items():
-            self.settings.setValue(f"fetch/{k}", v)
-
     def _set_busy(self, busy: bool) -> None:
         # Called after the fetch job starts (busy) or ends (idle); the update helpers read it.
         self.fetch_btn.setEnabled(not busy)
@@ -576,10 +440,7 @@ class MainWindow(QMainWindow):
         if busy:
             self.progress.setRange(0, 0)
             motion.fade_in(self.progress)
-        for w in (self.subreddit, self.query, self.range, self.date_from, self.date_to,
-                  self.include_comments, self.refresh_scores):
-            w.setEnabled(not busy)
-        self._update_comments_enabled()
+        self.fetch_form.set_busy(busy)
         self._update_delete_enabled()  # don't delete rows the fetch thread is writing
         if self.coverage is not None:
             self.coverage.set_busy(busy)
@@ -596,21 +457,14 @@ class MainWindow(QMainWindow):
     def _start_fetch(self) -> None:
         if self.fetch_job.busy:
             return
-        name = normalize_subreddit(self.subreddit.text())
+        field = self.fetch_form.subreddit
+        name = normalize_subreddit(field.text())
         if error := subreddit_error(name):
             self.progress_msg.setText(error)
-            self.subreddit.setFocus()
-            self.subreddit.selectAll()
+            field.setFocus()
+            field.selectAll()
             return
-        self.subreddit.setText(name)
-        self._save_fetch_settings()
-        self._on_range_changed()  # a preset counts back from now, not from when the app started
-        after, before = range_bounds(self.range.currentData(), self.date_from.date(), self.date_to.date())
-        req = collect.FetchRequest(
-            subreddit=name, after=after, before=before, limit=None, query=self.query.text().strip(),
-            include_comments=self.include_comments.isChecked(), refresh_scores=self.refresh_scores.isChecked(),
-            comments_per_post=self.comments_per_post.value())
-        self._launch(req, f"Contacting Arctic Shift for r/{name}…")
+        self._launch(self.fetch_form.request(name), f"Contacting Arctic Shift for r/{name}…")
 
     def start_request(self, req: collect.FetchRequest, message: str) -> bool:
         """Run a fetch the coverage panel asked for; False if one is already running."""
@@ -978,11 +832,6 @@ class MainWindow(QMainWindow):
             on = "" if self.chosen_days is None else f" from {plural(n_days, 'chosen day')}"
             self.statusBar().showMessage(f"Exported {n:,} {kind}{on} to {path}", 8000)
 
-    def fetch_range(self) -> tuple[float, float]:
-        """The sidebar's date range as (after, before), before being now for "up to now"."""
-        after, before = range_bounds(self.range.currentData(), self.date_from.date(), self.date_to.date())
-        return after, before if before is not None else datetime.now().timestamp()
-
     def _show_coverage(self) -> None:
         if not self.current:
             return
@@ -1008,7 +857,7 @@ class MainWindow(QMainWindow):
         paint_backdrop(self, over_native=self._native_backdrop is not None, mood=self.mood.state)
 
     def closeEvent(self, event) -> None:
-        self._save_fetch_settings()
+        self.fetch_form.save()
         if self.coverage is not None:
             self.coverage.close()
         self.settings.sync()  # app.main may end the process without Qt's usual clean-up

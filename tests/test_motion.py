@@ -173,7 +173,7 @@ def test_reduce_motion_changes_everything_at_once(make_window):
 
 def test_a_status_line_fades_in_when_it_appears(make_window):
     w = make_window()
-    w.subreddit.setText("not a sub!!")
+    w.fetch_form.subreddit.setText("not a sub!!")
     w._start_fetch()  # refused before anything is requested
     assert "valid subreddit" in w.progress_msg.text()
     assert isinstance(w.progress_msg.graphicsEffect(), QGraphicsOpacityEffect)

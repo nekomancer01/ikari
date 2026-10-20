@@ -90,7 +90,7 @@ def test_rows_arrive_one_by_one_fading_in_and_only_for_the_fetched_posts(tmp_pat
     w = mw.MainWindow(str(db))
     try:
         assert not hasattr(w, "live_btn")
-        w.subreddit.setText("Python")
+        w.fetch_form.subreddit.setText("Python")
         fg = Qt.ItemDataRole.ForegroundRole
         steps, fading = [], 0
         w._start_fetch()

@@ -84,8 +84,8 @@ def main() -> None:
         print(f"{label}: {time.time() - t0:.0f} s, {spent[0]:.1f} s reading rows back, worst freeze {worst:.1f} s; "
               f"tables show {sorted(subs)}; {w.progress_msg.text()}")
 
-    w.subreddit.setText(sub)
-    w.include_comments.setChecked(False)  # comments come from the coverage window below
+    w.fetch_form.subreddit.setText(sub)
+    w.fetch_form.include_comments.setChecked(False)  # comments come from the coverage window below
     run("Fetch, past week, every post", w._start_fetch)
     w.coverage_act.trigger()
     cov = w.coverage

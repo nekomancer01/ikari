@@ -177,15 +177,15 @@ def alignment(window) -> list[str]:
 
     problems = []
     side = window.findChild(QFormLayout).parentWidget()  # the sidebar's scrolling body
-    fields = {"subreddit": window.subreddit, "search": window.query, "posted": window.range,
-              "from": window.date_from, "to": window.date_to,
-              "comments": window.comments_per_post.parentWidget()}
+    fields = {"subreddit": window.fetch_form.subreddit, "search": window.fetch_form.query, "posted": window.fetch_form.range,
+              "from": window.fetch_form.date_from, "to": window.fetch_form.date_to,
+              "comments": window.fetch_form.comments_per_post.parentWidget()}
     _same(problems, "sidebar field left edges", {k: _rect(w, side).left() for k, w in fields.items()})
     _same(problems, "sidebar field right edges", {k: _rect(w, side).right() for k, w in fields.items()})
     _same(problems, "sidebar field heights", {k: w.height() for k, w in fields.items() if k != "comments"})
     _same(problems, "sidebar checkbox left edges",
-          {"fetch": _rect(window.include_comments, side).left(), "scores": _rect(window.refresh_scores, side).left(),
-           "fields": _rect(window.subreddit, side).left()})
+          {"fetch": _rect(window.fetch_form.include_comments, side).left(), "scores": _rect(window.fetch_form.refresh_scores, side).left(),
+           "fields": _rect(window.fetch_form.subreddit, side).left()})
     form = window.findChild(QFormLayout)
     labels = {}
     for row in range(form.rowCount()):
@@ -296,7 +296,7 @@ def field_edges(window) -> dict:
     from PySide6.QtWidgets import QFormLayout
     side = window.findChild(QFormLayout).parentWidget()
     return {name: (_rect(w, side).left(), _rect(w, side).right(), _rect(w, window).top())
-            for name, w in (("subreddit", window.subreddit), ("to", window.date_to), ("posted", window.range))}
+            for name, w in (("subreddit", window.fetch_form.subreddit), ("to", window.fetch_form.date_to), ("posted", window.fetch_form.range))}
 
 
 # A status line as long as the app writes, during a fetch and after it.
@@ -358,7 +358,7 @@ def child(spec: dict) -> int:
 
     window = main_window.MainWindow(spec["db"])
     motion.set_enabled(False)  # sizes and stills of the finished state, not mid-fade
-    window.subreddit.setText(screenshot.SUBREDDIT)
+    window.fetch_form.subreddit.setText(screenshot.SUBREDDIT)
     window.tabbar.setFocus()
 
     class Free:  # the screen's free area, for the app's own opening-size rule
@@ -443,7 +443,7 @@ def child(spec: dict) -> int:
     def fake_count(self, after, before):
         self._on_counts(self.subreddit, {d: 12 for d in range(int(after), int(before), 86400)})
     coverage.CoverageWindow._count = fake_count
-    window.range.setCurrentIndex(window.range.findData("month"))
+    window.fetch_form.range.setCurrentIndex(window.fetch_form.range.findData("month"))
     window._show_coverage()
     dialog = window.coverage
     if dialog is None:
