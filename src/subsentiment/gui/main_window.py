@@ -25,7 +25,7 @@ from subsentiment.gui.widgets import (
     ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatTile, StatusLabel, VerticalScrollArea, fit_to_screen, label,
     panel, plural, section,
 )
-from subsentiment.gui.worker import FetchWorker
+from subsentiment.gui.worker import BackgroundJob, FetchWorker
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, daily_means, summarize
 
@@ -290,8 +290,8 @@ class MainWindow(QMainWindow):
         self.store = Store(db_path)
         self.settings = QSettings()
         self.updates = UpdateFlow(self, self.settings)
-        self.thread: QThread | None = None
-        self.worker: FetchWorker | None = None
+        self.fetch_job = BackgroundJob(self)
+        self.fetch_job.ended.connect(self._on_fetch_ended)
         self._stopping = False  # Stop was pressed on the running fetch
         self.current: str | None = None
         self.request: collect.FetchRequest | None = None
@@ -732,7 +732,7 @@ class MainWindow(QMainWindow):
             self.coverage.refresh_saved()
 
     def _update_comments_enabled(self) -> None:
-        self.comments_per_post.setEnabled(self.thread is None and self.include_comments.isChecked())
+        self.comments_per_post.setEnabled(not self.fetch_job.busy and self.include_comments.isChecked())
 
     def _restore_fetch_settings(self) -> None:
         v = {k: self.settings.value(f"fetch/{k}", d, type(d)) for k, d in FETCH_DEFAULTS.items()}
@@ -767,7 +767,7 @@ class MainWindow(QMainWindow):
             self.settings.setValue(f"fetch/{k}", v)
 
     def _set_busy(self, busy: bool) -> None:
-        # Called after self.thread is set (busy) or cleared (idle); the update helpers read it.
+        # Called after the fetch job starts (busy) or ends (idle); the update helpers read it.
         self.fetch_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
         self.progress.setVisible(busy)
@@ -782,7 +782,7 @@ class MainWindow(QMainWindow):
             self.coverage.set_busy(busy)
 
     def _update_delete_enabled(self) -> None:
-        idle = self.thread is None
+        idle = not self.fetch_job.busy
         self.delete_btn.setEnabled(idle and bool(self.current))
         self.delete_act.setEnabled(idle and bool(self.current))
         self.delete_all_btn.setEnabled(idle and self.datasets.count() > 0)
@@ -791,7 +791,7 @@ class MainWindow(QMainWindow):
     # -- fetching -------------------------------------------------------------
 
     def _start_fetch(self) -> None:
-        if self.thread is not None:
+        if self.fetch_job.busy:
             return
         name = normalize_subreddit(self.subreddit.text())
         if error := subreddit_error(name):
@@ -811,7 +811,7 @@ class MainWindow(QMainWindow):
 
     def start_request(self, req: collect.FetchRequest, message: str) -> bool:
         """Run a fetch the coverage panel asked for; False if one is already running."""
-        if self.thread is not None:
+        if self.fetch_job.busy:
             return False
         self._launch(req, message)
         return True
@@ -823,25 +823,19 @@ class MainWindow(QMainWindow):
         self._flush_rows()
         self._follow = True
         self._open_fetched()  # if it's already saved, show it now; otherwise with its first rows
-        self.thread = QThread(self)
-        self.worker = FetchWorker(req, self.db_path)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.finished.connect(self._on_finished)
-        self.worker.saved.connect(self._on_saved)
-        self.worker.failed.connect(self._on_failed)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.finished.connect(self._on_thread_done)
+        worker = FetchWorker(req, self.db_path)
+        worker.progress.connect(self._on_progress)
+        worker.finished.connect(self._on_finished)
+        worker.saved.connect(self._on_saved)
+        worker.failed.connect(self._on_failed)
+        self.fetch_job.start(worker)
         self._set_busy(True)
         self._stopping = False
         self.progress_msg.setText(message)
-        self.thread.start()
 
     def _stop_fetch(self) -> None:
-        if self.worker:
-            self.worker.stop()
+        if self.fetch_job.busy:
+            self.fetch_job.stop()
             self._stopping = True
             self.progress_msg.setText("Stopping…")
             if self.coverage is not None:
@@ -884,7 +878,7 @@ class MainWindow(QMainWindow):
         return bool(self.request and self.current and self.current.lower() == self.request.subreddit.lower())
 
     def _queue_new_rows(self) -> None:
-        if self.thread is None or not self._showing_fetch():
+        if not self.fetch_job.busy or not self._showing_fetch():
             return
         name = self.current
         for kind, read in (("posts", self.store.posts_since), ("comments", self.store.comments_since)):
@@ -937,7 +931,7 @@ class MainWindow(QMainWindow):
                                 f"last fetched {when_text(fetched)}")
 
     def _live_refresh(self) -> None:
-        if self.thread is None or self.request is None:
+        if not self.fetch_job.busy or self.request is None:
             return
         if self._showing_fetch():
             self._refresh_datasets(reload=False)
@@ -974,10 +968,7 @@ class MainWindow(QMainWindow):
                                   else "Fetch failed.")
         QMessageBox.warning(self, "Fetch failed", message)
 
-    def _on_thread_done(self) -> None:
-        self.thread.deleteLater()
-        self.worker.deleteLater()
-        self.thread = self.worker = None
+    def _on_fetch_ended(self) -> None:
         self._set_busy(False)
         if self.coverage is not None:
             self.coverage.refresh_saved()
@@ -1013,7 +1004,7 @@ class MainWindow(QMainWindow):
 
     def _on_dataset_selected(self, item: QListWidgetItem | None) -> None:
         name = item.data(Qt.ItemDataRole.UserRole) if item else ""
-        if self.thread is not None and self.request and name.lower() != self.request.subreddit.lower():
+        if self.fetch_job.busy and self.request and name.lower() != self.request.subreddit.lower():
             self._follow = False  # the user chose to look at something else while it runs
         self._show_dataset(name)
         if name:
@@ -1054,7 +1045,7 @@ class MainWindow(QMainWindow):
         if not self.current:
             return
         self.chosen_days = days.save_choice(self.settings, self.current, chosen, self._day_counts)
-        if self.thread is not None and self._showing_fetch():
+        if self.fetch_job.busy and self._showing_fetch():
             # A running fetch has added rows since the subreddit was loaded: read them all again.
             self._flush_rows()
             self._show_dataset(self.current)
@@ -1098,7 +1089,7 @@ class MainWindow(QMainWindow):
             widget.addItem(item)
 
     def _delete_dataset(self) -> None:
-        if not self.current or self.thread is not None:
+        if not self.current or self.fetch_job.busy:
             return
         if QMessageBox.question(
                 self, "Delete saved data",
@@ -1112,7 +1103,7 @@ class MainWindow(QMainWindow):
         self._refresh_datasets()
 
     def _delete_all(self) -> None:
-        if self.thread is not None or not self.datasets.count():
+        if self.fetch_job.busy or not self.datasets.count():
             return
         if QMessageBox.question(
                 self, "Delete all saved data",
@@ -1153,7 +1144,7 @@ class MainWindow(QMainWindow):
         if self.coverage is None:
             self.coverage = CoverageWindow(self)
         self.coverage.set_subreddit(self.current)
-        self.coverage.set_busy(self.thread is not None)
+        self.coverage.set_busy(self.fetch_job.busy)
         self.coverage.show()
         self.coverage.raise_()
         self.coverage.activateWindow()
@@ -1173,9 +1164,9 @@ class MainWindow(QMainWindow):
         if self.coverage is not None:
             self.coverage.close()
         self.settings.sync()  # app.main may end the process without Qt's usual clean-up
-        if self.worker:
+        if self.fetch_job.busy:
             # A fetch ending after this must not touch the closed store, so nothing it sends is handled.
-            thread, worker = self.thread, self.worker
+            thread, worker = self.fetch_job.qthread, self.fetch_job.worker
             worker.stop()
             for sig in (worker.progress, worker.finished, worker.failed, worker.saved, thread.finished):
                 sig.disconnect()
@@ -1189,5 +1180,5 @@ class MainWindow(QMainWindow):
     def running_threads(self) -> list[QThread]:
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
-        threads = [self.thread, self.coverage and self.coverage._count_thread]
-        return [t for t in threads if t is not None and t.isRunning()]
+        jobs = [self.fetch_job, self.coverage and self.coverage.count_job]
+        return [j.qthread for j in jobs if j and j.running()]

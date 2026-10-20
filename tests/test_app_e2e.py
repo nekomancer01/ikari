@@ -37,7 +37,7 @@ def pump(ms: int) -> None:
 def wait_idle(w, timeout: float = 30) -> None:
     """Until the fetch the window is running has finished and its thread is cleaned up."""
     end = time.monotonic() + timeout
-    while w.thread is not None:
+    while w.fetch_job.busy:
         assert time.monotonic() < end, "fetch didn't finish"
         QApplication.processEvents()
         time.sleep(0.01)
@@ -126,7 +126,7 @@ def test_starting_and_browsing_never_downloads_anything(env):
     w.showMaximized()
     pump(1200)  # longer than the redraw timer's 1 s
     assert env.archive.paths() == []
-    assert w.thread is None
+    assert not w.fetch_job.busy
 
 
 def test_a_fetch_without_comments_asks_for_no_comments(env):
@@ -183,7 +183,7 @@ def test_stop_ends_a_fetch_and_frees_the_form(env):
     w.range.setCurrentIndex(w.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     pump(400)
-    assert w.thread is not None and w.stop_btn.isEnabled() and not w.fetch_btn.isEnabled()
+    assert w.fetch_job.busy and w.stop_btn.isEnabled() and not w.fetch_btn.isEnabled()
     QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
     wait_idle(w)
     env.archive.delay = 0
@@ -204,10 +204,10 @@ def test_stop_takes_effect_at_once_even_while_requests_wait_out_timeouts(env, mo
     w.range.setCurrentIndex(w.range.findData("day"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     pump(1500)
-    assert w.thread is not None
+    assert w.fetch_job.busy
     QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
     stopped_at, seen = time.monotonic(), set()
-    while w.thread is not None:
+    while w.fetch_job.busy:
         assert time.monotonic() - stopped_at < 3, f"still stopping; it said {seen}"
         seen.add(w.progress_msg.text())
         QApplication.processEvents()
@@ -259,7 +259,7 @@ def test_enter_in_the_sidebar_fetches_once(env):
     QTest.keyClick(w.subreddit, Qt.Key.Key_Return)  # a second Enter while busy is ignored
     wait_idle(w)
     pump(300)
-    assert w.thread is None and env.archive.paths().count(AGG) == 0
+    assert not w.fetch_job.busy and env.archive.paths().count(AGG) == 0
 
 
 @pytest.mark.parametrize("saved_before", [False, True])
@@ -281,7 +281,7 @@ def test_fetching_another_subreddit_shows_it_as_it_downloads(env, saved_before):
     while len(s.posts("python")) < 4 + 2 * saved_before and time.monotonic() < end:
         pump(20)
     pump(300)  # a few fade-in ticks, well under the 1 s refresh
-    assert w.thread is not None, "the fetch should still be running"
+    assert w.fetch_job.busy, "the fetch should still be running"
     assert w.current.lower() == "python"
     assert w.posts_tab.model.rowCount() > 2 * saved_before
     wait_idle(w)
@@ -301,7 +301,7 @@ def test_closing_mid_fetch_leaves_the_fetch_alone(env, monkeypatch):
     w.close()
     assert w.running_threads(), "app.main ends the process instead of destroying this thread"
     end = time.monotonic() + 20
-    while w.thread.isRunning() and time.monotonic() < end:
+    while w.fetch_job.running() and time.monotonic() < end:
         pump(50)
     pump(200)
     assert errors == []  # the fetch ending didn't reach for the closed store
@@ -428,7 +428,7 @@ def test_switching_subreddit_mid_fetch_keeps_each_table_to_its_own_rows(env):
     pump(300)
     shown = {w.posts_tab.model.row_at(i)["subreddit"].lower() for i in range(w.posts_tab.model.rowCount())}
     shown |= {w.comments_tab.model.row_at(i)["subreddit"].lower() for i in range(w.comments_tab.model.rowCount())}
-    assert w.thread is not None, "the fetch should still be running"
+    assert w.fetch_job.busy, "the fetch should still be running"
     assert w.current.lower() == "rust" and shown == {"rust"}
     wait_idle(w)
 
@@ -440,14 +440,14 @@ def test_rows_keep_fading_in_while_comments_are_saved_quickly(env):
     fetch(w, comments=False, limit=12)
     n = len(w.posts)
     w.posts_tab.load([])
-    w.request, w.thread = mw.collect.FetchRequest("python"), object()  # as if python were being fetched
+    w.request, w.fetch_job.qthread = mw.collect.FetchRequest("python"), object()  # as if python were being fetched
     w._read_to = {"posts": 0.0, "comments": 0.0}
     end = time.monotonic() + 1.5
     while w.posts_tab.model.rowCount() < n and time.monotonic() < end:
         w._on_saved()  # a comment saved every 10 ms
         pump(10)
     w._live.stop()
-    w.thread = None
+    w.fetch_job.qthread = None
     assert w.posts_tab.model.rowCount() == n
 
 
@@ -506,7 +506,7 @@ def test_when_the_server_says_no_requests_are_left_the_app_waits_for_the_reset(e
 def open_coverage(w):
     w.coverage_act.trigger()
     end = time.monotonic() + 30
-    while (w.coverage._count_thread is not None or not w.coverage.days) and time.monotonic() < end:
+    while (w.coverage.count_job.busy or not w.coverage.days) and time.monotonic() < end:
         pump(20)
     pump(50)
     return w.coverage
@@ -531,7 +531,7 @@ def test_coverage_counts_a_busy_subreddit_without_downloading_anything(env, monk
     QTest.keyClick(cov.day_table, Qt.Key.Key_Return)
     QTest.keyClick(cov.post_table, Qt.Key.Key_Return)
     pump(500)
-    assert set(env.archive.paths()) == {AGG} and w.thread is None
+    assert set(env.archive.paths()) == {AGG} and not w.fetch_job.busy
 
 
 def test_coverage_counts_posts_removed_from_reddit_as_checked(env):
@@ -571,7 +571,7 @@ def busy_day(env, sub: str, n: int) -> int:
 def wait_idle_stalls(w, timeout: float = 60) -> float:
     """wait_idle, returning the longest the window went without handling events (a freeze)."""
     end, worst = time.monotonic() + timeout, 0.0
-    while w.thread is not None:
+    while w.fetch_job.busy:
         assert time.monotonic() < end, "fetch didn't finish"
         t = time.perf_counter()
         QApplication.processEvents()
@@ -708,11 +708,11 @@ def test_coverage_counts_a_subreddit_picked_while_another_is_being_counted(env):
     env.archive.delays[AGG] = 1.0
     w.coverage_act.trigger()
     pump(200)
-    assert w.coverage._count_thread is not None  # python's count is still out
+    assert w.coverage.count_job.busy  # python's count is still out
     w.datasets.setCurrentRow(next(i for i in range(w.datasets.count())
                                   if w.datasets.item(i).data(Qt.ItemDataRole.UserRole).lower() == "rust"))
     end = time.monotonic() + 15
-    while ("rust" not in w.coverage.totals or w.coverage._count_thread is not None) and time.monotonic() < end:
+    while ("rust" not in w.coverage.totals or w.coverage.count_job.busy) and time.monotonic() < end:
         pump(20)
     cov = w.coverage
     assert cov.subreddit.lower() == "rust" and cov.count_error == ""
@@ -738,14 +738,14 @@ def test_closing_coverage_while_a_count_is_out_doesnt_freeze_the_window(env):
     env.archive.delays[AGG] = 3
     w.coverage_act.trigger()
     pump(200)
-    assert w.coverage._count_thread is not None
+    assert w.coverage.count_job.busy
     start = time.monotonic()
     w.coverage.close()
     assert time.monotonic() - start < 0.5  # it used to wait up to 3 s for the request
     end = time.monotonic() + 10
-    while w.coverage._count_thread is not None and time.monotonic() < end:
+    while w.coverage.count_job.busy and time.monotonic() < end:
         pump(20)
-    assert w.coverage._count_thread is None  # the count still ends and is tidied up
+    assert not w.coverage.count_job.busy  # the count still ends and is tidied up
 
 
 def test_a_fetch_ending_leaves_the_user_on_the_subreddit_they_switched_to(env):
@@ -761,7 +761,7 @@ def test_a_fetch_ending_leaves_the_user_on_the_subreddit_they_switched_to(env):
     w.datasets.setCurrentRow(next(i for i in range(w.datasets.count())
                                   if w.datasets.item(i).data(Qt.ItemDataRole.UserRole).lower() == "rust"))
     pump(50)
-    assert w.thread is not None and w.current.lower() == "rust"
+    assert w.fetch_job.busy and w.current.lower() == "rust"
     wait_idle(w, 60)
     assert w.current.lower() == "rust" and w.datasets.currentItem().text().lower() == "r/rust"
     assert "Added" in w.progress_msg.text()
@@ -791,7 +791,7 @@ def test_coverage_closed_and_opened_again_mid_count_counts_again_without_an_erro
     w.coverage.close()  # stops the count; its answer comes back cut short
     w.coverage_act.trigger()
     end = time.monotonic() + 15
-    while ("python" not in w.coverage.totals or w.coverage._count_thread is not None) and time.monotonic() < end:
+    while ("python" not in w.coverage.totals or w.coverage.count_job.busy) and time.monotonic() < end:
         pump(20)
     pump(100)
     cov = w.coverage
@@ -824,7 +824,7 @@ def test_choosing_days_never_downloads_and_a_fetch_only_adds_rows_from_chosen_da
     w.limit.setValue(60)
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     seen = 0
-    while w.thread is not None:  # rows from other days are saved but not shown while the fetch runs
+    while w.fetch_job.busy:  # rows from other days are saved but not shown while the fetch runs
         QApplication.processEvents()
         rows = [w.posts_tab.model.row_at(i) for i in range(w.posts_tab.model.rowCount())]
         assert all(int(r["created_utc"] // DAY * DAY) == day for r in rows)
