@@ -165,6 +165,7 @@ def test_a_cut_short_or_unsettled_thread_is_not_marked_complete(tmp_path):
     collect.run(FullThreadClient(), s, collect.FetchRequest("python", comment_posts=("p1",)))
     collect.run(FullThreadClient(whole=False), s, collect.FetchRequest("python", comment_posts=("p2",)))
     assert s.complete_keys("comments", "python") == set()
+    assert s.complete_keys("comments_so_far", "python") == {"p1"}  # whole for now, so not offered again yet
 
 
 def test_downloading_a_whole_day_marks_it_complete_only_when_the_archive_ran_out(tmp_path):

@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS comment_fetches (
     ok INTEGER, settled INTEGER, fetched_at REAL
 );
 -- Ranges whose whole content ikari has fetched: kind "posts" keys a UTC day (its start, in epoch
--- seconds) and kind "comments" keys a post id. Used to show a day or thread as fully downloaded even
+-- seconds) and kind "comments" keys a post id; "comments_so_far" keys a post whose whole thread was fetched
+-- before the archive re-checked it, so more comments may still come. Used to show a day or thread as fully downloaded even
 -- when the archive's totals (which count removed items) are higher than what could be saved.
 CREATE TABLE IF NOT EXISTS complete (
     kind TEXT NOT NULL, subreddit TEXT NOT NULL, key TEXT NOT NULL, fetched_at REAL,  -- subreddit lowercased

@@ -121,6 +121,7 @@ class FakeArchive:
         self.posts = posts
         self.rate, self.window_start, self.used = rate, time.perf_counter(), 0
         self.busy = {b.lower() for b in busy}
+        self.stuck: list[float] = []  # a search window holding any of these times always times out
         self.rejected: list[tuple[str, dict, int, str]] = []  # every 4xx sent: path, params, status, error
         self.requests: list[tuple[str, dict]] = []
         self.faults: dict[str, list[tuple[int, dict]]] = {}  # path -> responses to give before real ones
@@ -247,6 +248,8 @@ class FakeArchive:
         if q.get("subreddit", "").lower() in self.busy:
             if q.get("query") or q.get("title") or q.get("selftext"):
                 raise Rejected(200, "Query timed out")
+        if any((after or 0) < t < (before or float("inf")) for t in self.stuck):
+            raise Rejected(*SLOW_DOWN[:1], SLOW_DOWN[1]["error"])
         rows = self._matching(q)
         if q.get("subreddit", "").lower() in self.busy and len(rows) > BUSY_PAGE:
             raise Rejected(*SLOW_DOWN[:1], SLOW_DOWN[1]["error"])
