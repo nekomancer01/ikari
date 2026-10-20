@@ -230,14 +230,15 @@ def run_fetch(entry: dict, w, sub: str, start, stop_after: float | None = None, 
             samples.append({"t": round(el, 1), "db_posts": p, "db_comments": c, **visible(w)})
             next_sample += every
         if pending_shots and el >= pending_shots[0]:
-            entry["shots"].append(shot(w, f"{entry['step'].split()[0]}-at-{pending_shots.pop(0)}s"))
+            entry["shots"].append(shot(w, f"{entry['step'].split(':')[0]}-at-{pending_shots.pop(0)}s"))
         if stop_after is not None and stopped_at is None and el >= stop_after:
             stopped_at = el
             entry["before_stop"] = {"t": round(el, 1), **dict(zip(("db_posts", "db_comments"), db_counts(sub))),
                                     **visible(w)}
             QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
             entry["after_click"] = visible(w)
-        if el > ARGS.timeout:
+        if el > ARGS.timeout and not entry.get("timed_out"):
+            entry["timed_out"] = True
             entry["notes"].append(f"still running after {ARGS.timeout:.0f}s; pressing Stop")
             w._stop_fetch()
             stop_after, stopped_at = 0, el
@@ -249,7 +250,7 @@ def run_fetch(entry: dict, w, sub: str, start, stop_after: float | None = None, 
     pump(1.5)  # the drip and fade-in
     p, c = db_counts(sub)
     entry["end"] = {"db_posts": p, "db_comments": c, **visible(w)}
-    entry["shots"].append(shot(w, f"{entry['step'].split()[0]}-done"))
+    entry["shots"].append(shot(w, f"{entry['step'].split(':')[0]}-done"))
     # What a person would notice: rows saved but never shown while fetching.
     live = [s for s in samples if s["db_posts"] or s["db_comments"]]
     if live:
