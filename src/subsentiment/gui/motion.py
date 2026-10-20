@@ -29,16 +29,19 @@ STAGGER_MS = 45  # between cards fading in one after another
 
 _wanted = True  # the View > Reduce motion setting, inverted
 _os_allows: bool | None = None
+_EFFECTS = (Qt.UIEffect.UI_AnimateMenu, Qt.UIEffect.UI_FadeMenu, Qt.UIEffect.UI_AnimateCombo,
+            Qt.UIEffect.UI_AnimateTooltip, Qt.UIEffect.UI_FadeTooltip)
+_os_effects: dict | None = None  # which of Qt's effects the OS had on, read before we first change them
 
 
 def set_enabled(on: bool) -> None:
     """Turn motion on or off for the whole app (View > Reduce motion), including Qt's menu and list effects."""
-    global _wanted
+    global _wanted, _os_effects
     _wanted = on
-    effects = enabled()
-    for effect in (Qt.UIEffect.UI_AnimateMenu, Qt.UIEffect.UI_FadeMenu, Qt.UIEffect.UI_AnimateCombo,
-                   Qt.UIEffect.UI_AnimateTooltip, Qt.UIEffect.UI_FadeTooltip):
-        QApplication.setEffectEnabled(effect, effects)
+    if _os_effects is None:
+        _os_effects = {e: QApplication.isEffectEnabled(e) for e in _EFFECTS}
+    for effect, os_on in _os_effects.items():  # never on where the OS has it off ("Fade or slide menus")
+        QApplication.setEffectEnabled(effect, os_on and enabled())
 
 
 def enabled() -> bool:
@@ -93,9 +96,16 @@ def crossfade(target: QWidget, ms: int = VIEW_MS) -> None:
         return
     parent = target.parentWidget()
     while parent is not None:
-        if fading(parent):  # a fade over a whole area already covers this part of it: don't grab again
+        if fading(parent, early=True):  # a fade over a whole area already covers this part: don't grab again
             return
         parent = parent.parentWidget()
+    if target.window().testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground):
+        # Behind a native backdrop (Mica, Acrylic) the system draws the glass, so a still has see-through
+        # panels and would lay glass over glass. The new look fades in over the backdrop instead (not a
+        # whole window: an effect on the top-level widget would hide the system's glass behind it).
+        if not target.isWindow():
+            fade_in(target, ms)
+        return
     for old in target.findChildren(_Snapshot, options=Qt.FindChildOption.FindDirectChildrenOnly):
         # A fade already running: start from what's on screen now, not from the picture before it.
         old.hide()
@@ -103,9 +113,11 @@ def crossfade(target: QWidget, ms: int = VIEW_MS) -> None:
     _Snapshot(target, ms)
 
 
-def fading(target: QWidget) -> bool:
-    """Whether a crossfade is running over target (for tests)."""
-    return any(s.isVisible() for s in target.findChildren(_Snapshot, options=Qt.FindChildOption.FindDirectChildrenOnly))
+def fading(target: QWidget, early: bool = False) -> bool:
+    """Whether a crossfade is running over target; with early, only one in its first half, whose picture
+    still mostly hides what changes under it."""
+    return any(s.isVisible() and (not early or s.anim.currentTime() < s.anim.duration() / 2)
+               for s in target.findChildren(_Snapshot, options=Qt.FindChildOption.FindDirectChildrenOnly))
 
 
 # -- fade in ------------------------------------------------------------------------------------------------

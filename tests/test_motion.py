@@ -48,7 +48,7 @@ def save(store: Store, sub: str, n: int, label: str, first: int = 0) -> None:
 
 
 @pytest.fixture
-def make_window(tmp_path):
+def make_window(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     app.setOrganizationName("subsentiment-test")
     app.setApplicationName(tmp_path.name)
@@ -62,6 +62,8 @@ def make_window(tmp_path):
     save(s, "rust", 5, "positive")
     save(s, "rust", 25, "negative")
     s.close()
+    # The fades follow Windows' "Animation effects" too; a test machine with it off still checks them.
+    monkeypatch.setattr(motion, "_os_allows", True)
     motion.set_enabled(True)
     windows = []
 
@@ -176,3 +178,41 @@ def test_a_status_line_fades_in_when_it_appears(make_window):
     assert isinstance(w.progress_msg.graphicsEffect(), QGraphicsOpacityEffect)
     pump(motion.APPEAR_MS + 150)
     assert w.progress_msg.graphicsEffect() is None
+
+
+def test_the_status_bar_fades_in_once_not_on_every_message(make_window):
+    w = make_window()
+    bar = w.statusBar()
+    bar.showMessage("Exported 40 posts")
+    assert isinstance(bar.graphicsEffect(), QGraphicsOpacityEffect)
+    pump(motion.APPEAR_MS + 150)
+    bar.showMessage("Deleted r/rust")  # already showing: no flash back to transparent
+    assert bar.graphicsEffect() is None
+
+
+def test_behind_a_native_backdrop_the_new_look_fades_in_instead(make_window):
+    w = make_window()
+    w.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)  # what Mica or Acrylic sets up
+    w.tabbar.setCurrentIndex(1)
+    assert not snapshots(w.content)  # no still of see-through glass laid over the glass
+    assert isinstance(w.content.graphicsEffect(), QGraphicsOpacityEffect)
+    pump(motion.VIEW_MS + 150)
+    assert w.content.graphicsEffect() is None
+
+
+def test_qt_effects_the_os_has_off_stay_off(make_window, monkeypatch):
+    effects = (Qt.UIEffect.UI_General, *motion._EFFECTS)
+    before = {e: QApplication.isEffectEnabled(e) for e in effects}
+    try:
+        monkeypatch.setattr(motion, "_os_effects", None)
+        QApplication.setEffectEnabled(Qt.UIEffect.UI_General, True)
+        QApplication.setEffectEnabled(Qt.UIEffect.UI_FadeMenu, False)  # "Fade or slide menus" off
+        QApplication.setEffectEnabled(Qt.UIEffect.UI_AnimateCombo, True)
+        motion.set_enabled(True)
+        assert not QApplication.isEffectEnabled(Qt.UIEffect.UI_FadeMenu)
+        assert QApplication.isEffectEnabled(Qt.UIEffect.UI_AnimateCombo)
+        motion.set_enabled(False)
+        assert not QApplication.isEffectEnabled(Qt.UIEffect.UI_AnimateCombo)
+    finally:
+        for e, on in before.items():
+            QApplication.setEffectEnabled(e, on)

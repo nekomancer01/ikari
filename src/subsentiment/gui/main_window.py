@@ -338,8 +338,7 @@ class MainWindow(QMainWindow):
         # Permanent, so temporary messages (exports, restarts) don't wipe the access-mode note.
         # The status bar only appears while it has something to say (an export, a deletion).
         bar = self.statusBar()
-        bar.messageChanged.connect(lambda text: bar.setVisible(bool(text)))
-        bar.messageChanged.connect(lambda text: motion.fade_in(bar) if text else None)
+        bar.messageChanged.connect(self._status_changed)
         bar.hide()
         QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _: self._apply_theme())
         self._refresh_datasets(select=self.settings.value("ui/last_dataset", "", str))
@@ -626,6 +625,15 @@ class MainWindow(QMainWindow):
     def _set_reduce_motion(self, on: bool) -> None:
         self.settings.setValue("ui/reduce_motion", on)
         motion.set_enabled(not on)
+
+    def _status_changed(self, text: str) -> None:
+        """The status bar only shows while it has something to say, and fades in when it appears (not on
+        each new message while it's already up)."""
+        bar = self.statusBar()
+        appearing = bool(text) and not bar.isVisible()
+        bar.setVisible(bool(text))
+        if appearing:
+            motion.fade_in(bar)
 
     def _set_mood_tint(self, on: bool) -> None:
         self.settings.setValue("ui/mood_tint", on)
@@ -1014,8 +1022,10 @@ class MainWindow(QMainWindow):
     def _on_days_chosen(self, chosen: set[int] | None) -> None:
         if not self.current:
             return
-        motion.crossfade(self.content)
-        self.chosen_days = days.save_choice(self.settings, self.current, chosen, self._day_counts)
+        chosen = days.save_choice(self.settings, self.current, chosen, self._day_counts)
+        if chosen != self.chosen_days:
+            motion.crossfade(self.content)
+        self.chosen_days = chosen
         if self.fetch_job.busy and self._showing_fetch():
             # A running fetch has added rows since the subreddit was loaded: read them all again.
             self._flush_rows()
