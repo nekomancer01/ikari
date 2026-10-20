@@ -98,3 +98,20 @@ def test_posts_and_comments_since_return_only_what_a_fetch_just_saved(tmp_path):
     s.save_post(Post("b", "Python", "t", "", "u", 1, None, 1, 2.0, "p", ""), 0.0, "neutral")
     assert [r["id"] for r in s.posts_since("python", cut)] == ["b"]
     assert s.comments_since("python", cut) == []
+
+
+def test_day_counts_and_exporting_chosen_days(tmp_path):
+    s = Store(tmp_path / "d.db")
+    day = 1_700_006_400  # a UTC midnight
+    s.save_post(make_post(1, ts=day + 5), 0.5, "positive")
+    s.save_post(make_post(2, ts=day + 86400 + 5), 0.1, "neutral")
+    s.save_post(make_post(3, sub="rust", ts=day + 5), 0.1, "neutral")
+    s.save_comment(Comment("c1", "p1", "Python", "t3_p1", "b", "hi", 1, day + 86400 * 2, 0, "u"), 0.2, "positive")
+    s.commit()
+    # Comments count on the day they were written, not their post's day.
+    assert s.day_counts("python") == {day: (1, 0), day + 86400: (1, 0), day + 2 * 86400: (0, 1)}
+    out = tmp_path / "p.csv"
+    assert s.export_csv("python", "posts", out, days={day + 86400}) == 1
+    assert [r["id"] for r in csv.DictReader(open(out, encoding="utf-8"))] == ["p2"]
+    assert s.export_csv("python", "posts", out) == 2
+    assert s.export_csv("python", "comments", out, days=set()) == 0
