@@ -12,9 +12,11 @@ import bisect
 import math
 from functools import partial
 
-from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QFontMetricsF, QPainter, QPen
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QToolTip, QWidget
+from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QFontMetricsF, QPainter, QPen, QTextCursor
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QToolTip, QVBoxLayout, QWidget,
+)
 
 from subsentiment.gui import motion, theme
 from subsentiment.gui.days import DAY, flat_button, short_date
@@ -184,6 +186,7 @@ NAV_H, NAV_GAP = 28, 12  # the navigator strip under the plot, and the space abo
 VOLUME = 0.2  # how much of the plot's height the items-per-day bars may take
 DOTS = 45  # with at most this many points in view, each gets a dot
 GROUP_PX = 4  # days closer together than this on screen are shown a week, or a month, per point
+NOTE_WRAP = 240  # the widest a note's description runs in the hover box before wrapping
 
 
 def timeline_bound(points: list[tuple[int, float, int]]) -> float:
@@ -209,7 +212,13 @@ class TimelineChart(QWidget):
     Self-contained: the overview card holds it today, and it fills a page of any width just as well.
 
     `view` is the span in view, [lo, hi) in epoch seconds, or None for every day, which widens as a running
-    fetch adds days; a view that ends at the latest day keeps ending there as days are added."""
+    fetch adds days; a view that ends at the latest day keeps ending there as days are added.
+
+    `notes` mark days the user picked out: each one's label sits on its point (a week or month's point shows
+    the first in it), the hover box adds its description, and the navigator marks where it is. Clicking a day's
+    dot (or its label) sends `note_requested` with the day; clicking a week or month's zooms in to its days."""
+
+    note_requested = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -228,6 +237,9 @@ class TimelineChart(QWidget):
         self._pointer: QPointF | None = None  # where the pointer is over the chart
         self._drag: tuple | None = None  # (what, x where it started, view then)
         self._select: tuple[float, float] | None = None  # the band dragged across the plot, in x pixels
+        self.notes: dict[int, tuple[str, str]] = {}  # {day start: (label, description)}
+        self._note_days: list[int] = []
+        self._pills: list[tuple[QRectF, tuple]] = []  # each note label as painted, and the point it is on
 
         self.toolbar = QWidget()
         bar = QHBoxLayout(self.toolbar)
@@ -260,6 +272,16 @@ class TimelineChart(QWidget):
             grow = self.domain()[1] - old_end  # a fetch added later days: keep showing the latest ones
             self.view = (self.view[0] + grow, self.view[1] + grow)
         self._apply(False, follow=True)
+
+    def set_notes(self, notes: dict[int, tuple[str, str]]) -> None:
+        self.notes = dict(notes)
+        self._note_days = sorted(self.notes)
+        self.update()
+
+    def notes_in(self, start: float, end: float) -> list[tuple[str, str]]:
+        """The notes on days in [start, end), earliest first."""
+        days = self._note_days
+        return [self.notes[d] for d in days[bisect.bisect_left(days, start):bisect.bisect_left(days, end)]]
 
     def show_every_day(self) -> None:
         """Forget the zoom, for other data: another subreddit, or other days in the Days picker."""
@@ -391,6 +413,12 @@ class TimelineChart(QWidget):
         plot = QRectF(left, 8, nav.width(), max(1.0, bottom - NAV_GAP - fm.height() - 8 - 8))
         return plot, nav
 
+    def _spot(self, point: tuple, plot: QRectF) -> QPointF:
+        """Where a point (start, end, mean, items) is drawn now."""
+        lo, hi, bound = self._screen
+        start, end, mean = point[:3]
+        return QPointF(self._x((start + end) / 2, lo, hi, plot), plot.center().y() - mean / bound * plot.height() / 2)
+
     @staticmethod
     def _x(t: float, lo: float, hi: float, r: QRectF) -> float:
         return r.left() + (t - lo) / (hi - lo) * r.width()
@@ -498,6 +526,7 @@ class TimelineChart(QWidget):
             sel.setAlpha(36)
             p.fillRect(QRectF(a, plot.top(), b - a, plot.height()), sel)
         p.restore()
+        self._paint_notes(p, plot, shown, ring)
 
         if self._hover and not self._select:
             unit, start, end, mean, n = self._hover
@@ -512,9 +541,37 @@ class TimelineChart(QWidget):
                 self._paint_box(p, plot, x, self._hover)
         self._paint_navigator(p, nav, colors, t)
 
+    def _paint_notes(self, p: QPainter, plot: QRectF, shown: list, ring: QPen) -> None:
+        """Each noted point's dot, with the note's label in a pill above it (below it, near the top)."""
+        t = theme.tokens()
+        font = _ui_font(8)
+        font.setWeight(QFont.Weight.DemiBold)
+        fm = QFontMetricsF(font)
+        p.setFont(font)
+        self._pills = []
+        for point in shown:
+            marked = self.notes_in(point[0], point[1])
+            at = self._spot(point, plot)
+            if not marked or not plot.left() - 1 <= at.x() <= plot.right() + 1:
+                continue
+            text = marked[0][0] + ("+" if len(marked) > 1 else "")
+            h = fm.height() + 4
+            w = max(h, fm.horizontalAdvance(text) + 10)
+            top = at.y() - 9 - h if at.y() - 9 - h >= plot.top() - 4 else at.y() + 9
+            pill = QRectF(at.x() - w / 2, top, w, h)
+            p.setPen(ring)
+            p.setBrush(QColor(t["accent"]))
+            p.drawEllipse(at, 4, 4)
+            p.drawRoundedRect(pill, h / 2, h / 2)
+            p.setPen(QColor(t["on_accent"]))
+            p.drawText(pill, int(Qt.AlignmentFlag.AlignCenter), text)
+            self._pills.append((pill, point))
+        p.setFont(_ui_font(9))
+
     def _paint_box(self, p: QPainter, plot: QRectF, x: float, hover: tuple) -> None:
-        """The hover box: the day (or week, or month), its mean and how many items, beside the crosshair."""
-        unit, start, _, mean, n = hover
+        """The hover box: the day (or week, or month), its mean and how many items, beside the crosshair, and
+        the description of each note in it."""
+        unit, start, end, mean, n = hover
         t = theme.tokens()
         head = QFont(self.font())
         head.setWeight(QFont.Weight.DemiBold)
@@ -528,6 +585,16 @@ class TimelineChart(QWidget):
         fms = [QFontMetricsF(f) for f, _ in lines]
         w = max(fm.horizontalAdvance(text) for fm, (_, text) in zip(fms, lines)) + 20
         h = sum(fm.height() for fm in fms) + 4 * (len(lines) - 1) + 16
+        # Notes: the label, then the description wrapped beside it.
+        marked = self.notes_in(start, end)
+        hfm, bfm = QFontMetricsF(head), QFontMetricsF(body)
+        wrap = int(Qt.TextFlag.TextWordWrap)
+        tag_w = max((hfm.horizontalAdvance(tag) for tag, _ in marked), default=0) + 8
+        notes = [(tag, text, bfm.boundingRect(QRectF(0, 0, NOTE_WRAP, 1e5), wrap, text)) for tag, text in marked]
+        if notes:
+            text_w = max(r.width() for *_, r in notes)
+            w = max(w, tag_w + text_w + 20)
+            h += 13 + sum(max(r.height(), hfm.height()) + 4 for *_, r in notes) - 4
         left = x + 12 if x + 12 + w <= plot.right() else x - 12 - w
         box = QRectF(max(0.0, left), plot.top() + 4, w, h)
         p.setPen(QPen(QColor(*t["edge"]), 1))
@@ -540,6 +607,21 @@ class TimelineChart(QWidget):
             p.drawText(QRectF(box.left() + 10, top, w - 20, fm.height()),
                        int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
             top += fm.height() + 4
+        if notes:
+            top += 2
+            p.setPen(QPen(QColor(*t["edge"]), 1))
+            p.drawLine(QPointF(box.left() + 10, top), QPointF(box.right() - 10, top))
+            top += 7
+            for tag, text, r in notes:
+                p.setFont(head)
+                p.setPen(QColor(t["accent"]))
+                p.drawText(QRectF(box.left() + 10, top, tag_w, hfm.height()),
+                           int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), tag)
+                p.setFont(body)
+                p.setPen(QColor(t["text"]))
+                p.drawText(QRectF(box.left() + 10 + tag_w, top, w - 20 - tag_w, r.height()),
+                           int(Qt.AlignmentFlag.AlignLeft) | wrap, text)
+                top += max(r.height(), hfm.height()) + 4
 
     def _paint_navigator(self, p: QPainter, nav: QRectF, colors: dict, t: dict) -> None:
         """Every day in small, with the span in view as a window that can be dragged or resized."""
@@ -555,6 +637,11 @@ class TimelineChart(QWidget):
         line.setAlpha(150)
         self._draw_line(p, every, lambda at: self._x(at, a, b, nav),
                         lambda v: mid - v / bound * (nav.height() / 2 - 3), QPen(line, 1.2))
+        p.setPen(QPen(QColor(t["accent"]), 1.5))
+        for d in self._note_days:
+            if a <= d < b:
+                x = self._x(d + DAY / 2, a, b, nav)
+                p.drawLine(QPointF(x, nav.top() + 3), QPointF(x, nav.bottom() - 3))
         x0, x1 = self._x(lo, a, b, nav), self._x(hi, a, b, nav)
         window = QRectF(x0, nav.top(), max(2.0, x1 - x0), nav.height())
         fill = QColor(t["accent"])
@@ -613,8 +700,11 @@ class TimelineChart(QWidget):
         if self._drag is None:
             self._hover_at(pos, plot)
             part = self._nav_part(pos.x()) if nav.adjusted(0, -4, 0, 4).contains(pos) else None
+            if part is None and self._target(pos):
+                part = "point"
             self.setCursor({"left": Qt.CursorShape.SizeHorCursor, "right": Qt.CursorShape.SizeHorCursor,
-                            "move": Qt.CursorShape.OpenHandCursor}.get(part, Qt.CursorShape.ArrowCursor))
+                            "move": Qt.CursorShape.OpenHandCursor,
+                            "point": Qt.CursorShape.PointingHandCursor}.get(part, Qt.CursorShape.ArrowCursor))
             return
         what, x, then = self._drag
         if what == "select":
@@ -632,15 +722,34 @@ class TimelineChart(QWidget):
             self.set_view(lo, min(b, max(hi + dt, lo + MIN_SPAN)))
 
     def mouseReleaseEvent(self, event) -> None:
-        if self._drag and self._drag[0] == "select" and self._select:
-            plot, _ = self._areas()
-            x0, x1 = sorted(self._select)
-            if x1 - x0 > 6:  # a drag, not a click: zoom to the days it covers
-                lo, hi, _ = self._screen
-                self.set_view(self._t(x0, lo, hi, plot), self._t(x1, lo, hi, plot), animate=True)
+        selected = self._select if self._drag and self._drag[0] == "select" else None
         self._drag = self._select = None
         self.unsetCursor()
         self.update()
+        if not selected:
+            return
+        plot, _ = self._areas()
+        x0, x1 = sorted(selected)
+        lo, hi, _ = self._screen
+        if x1 - x0 > 6:  # a drag, not a click: zoom to the days it covers
+            self.set_view(self._t(x0, lo, hi, plot), self._t(x1, lo, hi, plot), animate=True)
+        elif point := self._target(event.position()):
+            if self.groups(lo, hi, plot.width())[0] == "day":
+                self.note_requested.emit(int(point[0]))
+            else:
+                self.set_view(point[0], point[1], animate=True)
+
+    def _target(self, pos: QPointF) -> tuple | None:
+        """The point (start, end, mean, items) whose dot or note label is under pos."""
+        hit = next((point for pill, point in self._pills if pill.contains(pos)), None)
+        if hit is None:
+            plot = self._areas()[0]
+            self._hover_at(pos, plot)
+            if self._hover:
+                at = self._spot(self._hover[1:], plot)
+                if (at.x() - pos.x()) ** 2 + (at.y() - pos.y()) ** 2 <= 12 ** 2:
+                    hit = self._hover[1:]
+        return hit
 
     def mouseDoubleClickEvent(self, event) -> None:
         if self._areas()[0].contains(event.position()):
@@ -691,3 +800,61 @@ class TimelineChart(QWidget):
         if e.type() == QEvent.Type.ToolTip:
             return True  # the hover box shows the day instead
         return super().event(e)
+
+
+class NoteDialog(QDialog):
+    """Add, change or remove the note on one day of the timeline: a label of up to two characters, shown on the
+    chart, and a description, shown when the pointer is over that day. Sends `chosen` with the (label,
+    description) saved, or two empty strings to remove the note; nothing if it's cancelled."""
+
+    chosen = Signal(str, str)
+
+    def __init__(self, day: int, tag: str = "", text: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Note")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(6)
+        when = datetime.fromtimestamp(day, timezone.utc)
+        lay.addWidget(theme.mark(QLabel(f"{when:%A} {when.day} {when:%B %Y}"), "role", "heading"))
+        lay.addSpacing(6)
+        lay.addWidget(theme.mark(QLabel("Label (up to two characters)"), "role", "section"))
+        self.tag = QLineEdit(tag)
+        self.tag.setMaxLength(2)
+        self.tag.setPlaceholderText("e.g. UP")
+        lay.addWidget(self.tag)
+        lay.addSpacing(4)
+        lay.addWidget(theme.mark(QLabel("Description"), "role", "section"))
+        self.text = QPlainTextEdit(text)
+        self.text.setPlaceholderText("What happened on this day")
+        self.text.setTabChangesFocus(True)
+        self.text.moveCursor(QTextCursor.MoveOperation.End)  # changing a note usually adds to it
+        self.text.setFixedHeight(self.text.fontMetrics().lineSpacing() * 4 + 16)
+        lay.addWidget(self.text)
+        lay.addSpacing(8)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        if tag or text:
+            remove = QPushButton("Remove")
+            remove.setAutoDefault(False)
+            remove.clicked.connect(lambda: self._done("", ""))
+            buttons.addWidget(remove)
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setAutoDefault(False)
+        cancel.clicked.connect(self.reject)
+        self.save = theme.mark(QPushButton("Save"), "primary", True)
+        self.save.setDefault(True)
+        self.save.clicked.connect(lambda: self._done(self.tag.text().strip(), self.text.toPlainText().strip()))
+        self.tag.textChanged.connect(lambda: self.save.setEnabled(bool(self.tag.text().strip())))
+        self.save.setEnabled(bool(tag.strip()))
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.save)
+        lay.addLayout(buttons)
+        self.setMinimumWidth(QFontMetrics(self.font()).horizontalAdvance("x") * 52)
+        self.tag.setFocus()
+
+    def _done(self, tag: str, text: str) -> None:
+        self.chosen.emit(tag, text)
+        self.accept()

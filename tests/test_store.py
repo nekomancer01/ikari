@@ -425,3 +425,49 @@ def test_importing_an_older_or_a_shrunk_database_keeps_every_comments_link(tmp_p
     expected = dict(old.execute("SELECT id, permalink FROM comments"))
     old.close()
     assert {r["id"]: r["permalink"] for r in s.comments("python")} == expected
+
+
+def test_timeline_notes_are_kept_per_subreddit_and_day_and_go_with_its_data(tmp_path):
+    s = Store(tmp_path / "x.db")
+    s.save_post(make_post(1), 0.5, "positive")
+    s.save_note("Python", 86400 * 3, "UP", "Release day")
+    s.save_note("python", 86400 * 5, "🎉", "")
+    s.save_note("rust", 86400 * 3, "R", "Theirs")
+    s.close()
+    s = Store(tmp_path / "x.db")  # saved in the file, under the subreddit whatever its case
+    assert s.notes("PYTHON") == {86400 * 3: ("UP", "Release day"), 86400 * 5: ("🎉", "")}
+    s.save_note("python", 86400 * 3, "UP", "Release day, delayed")  # changing a day's note replaces it
+    s.save_note("python", 86400 * 5, "", "")  # nothing left in it: removed
+    assert s.notes("python") == {86400 * 3: ("UP", "Release day, delayed")}
+    s.delete_subreddit("python")
+    assert s.notes("python") == {} and s.notes("rust") == {86400 * 3: ("R", "Theirs")}
+    s.delete_all()
+    assert s.notes("rust") == {}
+
+
+def test_import_brings_notes_keeping_the_one_saved_last(tmp_path, monkeypatch):
+    from subsentiment import store as store_mod
+    when = iter([100.0, 200.0, 300.0, 400.0])
+    monkeypatch.setattr(store_mod.time, "time", lambda: next(when))
+    mine, theirs = Store(tmp_path / "mine.db"), Store(tmp_path / "theirs.db")
+    mine.save_note("python", 0, "A", "mine, older")       # 100
+    theirs.save_note("python", 0, "B", "theirs, newer")   # 200
+    theirs.save_note("python", 86400, "C", "only theirs")  # 300
+    mine.save_note("python", 86400 * 2, "D", "only mine")  # 400
+    theirs.close()
+    monkeypatch.undo()
+    mine.import_from(tmp_path / "theirs.db")
+    assert mine.notes("python") == {0: ("B", "theirs, newer"), 86400: ("C", "only theirs"),
+                                    86400 * 2: ("D", "only mine")}
+
+
+def test_a_database_from_an_older_ikari_gets_notes_and_imports_without_them(tmp_path):
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(OLD_DB, path)
+    s = Store(path)  # migrated, and given the notes table
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    s.save_note("python", 0, "X", "kept")
+    shutil.copy(OLD_DB, tmp_path / "old.db")
+    s.import_from(tmp_path / "old.db")  # an older file has no notes table
+    s.close()
+    assert Store(path).notes("python") == {0: ("X", "kept")}
