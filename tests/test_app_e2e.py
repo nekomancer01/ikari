@@ -2,6 +2,7 @@
 talking to a fake Arctic Shift server on localhost. The rule checked throughout: nothing is requested
 unless the user asked for it, and each action requests only what it says."""
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -922,3 +923,47 @@ def test_a_second_fetch_into_a_shown_subreddit_ends_without_reading_it_all_back(
         shown = {tab.model.row_at(i)["id"]: tuple(tab.model.row_at(i)) for i in range(tab.model.rowCount())}
         assert shown == {r["id"]: tuple(r) for r in saved}  # new scores included
     assert w.overview.tiles["count"].value.text() == f"{len(store.posts('python')) + len(store.comments('python')):,}"
+
+
+def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
+    """Ame: "basically I just want everything to update live". The overview used to be redrawn only a second
+    after a save, from the rows dripped into the tables by then, so while the fetch waited on a slow request
+    the tables kept filling and the overview, day picker and coverage stood still behind them."""
+    w = env.window()
+    # Each day's posts come at once, more than the tables show in a second; then a long wait on comments.
+    env.archive.posts += make_posts("Burst", NOW, days=3, per_day=(80,), seed=4)
+    env.archive.delays[TREE] = 6.0
+    w.fetch_form.subreddit.setText("Burst")
+    w.fetch_form.include_comments.setChecked(True)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    want = in_range(env, w, "Burst")
+    end = time.monotonic() + 20
+    while w.posts_tab.model.rowCount() < want or w._drip.isActive():
+        assert time.monotonic() < end and w.fetch_job.busy, w.posts_tab.model.rowCount()
+        if w.current and w.coverage is None:  # opened with the first rows, to watch the rest come in
+            w._show_coverage()
+        pump(5)
+    pump(1200)  # past the overview's 250 ms and the saved-data list's 1 s; still waiting on the comments  # a little more than the overview's 250 ms; still waiting on the comments
+    assert w.fetch_job.busy and not w.comments_tab.model.rowCount()
+    rows = w.posts_tab.all_rows
+    o = w.overview
+    assert len(rows) == want
+    assert o.tiles["count"].value.text() == f"{want:,}"
+    assert sum(o.distribution._counts.values()) == want
+    assert o.distribution._counts == {k: sum(r["label"] == k for r in rows) for k in ("negative", "neutral", "positive")}
+    assert sum(n for _, _, n in o.timeline._shown[0]) == want
+    assert o.most_positive.item(0).text().startswith(f"{max(r['sentiment'] for r in rows):+.2f}")
+    assert o.most_negative.item(0).text().startswith(f"{min(r['sentiment'] for r in rows):+.2f}")
+    assert w.tabbar.tabText(1) == f"Posts  {want:,}" and w.subheading.text().startswith(f"{want}\xa0posts")
+    assert sum(p for p, _ in w.days_pick.counts.values()) == want
+    pump(800)  # what reads the store again does so once a second
+    assert w.fetch_job.busy
+    assert w.storage_info.text().startswith(f"{want}\xa0posts")
+    c = w.coverage
+    saved = env.store().posts_per_day("Burst", c.days[-1], c.days[0] + DAY)
+    for row, day in enumerate(c.days):
+        shown = c.day_table.cellWidget(row, 1).main.text()  # "12 of 20", "3 saved so far" or "No posts"
+        assert int(re.match(r"[\d,]*", shown).group().replace(",", "") or 0) == saved.get(day, 0), (day, shown)
+    w._stop_fetch()
+    wait_idle(w)
