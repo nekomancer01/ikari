@@ -453,8 +453,9 @@ def test_rows_keep_fading_in_while_comments_are_saved_quickly(env):
     # Each save used to restart the fade-in timer, so while comments were saved faster than it ticks,
     # no queued post appeared until the fetch ended.
     w = env.window()
-    fetch(w, comments=False)
+    fetch(w, comments=False, rng="day")  # a dozen or so rows, as with the old Max posts of 12
     n = len(w.posts)
+    assert 0 < n <= 18
     w.posts_tab.load([])
     w.request, w.thread = mw.collect.FetchRequest("python"), object()  # as if python were being fetched
     w._read_to = {"posts": 0.0, "comments": 0.0}
