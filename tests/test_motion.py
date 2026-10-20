@@ -39,8 +39,8 @@ def drawn(label: QLabel) -> str:
     return QLabel.text(label)
 
 
-def save(store: Store, sub: str, n: int, label: str, first: int = 0) -> None:
-    score = {"positive": 0.6, "negative": -0.6, "neutral": 0.0}[label]
+def save(store: Store, sub: str, n: int, label: str, first: int = 0, score: float | None = None) -> None:
+    score = {"positive": 0.6, "negative": -0.6, "neutral": 0.0}[label] if score is None else score
     for i in range(first, first + n):
         store.save_post(Post(f"{sub}{label}{i}", sub, f"{label} title {i}", "", "a", 1, 0.9, 0,
                              START + (i % 5) * DAY, f"https://r/{sub}/{i}", ""), score, label)
@@ -128,10 +128,11 @@ def test_new_data_while_shown_counts_up_and_new_extremes_fade_in(make_window):
     pick(w, "Python")
     pump(motion.DATA_MS + 6 * motion.STAGGER_MS + 300)
     s = Store(w.db_path)
-    save(s, "Python", 20, "negative", first=100)
+    save(s, "Python", 20, "negative", first=100, score=-0.9)  # the most negative yet
     s.close()
-    w.comments = []
-    w.posts = w.store.posts("Python")  # what a running fetch's live refresh does, a second's rows at a time
+    shown = {r["id"] for r in w.posts_tab.all_rows}
+    new = [r for r in w.store.posts("Python") if r["id"] not in shown]
+    w._add_rows("posts", w.posts_tab, new)  # what a running fetch does with the rows it saves
     w._render_overview()
     assert w.overview.tiles["count"].value.text() == "60"
     assert snapshots(w.overview.most_negative.viewport())  # its entries changed
