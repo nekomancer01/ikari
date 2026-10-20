@@ -65,7 +65,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 import requests  # noqa: E402
-from PySide6.QtCore import QSettings, Qt, QTimer  # noqa: E402
+from PySide6.QtCore import QEvent, QSettings, Qt, QTimer  # noqa: E402
 from PySide6.QtGui import QGuiApplication  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QPushButton  # noqa: E402
@@ -168,6 +168,8 @@ def pump(secs: float) -> None:
     end = time.monotonic() + secs
     while time.monotonic() < end:
         QApplication.processEvents()
+        # processEvents outside exec() never runs deleteLater; the app's own event loop does.
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         time.sleep(0.005)
 
 
@@ -257,6 +259,7 @@ def run_fetch(entry: dict, w, sub: str, start, stop_after: float | None = None, 
             entry["stop_never_ended"] = True
             break
         QApplication.processEvents()
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         time.sleep(0.005)
     entry["fetch_secs"] = round(time.monotonic() - t0, 1)
     if stopped_at is not None:
@@ -349,6 +352,8 @@ if not QGuiApplication.platformName().startswith("offscreen"):
     mw.fit_to_screen = lambda size, screen: size.boundedTo(size.__class__(fw, fh))
 print("opening the window", flush=True)
 w = mw.MainWindow(DB)
+F = getattr(w, "fetch_form", w)  # the fetch fields, on their own widget since #67
+FORM_MOD = sys.modules[type(F).__module__] if F is not w else mw
 w.show()
 print("window shown", flush=True)
 pump(0.5)
@@ -370,16 +375,16 @@ def first_launch(e):
 
 @step("small-fetch: type a subreddit and press Fetch and analyse with the default form")
 def small_fetch(e):
-    e["form"] = {"range": w.range.currentText(), "pick": getattr(w, "pick", None) and w.pick.currentText(),
-                 "limit": getattr(w, "limit", None) and w.limit.value(), "comments": w.include_comments.isChecked(), "per_post": w.comments_per_post.value()}
-    type_into(w.subreddit, ARGS.small)
+    e["form"] = {"range": F.range.currentText(), "pick": getattr(F, "pick", None) and F.pick.currentText(),
+                 "limit": getattr(F, "limit", None) and F.limit.value(), "comments": F.include_comments.isChecked(), "per_post": F.comments_per_post.value()}
+    type_into(F.subreddit, ARGS.small)
     run_fetch(e, w, ARGS.small, lambda: click(w.fetch_btn))
 
 
 @step("busy-fetch: with the first subreddit on screen, fetch a busy one")
 def busy_fetch(e):
     e["showing_before"] = w.heading.text()
-    type_into(w.subreddit, ARGS.busy)
+    type_into(F.subreddit, ARGS.busy)
     run_fetch(e, w, ARGS.busy, lambda: click(w.fetch_btn))
     shown = {s["heading"] for s in e["samples"]}
     e["notes"].append(f"headings seen while fetching: {sorted(shown)}")
@@ -387,9 +392,9 @@ def busy_fetch(e):
 
 @step("stop: fetch more of the busy subreddit and press Stop partway")
 def stop_midway(e):
-    w.range.setCurrentIndex(list(mw.RANGES).index("month"))
-    if hasattr(w, "limit"):  # max posts went with #55 (every post in the range)
-        w.limit.setValue(300)
+    F.range.setCurrentIndex(list(FORM_MOD.RANGES).index("month"))
+    if hasattr(F, "limit"):  # max posts went with #55 (every post in the range)
+        F.limit.setValue(300)
     run_fetch(e, w, ARGS.busy, lambda: click(w.fetch_btn), stop_after=ARGS.stop_after)
     b, end = e.get("before_stop", {}), e["end"]
     e["notes"].append(f"at Stop: db {b.get('db_posts')}/{b.get('db_comments')}, window {b.get('posts_rows')}/"
@@ -426,7 +431,8 @@ def days_pick(e):
         want_p = len(dd.keep(w.store.posts(w.current), chosen))
         want_c = len(dd.keep(w.store.comments(w.current), chosen))
         shown = (w.posts_tab.view.model().rowCount(), w.comments_tab.view.model().rowCount())
-        tile = w.tiles["count"].value.text() if hasattr(w.tiles["count"], "value") else ""
+        tiles = getattr(w, "tiles", None) or w.overview.tiles  # moved into OverviewPage by #62
+        tile = tiles["count"].value.text() if hasattr(tiles["count"], "value") else ""
         ok = shown == (want_p, want_c)
         e["notes"].append(f"{label}: combo {combo.currentText()!r}, tables {shown[0]}/{shown[1]}, expected "
                           f"{want_p}/{want_c}{'' if ok else ' MISMATCH'}; items tile {tile}; tabs {w.tabbar.tabText(1)!r} "
@@ -519,7 +525,11 @@ def motion_check(e):
                 w.grab().save(str(path))
                 e["shots"].append(path.name)
             pump(1.0)
-            out[what] = f"{started} fading, {len(fades())} left after 1.1s, call {took * 1000:.0f} ms"
+            left = fades()
+            seen = [f for f in left if f.isVisibleTo(w) and f.parentWidget().isVisibleTo(w)]
+            out[what] = (f"{started} fading, {len(left)} left after 1.1s ({len(seen)} visible: "
+                         f"{[f.parentWidget().objectName() or type(f.parentWidget()).__name__ for f in seen]}), "
+                         f"call {took * 1000:.0f} ms")
         e["notes"].append(f"motion {label}: " + "; ".join(f"{k} {v}" for k, v in out.items()))
 
     e["notes"].append(f"Reduce motion starts {'on' if w.motion_act.isChecked() else 'off'}")
@@ -551,20 +561,20 @@ def export(e):
 def comments_all(e):
     import sqlite3
 
-    w.range.setCurrentIndex(list(mw.RANGES).index("day"))
-    w.include_comments.setChecked(True)
-    w.comments_per_post.setValue(w.comments_per_post.minimum())
-    e["per_post_text"] = w.comments_per_post.text()
-    type_into(w.subreddit, ARGS.small)
+    F.range.setCurrentIndex(list(FORM_MOD.RANGES).index("day"))
+    F.include_comments.setChecked(True)
+    F.comments_per_post.setValue(F.comments_per_post.minimum())
+    e["per_post_text"] = F.comments_per_post.text()
+    type_into(F.subreddit, ARGS.small)
     run_fetch(e, w, ARGS.small, lambda: click(w.fetch_btn), shots_at=(5, 30))
     con = sqlite3.connect(DB)
     rows = con.execute("select p.num_comments, count(c.id) from posts p left join comments c on c.post_id = p.id "
                        "where lower(p.subreddit) = ? group by p.id", (ARGS.small.lower(),)).fetchall()
     con.close()
-    full = sum(1 for n, got in rows if got >= n)
+    full = sum(1 for n, got in rows if got >= (n or 0))
     e["notes"].append(f"spin box reads {e['per_post_text']!r}; {full} of {len(rows)} posts have every comment "
                       f"num_comments counts; most on one post {max((g for _, g in rows), default=0)}")
-    w.comments_per_post.setValue(mw.FETCH_DEFAULTS["comments_per_post"])
+    F.comments_per_post.setValue(FORM_MOD.FETCH_DEFAULTS["comments_per_post"])
 
 
 @step("coverage: open View > Download coverage for the busy subreddit")
