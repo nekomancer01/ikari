@@ -1,5 +1,6 @@
 """The fetch form and saved-data list survive a restart; the delete actions clear the store."""
 import os
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -254,9 +255,10 @@ def test_archive_counts_arrive_on_the_gui_thread(make_window, monkeypatch):
     c.totals = Totals()
     c.subreddit = "Python"
     c._count(1_699_920_000, 1_699_920_000 + 86400)
-    c._count_thread.wait(5000)
-    for _ in range(20):
+    end = time.monotonic() + 10  # the thread is wound down from the GUI thread, so keep handling events
+    while c._count_thread is not None and time.monotonic() < end:
         QApplication.processEvents()
+        time.sleep(0.01)
     assert seen["thread"] is threading.main_thread()
     assert c.totals["python"] == {1_699_920_000: 5} and c._count_thread is None
     c.close()
@@ -311,9 +313,10 @@ def test_recent_days_and_lagging_counts_show_no_total(make_window, monkeypatch):
     w._show_coverage()
     c = w.coverage
     c.refresh_saved()
-    for day in (yesterday, older):  # yesterday's count (9) is above the 3 saved but still isn't shown
+    # Yesterday's count (9) is above the 3 saved but isn't shown yet; the older day's count (1) can't be right.
+    for day, note in ((yesterday, "Still counting"), (older, "No usable count")):
         cell = c.day_table.cellWidget(c.days.index(day), 1)
-        assert (cell.main.text(), cell.note.text()) == ("3 saved so far", "Still counting")
+        assert (cell.main.text(), cell.note.text()) == ("3 saved so far", note)
     cell = c.day_table.cellWidget(c.days.index(older + 86400), 1)
     assert (cell.main.text(), cell.side.text()) == ("0 of 9", "0%")  # a settled day keeps its total
     c.close()

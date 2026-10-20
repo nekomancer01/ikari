@@ -99,8 +99,9 @@ def main() -> None:
         for row, d in enumerate(cov.days):
             cell = cov.day_table.cellWidget(row, 1)
             side = cell.note.text() if cell.note.isVisible() else cell.side.text()
+            gone = w.store.removed_per_day(sub, d, d + 86400).get(d, 0)
             print(f"  {coverage.day_text(d)}: {cell.main.text()} | {side} | "
-                  f"archive count {cov.totals.get(sub.lower(), {}).get(d)}")
+                  f"archive count {cov.totals.get(sub.lower(), {}).get(d)}, removed posts seen {gone}")
     print(f"Coverage window: counts in after {time.time() - t0:.0f} s, error: {cov.count_error or 'none'}")
     rows()
     row = back  # a settled day

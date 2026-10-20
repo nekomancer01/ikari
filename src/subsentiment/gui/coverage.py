@@ -169,18 +169,23 @@ class Cell(QWidget):
         self.lay.setContentsMargins(*((8, 2, 12, 2) if open_day else (8, 7, 12, 9)))
         self.lay.setSpacing(0 if open_day else 5)
 
-    def set_open(self, saved: int, is_today: bool = True) -> None:
-        """A day without a usable total: just what's saved so far, no share or estimate."""
+    def set_open(self, saved: int, why: str = "today", total: int | None = None) -> None:
+        """A day without a usable total: just what's saved so far, no share or estimate. ``why`` is
+        "today" (not over yet), "counting" (the archive's count lags) or "wrong" (a settled day whose
+        count is below what's saved, as when the archive answers a busy day's count with 0)."""
         self.main.setText(f"{saved:,} saved so far")
         self.side.setText("")
-        self.note.setText("Today" if is_today else "Still counting")
+        self.note.setText({"today": "Today", "counting": "Still counting"}.get(why, "No usable count"))
         self.bar.setVisible(False)  # an empty bar would read as 0%
         self.note.setVisible(True)
         self._pad(open_day=True)
-        self.setToolTip("Today isn't over, so there's no total yet. Download all fetches everything "
-                        "posted today so far." if is_today else
-                        "Arctic Shift's count for this day is still filling in, so there's no total yet. "
-                        "Download all fetches everything posted that day.")
+        self.setToolTip(
+            "Today isn't over, so there's no total yet. Download all fetches everything posted today so far."
+            if why == "today" else
+            "Arctic Shift's count for this day is still filling in, so there's no total yet. "
+            "Download all fetches everything posted that day." if why == "counting" else
+            f"Arctic Shift counted {total or 0:,} posts for this day, fewer than are already saved, so the "
+            "count can't be right. Download all fetches everything posted that day.")
 
     def set(self, saved: int, total: int | None, complete: bool, noun: str, removed: int = 0) -> None:
         main, side, share, tip = share_text(saved, total, complete, noun, removed)
@@ -458,7 +463,8 @@ class CoverageWindow(QDialog):
             cell: Cell = t.cellWidget(row, 1)
             button: QPushButton = t.cellWidget(row, 2).findChild(QPushButton)
             if no_total(day, n, total, done):
-                cell.set_open(n, day >= current)
+                lagging = day >= current - COUNT_LAG_DAYS * DAY
+                cell.set_open(n, "today" if day >= current else "counting" if lagging else "wrong", total)
                 button.setText("Download all")
                 button.setEnabled(not self.busy)
                 button.setToolTip("Fetch everything posted today so far" if day >= current
