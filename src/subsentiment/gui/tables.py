@@ -1,14 +1,18 @@
-"""Table models for posts and comments."""
+"""The Posts and Comments tables: their model and the filterable page that shows one."""
 from __future__ import annotations
 
 import time
 from datetime import datetime
 from typing import Any, Callable
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer
-from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QPixmap
+from PySide6.QtWidgets import (
+    QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QHeaderView, QLineEdit, QTableView, QVBoxLayout, QWidget,
+)
 
 from subsentiment.gui.charts import palette
+from subsentiment.gui.widgets import label, panel, plural
 
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1
 NUMERIC = ("sentiment", "score", "num_comments")
@@ -190,3 +194,147 @@ class RowsModel(QAbstractTableModel):
 
     def row_at(self, i: int):
         return self.rows[i]
+
+
+class TablePage(QWidget):
+    """Filterable, sortable table on a solid panel; double-click opens the item on Reddit."""
+
+    SHRINKS = ("author", "post_title")  # free text that can end in "…" to leave room for the main text
+    OPTIONAL = ("author", "post_title", "num_comments")  # hidden in this order when there's still no room
+
+    def __init__(self, columns, stretch_col: int):
+        super().__init__()
+        self.model = RowsModel(columns)
+        self._all_rows: list = []
+        self.proxy = QSortFilterProxyModel()
+        self.proxy.setSourceModel(self.model)
+        self.proxy.setSortRole(SORT_ROLE)
+        self.proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.proxy.setFilterKeyColumn(stretch_col)
+
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("Filter by text…")
+        self.filter.setClearButtonEnabled(True)
+        self.filter.textChanged.connect(self.proxy.setFilterFixedString)
+        self.label_filter = QComboBox()
+        self.label_filter.addItems(["All labels", "Positive", "Neutral", "Negative"])
+        self.label_filter.currentTextChanged.connect(self._apply_label_filter)
+        self.count = label("", "muted")
+
+        self.view = QTableView()
+        self.view.setModel(self.proxy)
+        self.view.setSortingEnabled(True)
+        self.view.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        self.view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.view.setAlternatingRowColors(True)
+        self.view.setShowGrid(False)
+        self.view.setMouseTracking(True)
+        self.view.verticalHeader().hide()
+        self.view.verticalHeader().setDefaultSectionSize(34)
+        self.view.setWordWrap(False)
+        self.view.setFrameShape(QFrame.Shape.NoFrame)
+        self.stretch_col = stretch_col
+        header = self.view.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(stretch_col, QHeaderView.ResizeMode.Stretch)
+        header.setHighlightSections(False)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.view.doubleClicked.connect(self._open)
+
+        card, inner = panel("solid", margins=14, spacing=10)
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        top.addWidget(self.filter, 1)
+        top.addWidget(self.label_filter)
+        top.addWidget(self.count)
+        inner.addLayout(top)
+        inner.addWidget(self.view)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(card)
+        for sig in (self.proxy.rowsInserted, self.proxy.rowsRemoved, self.proxy.modelReset, self.proxy.layoutChanged):
+            sig.connect(self._update_count)
+
+    def load(self, rows, animate: bool = False) -> None:
+        self._all_rows = rows
+        self._apply_label_filter(self.label_filter.currentText(), animate)
+
+    def add_rows(self, rows) -> int:
+        """Append rows a running fetch has just saved; they fade in. Returns how many were new."""
+        have = {r["id"] for r in self._all_rows}
+        new = [r for r in rows if r["id"] not in have]
+        label = self.label_filter.currentText()
+        self._all_rows.extend(new)
+        shown = new if label == "All labels" else [r for r in new if r["label"] == label.lower()]
+        self.model.append_rows(shown)
+        self._update_count()
+        return len(new)
+
+    def _apply_label_filter(self, text: str, animate: bool = False) -> None:
+        rows = self._all_rows
+        if text != "All labels":
+            rows = [r for r in rows if r["label"] == text.lower()]
+        self.model.set_rows(rows, animate)
+        if not animate:
+            self._fit_columns()
+        self._update_count()
+
+    def _fit_columns(self) -> None:
+        """Size each column to its values and its full header title, leaving the rest to the text column.
+
+        Qt's own sizing leaves out room for the sort arrow, so a sorted column's title got cut short."""
+        header = self.view.horizontalHeader()
+        font = QFont(self.view.font())  # the font the stylesheet draws headers with (8.5pt semibold)
+        font.setPointSizeF(8.5)
+        font.setWeight(QFont.Weight.DemiBold)
+        header.setFont(font)  # Qt elides header titles using the widget's font, not the stylesheet's
+        metrics = QFontMetrics(font)
+        self._widths = {}  # column -> (width for its values, narrowest that still shows its title)
+        for col in range(self.model.columnCount()):
+            if col != self.stretch_col:
+                title = self.model.headerData(col, Qt.Orientation.Horizontal)
+                least = metrics.horizontalAdvance(title) + 16 + 24 + 8  # padding, sort arrow, slack
+                self._widths[col] = (max(self.view.sizeHintForColumn(col), least), least)
+        self._share_width()
+
+    def _share_width(self) -> None:
+        """Keep room for the text column (the title, the comment). A comment's post title and the author
+        used to take so much that the comment itself showed as "T…".
+
+        First the free-text columns (author, post title) give up width down to their titles and their
+        values end in "…"; if the text column still has under 40% of the width, the least needed columns
+        are hidden, author first."""
+        widths = getattr(self, "_widths", None)
+        if not widths:
+            return
+        keys = {col: self.model.columns[col][1] for col in widths}
+        room = self.view.viewport().width()
+        hidden = set()
+        for key in (None, *self.OPTIONAL):
+            if key is not None:
+                hidden |= {col for col, k in keys.items() if k == key}
+            shown = {col: wl for col, wl in widths.items() if col not in hidden}
+            fixed = sum(w for col, (w, _) in shown.items() if keys[col] not in self.SHRINKS)
+            loose = {col: wl for col, wl in shown.items() if keys[col] in self.SHRINKS}
+            spare = sum(w - least for w, least in loose.values())
+            over = fixed + sum(w for w, _ in loose.values()) - room * 0.6
+            give = min(1.0, over / spare) if over > 0 and spare > 0 else (0.0 if over <= 0 else 1.0)
+            used = fixed + sum(round(w - (w - least) * give) for w, least in loose.values())
+            if room - used >= room * 0.4 or key == self.OPTIONAL[-1]:
+                break
+        header = self.view.horizontalHeader()
+        for col, (w, least) in widths.items():
+            header.setSectionHidden(col, col in hidden)
+            header.resizeSection(col, round(w - (w - least) * give) if keys[col] in self.SHRINKS else w)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._share_width()
+
+    def _update_count(self, *args) -> None:
+        self.count.setText(plural(self.proxy.rowCount(), "row"))
+
+    def _open(self, index) -> None:
+        row = self.model.row_at(self.proxy.mapToSource(index).row())
+        QDesktopServices.openUrl(QUrl(row["permalink"]))
