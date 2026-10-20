@@ -95,7 +95,7 @@ def test_rows_arrive_one_by_one_fading_in_and_only_for_the_fetched_posts(tmp_pat
         steps, fading = [], 0
         w._start_fetch()
         deadline = time.time() + 30
-        while w.thread is not None and time.time() < deadline:
+        while w.fetch_job.busy and time.time() < deadline:
             app.processEvents()
             pm, cm = w.posts_tab.model, w.comments_tab.model
             state = (pm.rowCount(), cm.rowCount())
@@ -106,7 +106,7 @@ def test_rows_arrive_one_by_one_fading_in_and_only_for_the_fetched_posts(tmp_pat
         for _ in range(100):
             app.processEvents()
             time.sleep(0.01)
-        assert w.thread is None
+        assert not w.fetch_job.busy
         posts_seen = sorted({p for p, _ in steps})
         assert posts_seen[-1] == 40 and len(posts_seen) >= 4  # grew in several steps, not one jump
         assert len({c for _, c in steps}) >= 4  # so did the comments

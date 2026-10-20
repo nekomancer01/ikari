@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 
 import shiboken6
-from PySide6.QtCore import QEvent, QSize, Qt, QThread, Slot
+from PySide6.QtCore import QEvent, QSize, Qt, Slot
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton,
@@ -22,7 +22,7 @@ from subsentiment import collect
 from subsentiment.gui import theme
 from subsentiment.gui.widgets import ElidedLabel, ShareBar, fit_to_screen, label, panel, plural, section
 from subsentiment.gui.theme import paint_backdrop
-from subsentiment.gui.worker import CountWorker
+from subsentiment.gui.worker import BackgroundJob, CountWorker
 
 DAY = 86400
 MAX_DAY_POSTS = collect.MAX_DAY_POSTS
@@ -209,10 +209,10 @@ class CoverageWindow(QDialog):
         self.days: list[int] = []
         self.totals: dict[str, dict[int, int]] = {}  # subreddit (lowercase) -> day -> archive count
         self.count_error = ""
-        self._count_thread: QThread | None = None
+        self.count_job = BackgroundJob(self)
+        self.count_job.ended.connect(self._on_count_done)
         self._counting: tuple[str, float, float] = ("", 0.0, 0.0)  # what the running count asked for
         self._count_stopped = False  # the window closed while it ran, so its answer may be cut short
-        self._count_worker: CountWorker | None = None
         self._post_rows: list = []
         self._post_ids: list[str] = []
         self._built: dict[int, tuple] = {}  # post rows with widgets, and what they last showed
@@ -352,7 +352,7 @@ class CoverageWindow(QDialog):
                               f"{plural(len(days), 'day')}")
         totals = self.totals.get(self.subreddit.lower(), {})
         missing = [d for d in days if d not in totals]
-        if missing and self._count_thread is None and not self.count_error:
+        if missing and not self.count_job.busy and not self.count_error:
             self._count(min(missing), max(missing) + DAY)
         self._fill_days(totals, rebuild)
         self._load_posts()
@@ -378,7 +378,7 @@ class CoverageWindow(QDialog):
             self._day_rows = list(self.days)
             row = self.days.index(keep) if keep in self.days else 0
             t.selectRow(row)
-        counting = self._count_thread is not None
+        counting = self.count_job.busy
         current = today()
         for row, day in enumerate(self.days):
             n, total, done = saved.get(day, 0), totals.get(day), str(day) in complete
@@ -510,20 +510,13 @@ class CoverageWindow(QDialog):
     def _count(self, after: float, before: float) -> None:
         sub = self.subreddit
         self.status.setText(f"Asking Arctic Shift how many posts r/{sub} has each day…")
-        thread = QThread(self)
         worker = CountWorker(sub, after, before)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
         # Bound methods, not lambdas, so the results are handled on the GUI thread.
         worker.finished.connect(self._on_counts)
         worker.failed.connect(self._on_count_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(self._on_count_done)
-        self._count_thread, self._count_worker = thread, worker
         self._counting = (sub.lower(), after, before)
         self._count_stopped = False
-        thread.start()
+        self.count_job.start(worker)
 
     @Slot(str, object)
     def _on_counts(self, sub: str, counts: dict) -> None:
@@ -548,9 +541,6 @@ class CoverageWindow(QDialog):
 
     @Slot()
     def _on_count_done(self) -> None:
-        self._count_thread.deleteLater()
-        self._count_worker.deleteLater()
-        self._count_thread = self._count_worker = None
         if not (self.subreddit and self.days and self.isVisible()):
             return  # closed meanwhile (the store may be too); showing it again counts what's missing
         sub, after, before = self._counting
@@ -569,7 +559,7 @@ class CoverageWindow(QDialog):
         self._fill_days(totals, rebuild=False)
 
     def _recount(self) -> None:
-        if self.subreddit and self._count_thread is None:
+        if self.subreddit and not self.count_job.busy:
             self.totals.pop(self.subreddit.lower(), None)
             self.count_error = ""
             self.refresh_saved()
@@ -602,10 +592,10 @@ class CoverageWindow(QDialog):
         paint_backdrop(self)
 
     def closeEvent(self, event) -> None:
-        if self._count_worker:
+        if self.count_job.busy:
             # Not waited for: a request still out held the window (and the app's own close) for up to
             # 3 s. It ends by itself; app.main ends the process if it still runs when the app quits.
-            self._count_worker.stop()
+            self.count_job.stop()
             self._count_stopped = True
         super().closeEvent(event)
 
