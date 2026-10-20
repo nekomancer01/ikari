@@ -81,32 +81,28 @@ class RowsModel(QAbstractTableModel):
                     self.rows[old[r["id"]]] = r
             if self.rows:
                 self.dataChanged.emit(self.index(0, 0), self.index(len(self.rows) - 1, len(self.columns) - 1))
-            if added:
-                start = len(self.rows)
-                self.beginInsertRows(QModelIndex(), start, start + len(added) - 1)
-                self.rows.extend(added)
-                self.endInsertRows()
-                now = self._clock()
-                self._born.update({i: now for i in range(start, start + len(added))})
-                self._fade.start()
+            self._insert(added)
             return
         self.beginResetModel()
         self.rows = list(rows)
         self._born.clear()
         self._fade.stop()
-        self._colors = palette()
-        self._icons = {k: _swatch(self._colors[k]) for k in ("positive", "neutral", "negative")}
+        self._load_colors()
         self.endResetModel()
 
     def append_rows(self, rows: list) -> int:
         """Add rows not shown yet, each fading in from now; returns how many were new."""
         have = {r["id"] for r in self.rows}
         added = [r for r in rows if r["id"] not in have]
-        if not added:
-            return 0
         if not self._colors:
-            self._colors = palette()
-            self._icons = {k: _swatch(self._colors[k]) for k in ("positive", "neutral", "negative")}
+            self._load_colors()
+        self._insert(added)
+        return len(added)
+
+    def _insert(self, added: list) -> None:
+        """Append ``added`` at the end, each fading in from now."""
+        if not added:
+            return
         start = len(self.rows)
         self.beginInsertRows(QModelIndex(), start, start + len(added) - 1)
         self.rows.extend(added)
@@ -114,7 +110,10 @@ class RowsModel(QAbstractTableModel):
         now = self._clock()
         self._born.update({i: now for i in range(start, start + len(added))})
         self._fade.start()
-        return len(added)
+
+    def _load_colors(self) -> None:
+        self._colors = palette()
+        self._icons = {k: _swatch(self._colors[k]) for k in ("positive", "neutral", "negative")}
 
     def _tick(self) -> None:
         now = self._clock()
@@ -165,7 +164,8 @@ class RowsModel(QAbstractTableModel):
             return fmt(value)
         if role == SORT_ROLE:
             if value is None:
-                return -1 if key in NUMERIC else ""  # keeps unknown numbers sortable alongside real ones
+                # Below every real number, so pending rows don't land among (and tie with) scores of -1.
+                return float("-inf") if key in NUMERIC else ""
             return value
         if role == Qt.ItemDataRole.DecorationRole and key == "label":
             return self._icons.get(value)
