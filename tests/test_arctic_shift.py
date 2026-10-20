@@ -350,7 +350,7 @@ def test_long_waits_are_announced():
     told = []
     c.limiter.on_wait = lambda secs, why: told.append((round(secs), why))
     c.get(*SEARCH)
-    assert told == [(30, "Arctic Shift asked ikari to slow down")]
+    assert told == [(30, "Arctic Shift asked ikari to slow down"), (0, "")]  # and when the wait is over
 
 
 def test_running_out_of_requests_pauses_before_the_next_one():
