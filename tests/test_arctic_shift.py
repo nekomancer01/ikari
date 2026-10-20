@@ -470,7 +470,7 @@ def test_day_counts_read_each_bucket_format_and_fill_empty_days():
     url, params = c.session.calls[0]
     assert url == BASE_URL + "/api/posts/search/aggregate"
     assert params == {"subreddit": "Python", "aggregate": "created_utc", "frequency": "day",
-                      "after": D0 - 1, "before": D0 + 4 * DAY, "limit": 5}  # `after` is exclusive
+                      "after": D0, "before": D0 + 4 * DAY, "limit": 5}
 
 
 def test_a_timing_out_count_is_split_and_a_day_that_still_times_out_is_left_out():
@@ -480,7 +480,7 @@ def test_a_timing_out_count_is_split_and_a_day_that_still_times_out_is_left_out(
     c = client([slow] * 3 + [ok([{"created_utc": D0, "count": 4}])] + [slow] * 6)
     assert c.day_counts("Python", D0, D0 + 2 * DAY) == {D0: 4}
     assert [p["limit"] for _, p in c.session.calls] == [3, 3, 3] + [2] * 7  # never shrunk like a page
-    assert [p["after"] for _, p in c.session.calls[-6:]] == [D0 + DAY - 1] * 6
+    assert [p["after"] for _, p in c.session.calls[-6:]] == [D0 + DAY] * 6
 
 
 def test_a_day_whose_count_timed_out_gets_a_second_go():
