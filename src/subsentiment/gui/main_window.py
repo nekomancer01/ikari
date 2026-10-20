@@ -105,6 +105,12 @@ class MainWindow(QMainWindow):
         self._drip = QTimer(self)  # releases fetched rows into the tables a few at a time, so each is seen
         self._drip.setInterval(40)
         self._drip.timeout.connect(self._release_rows)
+        # The overview and day picker follow the rows the drip releases, a few times a second: often enough to
+        # read as live, rarely enough that each change has time to ease in.
+        self._shown_live = QTimer(self)
+        self._shown_live.setSingleShot(True)
+        self._shown_live.setInterval(250)
+        self._shown_live.timeout.connect(self._show_released)
         self._queued: dict[str, list] = {"posts": [], "comments": []}
         self._queued_ids: set[str] = set()
         self._since = 0.0  # rows saved since this moment belong to the running fetch
@@ -549,6 +555,8 @@ class MainWindow(QMainWindow):
                     self._queued[kind].append(r)
         if any(self._queued.values()) and not self._drip.isActive():  # start() would restart it, and
             self._drip.start()  # comments saved every few ms would then hold every row back
+        if self._days_changed and not self._shown_live.isActive():  # rows on days not chosen still count there
+            self._shown_live.start()
 
     def _count_days(self, kind: str, rows) -> None:
         """Count rows the running fetch saved into the day picker's days, so the picker needn't count every
@@ -574,9 +582,17 @@ class MainWindow(QMainWindow):
             batch, self._queued[kind] = queue[:max(1, len(queue) // 25)], queue[max(1, len(queue) // 25):]
             if batch:
                 self._add_rows(kind, tab, batch)
+                if not self._shown_live.isActive():
+                    self._shown_live.start()
         if not any(self._queued.values()):
             self._drip.stop()
         self._update_dataset_labels()
+
+    def _show_released(self) -> None:
+        if self._days_changed:
+            self._days_changed = False
+            self.days_pick.set_days(self._day_counts, self.chosen_days)
+        self._render_overview()
 
     def _add_rows(self, kind: str, tab: TablePage, rows) -> None:
         before = len(tab.all_rows)
@@ -612,14 +628,12 @@ class MainWindow(QMainWindow):
                                 f"last fetched {when_text(self._last_fetched)}")
 
     def _live_refresh(self) -> None:
+        # What reads the store again (the saved-data list, Download coverage) once a second; the overview and
+        # day picker follow the drip instead (_show_released).
         if not self.fetch_job.busy or self.request is None:
             return
         if self._showing_fetch():
             self._refresh_datasets(reload=False)
-            if self._days_changed:
-                self._days_changed = False
-                self.days_pick.set_days(self._day_counts, self.chosen_days)
-            self._render_overview()
         elif self._follow:
             self._open_fetched()
         else:
@@ -729,10 +743,13 @@ class MainWindow(QMainWindow):
         if switching:  # the old subreddit fades out over the new one, whose cards fade in one by one
             motion.crossfade(self.content)
         self.current = name or None
-        self._saved = {"posts": self.store.posts(name) if name else [],
-                       "comments": self.store.comments(name) if name else []}
         self.chosen_days = days.load_choice(self.settings, name) if name else None
-        self._refresh_days()
+        # One snapshot, so a row a running fetch saves meanwhile isn't in the day counts without being in the
+        # rows too: it comes in with the fetch's next rows and would be counted twice.
+        with self.store.snapshot():
+            self._saved = {"posts": self.store.posts(name) if name else [],
+                           "comments": self.store.comments(name) if name else []}
+            self._refresh_days()
         self._apply_days()
         self._update_delete_enabled()
         self.coverage_act.setEnabled(bool(self.current))
@@ -871,6 +888,7 @@ class MainWindow(QMainWindow):
             thread.wait(3000)
         self._live.stop()  # both read the store
         self._drip.stop()
+        self._shown_live.stop()
         self.store.close()
         super().closeEvent(event)
 
