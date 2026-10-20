@@ -232,7 +232,7 @@ class MainWindow(QMainWindow):
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(19, 16, 19, 16)
-        lay.setSpacing(10)
+        lay.setSpacing(12)
         scroll.setWidget(body)
         outer.addWidget(scroll)
         # The scroll bar sits in the right margin when it shows, so the fields don't shift left.
@@ -607,12 +607,8 @@ class MainWindow(QMainWindow):
             self.subheading.setText("Enter a subreddit on the left and press Fetch and analyse.")
             return
         self.heading.setText(f"r/{self.current}")
-        on = ""
-        if self.chosen_days is not None:
-            n = len(self.chosen_days & set(self._day_counts))
-            on = f" on {plural(n, 'chosen day')}"
-        self.subheading.setText(f"{plural(len(self.posts), 'post')} and {plural(len(self.comments), 'comment')}{on} · "
-                                f"last fetched {when_text(self._last_fetched)}")
+        # The tabs carry the counts and the day picker the chosen days, so this line only says how fresh it is.
+        self.subheading.setText(f"Last fetched {when_text(self._last_fetched)}")
 
     def _live_refresh(self) -> None:
         if not self.fetch_job.busy or self.request is None:

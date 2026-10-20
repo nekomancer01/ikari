@@ -91,7 +91,7 @@ def test_switching_subreddit_fades_and_counts_to_the_new_values(make_window):
     pick(w, "Python")
     pump(motion.DATA_MS + 300)
     assert w.overview.tiles["count"].value.text() == "40"
-    chart = w.overview.distribution.chart()
+    chart = w.overview.distribution
 
     pick(w, "rust")
     # The new values are there at once...
@@ -104,7 +104,7 @@ def test_switching_subreddit_fades_and_counts_to_the_new_values(make_window):
     assert drawn(w.overview.tiles["count"].value) not in ("40", "30")
     heights = w.overview.distribution.shown_heights()
     assert 10 < heights[0] < 25 and 5 < heights[2] < 30  # negative growing, positive shrinking
-    assert w.overview.distribution.chart() is chart  # updated in place, not rebuilt
+    assert w.overview.distribution is chart  # updated in place, not rebuilt
 
     pump(motion.DATA_MS + 6 * motion.STAGGER_MS + 300)
     assert drawn(w.overview.tiles["count"].value) == "30" and drawn(w.overview.tiles["negative"].value) == "83%"

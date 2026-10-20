@@ -1,6 +1,6 @@
 Copyright 2016-2023 The Inter Project Authors (https://github.com/rsms/inter)
 
-Bundled here: Inter 4.0 Regular, Medium, SemiBold and Bold, subset to Latin and common punctuation,
+Bundled here: Inter 4.0 Regular, Medium, SemiBold and Bold and Inter Display Medium and SemiBold, subset to Latin and common punctuation,
 with tabular figures (tnum) applied to digits and signs only, so dates and decimals keep normal spacing.
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.

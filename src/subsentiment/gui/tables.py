@@ -384,7 +384,7 @@ class TablePage(QWidget):
         self.view.setShowGrid(False)
         self.view.setMouseTracking(True)
         self.view.verticalHeader().hide()
-        self.view.verticalHeader().setDefaultSectionSize(38)
+        self.view.verticalHeader().setDefaultSectionSize(42)
         self.view.setWordWrap(False)
         self.view.setFrameShape(QFrame.Shape.NoFrame)
         self.stretch_col = stretch_col

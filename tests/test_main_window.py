@@ -356,3 +356,18 @@ def test_an_export_that_cant_be_saved_says_so(make_window, monkeypatch, tmp_path
     w._export("posts")
     assert warned and warned[0][0] == "Export failed"
     assert "close it and try again" in warned[0][1]
+
+
+def test_bundled_fonts_are_weights_of_the_families_the_theme_asks_for():
+    """Each bundled weight must belong to the family the theme names, or Qt (on Windows too) treats
+    "Inter Medium" as a family of its own and draws medium and semibold text in a synthetic weight."""
+    from PySide6.QtGui import QFontDatabase
+
+    from subsentiment.gui import theme
+    QApplication.instance() or QApplication([])
+    files = sorted(theme.ASSETS.glob("*.otf"))
+    assert files
+    for path in files:
+        families = QFontDatabase.applicationFontFamilies(QFontDatabase.addApplicationFont(str(path)))
+        wanted = theme.DISPLAY_FAMILY if path.name.startswith("InterDisplay") else theme.UI_FAMILIES[0]
+        assert wanted in families, f"{path.name} registers as {families}, not as a weight of {wanted}"

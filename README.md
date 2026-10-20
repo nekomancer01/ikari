@@ -238,7 +238,8 @@ Manager, macOS Keychain or Secret Service) under "Subreddit Sentiment", and you 
 <details>
 <summary>Type, panels and chart colors</summary>
 
-- Type: [Inter](https://rsms.me/inter/) throughout, headings in its heavier weights. Tabular figures
+- Type: [Inter](https://rsms.me/inter/) throughout, medium for primary text and regular for secondary, with
+  Inter Display for headings and big numbers. Tabular figures
   are on so numbers line up. Qt's variable-font weight matching is unreliable, so the font is bundled
   as static weights in `src/subsentiment/gui/assets/`, cut down to Latin and common punctuation.
 - A flat, light dashboard look: white panels with hairline borders on a soft gray window, outlined

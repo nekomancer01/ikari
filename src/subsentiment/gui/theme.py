@@ -6,7 +6,8 @@ The window background can carry the mood of the subreddit on screen: MoodTint pu
 green when it skews positive, white when it's neutral and red when it skews negative, easing between
 subreddits. It shows around the panels, so panel and text contrast hold.
 
-Type: Inter (SIL Open Font License, bundled in assets/) for everything, headings in its heavier weights.
+Type: Inter (SIL Open Font License, bundled in assets/), medium for primary text and regular for secondary,
+with its Display cut for headings and big numbers.
 Tabular figures are switched on so numbers line up in columns.
 """
 from __future__ import annotations
@@ -46,7 +47,7 @@ THEMES = {
 }
 
 UI_FAMILIES = ["Inter", "Segoe UI Variable Text", "SF Pro Text", "Segoe UI", "Noto Sans"]
-DISPLAY_FAMILY = "Inter"
+DISPLAY_FAMILY = "Inter Display"  # Inter cut for larger sizes: tighter spacing, finer details
 
 # Sentiment wash over the window background: (rgb, peak alpha) per mood.
 MOOD = {
@@ -121,6 +122,7 @@ def load_fonts(app: QApplication) -> None:
     font = QFont()
     font.setFamilies(UI_FAMILIES)
     font.setPointSizeF(10)
+    font.setWeight(QFont.Weight.Medium)  # primary text in medium, as in the reference; secondary text is regular
     if sys.platform != "win32":  # Windows text is crisper with its default (DirectWrite) hinting
         font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
     font.setFeature(QFont.Tag("tnum"), 1)
@@ -163,11 +165,11 @@ QFrame[glass="tile"], QFrame[glass="solid"] {{ background: {panel}; border: 1px 
 QFrame[role="divider"] {{ background: {edge}; border: none; min-height: 1px; max-height: 1px; }}
 QLabel {{ background: transparent; border: none; }}
 QLabel[role="title"] {{ font-family: {display}; font-size: 13pt; font-weight: 600; letter-spacing: -0.2px; }}
-QLabel[role="subtitle"] {{ color: {t['muted']}; }}
-QLabel[role="section"] {{ color: {t['muted']}; font-size: 9pt; }}
+QLabel[role="subtitle"] {{ color: {t['muted']}; font-weight: 400; }}
+QLabel[role="section"] {{ color: {t['muted']}; font-size: 9pt; font-weight: 400; }}
 QLabel[role="heading"] {{ font-family: {display}; font-size: 14pt; font-weight: 600; letter-spacing: -0.3px; }}
 QLabel[role="value"] {{ font-family: {display}; font-size: 19pt; font-weight: 600; letter-spacing: -0.6px; }}
-QLabel[role="caption"], QLabel[role="muted"] {{ color: {t['muted']}; }}
+QLabel[role="caption"], QLabel[role="muted"] {{ color: {t['muted']}; font-weight: 400; }}
 QLabel[role="status"] {{ color: {t['muted']}; padding: 2px 6px; }}
 
 /* Inputs */
