@@ -1298,3 +1298,40 @@ def test_a_count_that_keeps_timing_out_doesnt_hold_up_a_download(env, monkeypatc
     while w.coverage.count_job.busy and time.monotonic() < end:
         pump(20)
     assert not w.coverage.count_job.busy
+
+
+def test_starting_a_new_subreddit_switches_to_it_at_once(env):
+    w = env.window()
+    fetch(w, comments=False)
+    assert w.current.lower() == "python"
+    env.archive.delay = 0.5  # nothing of r/rust is saved for a good while
+    w.fetch_form.subreddit.setText("rust")
+    w.fetch_form.include_comments.setChecked(False)
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    assert w.fetch_job.busy and w.current.lower() == "rust" and w.posts_tab.model.rowCount() == 0
+    assert w.datasets.currentItem() is None and w.coverage.subreddit.lower() == "rust"
+    env.archive.delay = 0
+    wait_idle(w)
+    assert w.current.lower() == "rust" and w.posts_tab.model.rowCount() > 0
+    assert w.datasets.currentItem().data(Qt.ItemDataRole.UserRole).lower() == "rust"
+
+
+def test_a_new_subreddit_that_saves_nothing_goes_back_to_a_saved_one(env):
+    w = env.window()
+    fetch(w, comments=False)
+    fetch(w, sub="nosuchsub", comments=False)
+    assert w.current.lower() == "python" and w.datasets.currentItem() is not None
+
+
+def test_starting_a_saved_subreddit_after_another_switches_to_it_at_once(env):
+    w = env.window()
+    fetch(w, comments=False)
+    fetch(w, sub="rust", comments=False)
+    assert w.current.lower() == "rust"
+    env.archive.delay = 0.5
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(False)
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    assert w.fetch_job.busy and w.current.lower() == "python" and w.posts_tab.model.rowCount() > 0
+    env.archive.delay = 0
+    wait_idle(w)
