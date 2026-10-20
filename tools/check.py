@@ -37,6 +37,8 @@ def main() -> int:
                   "(git merge origin/main) and run this again.", file=sys.stderr)
             return 1
     env = dict(os.environ)
+    # Test this checkout's own src, even when an install of the package points at another checkout.
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(ROOT / "src"), env.get("PYTHONPATH")]))
     if sys.platform.startswith("linux") and "QT_QPA_PLATFORM" not in env:
         env["QT_QPA_PLATFORM"] = "offscreen"
     # One worker per core; each test file stays on one worker, so the layout matrix (one long render) runs
