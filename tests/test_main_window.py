@@ -1,5 +1,6 @@
 """The fetch form and saved-data list survive a restart; the delete actions clear the store."""
 import os
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -255,7 +256,8 @@ def test_archive_counts_arrive_on_the_gui_thread(make_window, monkeypatch):
     c.subreddit = "Python"
     c._count(1_699_920_000, 1_699_920_000 + 86400)
     c._count_thread.wait(5000)
-    for _ in range(20):
+    end = time.monotonic() + 5  # the results come back as queued signals, slower on a busy machine
+    while (c._count_thread is not None or "thread" not in seen) and time.monotonic() < end:
         QApplication.processEvents()
     assert seen["thread"] is threading.main_thread()
     assert c.totals["python"] == {1_699_920_000: 5} and c._count_thread is None

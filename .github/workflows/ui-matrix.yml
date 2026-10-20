@@ -43,13 +43,21 @@ jobs:
         run: |
           python tools/ui_matrix.py --out ui-matrix/dark --only ${{ matrix.screens }}
           python tools/ui_matrix.py --out ui-matrix/light --theme light --no-sweep --only ${{ matrix.screens }}
-          if [ "$RUNNER_OS" = Windows ]; then
-            # The text before the switch to grayscale edges, at the owner's 1920x1200 150%.
-            python tools/ui_matrix.py --out ui-matrix/cleartype --subpixel --no-sweep --only win-1920x1200-150
-          fi
           cat ui-matrix/dark/report.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Text edges at a real 150%, with before/after shots of the whole window
+        if: runner.os == 'Windows'
+        shell: bash
+        run: mkdir -p text-edges && python tools/text_aa_check.py --out text-edges | tee -a text-edges/table.md "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v4
+        if: always() && runner.os == 'Windows'
+        with:
+          name: text-edges
+          path: text-edges
+
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ui-matrix-${{ matrix.name }}
           path: ui-matrix

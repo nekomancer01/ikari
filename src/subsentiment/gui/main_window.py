@@ -223,18 +223,22 @@ class ShrinkingComboBox(QComboBox):
         return QSize(min(full.width(), 120), full.height())
 
 
-class StatusLabel(QLabel):
-    """Wrapped muted text that takes no room in the panel while it's empty."""
+class StatusLabel(ElidedLabel):
+    """The muted line under Fetch: one line that ends in "…" (the tooltip has it all), no room while empty.
+
+    It used to wrap, and a long "Added … Updated …" message took three lines, which pushed the sidebar
+    into scrolling and shifted its fields."""
 
     def __init__(self):
-        super().__init__()
-        self.setProperty("role", "muted")
-        self.setWordWrap(True)
+        super().__init__("", "muted")
         self.setVisible(False)
 
     def setText(self, text: str) -> None:
         super().setText(text)
         self.setVisible(bool(text))
+
+    def text(self) -> str:
+        return self.full_text()
 
 
 class QuietScrollBars(QObject):
@@ -316,6 +320,9 @@ class StatTile(QFrame):
 
 class TablePage(QWidget):
     """Filterable, sortable table on a solid panel; double-click opens the item on Reddit."""
+
+    SHRINKS = ("author", "post_title")  # free text that can end in "…" to leave room for the main text
+    OPTIONAL = ("author", "post_title", "num_comments")  # hidden in this order when there's still no room
 
     def __init__(self, columns, stretch_col: int):
         super().__init__()
@@ -403,12 +410,48 @@ class TablePage(QWidget):
         font = header_font(self.view.font())
         header.setFont(font)  # Qt elides header titles using the widget's font, not the stylesheet's
         metrics = QFontMetrics(font)
+        self._widths = {}  # column -> (width for its values, narrowest that still shows its title)
         for col in range(self.model.columnCount()):
-            if col == self.stretch_col:
-                continue
-            title = self.model.headerData(col, Qt.Orientation.Horizontal)
-            header.resizeSection(col, max(self.view.sizeHintForColumn(col),
-                                          metrics.horizontalAdvance(title) + 16 + 24 + 8))  # padding, arrow, slack
+            if col != self.stretch_col:
+                title = self.model.headerData(col, Qt.Orientation.Horizontal)
+                least = metrics.horizontalAdvance(title) + 16 + 24 + 8  # padding, sort arrow, slack
+                self._widths[col] = (max(self.view.sizeHintForColumn(col), least), least)
+        self._share_width()
+
+    def _share_width(self) -> None:
+        """Keep room for the text column (the title, the comment). A comment's post title and the author
+        used to take so much that the comment itself showed as "T…".
+
+        First the free-text columns (author, post title) give up width down to their titles and their
+        values end in "…"; if the text column still has under 40% of the width, the least needed columns
+        are hidden, author first."""
+        widths = getattr(self, "_widths", None)
+        if not widths:
+            return
+        keys = {col: self.model.columns[col][1] for col in widths}
+        room = self.view.viewport().width()
+        hidden = set()
+        for key in (None, *self.OPTIONAL):
+            if key is not None:
+                hidden |= {col for col, k in keys.items() if k == key}
+            shown = {col: wl for col, wl in widths.items() if col not in hidden}
+            fixed = sum(w for col, (w, _) in shown.items() if keys[col] not in self.SHRINKS)
+            loose = {col: wl for col, wl in shown.items() if keys[col] in self.SHRINKS}
+            spare = sum(w - least for w, least in loose.values())
+            over = fixed + sum(w for w, _ in loose.values()) - room * 0.6
+            give = min(1.0, over / spare) if over > 0 and spare > 0 else (0.0 if over <= 0 else 1.0)
+            used = fixed + sum(round(w - (w - least) * give) for w, least in loose.values())
+            if room - used >= room * 0.4 or key == self.OPTIONAL[-1]:
+                break
+        header = self.view.horizontalHeader()
+        for col, (w, least) in widths.items():
+            header.setSectionHidden(col, col in hidden)
+            header.resizeSection(col, round(w - (w - least) * give) if keys[col] in self.SHRINKS else w)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._share_width()
+
     def _update_count(self, *args) -> None:
         self.count.setText(f"{self.proxy.rowCount():,} rows")
 
@@ -554,6 +597,10 @@ class MainWindow(QMainWindow):
         lay.setSpacing(10)
         scroll.setWidget(body)
         outer.addWidget(scroll)
+        # The scroll bar sits in the right margin when it shows, so the fields don't shift left.
+        bar = scroll.verticalScrollBar()
+        bar.rangeChanged.connect(
+            lambda _lo, hi: lay.setContentsMargins(19, 16, 19 - (bar.sizeHint().width() if hi > 0 else 0), 16))
 
         brand = QVBoxLayout()
         brand.setSpacing(2)
@@ -655,10 +702,11 @@ class MainWindow(QMainWindow):
         lay.addLayout(saved_head)
         self.datasets = QListWidget()
         self.datasets.setFrameShape(QFrame.Shape.NoFrame)
-        # Fills whatever height is left, down to two rows. Its default preferred height (about 190 px)
-        # counted in full and pushed the storage line below a 150% maximized window.
+        # Fills whatever height is left, down to one row. Its default preferred height (about 190 px)
+        # counted in full and pushed the storage line below a 150% maximized window, and at two rows a
+        # status line under Fetch did the same.
         self.datasets.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
-        self.datasets.setMinimumHeight(84)
+        self.datasets.setMinimumHeight(42)
         QuietScrollBars(self.datasets)
         self.datasets.currentItemChanged.connect(self._on_dataset_selected)
         lay.addWidget(self.datasets, 1)
