@@ -12,7 +12,7 @@ import bisect
 import math
 from functools import partial
 
-from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QFontMetricsF, QPainter, QPen, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QToolTip, QVBoxLayout, QWidget,
@@ -474,19 +474,21 @@ class TimelineChart(QWidget):
         band, a crossfade or the window's tint repaint only what's on top: the band, the crosshair and its box."""
         colors, t = palette(), theme.tokens()
         dpr = self.devicePixelRatioF()
-        key = (self.size(), dpr, self._screen, self._version, tuple(colors.values()), t["accent"], t["soft"])
+        lead = motion.lead(self)  # the picture starts on a whole device pixel, so it matches painting directly
+        key = (self.size(), dpr, lead, self._screen, self._version, tuple(colors.values()), t["accent"], t["soft"])
         p = QPainter(self)
         if key == self._drawn_for:
-            p.drawPixmap(0, 0, self._drawn)
+            p.drawPixmap(-lead, self._drawn)
         elif key == self._painted_for:  # painted like this once already, so it holds still: keep a picture
-            self._drawn = QPixmap(self.size() * dpr)
+            self._drawn = QPixmap((self.size() + QSize(lead.x(), lead.y())) * dpr)
             self._drawn.setDevicePixelRatio(dpr)
             self._drawn.fill(Qt.GlobalColor.transparent)
             under = QPainter(self._drawn)
+            under.translate(lead)
             self._paint_chart(under, colors, t)
             under.end()
             self._drawn_for = key
-            p.drawPixmap(0, 0, self._drawn)
+            p.drawPixmap(-lead, self._drawn)
         else:  # each frame of a zoom or a drag differs: straight onto the widget
             self._paint_chart(p, colors, t)
             p.setFont(_ui_font(9))

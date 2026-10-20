@@ -28,7 +28,7 @@ from PySide6.QtCore import QElapsedTimer, QEventLoop, QPoint, QPointF, QSettings
 from PySide6.QtGui import QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import QApplication
 
-from subsentiment.store import POST_COLUMNS, Store
+from subsentiment.store import COMMENT_COLUMNS, POST_COLUMNS, Store
 
 FRAME_MS = 1000 / 60
 POSTS, COMMENTS, DAYS = 2853, 47955, 730
@@ -67,7 +67,7 @@ def seed(path: str, sub: str, scale: float, seed_no: int) -> None:
         comments.append((f"{sub}c{j}", f"{sub}p{i}", sub, f"t3_{sub}p{i}", f"user{j % 3000}",
                          corpus.text(rng.randint(3, 40)), rng.randint(-5, 900), created[i] + rng.uniform(0, 2 * 86400),
                          0, f"/r/{sub}/comments/c{j}/", rng.uniform(-1, 1), rng.choice(LABELS), now - 3600))
-    db.executemany(f"INSERT INTO comments VALUES ({','.join('?' * 13)})", comments)
+    db.executemany(f"INSERT INTO comments ({','.join(COMMENT_COLUMNS)}) VALUES ({','.join('?' * len(COMMENT_COLUMNS))})", comments)
     db.commit()
     db.close()
 
@@ -230,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     from subsentiment.gui import theme
     from subsentiment.gui.main_window import MainWindow
     theme.load_fonts(app)
+    theme.apply(app, "light")  # as the app does before its window
     w = MainWindow(db)
     w.resize(1280, 760)
     w.show()
@@ -282,6 +283,11 @@ def main(argv: list[str] | None = None) -> int:
         for name in ("linux_gaming", "Deltarune"):  # as a click in the Saved list does it
             row = next(i for i in range(w.datasets.count()) if w.datasets.item(i).data(Qt.ItemDataRole.UserRole) == name)
             report(f"{page}: switch to {name}", [lambda r=row: w.datasets.setCurrentRow(r)])
+    for page in ("overview", "words", "comments"):
+        w.show_page(page)
+        beat.run([], 800)
+        for key in ("dark", "light"):  # as View > Theme does it
+            report(f"{page}: theme {key}", [lambda k=key: w._set_theme(k)])
     w.close()
     return 0
 
