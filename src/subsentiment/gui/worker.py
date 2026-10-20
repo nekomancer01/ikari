@@ -13,6 +13,15 @@ from subsentiment.store import Store
 LIMITER = RateLimiter()
 
 
+def failure_text(e: Exception) -> str:
+    """What to tell the user about a job that raised ``e``."""
+    if isinstance(e, FetchError):
+        return str(e)
+    if isinstance(e, requests.RequestException):
+        return f"Network error: {e}"
+    return f"{type(e).__name__}: {e}"
+
+
 class FetchWorker(QObject):
     progress = Signal(int, int, str)
     finished = Signal(object)  # collect.FetchResult
@@ -37,12 +46,8 @@ class FetchWorker(QObject):
                                  progress=self.progress.emit, should_stop=lambda: self._stop,
                                  saved=self.saved.emit)
             self.finished.emit(result)
-        except FetchError as e:
-            self.failed.emit(str(e))
-        except requests.RequestException as e:
-            self.failed.emit(f"Network error: {e}")
-        except Exception as e:  # keep the GUI alive on unexpected failures
-            self.failed.emit(f"{type(e).__name__}: {e}")
+        except Exception as e:  # keep the GUI alive on unexpected failures too
+            self.failed.emit(failure_text(e))
         finally:
             LIMITER.on_wait = None  # collect.run pointed it at this worker, which is about to go
             if store is not None:
@@ -68,10 +73,6 @@ class CountWorker(QObject):
             counts = ArcticShiftClient(limiter=LIMITER, should_stop=lambda: self._stop).day_counts(
                 *self.args, should_stop=lambda: self._stop)
             self.finished.emit(self.args[0], counts)
-        except FetchError as e:
-            self.failed.emit(str(e))
-        except requests.RequestException as e:
-            self.failed.emit(f"Network error: {e}")
         except Exception as e:
-            self.failed.emit(f"{type(e).__name__}: {e}")
+            self.failed.emit(failure_text(e))
 

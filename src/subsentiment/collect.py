@@ -122,43 +122,9 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
                                 if pid not in refreshed and (_comments_missing(r)
                                                              or (pid in repicked and _never_asked(r)))]
         todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up
-        done = 0
-        gave_up = threading.Event()
-        streak = [0]  # failures in a row, counted as they happen so no new requests start after the limit
-        lock = threading.Lock()
 
-        def fetch(p: Post):
-            if should_stop() or gave_up.is_set():
-                return None  # not tried
-            try:
-                comments = client.fetch_comments(p, req.comments_per_post)
-            except Stopped:
-                return None  # not tried
-            except (FetchError, requests.RequestException):
-                with lock:
-                    streak[0] += 1
-                    if streak[0] >= GIVE_UP_AFTER:  # the archive is struggling; don't hammer it
-                        gave_up.set()
-                raise
-            with lock:
-                streak[0] = 0
-            return comments
-
-        # A few posts' comments are fetched at once; each finished one is saved here, on this thread.
-        tried: set[str] = set()
-        for p, comments, error in in_parallel(fetch, todo, getattr(client, "workers", 1), should_stop):
-            if comments is None and error is None:
-                continue
-            tried.add(p.id)
-            done += 1
-            progress(done, len(todo), f"Comments for post {done}/{len(todo)}: {p.title[:60]}")
-            if error is not None:
-                if not isinstance(error, (FetchError, requests.RequestException)):
-                    raise error
-                store.mark_comments(p.id, ok=False, settled=False)
-                store.commit()
-                errors += 1
-                continue
+        def save(p: Post, comments) -> None:
+            nonlocal n_comments
             for c in comments:
                 store.save_comment(c, *sentiment.score(c.body))
                 n_comments += 1
@@ -166,7 +132,11 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
             store.commit()
             if comments:
                 saved()
-        if gave_up.is_set():
+
+        errors, tried, gave_up = _each_thread(
+            todo, lambda p: client.fetch_comments(p, req.comments_per_post), save, "Comments for post",
+            store, getattr(client, "workers", 1), progress, should_stop)
+        if gave_up:
             rest = [p for p in todo if p.id not in tried]  # not tried this time: retried on the next fetch
             errors += len(rest)
             for p in rest:
@@ -193,7 +163,36 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
             store.save_post(p, *sentiment.score(p.text))
         store.commit()
         posts = [fresh.get(p.id, p) for p in posts]
-    n_comments = errors = done = 0
+    n_comments = 0
+
+    def save(p: Post, got) -> None:
+        nonlocal n_comments
+        comments, whole = got
+        for c in comments:
+            store.save_comment(c, *sentiment.score(c.body))
+            n_comments += 1
+        store.mark_comments(p.id, ok=True, settled=p.score is not None)
+        if whole and p.score is not None:  # an unsettled thread may still be growing
+            store.mark_complete("comments", name, p.id)
+        store.commit()
+        saved()
+
+    errors, tried, gave_up = _each_thread(posts, client.fetch_all_comments, save, "All comments for post",
+                                          store, getattr(client, "workers", 1), progress, should_stop)
+    if gave_up:
+        errors += len([p for p in posts if p.id not in tried])  # not tried: retried next time
+    if posts:
+        progress(len(posts), len(posts), "Done")
+    subreddit = posts[0].subreddit if posts else name
+    return FetchResult(subreddit, 0, n_comments, should_stop(), updated=len(fresh), comment_errors=errors)
+
+
+def _each_thread(posts: list[Post], get: Callable, save: Callable, what: str, store: Store, workers: int,
+                 progress, should_stop) -> tuple[int, set[str], bool]:
+    """Run get(post) for each post, a few at once, and hand each result to save(post, result) here, on
+    this thread. A post whose comments couldn't be fetched is recorded as failed, so the next fetch retries
+    it; after GIVE_UP_AFTER failures in a row no new ones start, since the archive is struggling and
+    shouldn't be hammered. Returns (posts that failed, ids of the posts tried, whether it gave up)."""
     gave_up = threading.Event()
     streak = [0]  # failures in a row, counted as they happen so no new requests start after the limit
     lock = threading.Lock()
@@ -202,9 +201,9 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
         if should_stop() or gave_up.is_set():
             return None  # not tried
         try:
-            got = client.fetch_all_comments(p)
+            got = get(p)
         except Stopped:
-            return None
+            return None  # not tried
         except (FetchError, requests.RequestException):
             with lock:
                 streak[0] += 1
@@ -215,14 +214,13 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
             streak[0] = 0
         return got
 
-    # A few posts' threads are fetched at once; each finished one is saved here, on this thread.
     tried: set[str] = set()
-    for p, got, error in in_parallel(fetch, posts, getattr(client, "workers", 1), should_stop):
+    errors = 0
+    for p, got, error in in_parallel(fetch, posts, workers, should_stop):
         if got is None and error is None:
             continue
         tried.add(p.id)
-        done += 1
-        progress(done, len(posts), f"All comments for post {done}/{len(posts)}: {p.title[:60]}")
+        progress(len(tried), len(posts), f"{what} {len(tried)}/{len(posts)}: {p.title[:60]}")
         if error is not None:
             if not isinstance(error, (FetchError, requests.RequestException)):
                 raise error
@@ -230,21 +228,8 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
             store.commit()
             errors += 1
             continue
-        comments, whole = got
-        for c in comments:
-            store.save_comment(c, *sentiment.score(c.body))
-            n_comments += 1
-        store.mark_comments(p.id, ok=True, settled=p.score is not None)
-        if whole and p.score is not None:  # an unsettled thread may still be growing
-            store.mark_complete("comments", name, p.id)
-        store.commit()
-        saved()
-    if gave_up.is_set():
-        errors += len([p for p in posts if p.id not in tried])  # not tried: retried next time
-    if posts:
-        progress(len(posts), len(posts), "Done")
-    subreddit = posts[0].subreddit if posts else name
-    return FetchResult(subreddit, 0, n_comments, should_stop(), updated=len(fresh), comment_errors=errors)
+        save(p, got)
+    return errors, tried, gave_up.is_set()
 
 
 def _comments_missing(r) -> bool:
