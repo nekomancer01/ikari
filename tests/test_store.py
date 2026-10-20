@@ -273,7 +273,8 @@ def test_import_keeps_image_posts_hidden_from_files_old_and_new(tmp_path):
         author TEXT, body TEXT, score INTEGER, created_utc REAL, depth INTEGER, permalink TEXT, sentiment REAL,
         label TEXT, fetched_at REAL);
         INSERT INTO posts VALUES ('a', 'Python', 'pic', '', 'x', 1, 1, 0, 1700000000, '', 'https://i.redd.it/a.jpeg', 0, 'neutral', 1);
-        INSERT INTO posts VALUES ('c', 'Python', 'text', '', 'x', 1, 1, 0, 1700000000, '', '', 0, 'neutral', 1);""")
+        INSERT INTO posts VALUES ('c', 'Python', 'text', '', 'x', 1, 1, 0, 1700000000, '', '', 0, 'neutral', 1);
+        INSERT INTO comments VALUES ('k', 'a', 'Python', 't3_a', 'y', 'cute', 1, 1700000100, 0, '', 0, 'neutral', 1);""")
     old.commit()
     old.close()
     new = Store(tmp_path / "new.db")
@@ -285,7 +286,7 @@ def test_import_keeps_image_posts_hidden_from_files_old_and_new(tmp_path):
     new.close()
 
     s = Store(tmp_path / "mine.db")
-    assert s.import_from(tmp_path / "old.db") == (1, 0)
+    assert s.import_from(tmp_path / "old.db") == (1, 0)  # the picture's comment comes in hidden with it
     assert s.import_from(tmp_path / "new.db") == (1, 0)
     assert [r["id"] for r in s.posts("python")] == ["c"]
     assert [r["id"] for r in s.posts("rust")] == ["p8"]

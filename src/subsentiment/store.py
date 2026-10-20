@@ -280,7 +280,7 @@ class Store:
     def import_from(self, path: str | Path) -> tuple[int, int]:
         """Merge another ikari database into this one: rows this one lacks are added, and a row both have
         keeps the copy fetched last. Nothing is removed from either file. Returns (new posts, new comments),
-        image posts left out as they are everywhere.
+        image posts and their comments left out as they are everywhere.
         Raises sqlite3.DatabaseError if path isn't an ikari database, ValueError if it is this one,
         FileNotFoundError if there's no file there."""
         if not Path(path).is_file():  # ATTACH would create an empty file there
@@ -295,8 +295,8 @@ class Store:
                 raise sqlite3.DatabaseError("It has no saved posts or comments.")
             self.db.execute("CREATE TEMP TABLE new_posts AS SELECT id FROM other.posts "
                             "WHERE id NOT IN (SELECT id FROM main.posts)")
-            new_comments = self.db.execute("SELECT COUNT(*) FROM other.comments "
-                                           "WHERE id NOT IN (SELECT id FROM main.comments)").fetchone()[0]
+            self.db.execute("CREATE TEMP TABLE new_comments AS SELECT id FROM other.comments "
+                            "WHERE id NOT IN (SELECT id FROM main.comments)")
             # A file saved before image posts were marked has no image column; its picture posts are found
             # the way Store.__init__ finds them, once they're in.
             flagged = "image" in {r["name"] for r in self.db.execute("PRAGMA other.table_info(posts)")}
@@ -322,12 +322,15 @@ class Store:
                     self.db.execute(f"INSERT OR IGNORE INTO main.{table} ({cols}) SELECT {cols} FROM other.{table}")
             new_posts = self.db.execute("SELECT COUNT(*) FROM main.posts WHERE image = 0 "
                                         "AND id IN (SELECT id FROM temp.new_posts)").fetchone()[0]
+            new_comments = self.db.execute(f"SELECT COUNT(*) FROM main.comments c WHERE {NOT_IMAGE} "
+                                           "AND c.id IN (SELECT id FROM temp.new_comments)").fetchone()[0]
             self.db.commit()
         except BaseException:
             self.db.rollback()
             raise
         finally:
             self.db.execute("DROP TABLE IF EXISTS temp.new_posts")
+            self.db.execute("DROP TABLE IF EXISTS temp.new_comments")
             self.db.execute("DETACH DATABASE other")
         return new_posts, new_comments
 
