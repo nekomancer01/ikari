@@ -181,6 +181,9 @@ class Store:
     @contextmanager
     def snapshot(self):
         """Reads inside see the database as it was at the first one, whatever another connection saves meanwhile."""
+        if self.db.in_transaction:  # already inside one, which sees a single state too
+            yield
+            return
         self.db.execute("BEGIN")
         try:
             yield
