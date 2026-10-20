@@ -523,7 +523,7 @@ def test_slices_are_read_a_few_at_once_with_the_same_result():
     items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(24)]
     got = {}
     for workers in (1, 4):
-        session = SlowServer(items, delay=0.05)
+        session = SlowServer(items, delay=0.1)
         c = ArcticShiftClient(session=session, limiter=RateLimiter(0.0), workers=workers)
         start = time.perf_counter()
         seen_on = set()
@@ -533,7 +533,7 @@ def test_slices_are_read_a_few_at_once_with_the_same_result():
         assert seen_on == {threading.get_ident()}  # results are handed over on the calling thread
     assert got[1][0] == got[4][0]
     assert got[4][2] == 4 and got[1][2] == 1
-    assert got[4][1] < got[1][1] / 2.5  # 28 slices of 50 ms: about 1.4 s one at a time, 0.35 s four at once
+    assert got[4][1] < got[1][1] / 2.5  # 28 slices of 100 ms: about 2.8 s one at a time, 0.7 s four at once
 
 
 def test_requests_still_start_no_faster_than_the_limiter_allows():
