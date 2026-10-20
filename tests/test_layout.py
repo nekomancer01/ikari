@@ -20,6 +20,8 @@ _spec = importlib.util.spec_from_file_location("ui_matrix", TOOL)
 ui_matrix = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ui_matrix)
 TAGS = [row[0] for row in ui_matrix.screens()]
+# One render covers every screen, so the whole matrix stays on one test worker (tools/check.py uses loadgroup).
+pytestmark = pytest.mark.xdist_group("layout")
 
 
 @pytest.fixture(scope="module")

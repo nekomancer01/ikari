@@ -41,6 +41,7 @@ def window(tmp_path, monkeypatch):
     QSettings.setDefaultFormat(QSettings.Format.IniFormat)
     QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path / "cfg"))
     QSettings().setValue("updates/auto", False)
+    QSettings().setValue("ui/reduce_motion", True)  # the window sets motion from this when it opens
     s = Store(tmp_path / "t.db")
     for i, day in enumerate(SAVED):
         for k in range(1 + i % 3):

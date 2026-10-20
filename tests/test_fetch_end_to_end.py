@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from subsentiment import arctic_shift  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
+from subsentiment.gui import worker  # noqa: E402
 from subsentiment.reddit import Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
@@ -70,6 +71,9 @@ def server(monkeypatch):
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     monkeypatch.setattr(arctic_shift, "BASE_URL", f"http://127.0.0.1:{srv.server_port}")
+    # The app's own spacing (0.4 s, one request at a time while this server sends no budget) made the fetch
+    # take 26 s of the test's 30 s, so a busy Windows runner ran out. Spaced as in the other window tests.
+    monkeypatch.setattr(worker, "LIMITER", arctic_shift.RateLimiter(arctic_shift.BASE_INTERVAL / 10))
     yield seen
     srv.shutdown()
 
