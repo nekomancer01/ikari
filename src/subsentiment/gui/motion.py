@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from typing import Callable
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QRect, Qt, QTimer, QVariantAnimation
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QRect, QSize, Qt, QVariantAnimation
+from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import QApplication, QGraphicsOpacityEffect, QLabel, QWidget
 
 from subsentiment.gui import native
@@ -25,7 +26,6 @@ VIEW_MS = 220   # a page, tab or filter changing
 THEME_MS = 320  # light to dark and back
 DATA_MS = 420   # numbers and bars easing to new values
 APPEAR_MS = 200  # a status line or window appearing
-STAGGER_MS = 45  # between cards fading in one after another
 
 _wanted = True  # the View > Reduce motion setting, inverted
 _os_allows: bool | None = None
@@ -60,7 +60,12 @@ def _ease(anim: QVariantAnimation) -> QVariantAnimation:
 
 class _Snapshot(QLabel):
     """A still of a widget's old look, laid over it and fading out. Gone at once if the widget is resized,
-    so a stale picture never sits over a new layout."""
+    so a stale picture never sits over a new layout.
+
+    The still lines up with the window's own pixels. At 150% a widget at x=105 starts at device pixel 157.5,
+    and a grab from there is rounded to 157 or 158: the old look then sat a pixel off and everything under a
+    fade jumped sideways and back. So the grab starts a little up and left, at a whole device pixel, and is
+    drawn back at that same pixel."""
 
     def __init__(self, target: QWidget, ms: int):
         super().__init__(target)
@@ -70,17 +75,27 @@ class _Snapshot(QLabel):
         # Grabbed from the window, so the backdrop behind see-through panels is in the picture too and the
         # fade is a true crossfade rather than two layers of glass.
         origin = target.mapTo(window, QPoint(0, 0))
-        self.setPixmap(window.grab(QRect(origin, target.size())))
+        dpr = window.devicePixelRatioF()
+        self._lead = QPoint(_to_whole_pixel(origin.x(), dpr), _to_whole_pixel(origin.y(), dpr))
+        self._still = window.grab(QRect(origin - self._lead, target.size() + QSize(self._lead.x(), self._lead.y())))
+        self.opacity = 1.0
         self.setGeometry(target.rect())
-        self._effect = QGraphicsOpacityEffect(self)
-        self.setGraphicsEffect(self._effect)
         self.anim = _ease(QVariantAnimation(self, duration=ms, startValue=1.0, endValue=0.0))
-        self.anim.valueChanged.connect(self._effect.setOpacity)
+        self.anim.valueChanged.connect(self._fade)
         self.anim.finished.connect(self.deleteLater)
         target.installEventFilter(self)
         self.show()
         self.raise_()
         self.anim.start()
+
+    def _fade(self, value: float) -> None:
+        self.opacity = value
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setOpacity(self.opacity)
+        p.drawPixmap(-self._lead, self._still)
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.Type.Resize:
@@ -88,6 +103,12 @@ class _Snapshot(QLabel):
             self.anim.stop()
             self.deleteLater()
         return False
+
+
+def _to_whole_pixel(at: int, dpr: float) -> int:
+    """How far back from logical coordinate ``at`` the nearest one on a whole device pixel is (0 at 100% and
+    200%, 0 or 1 at 150%, up to 3 at 125%)."""
+    return next((k for k in range(8) if abs((at - k) * dpr - round((at - k) * dpr)) < 1e-6), 0)
 
 
 def crossfade(target: QWidget, ms: int = VIEW_MS) -> None:
@@ -122,7 +143,7 @@ def fading(target: QWidget, early: bool = False) -> bool:
 
 # -- fade in ------------------------------------------------------------------------------------------------
 
-def fade_in(widget: QWidget, ms: int = APPEAR_MS, delay: int = 0) -> None:
+def fade_in(widget: QWidget, ms: int = APPEAR_MS) -> None:
     """Fade a widget in from transparent. Its opacity effect is removed when done, so it paints as before."""
     if not enabled() or not widget.isVisible():
         return
@@ -140,16 +161,7 @@ def fade_in(widget: QWidget, ms: int = APPEAR_MS, delay: int = 0) -> None:
         if widget.graphicsEffect() is effect:
             widget.setGraphicsEffect(None)
     anim.finished.connect(done)
-    if delay:
-        QTimer.singleShot(delay, anim, anim.start)  # cancelled if the widget (and its anim) goes first
-    else:
-        anim.start()
-
-
-def fade_in_all(widgets: list[QWidget], ms: int = DATA_MS) -> None:
-    """Fade widgets in one after another, a few frames apart."""
-    for i, w in enumerate(widgets):
-        fade_in(w, ms, delay=i * STAGGER_MS)
+    anim.start()
 
 
 def fade_window(window: QWidget, ms: int = APPEAR_MS) -> None:

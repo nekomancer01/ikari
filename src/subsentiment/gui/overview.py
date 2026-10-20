@@ -82,7 +82,7 @@ class OverviewPage(VerticalScrollArea):
         bottom.addWidget(card("Words", self.words), 3)
         lay.addLayout(bottom, 4)
 
-        # What fades in, one after another, when another subreddit is shown.
+        # The page's cards.
         self.cards = [*self.tiles.values(), self.timeline.parentWidget(), self.distribution.parentWidget(),
                       self.words.parentWidget()]
         self.setWidget(page)
