@@ -29,7 +29,7 @@ MAX_DAY_POSTS = collect.MAX_DAY_POSTS
 days_in = collect.days_in  # cap on one day's "Download all"
 
 NOTE = ("Totals come from Arctic Shift and include posts and comments later removed from Reddit, which ikari "
-        "can't save. A day's share counts the removed posts ikari has seen as checked, and a thread can stop short "
+        "can't save. A day's share counts the removed posts and image posts ikari has seen as checked, and a thread can stop short "
         "of 100%. A check mark means everything the archive still has is saved. Days are UTC. A day's Download all fetches its posts only; comments download only from the "
         "buttons on the right.")
 
@@ -66,7 +66,7 @@ def share_text(saved: int, total: int | None, complete: bool, noun: str,
                removed: int = 0) -> tuple[str, str, float | None, str]:
     """(main text, side text, share 0..1 or None, tooltip) for one coverage cell. ``removed`` is how many
     of the archive's items ikari has seen were removed from Reddit: the archive's count includes them but
-    they can't be saved, so they count as checked."""
+    they can't be saved, so they count as checked, and so do the image posts ikari skips."""
     if complete:
         tip = f"All {plural(saved, noun)} the archive still has are saved."
         if total is not None and total > saved:
@@ -76,7 +76,7 @@ def share_text(saved: int, total: int | None, complete: bool, noun: str,
         checked = saved + removed
         share = min(1.0, checked / total)
         tip = (f"Arctic Shift counts {plural(total, noun)} here. ikari has checked {min(checked, total):,} of "
-               f"them: {saved:,} saved and {removed:,} removed from Reddit, which can't be saved.")
+               f"them: {saved:,} saved and {removed:,} removed from Reddit or image posts, which aren't saved.")
         return f"{saved:,} saved", f"{100 * share:.0f}%", share, tip
     if total is None:
         return f"{saved:,} saved", "total unknown", None, "The archive hasn't counted these yet."
@@ -362,6 +362,8 @@ class CoverageWindow(QDialog):
         store = self.window_.store
         saved = store.posts_per_day(self.subreddit, self.days[-1], self.days[0] + DAY)
         removed = store.removed_per_day(self.subreddit, self.days[-1], self.days[0] + DAY)
+        for day, n in store.posts_per_day(self.subreddit, self.days[-1], self.days[0] + DAY, images=True).items():
+            removed[day] = removed.get(day, 0) + n  # skipped image posts are checked too
         complete = store.complete_keys("posts", self.subreddit)
         t = self.day_table
         if rebuild or self._day_rows != self.days:

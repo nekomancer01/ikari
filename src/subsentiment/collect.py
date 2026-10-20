@@ -71,7 +71,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     stored = {r["id"]: r for r in store.posts_between(name, req.after, req.before)}
 
     # 1. If asked, saved posts from this range whose scores weren't settled yet: re-fetch them in batches.
-    stale = [pid for pid, r in stored.items() if r["score"] is None] if req.refresh_scores else []
+    stale = [pid for pid, r in stored.items() if r["score"] is None and not r["image"]] if req.refresh_scores else []
     updated: list[Post] = []
     if stale:
         note(f"Checking {len(stale):,} saved posts for updated scores…")
@@ -106,6 +106,9 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         removed = take() if take else {}
         if removed:  # the archive's daily counts include these, so Download coverage counts them as checked
             store.save_removed(name, removed)
+        for p in getattr(client, "take_images", list)():  # same for image posts, kept hidden
+            store.save_post(p, None, None)
+        store.commit()
         # Complete only when every part of the day was read to its end: a fetch that stopped at the limit, or
         # was stopped, may have missed posts. A day that isn't over yet can still get posts, so it never is,
         # and a keyword search only reads the posts that match.
@@ -133,7 +136,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         repicked = {p.id for p in picked if p.id in stored}  # top mode can pick posts that are already saved
         todo = [p for p in picked if p.id not in stored] + updated + [
             _stored_post(r) for pid, r in stored.items()
-            if in_part(pid) and pid not in refreshed and (
+            if in_part(pid) and not r["image"] and pid not in refreshed and (
                 _comments_missing(r) or (pid in repicked and _never_asked(r))
                 or (everything and pid not in saved_whole))]
         todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up

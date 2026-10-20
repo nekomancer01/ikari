@@ -181,3 +181,113 @@ def test_day_counts_and_exporting_chosen_days(tmp_path):
     assert [r["id"] for r in csv.DictReader(open(out, encoding="utf-8-sig"))] == ["p2"]  # starts with a BOM
     assert s.export_csv("python", "posts", out) == 2
     assert s.export_csv("python", "comments", out, days=set()) == 0
+
+
+def test_import_merges_another_database_keeping_the_copy_fetched_last(tmp_path, monkeypatch):
+    import itertools
+    import sqlite3
+    import time as clock
+    from subsentiment import store as store_mod
+    when = itertools.count(100.0, 100.0)  # each save is fetched later than the one before
+    monkeypatch.setattr(store_mod.time, "time", lambda: next(when))
+    mine, theirs = Store(tmp_path / "mine.db"), Store(tmp_path / "theirs.db")
+    mine.save_post(make_post(1), 0.1, "neutral")           # fetched at 100: older than theirs
+    theirs.save_post(make_post(1), 0.9, "positive")        # 200
+    theirs.save_post(make_post(2, sub="rust"), 0.5, "positive")  # 300, only theirs has it
+    mine.save_post(make_post(3), -0.5, "negative")         # 400, only mine has it
+    theirs.save_comment(Comment("c1", "p2", "rust", "t3_p2", "b", "hi", 1, 1_700_000_100, 0, "u"), 0.2, "positive")
+    theirs.mark_complete("posts", "rust", "1699920000")
+    theirs.save_removed("rust", {"gone": 1_700_000_000.0})
+    mine.commit()
+    theirs.commit()
+    theirs.close()
+    monkeypatch.setattr(store_mod.time, "time", clock.time)
+
+    assert mine.import_from(tmp_path / "theirs.db") == (1, 1)
+    assert {r["id"]: r["sentiment"] for r in mine.db.execute("SELECT * FROM posts")} == {"p1": 0.9, "p2": 0.5, "p3": -0.5}
+    assert [r["body"] for r in mine.comments("rust")] == ["hi"]
+    assert mine.complete_keys("posts", "rust") == {"1699920000"}
+    assert mine.import_from(tmp_path / "theirs.db") == (0, 0)  # importing again adds nothing
+    assert len(Store(tmp_path / "theirs.db").posts("rust")) == 1  # the imported file is left as it was
+
+    (tmp_path / "junk.db").write_bytes(b"not a database at all" * 100)
+    with pytest.raises(sqlite3.DatabaseError):
+        mine.import_from(tmp_path / "junk.db")
+    with pytest.raises(ValueError):
+        mine.import_from(tmp_path / "mine.db")
+    with pytest.raises(FileNotFoundError):
+        mine.import_from(tmp_path / "missing.db")
+    assert not (tmp_path / "missing.db").exists()
+    assert len(mine.subreddits()) == 2  # a failed import changes nothing and the store still works
+
+
+def test_image_posts_are_hidden_from_every_read_and_counted_apart(tmp_path):
+    s = Store(tmp_path / "x.db")
+    s.save_post(make_post(1), 0.5, "positive")
+    img = make_post(2)
+    img.image = True
+    s.save_post(img, None, None)
+    s.save_comment(Comment("c1", "p1", "Python", "t3_p1", "b", "hi", 1, 1_700_000_100, 0, "u"), 0.1, "positive")
+    s.save_comment(Comment("c2", "p2", "Python", "t3_p2", "b", "pretty", 1, 1_700_000_100, 0, "u"), 0.1, "positive")
+    s.commit()
+    day = int(1_700_000_000 // 86400 * 86400)
+    assert [r["id"] for r in s.posts("python")] == ["p1"]
+    assert [r["id"] for r in s.posts_since("python", 0)] == ["p1"]
+    assert [r["id"] for r in s.comments("python")] == ["c1"]
+    assert [r["id"] for r in s.comments_since("python", 0)] == ["c1"]
+    assert s.datasets()[0]["posts"] == 1 and s.datasets()[0]["comments"] == 1
+    assert s.day_counts("python") == {day: (1, 1)}
+    assert s.posts_per_day("python", day, day + 86400) == {day: 1}
+    assert s.posts_per_day("python", day, day + 86400, images=True) == {day: 1}
+    assert [r["id"] for r in s.comment_coverage("python", day, day + 86400)] == ["p1"]
+    assert {r["id"]: r["image"] for r in s.posts_between("python")} == {"p1": 0, "p2": 1}  # collect needs both
+    assert s.export_csv("python", "posts", tmp_path / "p.csv") == 1
+    assert s.export_csv("python", "comments", tmp_path / "c.csv") == 1
+
+
+def test_posts_saved_before_images_were_filtered_are_hidden_on_open(tmp_path):
+    import sqlite3
+    db = sqlite3.connect(tmp_path / "old.db")
+    db.executescript("""CREATE TABLE posts (id TEXT PRIMARY KEY, subreddit TEXT NOT NULL, title TEXT, selftext TEXT,
+        author TEXT, score INTEGER, upvote_ratio REAL, num_comments INTEGER, created_utc REAL, permalink TEXT,
+        url TEXT, sentiment REAL, label TEXT, fetched_at REAL);
+        INSERT INTO posts VALUES ('a', 'Python', 'pic', '', 'x', 1, 1, 0, 1700000000, '', 'https://i.redd.it/a.jpeg', 0, 'neutral', 1);
+        INSERT INTO posts VALUES ('b', 'Python', 'pic with words', 'words', 'x', 1, 1, 0, 1700000000, '', 'https://i.redd.it/b.jpeg', 0, 'neutral', 1);
+        INSERT INTO posts VALUES ('c', 'Python', 'text', '', 'x', 1, 1, 0, 1700000000, '', '', 0, 'neutral', 1);""")
+    db.commit()
+    db.close()
+    s = Store(tmp_path / "old.db")
+    assert sorted(r["id"] for r in s.posts("python")) == ["b", "c"]
+    s.close()
+    s = Store(tmp_path / "old.db")  # reopened: migrated once, not again
+    assert sorted(r["id"] for r in s.posts("python")) == ["b", "c"]
+
+
+def test_import_keeps_image_posts_hidden_from_files_old_and_new(tmp_path):
+    import sqlite3
+    old = sqlite3.connect(tmp_path / "old.db")  # saved before image posts were marked: no image column
+    old.executescript("""CREATE TABLE posts (id TEXT PRIMARY KEY, subreddit TEXT NOT NULL, title TEXT, selftext TEXT,
+        author TEXT, score INTEGER, upvote_ratio REAL, num_comments INTEGER, created_utc REAL, permalink TEXT,
+        url TEXT, sentiment REAL, label TEXT, fetched_at REAL);
+        CREATE TABLE comments (id TEXT PRIMARY KEY, post_id TEXT NOT NULL, subreddit TEXT NOT NULL, parent_id TEXT,
+        author TEXT, body TEXT, score INTEGER, created_utc REAL, depth INTEGER, permalink TEXT, sentiment REAL,
+        label TEXT, fetched_at REAL);
+        INSERT INTO posts VALUES ('a', 'Python', 'pic', '', 'x', 1, 1, 0, 1700000000, '', 'https://i.redd.it/a.jpeg', 0, 'neutral', 1);
+        INSERT INTO posts VALUES ('c', 'Python', 'text', '', 'x', 1, 1, 0, 1700000000, '', '', 0, 'neutral', 1);
+        INSERT INTO comments VALUES ('k', 'a', 'Python', 't3_a', 'y', 'cute', 1, 1700000100, 0, '', 0, 'neutral', 1);""")
+    old.commit()
+    old.close()
+    new = Store(tmp_path / "new.db")
+    img = make_post(9, sub="rust")
+    img.image = True
+    new.save_post(img, None, None)
+    new.save_post(make_post(8, sub="rust"), 0.5, "positive")
+    new.commit()
+    new.close()
+
+    s = Store(tmp_path / "mine.db")
+    assert s.import_from(tmp_path / "old.db") == (1, 0)  # the picture's comment comes in hidden with it
+    assert s.import_from(tmp_path / "new.db") == (1, 0)
+    assert [r["id"] for r in s.posts("python")] == ["c"]
+    assert [r["id"] for r in s.posts("rust")] == ["p8"]
+    assert "image" not in {r[1] for r in sqlite3.connect(tmp_path / "old.db").execute("PRAGMA table_info(posts)")}
