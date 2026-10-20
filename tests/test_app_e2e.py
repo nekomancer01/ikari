@@ -174,6 +174,26 @@ def test_a_fetch_downloads_every_post_in_the_range_a_day_at_a_time(env):
     assert windows <= {int(after // DAY), int(coverage.today() // DAY)}
 
 
+def test_a_long_fetch_shows_comments_from_its_first_day_on(env):
+    # Live: a week of r/AskReddit read every post before any comment, so the first minutes showed none.
+    w = env.window()
+    env.archive.delay = 0.01
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(True)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    s = env.store()
+    posts_at_first_comment = None
+    while w.fetch_job.busy:
+        if posts_at_first_comment is None and s.comments("python"):
+            posts_at_first_comment = len(s.posts("python"))
+        pump(5)
+    pump(50)
+    total = len(s.posts("python"))
+    assert s.comments("python") and posts_at_first_comment is not None
+    assert posts_at_first_comment < total / 2, (posts_at_first_comment, total)  # the newest day's, not all
+
+
 def test_removed_posts_are_not_saved(env):
     w = env.window()
     fetch(w, comments=False)
