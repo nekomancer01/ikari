@@ -453,7 +453,7 @@ class TablePage(QWidget):
         self._share_width()
 
     def _update_count(self, *args) -> None:
-        self.count.setText(f"{self.proxy.rowCount():,} rows")
+        self.count.setText(plural(self.proxy.rowCount(), "row"))
 
     def _open(self, index) -> None:
         row = self.model.row_at(self.proxy.mapToSource(index).row())
@@ -879,12 +879,19 @@ class MainWindow(QMainWindow):
                 edit.setMaximumDate(today)
                 edit.setDate(date)
                 edit.blockSignals(False)
+        self._range_moved()
 
     def _on_date_edited(self) -> None:
         """Typing or picking a date means a custom range."""
         self.range.blockSignals(True)
         self.range.setCurrentIndex(self.range.findData("custom"))
         self.range.blockSignals(False)
+        self._range_moved()
+
+    def _range_moved(self) -> None:
+        """The Download coverage window lists the sidebar's range, so it follows a change."""
+        if getattr(self, "coverage", None) is not None and self.coverage.isVisible():
+            self.coverage.refresh_saved()
 
     def _update_comments_enabled(self) -> None:
         self.comments_per_post.setEnabled(self.thread is None and self.include_comments.isChecked())
@@ -1001,6 +1008,7 @@ class MainWindow(QMainWindow):
             self.progress_msg.setText("Stopping…")
             if self.coverage is not None:
                 self.coverage.set_progress(0, 0, "Stopping…")
+                self.coverage.stop_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
 
     def _on_progress(self, done: int, total: int, msg: str) -> None:
@@ -1102,13 +1110,16 @@ class MainWindow(QMainWindow):
         if self.current and self.current.lower() == result.subreddit.lower():
             self._refresh_datasets(reload=False)
             self._show_dataset(self.current, animate=True)  # keeps the tables where they are
-        elif result.posts or result.updated or result.comments:
+        elif self._follow and (result.posts or result.updated or result.comments):
             self._refresh_datasets(select=result.subreddit)
+        else:  # the user went to look at another subreddit meanwhile: stay there
+            self._refresh_datasets(reload=False)
 
     def _on_failed(self, message: str) -> None:
         self._live.stop()
         self._flush_rows()
-        self._refresh_datasets(select=self.request.subreddit)  # show anything stored before the error
+        # Show anything stored before the error, unless the user went to look at another subreddit.
+        self._refresh_datasets(select=self.request.subreddit if self._follow else None)
         kept = self.current and self.current.lower() == self.request.subreddit.lower()
         self.progress_msg.setText("Fetch failed. What was fetched before the error is saved." if kept
                                   else "Fetch failed.")

@@ -165,7 +165,8 @@ class RowsModel(QAbstractTableModel):
             return fmt(value)
         if role == SORT_ROLE:
             if value is None:
-                return -1 if key in NUMERIC else ""  # keeps unknown numbers sortable alongside real ones
+                # Below every real number, so pending rows don't land among (and tie with) scores of -1.
+                return float("-inf") if key in NUMERIC else ""
             return value
         if role == Qt.ItemDataRole.DecorationRole and key == "label":
             return self._icons.get(value)

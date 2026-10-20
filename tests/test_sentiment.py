@@ -59,3 +59,12 @@ def test_sarcasm_with_two_frames_and_an_everyday_complaint():
     assert sentiment.score(text)[1] == "negative"
     assert sentiment.score("Gotta love how the game crashes every time I alt-tab")[1] == "negative"
     assert not sentiment.is_sarcastic(sentiment.clean("Oh wow, my go-to for frozen fries"))
+
+
+def test_a_post_of_many_short_lines_scores_quickly():
+    # Quote stripping matched "\s*" across line breaks, so a long post of short lines took seconds.
+    import time
+    start = time.perf_counter()
+    sentiment.score(" \n" * 20000)  # 40,000 characters, the most a Reddit post holds
+    assert time.perf_counter() - start < 0.5  # over a second before
+    assert sentiment.score("great point\n> this is awful and terrible\n")[0] > 0  # quotes still ignored
