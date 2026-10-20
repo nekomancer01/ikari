@@ -30,8 +30,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]" pyinstaller
       - name: Walkthrough at 150%
-        shell: bash
-        run: python tools/qa_walkthrough.py --out qa/150 --scale 1.5 --timeout 240 --stop-after 15 --latency 0.6
+        shell: pwsh
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONFAULTHANDLER: "1"
+          QT_DEBUG_PLUGINS: "0"
+        run: |
+          python -c "import PySide6.QtWidgets as w, sys; a = w.QApplication([]); s = a.primaryScreen(); print(a.platformName(), s.geometry(), s.devicePixelRatio(), s.logicalDotsPerInch())"
+          python tools/qa_walkthrough.py --out qa/150 --scale 1.5 --timeout 240 --stop-after 15 --latency 0.6
+          Write-Host "exit code $LASTEXITCODE"
       - name: Build and capture ikari.exe at 150%
         shell: pwsh
         run: |
