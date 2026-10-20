@@ -1228,3 +1228,26 @@ def test_a_fetchs_settled_days_are_packed_and_still_show_what_was_fetched(env, m
         page.view.doubleClicked.emit(page.model.index(i, 0))
     assert sorted(opened) == sorted("https://www.reddit.com" + archive[r["post_id"]]["permalink"] + r["id"] + "/"
                                     for r in s.comments("python"))
+
+
+def test_starting_a_new_subreddit_switches_to_it_at_once(env):
+    w = env.window()
+    fetch(w, comments=False)
+    assert w.current.lower() == "python"
+    env.archive.delay = 0.5  # nothing of r/rust is saved for a good while
+    w.fetch_form.subreddit.setText("rust")
+    w.fetch_form.include_comments.setChecked(False)
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    assert w.fetch_job.busy and w.current.lower() == "rust" and w.posts_tab.model.rowCount() == 0
+    assert w.datasets.currentItem() is None and w.coverage.subreddit.lower() == "rust"
+    env.archive.delay = 0
+    wait_idle(w)
+    assert w.current.lower() == "rust" and w.posts_tab.model.rowCount() > 0
+    assert w.datasets.currentItem().data(Qt.ItemDataRole.UserRole).lower() == "rust"
+
+
+def test_a_new_subreddit_that_saves_nothing_goes_back_to_a_saved_one(env):
+    w = env.window()
+    fetch(w, comments=False)
+    fetch(w, sub="nosuchsub", comments=False)
+    assert w.current.lower() == "python" and w.datasets.currentItem() is not None
