@@ -150,6 +150,8 @@ class RateLimiter:
                         self._sleep(STOP_POLL)  # then look again: Stop may have been pressed
                         continue
                     self._sleep(delay)
+                    if should_stop and should_stop():  # pressed during that last short wait
+                        raise Stopped
                 self._next = self._clock() + self.interval
                 flight = _Flight(should_stop)
                 self._in_flight.append(flight)
