@@ -231,10 +231,11 @@ class FakeArchive:
         return keep
 
     def _matching(self, q: dict) -> list[dict]:
+        # Both bounds are exclusive, as on the real archive (checked live on 20 Oct 2026).
         sub = q.get("subreddit", "").lower()
         after, before = float(q.get("after", 0)), float(q.get("before", 1e12))
         words = q.get("query", "").lower()
-        return sorted((p for p in self.posts if p["subreddit"].lower() == sub and after <= p["created_utc"] < before
+        return sorted((p for p in self.posts if p["subreddit"].lower() == sub and after < p["created_utc"] < before
                        and words in (p["title"] + " " + p["selftext"]).lower()), key=lambda p: p["created_utc"])
 
     def _search(self, q: dict) -> list[dict]:

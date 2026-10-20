@@ -291,10 +291,13 @@ def test_closing_mid_fetch_leaves_the_fetch_alone(env, monkeypatch):
     errors = []
     monkeypatch.setattr(sys, "excepthook", lambda *e: errors.append(e))
     w = env.window()
-    env.archive.delay = 4  # a request still out when the window closes
+    # A request Stop waits for is still out when the window closes: in top mode, the download of a ranked
+    # day's picks. (A plain search no longer holds Stop up; that case is the test below.)
+    env.archive.delays[IDS] = 4
     w.subreddit.setText("python")
+    w.pick.setCurrentIndex(w.pick.findData("top"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
-    pump(500)
+    pump(1500)
     w.close()
     assert w.running_threads(), "app.main ends the process instead of destroying this thread"
     end = time.monotonic() + 20
@@ -302,6 +305,22 @@ def test_closing_mid_fetch_leaves_the_fetch_alone(env, monkeypatch):
         pump(50)
     pump(200)
     assert errors == []  # the fetch ending didn't reach for the closed store
+
+
+def test_closing_while_a_search_is_out_ends_the_fetch_at_once(env, monkeypatch):
+    # The setup the test above had before Stop stopped waiting for searches in flight.
+    errors = []
+    monkeypatch.setattr(sys, "excepthook", lambda *e: errors.append(e))
+    w = env.window()
+    env.archive.delay = 4  # a request still out when the window closes
+    w.subreddit.setText("python")
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    pump(500)
+    start = time.monotonic()
+    w.close()
+    assert time.monotonic() - start < 2 and not w.running_threads()
+    pump(5000)  # the search's answer arrives after the window has gone
+    assert errors == []
 
 
 QUIT_MID_FETCH = """
