@@ -15,6 +15,7 @@ from PySide6.QtCore import QItemSelectionModel, QSettings, Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QTableView  # noqa: E402
 
 from subsentiment.gui import main_window as mw  # noqa: E402
+from subsentiment.gui import tables  # noqa: E402
 from subsentiment.gui.tables import POST_COLUMNS, RowsModel  # noqa: E402
 from subsentiment.analysis import Analysis  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
@@ -76,7 +77,7 @@ def test_opening_a_big_subreddit_doesnt_ask_the_model_for_every_value_again_and_
         def data(self, index, role=Qt.ItemDataRole.DisplayRole):
             calls.append(1)
             return super().data(index, role)
-    monkeypatch.setattr(mw, "RowsModel", Counted)
+    monkeypatch.setattr(tables, "RowsModel", Counted)  # where TablePage makes its model
     w = mw.MainWindow(window.db_path)
     try:
         calls.clear()
