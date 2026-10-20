@@ -215,6 +215,13 @@ def visible(w) -> dict:
             "tab_posts": w.tabbar.tabText(1), "tab_comments": w.tabbar.tabText(2)}
 
 
+def busy(job_owner, job="fetch_job", old="thread") -> bool:
+    """Whether a fetch (or coverage count) is running: BackgroundJob since #60, a QThread attribute before."""
+    if hasattr(job_owner, job):
+        return getattr(job_owner, job).busy
+    return getattr(job_owner, "_" + old if old == "count_thread" else old) is not None
+
+
 def run_fetch(entry: dict, w, sub: str, start, stop_after: float | None = None, every: float = 1.0,
               shots_at=(3, 15, 60)) -> None:
     """Start a fetch with ``start()`` and watch it to the end, sampling the database and the window."""
@@ -222,11 +229,11 @@ def run_fetch(entry: dict, w, sub: str, start, stop_after: float | None = None, 
     t0 = time.monotonic()
     start()
     pump(0.05)
-    if w.thread is None:
+    if not busy(w):
         entry["notes"].append("fetch didn't start: " + w.progress_msg.text())
         return
     next_sample, pending_shots, stopped_at = 0.0, list(shots_at), None
-    while w.thread is not None:
+    while busy(w):
         el = time.monotonic() - t0
         if el >= next_sample:
             p, c = db_counts(sub)
@@ -245,6 +252,10 @@ def run_fetch(entry: dict, w, sub: str, start, stop_after: float | None = None, 
             entry["notes"].append(f"still running after {ARGS.timeout:.0f}s; pressing Stop")
             w._stop_fetch()
             stop_after, stopped_at = 0, el
+        if stopped_at is not None and el - stopped_at > 120:
+            entry["notes"].append(f"STOP DIDN'T END THE FETCH: still running {el - stopped_at:.0f}s after Stop")
+            entry["stop_never_ended"] = True
+            break
         QApplication.processEvents()
         time.sleep(0.005)
     entry["fetch_secs"] = round(time.monotonic() - t0, 1)
@@ -359,8 +370,8 @@ def first_launch(e):
 
 @step("small-fetch: type a subreddit and press Fetch and analyse with the default form")
 def small_fetch(e):
-    e["form"] = {"range": w.range.currentText(), "pick": w.pick.currentText(), "limit": w.limit.value(),
-                 "comments": w.include_comments.isChecked(), "per_post": w.comments_per_post.value()}
+    e["form"] = {"range": w.range.currentText(), "pick": getattr(w, "pick", None) and w.pick.currentText(),
+                 "limit": getattr(w, "limit", None) and w.limit.value(), "comments": w.include_comments.isChecked(), "per_post": w.comments_per_post.value()}
     type_into(w.subreddit, ARGS.small)
     run_fetch(e, w, ARGS.small, lambda: click(w.fetch_btn))
 
@@ -377,7 +388,8 @@ def busy_fetch(e):
 @step("stop: fetch more of the busy subreddit and press Stop partway")
 def stop_midway(e):
     w.range.setCurrentIndex(list(mw.RANGES).index("month"))
-    w.limit.setValue(300)
+    if hasattr(w, "limit"):  # max posts went with #55 (every post in the range)
+        w.limit.setValue(300)
     run_fetch(e, w, ARGS.busy, lambda: click(w.fetch_btn), stop_after=ARGS.stop_after)
     b, end = e.get("before_stop", {}), e["end"]
     e["notes"].append(f"at Stop: db {b.get('db_posts')}/{b.get('db_comments')}, window {b.get('posts_rows')}/"
@@ -535,6 +547,26 @@ def export(e):
                           f"{view.view.model().rowCount()}")
 
 
+@step("comments-all: Comments per post All on the small subreddit's past day")
+def comments_all(e):
+    import sqlite3
+
+    w.range.setCurrentIndex(list(mw.RANGES).index("day"))
+    w.include_comments.setChecked(True)
+    w.comments_per_post.setValue(w.comments_per_post.minimum())
+    e["per_post_text"] = w.comments_per_post.text()
+    type_into(w.subreddit, ARGS.small)
+    run_fetch(e, w, ARGS.small, lambda: click(w.fetch_btn), shots_at=(5, 30))
+    con = sqlite3.connect(DB)
+    rows = con.execute("select p.num_comments, count(c.id) from posts p left join comments c on c.post_id = p.id "
+                       "where lower(p.subreddit) = ? group by p.id", (ARGS.small.lower(),)).fetchall()
+    con.close()
+    full = sum(1 for n, got in rows if got >= n)
+    e["notes"].append(f"spin box reads {e['per_post_text']!r}; {full} of {len(rows)} posts have every comment "
+                      f"num_comments counts; most on one post {max((g for _, g in rows), default=0)}")
+    w.comments_per_post.setValue(mw.FETCH_DEFAULTS["comments_per_post"])
+
+
 @step("coverage: open View > Download coverage for the busy subreddit")
 def coverage_open(e):
     for i in range(w.datasets.count()):
@@ -546,7 +578,7 @@ def coverage_open(e):
     c = w.coverage
     e["shots"].append(shot(c, "coverage-open"))
     t0 = time.monotonic()
-    while c._count_thread is not None and time.monotonic() - t0 < 120:
+    while busy(c, "count_job", "count_thread") and time.monotonic() - t0 < 120:
         pump(0.2)
     e["count_secs"] = round(time.monotonic() - t0, 1)
     pump(0.5)
@@ -588,7 +620,7 @@ def delete(e):
     e["shots"].append(shot(w, "after-delete"))
 
 
-for fn in (first_launch, small_fetch, busy_fetch, stop_midway, days_pick, look_around, motion_check, export, coverage_open, coverage_day,
+for fn in (first_launch, small_fetch, busy_fetch, stop_midway, days_pick, look_around, motion_check, export, comments_all, coverage_open, coverage_day,
            coverage_comments, delete):
     fn()
 
