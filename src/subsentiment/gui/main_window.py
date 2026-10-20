@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from subsentiment import __version__, collect
-from subsentiment.gui import native, theme
+from subsentiment.gui import days, native, theme
 from subsentiment.gui.charts import DistributionChart, TimelineChart, palette
 from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, RowsModel
 from subsentiment.gui.theme import mark, paint_backdrop
@@ -480,8 +480,11 @@ class MainWindow(QMainWindow):
         # How far each table has read the running fetch's rows, so each save reads only what's new.
         self._read_to = {"posts": 0.0, "comments": 0.0}
         self._follow = False  # show the subreddit being fetched, until the user picks another one
-        self.posts: list = []
+        self.posts: list = []  # what the analysis counts: the saved rows from the chosen days
         self.comments: list = []
+        self._saved: dict[str, list] = {"posts": [], "comments": []}  # every saved row of the subreddit shown
+        self._day_counts: dict[int, tuple[int, int]] = {}
+        self.chosen_days: set[int] | None = None  # None: every day
         self.coverage = None  # the Download coverage window, once opened
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
         # A native material (Mica/Acrylic/vibrancy) needs a translucent window from the start,
@@ -724,17 +727,22 @@ class MainWindow(QMainWindow):
         saved = self.settings.value("ui/overview_scope", SCOPES[0], str)
         self.scope.setCurrentIndex(max(self.scope.findText(saved), 0))
         self.scope.currentTextChanged.connect(self._on_scope_changed)
+        # Which saved days every view counts (the Overview, both tables, CSV export). Picking never fetches.
+        self.days_pick = days.DaysCombo()
+        self.days_pick.chosen_changed.connect(self._on_days_chosen)
         self.heading.setMinimumWidth(QFontMetrics(theme.display_font(15, 650)).horizontalAdvance("r/subreddit"))
-        # The title, the Overview's scope picker and the tabs share one centre line, and the subtitle runs
-        # the full width under them. It used to share a narrow column with the title and wrapped at 150%,
-        # cutting off "last fetched".
+        # The title, the Overview's scope picker, the day picker and the tabs share one centre line, and the
+        # subtitle runs the full width under them. It used to share a narrow column with the title and wrapped
+        # at 150%, cutting off "last fetched". The day picker sits by the tabs, which it filters too, so it
+        # stays put when the scope picker hides on the other tabs.
         header = QGridLayout()
         header.setHorizontalSpacing(12)
         header.setVerticalSpacing(2)
         header.addWidget(self.heading, 0, 0, Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.scope, 0, 1, Qt.AlignmentFlag.AlignVCenter)
-        header.addWidget(self.tabbar, 0, 2, Qt.AlignmentFlag.AlignVCenter)
-        header.addWidget(self.subheading, 1, 0, 1, 3)
+        header.addWidget(self.days_pick, 0, 2, Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.tabbar, 0, 3, Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.subheading, 1, 0, 1, 4)
         header.setColumnStretch(0, 1)
         lay.addLayout(header)
 
@@ -1010,7 +1018,7 @@ class MainWindow(QMainWindow):
         if not name or name.lower() != self.request.subreddit.lower() or self._showing_fetch():
             return
         self._show_dataset(name)
-        for kind, rows in (("posts", self.posts), ("comments", self.comments)):
+        for kind, rows in self._saved.items():
             # What was just loaded needn't be read again; rows sharing the last instant are caught by id.
             self._read_to[kind] = max([self._read_to[kind]] + [r["fetched_at"] for r in rows])
 
@@ -1025,7 +1033,7 @@ class MainWindow(QMainWindow):
             rows = read(name, self._read_to[kind])
             if rows:  # rows saved in the same instant as the last one read come back too; the ids catch them
                 self._read_to[kind] = rows[-1]["fetched_at"]
-            for r in rows:
+            for r in days.keep(rows, self.chosen_days):
                 if r["id"] not in self._queued_ids:
                     self._queued_ids.add(r["id"])
                     self._queued[kind].append(r)
@@ -1056,8 +1064,18 @@ class MainWindow(QMainWindow):
         self.tabbar.setTabText(2, f"Comments  {len(self.comments):,}")
         self.export_posts.setEnabled(bool(self.posts))
         self.export_comments.setEnabled(bool(self.comments))
-        fetched = max((r["fetched_at"] for r in self.posts), default=None)
-        self.subheading.setText(f"{plural(len(self.posts), 'post')} and {plural(len(self.comments), 'comment')} · "
+        if not self.current:
+            self.heading.setText("No data yet")
+            self.subheading.setText("Enter a subreddit on the left and press Fetch and analyse.")
+            return
+        self.heading.setText(f"r/{self.current}")
+        fetched = max(max((r["fetched_at"] for r in rows), default=0)
+                      for rows in (self._saved["posts"], self.posts)) or None
+        on = ""
+        if self.chosen_days is not None:
+            n = len(self.chosen_days & set(self._day_counts))
+            on = f" on {plural(n, 'chosen day')}"
+        self.subheading.setText(f"{plural(len(self.posts), 'post')} and {plural(len(self.comments), 'comment')}{on} · "
                                 f"last fetched {when_text(fetched)}")
 
     def _live_refresh(self) -> None:
@@ -1065,6 +1083,7 @@ class MainWindow(QMainWindow):
             return
         if self._showing_fetch():
             self._refresh_datasets(reload=False)
+            self._refresh_days()
             self._render_overview()
         elif self._follow:
             self._open_fetched()
@@ -1146,27 +1165,42 @@ class MainWindow(QMainWindow):
         self._drip.stop()
         self._queued = {"posts": [], "comments": []}
         self.current = name or None
-        self.posts = self.store.posts(name) if name else []
-        self.comments = self.store.comments(name) if name else []
-        self.posts_tab.load(self.posts, animate)
-        self.comments_tab.load(self.comments, animate)
-        self.export_posts.setEnabled(bool(self.posts))
-        self.export_comments.setEnabled(bool(self.comments))
+        self._saved = {"posts": self.store.posts(name) if name else [],
+                       "comments": self.store.comments(name) if name else []}
+        self.chosen_days = days.load_choice(self.settings, name) if name else None
+        self._refresh_days()
+        self._apply_days(animate)
         self._update_delete_enabled()
-        self.tabbar.setTabText(1, f"Posts  {len(self.posts):,}")
-        self.tabbar.setTabText(2, f"Comments  {len(self.comments):,}")
-        if self.current:
-            self.heading.setText(f"r/{self.current}")
-            fetched = max((r["fetched_at"] for r in self.posts), default=None)
-            self.subheading.setText(f"{plural(len(self.posts), 'post')} and {plural(len(self.comments), 'comment')} · "
-                                    f"last fetched {when_text(fetched)}")
-        else:
-            self.heading.setText("No data yet")
-            self.subheading.setText("Enter a subreddit on the left and press Fetch and analyse.")
-        self._render_overview()
         self.coverage_act.setEnabled(bool(self.current))
         if self.coverage is not None:
             self.coverage.set_subreddit(self.current)
+
+    def _refresh_days(self) -> None:
+        """Re-read which days have saved data, for the day picker."""
+        self._day_counts = self.store.day_counts(self.current) if self.current else {}
+        self.days_pick.set_days(self._day_counts, self.chosen_days)
+
+    def _apply_days(self, animate: bool = False) -> None:
+        """Point every view at the saved rows from the chosen days."""
+        self.posts = days.keep(self._saved["posts"], self.chosen_days)
+        self.comments = days.keep(self._saved["comments"], self.chosen_days)
+        self.posts_tab.load(self.posts, animate)
+        self.comments_tab.load(self.comments, animate)
+        self._update_dataset_labels()
+        self._render_overview()
+
+    def _on_days_chosen(self, chosen: set[int] | None) -> None:
+        if not self.current:
+            return
+        self.chosen_days = days.save_choice(self.settings, self.current, chosen, self._day_counts)
+        if self.thread is not None and self._showing_fetch():
+            # A running fetch has added rows since the subreddit was loaded: read them all again.
+            self._flush_rows()
+            self._show_dataset(self.current)
+            self._read_to = {k: max([self._since] + [r["fetched_at"] for r in self._saved[k]])
+                             for k in ("posts", "comments")}
+        else:
+            self._apply_days()
 
     def _on_scope_changed(self, text: str) -> None:
         self.settings.setValue("ui/overview_scope", text)
@@ -1207,10 +1241,11 @@ class MainWindow(QMainWindow):
             return
         if QMessageBox.question(
                 self, "Delete saved data",
-                f"Delete the {len(self.posts):,} posts and {len(self.comments):,} comments saved for "
+                f"Delete the {len(self._saved['posts']):,} posts and {len(self._saved['comments']):,} comments saved for "
                 f"r/{self.current}? This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_subreddit(self.current)
+        self.settings.remove(days.settings_key(self.current))
         self.statusBar().showMessage(f"Deleted the saved data for r/{self.current}.", 8000)
         self.current = None
         self._refresh_datasets()
@@ -1225,6 +1260,7 @@ class MainWindow(QMainWindow):
             return
         self.store.delete_all()
         self.settings.remove("ui/last_dataset")
+        self.settings.remove(days.SETTINGS_GROUP)
         self.statusBar().showMessage("Deleted all saved data.", 8000)
         self.current = None
         self._refresh_datasets()
@@ -1234,8 +1270,10 @@ class MainWindow(QMainWindow):
             return
         path, _ = QFileDialog.getSaveFileName(self, f"Export {kind}", f"{self.current}_{kind}.csv", "CSV files (*.csv)")
         if path:
-            n = self.store.export_csv(self.current, kind, path)
-            self.statusBar().showMessage(f"Exported {n} {kind} to {path}", 8000)
+            n = self.store.export_csv(self.current, kind, path, days=self.chosen_days)
+            n_days = len(self.chosen_days & set(self._day_counts)) if self.chosen_days is not None else 0
+            on = "" if self.chosen_days is None else f" from {plural(n_days, 'chosen day')}"
+            self.statusBar().showMessage(f"Exported {n:,} {kind}{on} to {path}", 8000)
 
     def fetch_range(self) -> tuple[float, float]:
         """The sidebar's date range as (after, before), before being now for "up to now"."""
