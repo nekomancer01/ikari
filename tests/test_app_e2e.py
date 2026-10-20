@@ -2,6 +2,8 @@
 talking to a fake Arctic Shift server on localhost. The rule checked throughout: nothing is requested
 unless the user asked for it, and each action requests only what it says."""
 import os
+import subprocess
+import sys
 import time
 
 import pytest
@@ -234,6 +236,89 @@ def test_enter_in_the_sidebar_fetches_once(env):
     wait_idle(w)
     pump(300)
     assert w.thread is None and env.archive.paths().count(AGG) == 0
+
+
+@pytest.mark.parametrize("saved_before", [False, True])
+def test_fetching_another_subreddit_shows_it_as_it_downloads(env, saved_before):
+    # The window used to stay on whatever was open for the whole fetch, so nothing seemed to happen.
+    w = env.window()
+    if saved_before:
+        fetch(w, comments=False, limit=2)
+    fetch(w, sub="rust", comments=False, limit=5)
+    assert w.current.lower() == "rust"
+    env.archive.delay = 0.1
+    w.subreddit.setText("python")
+    w.include_comments.setChecked(True)
+    w.limit.setValue(30)
+    w.range.setCurrentIndex(w.range.findData("month"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    s = env.store()
+    end = time.monotonic() + 20
+    while len(s.posts("python")) < 4 + 2 * saved_before and time.monotonic() < end:
+        pump(20)
+    pump(300)  # a few fade-in ticks, well under the 1 s refresh
+    assert w.thread is not None, "the fetch should still be running"
+    assert w.current.lower() == "python"
+    assert w.posts_tab.model.rowCount() > 2 * saved_before
+    wait_idle(w)
+
+
+def test_closing_mid_fetch_leaves_the_fetch_alone(env, monkeypatch):
+    errors = []
+    monkeypatch.setattr(sys, "excepthook", lambda *e: errors.append(e))
+    w = env.window()
+    env.archive.delay = 4  # a request still out when the window closes
+    w.subreddit.setText("python")
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    pump(500)
+    w.close()
+    assert w.running_threads(), "app.main ends the process instead of destroying this thread"
+    end = time.monotonic() + 20
+    while w.thread.isRunning() and time.monotonic() < end:
+        pump(50)
+    pump(200)
+    assert errors == []  # the fetch ending didn't reach for the closed store
+
+
+QUIT_MID_FETCH = """
+import os, sys
+from PySide6.QtCore import QSettings, QTimer
+from subsentiment import arctic_shift
+from subsentiment.gui import app, main_window
+arctic_shift.BASE_URL = sys.argv[1]
+QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, sys.argv[2])
+QSettings(app.STORAGE_ORG, app.STORAGE_APP).setValue("updates/auto", False)
+app.default_db_path = lambda: os.path.join(sys.argv[2], "quit.db")
+def window(path):
+    w = main_window.MainWindow(path)
+    w.subreddit.setText("python")
+    QTimer.singleShot(300, w.fetch_btn.click)
+    QTimer.singleShot(1100, w.close)  # while a slow request is still out
+    return w
+app.MainWindow = window
+sys.exit(app.main([]))
+"""
+
+
+def test_quitting_mid_fetch_exits_cleanly(env, tmp_path):
+    # Qt aborts the process (an access violation on Windows) when a thread is destroyed while running.
+    # Before, the process also lived on with the fetch after the window had gone, raising in its signals.
+    env.archive.delay = 15
+    start = time.monotonic()
+    run = subprocess.run([sys.executable, "-c", QUIT_MID_FETCH, env.archive.url, str(tmp_path)],
+                         capture_output=True, text=True, timeout=90,
+                         env=dict(os.environ, QT_QPA_PLATFORM="offscreen"))
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert "Traceback" not in run.stderr and "Destroyed while thread" not in run.stderr, run.stderr[-2000:]
+    assert time.monotonic() - start < 15  # gone without waiting for the slow request
+
+
+def test_about_names_the_bundled_model(env, monkeypatch):
+    shown = []
+    monkeypatch.setattr(QMessageBox, "about", lambda parent, title, text: shown.append(text))
+    env.window()._show_about()
+    assert shown and "VADER" not in shown[0]
 
 
 def test_switching_subreddit_mid_fetch_keeps_each_table_to_its_own_rows(env):

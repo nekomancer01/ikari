@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -36,4 +37,9 @@ def main(argv: list[str] | None = None) -> int:
                 settings.value("ui/reduce_transparency", False, bool))
     window = MainWindow(default_db_path())
     window.show()
-    return app.exec()
+    code = app.exec()
+    if window.running_threads():
+        # A request was still out when the window closed. Everything fetched is saved, so don't wait
+        # for it: Qt aborts the process if a running thread is destroyed on the way out.
+        os._exit(code)
+    return code
