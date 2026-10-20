@@ -28,7 +28,7 @@ import requests
 
 from subsentiment import __version__
 from subsentiment.reddit import (
-    Comment, FetchError, Post, ProgressFn, StopFn, normalize_subreddit, subreddit_error,
+    Comment, FetchError, Post, ProgressFn, StopFn, is_image_post, normalize_subreddit, subreddit_error,
 )
 
 BASE_URL = "https://arctic-shift.photon-reddit.com"
@@ -243,11 +243,12 @@ def _post(d: dict) -> Post:
     subreddit = _text(d.get("subreddit"))
     selftext = _text(d.get("selftext"))
     permalink = _text(d.get("permalink")) or f"/r/{subreddit}/comments/{d['id']}/"
+    selftext = "" if selftext in _GONE else selftext
     return Post(
         id=d["id"],
         subreddit=subreddit,
         title=_text(d.get("title")),
-        selftext="" if selftext in _GONE else selftext,
+        selftext=selftext,
         author=_text(d.get("author")) or "[deleted]",
         score=_int(d.get("score")) if settled else None,
         upvote_ratio=_ratio(d.get("upvote_ratio")) if settled else None,
@@ -255,6 +256,7 @@ def _post(d: dict) -> Post:
         created_utc=_number(d.get("created_utc"), 0),
         permalink="https://www.reddit.com" + permalink,
         url=_text(d.get("url")),
+        image=is_image_post(d.get("url"), selftext, d.get("post_hint") or "", d.get("is_gallery")),
     )
 
 
@@ -314,6 +316,7 @@ class ArcticShiftClient:
         # Posts the archive returned that were removed on Reddit, id -> created_utc: fetching skips them,
         # but the archive's daily counts include them, so Download coverage counts them as checked.
         self.removed: dict[str, float] = {}
+        self.images: dict[str, Post] = {}
         self._removed_lock = threading.Lock()
         self.exhausted = False  # whether the last fetch_posts read its whole range (see there)
         self.timed_out = False  # whether it had to skip a stretch the archive kept timing out on
@@ -584,8 +587,10 @@ class ArcticShiftClient:
                 seen.add(d["id"])
                 if _removed(d):
                     self._note_removed(d)
+                elif d["id"] not in skip and (post := _post(d)).image:
+                    self._note_image(post)
                 elif d["id"] not in skip and len(out) < want:
-                    out.append(_post(d))
+                    out.append(post)
                     fresh.append(out[-1])
                     cursor = max(cursor, int(_number(d.get("created_utc"), 0)) - 1)
             if len(out) >= want or (should_stop and should_stop()):
@@ -663,8 +668,10 @@ class ArcticShiftClient:
                     continue
                 if _removed(d):
                     self._note_removed(d)
+                elif (post := _post(d)).image:
+                    self._note_image(post)
                 else:
-                    out.append(_post(d))
+                    out.append(post)
         return out
 
     def _note_removed(self, d: dict) -> None:
@@ -672,6 +679,17 @@ class ArcticShiftClient:
         if created is not None:
             with self._removed_lock:  # slice threads Stop left running may still be adding
                 self.removed[d["id"]] = float(created)
+
+    def _note_image(self, post: Post) -> None:
+        with self._removed_lock:
+            self.images[post.id] = post
+
+    def take_images(self) -> list[Post]:
+        """The image posts skipped so far, which are then forgotten: kept as hidden rows, so they count as
+        checked in Download coverage and aren't looked at again."""
+        with self._removed_lock:
+            taken, self.images = list(self.images.values()), {}
+        return taken
 
     def take_removed(self) -> dict[str, float]:
         """The removed posts noted so far, which are then forgotten."""
