@@ -283,6 +283,7 @@ class CoverageWindow(QDialog):
         self.count_error = ""
         self._count_thread: QThread | None = None
         self._counting: tuple[str, float, float] = ("", 0.0, 0.0)  # what the running count asked for
+        self._count_stopped = False  # the window closed while it ran, so its answer may be cut short
         self._count_worker: CountWorker | None = None
         self._post_rows: list = []
         self._post_ids: list[str] = []
@@ -394,7 +395,7 @@ class CoverageWindow(QDialog):
     def set_busy(self, busy: bool) -> None:
         self.busy = busy
         self.stop_btn.setVisible(busy)
-        self.stop_btn.setEnabled(busy)
+        self.stop_btn.setEnabled(busy and not self.window_._stopping)  # pressed already: stays off
         self.progress.setVisible(busy)
         if busy:
             self.progress.setRange(0, 0)
@@ -593,19 +594,27 @@ class CoverageWindow(QDialog):
         thread.finished.connect(self._on_count_done)
         self._count_thread, self._count_worker = thread, worker
         self._counting = (sub.lower(), after, before)
+        self._count_stopped = False
         thread.start()
 
     @Slot(str, object)
     def _on_counts(self, sub: str, counts: dict) -> None:
         self.totals.setdefault(sub.lower(), {}).update(counts)
+        if not self._count_is_current():
+            return  # stopped, or for a subreddit no longer shown: not this one's error
         if not self.busy:
             self.status.setText("")
         if not counts:
             self.count_error = "Arctic Shift couldn't count these days."
             self.status.setText(self.count_error + " Press Recount to try again.")
 
+    def _count_is_current(self) -> bool:
+        return not self._count_stopped and self._counting[0] == (self.subreddit or "").lower()
+
     @Slot(str)
     def _on_count_failed(self, message: str) -> None:
+        if not self._count_is_current():
+            return
         self.count_error = message
         self.status.setText(f"Couldn't get totals from Arctic Shift: {message} Press Recount to try again.")
 
@@ -617,6 +626,9 @@ class CoverageWindow(QDialog):
         if not (self.subreddit and self.days and self.isVisible()):
             return  # closed meanwhile (the store may be too); showing it again counts what's missing
         sub, after, before = self._counting
+        if self._count_stopped:  # closed and opened again while it ran: its answer may be cut short
+            self.refresh_saved()
+            return
         totals = self.totals.get(self.subreddit.lower(), {})
         if sub != self.subreddit.lower() or any(d not in totals and not after <= d < before for d in self.days):
             # The user picked another subreddit or range while this count ran: count that now. It used to
@@ -666,6 +678,7 @@ class CoverageWindow(QDialog):
             # Not waited for: a request still out held the window (and the app's own close) for up to
             # 3 s. It ends by itself; app.main ends the process if it still runs when the app quits.
             self._count_worker.stop()
+            self._count_stopped = True
         super().closeEvent(event)
 
 

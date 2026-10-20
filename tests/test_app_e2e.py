@@ -658,10 +658,10 @@ def test_coverage_follows_a_change_of_date_range_in_the_sidebar(env):
     cov = open_coverage(w)
     assert len(cov.days) == 8
     w.range.setCurrentIndex(w.range.findData("month"))
-    pump(50)
+    pump(500)
     assert len(cov.days) == 31 and cov.day_table.rowCount() == 31
     w.date_from.setDate(w.date_to.date().addDays(-2))  # typing a date: a custom range
-    pump(50)
+    pump(500)
     assert len(cov.days) == 3
 
 

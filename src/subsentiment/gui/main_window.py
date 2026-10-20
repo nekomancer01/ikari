@@ -478,6 +478,10 @@ class MainWindow(QMainWindow):
         self._live.setSingleShot(True)
         self._live.setInterval(1000)
         self._live.timeout.connect(self._live_refresh)
+        self._range_timer = QTimer(self)
+        self._range_timer.setSingleShot(True)
+        self._range_timer.setInterval(300)
+        self._range_timer.timeout.connect(self._refresh_coverage_range)
         self._drip = QTimer(self)  # releases fetched rows into the tables a few at a time, so each is seen
         self._drip.setInterval(40)
         self._drip.timeout.connect(self._release_rows)
@@ -897,8 +901,13 @@ class MainWindow(QMainWindow):
         self._range_moved()
 
     def _range_moved(self) -> None:
-        """The Download coverage window lists the sidebar's range, so it follows a change."""
+        """The Download coverage window lists the sidebar's range, so it follows a change: shortly after
+        it, so holding an arrow key on a date doesn't rebuild the window (and ask for counts) per step."""
         if getattr(self, "coverage", None) is not None and self.coverage.isVisible():
+            self._range_timer.start()
+
+    def _refresh_coverage_range(self) -> None:
+        if self.coverage is not None and self.coverage.isVisible():
             self.coverage.refresh_saved()
 
     def _update_comments_enabled(self) -> None:
@@ -1131,7 +1140,7 @@ class MainWindow(QMainWindow):
             self._show_dataset(self.current, animate=True)  # keeps the tables where they are
         elif self._follow and (result.posts or result.updated or result.comments):
             self._refresh_datasets(select=result.subreddit)
-        else:  # the user went to look at another subreddit meanwhile: stay there
+        elif not self._follow:  # the user went to look at another subreddit meanwhile: stay there
             self._refresh_datasets(reload=False)
 
     def _on_failed(self, message: str) -> None:

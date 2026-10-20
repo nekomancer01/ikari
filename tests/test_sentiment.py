@@ -64,6 +64,7 @@ def test_sarcasm_with_two_frames_and_an_everyday_complaint():
 def test_a_post_of_many_short_lines_scores_quickly():
     # Quote stripping matched "\s*" across line breaks, so a long post of short lines took seconds.
     import time
+    sentiment.score("warm up")  # loads the model, which isn't what's timed
     start = time.perf_counter()
     sentiment.score(" \n" * 20000)  # 40,000 characters, the most a Reddit post holds
     assert time.perf_counter() - start < 0.5  # over a second before
