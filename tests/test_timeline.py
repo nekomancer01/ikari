@@ -239,7 +239,9 @@ def test_zooming_eases_unless_motion_is_reduced(window, monkeypatch):
     motion.set_enabled(True)
     QTest.mouseClick(tl.presets["1w"], Qt.MouseButton.LeftButton)
     assert tl._zoom.running() and tl._screen[0] < LAST_END - 7 * DAY  # on its way, from every day
-    pump(motion.DATA_MS + 200)
+    end = time.monotonic() + 5  # on its own clock: a loaded runner's frames stall past a wall-clock wait
+    while tl._zoom.running() and time.monotonic() < end:
+        pump(20)
     assert tl._screen[:2] == (LAST_END - 7 * DAY, LAST_END)
     motion.set_enabled(False)  # View > Reduce motion
     QTest.mouseClick(tl.presets["All"], Qt.MouseButton.LeftButton)
