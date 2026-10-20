@@ -4,10 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import QDate, QObject, QSettings, Qt, Signal
-from PySide6.QtWidgets import QCheckBox, QComboBox, QDateEdit, QFormLayout, QHBoxLayout, QLineEdit, QSpinBox, QWidget
+from PySide6.QtWidgets import QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QLineEdit, QSpinBox, QWidget
 
 from subsentiment import collect
-from subsentiment.gui.widgets import label
+from subsentiment.gui.widgets import DateEdit, label
 
 # Date ranges the fetch form offers: key -> (label, days back from now). "custom" uses the From/To dates.
 RANGES = {"day": ("Past 24 hours", 1), "week": ("Past week", 7), "month": ("Past 30 days", 30),
@@ -31,9 +31,8 @@ def range_bounds(key: str, start: QDate, end: QDate, now: datetime | None = None
     return first.timestamp(), last.timestamp()
 
 
-def date_edit() -> QDateEdit:
-    edit = QDateEdit()
-    edit.setCalendarPopup(True)
+def date_edit() -> DateEdit:
+    edit = DateEdit()
     edit.setDisplayFormat("d MMM yyyy")
     edit.setMinimumDate(QDate(2005, 6, 1))  # Reddit's first month
     edit.setMaximumDate(QDate.currentDate())
