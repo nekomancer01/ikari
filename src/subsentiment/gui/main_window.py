@@ -99,13 +99,14 @@ def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
         if result.stopped:
             parts.append("Stopped early.")
         return " ".join(parts)
-    if not (result.posts or result.updated or result.already):
+    if not (result.posts or result.updated or result.already or result.comments):
         if result.stopped:
             return "Stopped before any posts were fetched."
         if result.timed_out:
             return f"Arctic Shift timed out on r/{result.subreddit} in this range; try again in a few minutes."
         matching = f" matching \u201c{req.query}\u201d" if req.query else ""
-        return f"No new posts found in r/{result.subreddit}{matching} in this date range."
+        return f"No new posts found in r/{result.subreddit}{matching} " + (
+            "on the ticked days." if req.days else "in this date range.")
     parts = [f"Added {plural(result.posts, 'new post')}"
              + (f" and {plural(result.comments, 'comment')}" if req.include_comments else "")
              + f" from r/{result.subreddit}."]
@@ -796,6 +797,8 @@ class MainWindow(QMainWindow):
     def _on_finished(self, result: collect.FetchResult) -> None:
         self._loaded.clear()  # what it saved (scores too) is read again, not shown from memory
         self.progress_msg.setText(finish_text(result, self.request))
+        if self.request.days and not (result.stopped or result.timed_out):  # stopped: the ticks stay, to go on
+            self.coverage.untick(self.request.days)
         self._live.stop()
         self._flush_rows()
         if self.current and self.current.lower() == result.subreddit.lower():
