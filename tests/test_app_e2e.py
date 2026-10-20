@@ -537,7 +537,54 @@ def test_coverage_counts_posts_removed_from_reddit_as_checked(env):
 
 
 def no_total_day(cov, day):
-    return day >= coverage.today() - coverage.COUNT_LAG_DAYS * DAY
+    return day >= coverage.today()
+
+
+def busy_day(env, sub: str, n: int) -> int:
+    """Adds ``n`` posts to the archive on the day three days back, and returns that day."""
+    day = int((NOW - 3 * DAY) // DAY * DAY)
+    base = make_posts(sub, NOW, days=1, per_day=(1,), seed=4)[0]
+    env.archive.posts += [dict(base, id=f"bd{i:05d}", title=f"question {i}", created_utc=day + 30 + i * 50,
+                               num_comments=3, permalink=f"/r/{sub}/comments/bd{i:05d}/x/") for i in range(n)]
+    return day
+
+
+def wait_idle_stalls(w, timeout: float = 60) -> float:
+    """wait_idle, returning the longest the window went without handling events (a freeze)."""
+    end, worst = time.monotonic() + timeout, 0.0
+    while w.thread is not None:
+        assert time.monotonic() < end, "fetch didn't finish"
+        t = time.perf_counter()
+        QApplication.processEvents()
+        worst = max(worst, time.perf_counter() - t)
+        time.sleep(0.01)
+    for _ in range(20):
+        t = time.perf_counter()
+        QApplication.processEvents()
+        worst = max(worst, time.perf_counter() - t)
+        time.sleep(0.01)
+    return worst
+
+
+def test_coverage_stays_responsive_while_a_busy_day_downloads(env):
+    # A day with 1,500 posts used to rebuild 4,500 widgets on every refresh: 2-3 s frozen each time.
+    day = busy_day(env, "bigday", 1500)
+    w = env.window()
+    fetch(w, sub="bigday", comments=False, limit=3)
+    cov = open_coverage(w)
+    row = cov.days.index(day)
+    cov.day_table.selectRow(row)
+    pump(100)
+    env.archive.delay = 0.02
+    QTest.mouseClick(cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    worst = wait_idle_stalls(w)
+    assert worst < 1.0
+    t = cov.post_table
+    assert t.rowCount() == 1500 and t.cellWidget(1499, 1) is None  # rows off screen aren't built
+    t.scrollToBottom()
+    pump(50)
+    assert t.cellWidget(1499, 0).toolTip() or t.cellWidget(1499, 0).text()  # scrolled to: built and filled
+    assert t.cellWidget(1499, 2).findChild(type(w.fetch_btn)).isEnabled()
 
 
 def test_coverage_downloads_do_only_what_they_say(env):

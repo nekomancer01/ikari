@@ -27,8 +27,8 @@ class FetchRequest:
     comments_per_post: int = 50
     top: bool = False  # highest-scored posts of each part of the range, instead of an even sample
     refresh_scores: bool = False  # also re-check saved posts whose scores hadn't settled
-    # Every post in [after, before), with limit as a cap; when the archive runs out first, the range
-    # (one UTC day, starting at after) is recorded as fully downloaded.
+    # Every post in [after, before), with limit as a cap; when every part of the range was read to its
+    # end, the range (one UTC day, starting at after) is recorded as fully downloaded.
     everything: bool = False
     # Only fetch every comment on these saved posts; the other fields but subreddit are ignored.
     comment_posts: tuple[str, ...] = ()
@@ -91,7 +91,8 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
 
     picked = client.fetch_posts(name, req.after, req.before, req.limit, req.query, top=req.top,
                                 skip=() if req.top else stored.keys(),
-                                progress=note, should_stop=should_stop, on_posts=save_streamed)
+                                progress=note, should_stop=should_stop, on_posts=save_streamed,
+                                exhaust=req.everything)
     removed = getattr(client, "removed", None)
     if removed:  # the archive's daily counts include these, so Download coverage counts them as checked
         store.save_removed(name, removed)
@@ -100,9 +101,10 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     for p in new:
         if p.id not in streamed:
             store.save_post(p, *sentiment.score(p.text))
-    # A day that isn't over yet can still get posts, so it's never recorded as complete.
+    # Complete only when every part of the day was read to its end: a fetch that stopped at the limit, or
+    # was stopped, may have missed posts. A day that isn't over yet can still get posts, so it never is.
     if (req.everything and req.after is not None and req.before is not None and req.before <= time.time()
-            and not should_stop() and len(new) < req.limit):
+            and not should_stop() and getattr(client, "exhausted", False)):
         store.mark_complete("posts", name, str(int(req.after)))
     store.commit()
     saved()

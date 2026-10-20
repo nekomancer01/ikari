@@ -225,7 +225,7 @@ def test_coverage_window_lists_days_and_downloads_through_the_fetch_job(make_win
     c.day_table.cellWidget(row, 2).findChild(mw.QPushButton).click()
     req = started[-1]
     assert (req.after, req.before, req.everything, req.subreddit) == (day, day + 86400, True, "Python")
-    assert req.limit == 4 + coverage.SLACK
+    assert req.limit == coverage.MAX_DAY_POSTS  # everything; the day is complete only if the archive ran out
 
     c.day_table.selectRow(row)
     QApplication.processEvents()
@@ -255,10 +255,10 @@ def test_archive_counts_arrive_on_the_gui_thread(make_window, monkeypatch):
     c.totals = Totals()
     c.subreddit = "Python"
     c._count(1_699_920_000, 1_699_920_000 + 86400)
-    c._count_thread.wait(5000)
-    end = time.monotonic() + 5  # the results come back as queued signals, slower on a busy machine
+    end = time.monotonic() + 10  # the thread is wound down from the GUI thread, so keep handling events
     while (c._count_thread is not None or "thread" not in seen) and time.monotonic() < end:
         QApplication.processEvents()
+        time.sleep(0.01)
     assert seen["thread"] is threading.main_thread()
     assert c.totals["python"] == {1_699_920_000: 5} and c._count_thread is None
     c.close()
@@ -295,11 +295,11 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     c.close()
 
 
-def test_recent_days_and_lagging_counts_show_no_total(make_window, monkeypatch):
+def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypatch):
     from subsentiment.gui import coverage
     yesterday, older = coverage.today() - 86400, coverage.today() - 3 * 86400
 
-    def count(self, after, before):  # 3 days ago the count is below what's saved; yesterday's is partial
+    def count(self, after, before):  # 3 days ago the count is below what's saved
         self._on_counts(self.subreddit, {d: (1 if d == older else 9) for d in range(int(after), int(before), 86400)})
     monkeypatch.setattr(coverage.CoverageWindow, "_count", count)
     w = make_window()
@@ -313,9 +313,11 @@ def test_recent_days_and_lagging_counts_show_no_total(make_window, monkeypatch):
     w._show_coverage()
     c = w.coverage
     c.refresh_saved()
-    for day in (yesterday, older):  # yesterday's count (9) is above the 3 saved but still isn't shown
-        cell = c.day_table.cellWidget(c.days.index(day), 1)
-        assert (cell.main.text(), cell.note.text()) == ("3 saved so far", "Still counting")
+    # The older day's count (1) can't be right; yesterday's is whole and shown.
+    cell = c.day_table.cellWidget(c.days.index(older), 1)
+    assert (cell.main.text(), cell.note.text()) == ("3 saved so far", "No usable count")
+    cell = c.day_table.cellWidget(c.days.index(yesterday), 1)
+    assert (cell.main.text(), cell.side.text()) == ("3 of 9", "33%")
     cell = c.day_table.cellWidget(c.days.index(older + 86400), 1)
     assert (cell.main.text(), cell.side.text()) == ("0 of 9", "0%")  # a settled day keeps its total
     c.close()

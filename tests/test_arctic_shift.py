@@ -445,10 +445,29 @@ def test_day_counts_read_each_bucket_format_and_fill_empty_days():
 
 def test_a_timing_out_count_is_split_and_a_day_that_still_times_out_is_left_out():
     slow = FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
-    # two days: the whole range times out three times, then day one works and day two keeps timing out
-    c = client([slow] * 3 + [ok([{"created_utc": D0, "count": 4}])] + [slow] * 3)
+    # two days: the whole range times out three times, then day one works and day two keeps timing out,
+    # including the second go it gets at the end; it's left out (unknown), never counted as 0
+    c = client([slow] * 3 + [ok([{"created_utc": D0, "count": 4}])] + [slow] * 6)
     assert c.day_counts("Python", D0, D0 + 2 * DAY) == {D0: 4}
-    assert [p["limit"] for _, p in c.session.calls] == [3, 3, 3, 2, 2, 2, 2]  # never shrunk like a page
+    assert [p["limit"] for _, p in c.session.calls] == [3, 3, 3] + [2] * 7  # never shrunk like a page
+    assert [p["after"] for _, p in c.session.calls[-6:]] == [D0 + DAY] * 6
+
+
+def test_a_day_whose_count_timed_out_gets_a_second_go():
+    slow = FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
+    c = client([slow] * 3 + [ok([{"created_utc": D0 - 7200, "count": 4}])])
+    assert c.day_counts("Python", D0, D0 + DAY) == {D0: 4}
+
+
+def test_day_buckets_keyed_two_hours_before_utc_midnight_count_for_that_utc_day():
+    # The archive keys a UTC day's bucket at 22:00Z the day before (its own midnight, UTC+2), and the
+    # hour before the clocks change, UTC+1: 23:00Z. Each still belongs to the UTC day that follows.
+    buckets = [{"created_utc": "2026-10-13T22:00:00.000Z", "count": 12},
+               {"created_utc": (D0 + DAY - 7200) * 1000, "count": 3},
+               {"created_utc": D0 + 3 * DAY - 3600, "count": 7},
+               {"created_utc": D0 + 4 * DAY - 7200, "count": 9}]  # the day after the range
+    counts = client([ok(buckets)]).day_counts("Python", D0, D0 + 4 * DAY)
+    assert counts == {D0: 12, D0 + DAY: 3, D0 + 2 * DAY: 0, D0 + 3 * DAY: 7}
 
 
 def test_all_comments_ask_for_the_whole_thread_and_say_whether_it_is_complete():
@@ -493,6 +512,44 @@ def test_a_page_shrunk_after_a_timeout_doesnt_end_the_slice_early():
     assert per_day == [4] * 7
     timeouts = [p for _, p in c.session.calls if p["limit"] > 50]
     assert len(timeouts) == 1  # the smaller page that worked is kept, not retried at full size each time
+
+
+def busy_day(n, removed_every=5):
+    """A day holding n posts spread evenly, every ``removed_every``-th one removed on Reddit."""
+    step = DAY / n
+    return [at(int(T0 + 1 + k * step), k, **({"removed_by_category": "deleted"} if k % removed_every == 0 else {}))
+            for k in range(n)]
+
+
+def test_reading_a_whole_busy_day_goes_on_until_every_slice_runs_out():
+    # Sat 17 Oct on r/AskReddit: 4,288 posts, about a fifth removed, and the archive kept timing out on
+    # full pages. "Download all" stopped at 2,639 of them and still said the day was complete.
+    items = busy_day(4000)
+    usable = {d["id"] for d in items if "removed_by_category" not in d}
+    clock = FakeClock()
+    sample = ArcticShiftClient(session=BusyArchive(items, max_limit=25), limiter=RateLimiter(0.0, clock, clock.sleep))
+    short = sample.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000)
+    assert len(short) < len(usable) and not sample.exhausted  # a few rounds only: it can't say it got them all
+
+    c = ArcticShiftClient(session=BusyArchive(items, max_limit=25), limiter=RateLimiter(0.0, clock, clock.sleep))
+    posts = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True)
+    assert {p.id for p in posts} == usable and c.exhausted
+    assert len(c.removed) == len(items) - len(usable)
+
+
+def test_a_whole_day_read_to_the_limit_or_stopped_is_not_called_exhausted():
+    items = busy_day(400)
+    c = archive(items)
+    assert len(c.fetch_posts("python", after=T0, before=T0 + DAY, limit=100, exhaust=True)) == 100
+    assert not c.exhausted  # stopped at the limit with posts left
+    calls = []
+    stop = lambda: len(calls) > 3 or calls.append(1)  # noqa: E731
+    c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True, should_stop=stop)
+    assert not c.exhausted
+    c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True)
+    assert c.exhausted
+    c.fetch_posts("python", after=T0, before=T0 + DAY, limit=5, top=True)
+    assert not c.exhausted  # top mode picks, it never reads everything
 
 
 def test_a_post_right_on_a_slice_edge_is_found():

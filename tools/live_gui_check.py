@@ -1,6 +1,6 @@
 """Runs the real app window (offscreen) against the live Arctic Shift API and reports what happened.
 
-Run from the repo root:  QT_QPA_PLATFORM=offscreen python tools/live_gui_check.py [subreddit]
+Run from the repo root:  QT_QPA_PLATFORM=offscreen python tools/live_gui_check.py [subreddit] [days back] [seconds per step]
 Does a normal fetch, then opens View > Download coverage, prints each day's row once the archive's counts
 are in, and clicks that window's own Download all for one day and Download all comments for it, all into a
 throwaway database and settings folder. Prints every HTTP status the archive sent, any 4xx/5xx, warning dialogs,
@@ -41,6 +41,8 @@ def _logged_get(self, url, **kw):
 
 def main() -> None:
     sub = sys.argv[1] if len(sys.argv) > 1 else "python"
+    back = int(sys.argv[2]) if len(sys.argv) > 2 else 3  # which day's Download all to click, in days back
+    cap = float(sys.argv[3]) if len(sys.argv) > 3 else 600  # seconds before a step presses Stop
     requests.Session.get = _logged_get
     app = QApplication([])
     app.setOrganizationName("ikari-live-check")
@@ -63,17 +65,23 @@ def main() -> None:
     w._queue_new_rows = timed
 
     def run(label, start):
-        t0, spent[0] = time.time(), 0.0
+        t0, spent[0], worst = time.time(), 0.0, 0.0
         start()
+        stopped = False
         while w.thread is not None:
+            if not stopped and time.time() - t0 > cap:
+                w._stop_fetch()
+                stopped = True
+            t = time.perf_counter()
             app.processEvents()
+            worst = max(worst, time.perf_counter() - t)  # how long the window went without handling input
             time.sleep(0.005)
         for _ in range(50):
             app.processEvents()
             time.sleep(0.01)
         model = w.posts_tab.model
         subs = {model.row_at(i)["subreddit"].lower() for i in range(model.rowCount())}
-        print(f"{label}: {time.time() - t0:.0f} s, {spent[0]:.1f} s reading rows back; "
+        print(f"{label}: {time.time() - t0:.0f} s, {spent[0]:.1f} s reading rows back, worst freeze {worst:.1f} s; "
               f"tables show {sorted(subs)}; {w.progress_msg.text()}")
 
     w.subreddit.setText(sub)
@@ -91,11 +99,12 @@ def main() -> None:
         for row, d in enumerate(cov.days):
             cell = cov.day_table.cellWidget(row, 1)
             side = cell.note.text() if cell.note.isVisible() else cell.side.text()
+            gone = w.store.removed_per_day(sub, d, d + 86400).get(d, 0)
             print(f"  {coverage.day_text(d)}: {cell.main.text()} | {side} | "
-                  f"archive count {cov.totals.get(sub.lower(), {}).get(d)}")
+                  f"archive count {cov.totals.get(sub.lower(), {}).get(d)}, removed posts seen {gone}")
     print(f"Coverage window: counts in after {time.time() - t0:.0f} s, error: {cov.count_error or 'none'}")
     rows()
-    row = 3  # a settled day, three days back
+    row = back  # a settled day
     day = cov.days[row]
     cov.day_table.selectRow(row)
     run(f"Coverage Download all, {coverage.day_text(day)}",

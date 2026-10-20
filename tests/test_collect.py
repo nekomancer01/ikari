@@ -26,9 +26,11 @@ class FakeClient:
         return [self.by_id[i] for i in ids if i in self.by_id]
 
     def fetch_posts(self, subreddit, after, before, limit, query, top=False, skip=(), progress=None,
-                    should_stop=None, on_posts=None):
+                    should_stop=None, on_posts=None, exhaust=False):
         self.calls.append(("posts", top, set(skip)))
-        picked = [p for p in self.posts if top or p.id not in skip][:limit]
+        left = [p for p in self.posts if top or p.id not in skip]
+        picked = left[:limit]
+        self.exhausted = not top and len(picked) == len(left)
         for p in picked:  # the real client hands over each page as it is downloaded
             if on_posts:
                 on_posts([p])
@@ -177,6 +179,22 @@ def test_downloading_a_whole_day_marks_it_complete_only_when_the_archive_ran_out
                 collect.FetchRequest("python", after=T, before=T + 86400, limit=2, everything=True,
                                      include_comments=False))
     assert s2.complete_keys("posts", "python") == set()  # it may have had more than the 2 asked for
+
+
+def test_a_whole_day_that_stopped_short_of_the_limit_is_not_marked_complete(tmp_path):
+    # Sat 17 Oct: Download all saved 1,859 posts, well under its limit, but the archive had more it never
+    # read. Getting fewer than asked for doesn't mean the archive ran out; only the client can say that.
+    class ShortClient(FakeClient):
+        def fetch_posts(self, *a, **kw):
+            picked = super().fetch_posts(*a, **kw)[:2]
+            self.exhausted = False
+            return picked
+
+    s = store_with(tmp_path, [])
+    collect.run(ShortClient(posts=[mk(1), mk(2), mk(3)]), s,
+                collect.FetchRequest("python", after=T, before=T + 86400, limit=10000, everything=True,
+                                     include_comments=False))
+    assert s.complete_keys("posts", "python") == set()
 
 
 def test_each_post_and_comment_is_saved_and_announced_as_it_arrives(tmp_path):

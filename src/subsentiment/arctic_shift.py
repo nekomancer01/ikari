@@ -16,6 +16,7 @@ What callers should know:
 """
 from __future__ import annotations
 
+import itertools
 import math
 import queue
 import threading
@@ -261,6 +262,7 @@ class ArcticShiftClient:
         # Posts the archive returned that were removed on Reddit, id -> created_utc: fetching skips them,
         # but the archive's daily counts include them, so Download coverage counts them as checked.
         self.removed: dict[str, float] = {}
+        self.exhausted = False  # whether the last fetch_posts read its whole range (see there)
 
     # -- HTTP ---------------------------------------------------------------
 
@@ -338,6 +340,7 @@ class ArcticShiftClient:
         progress: ProgressFn | None = None,
         should_stop: StopFn | None = None,
         on_posts: Callable[[list[Post]], None] | None = None,
+        exhaust: bool = False,
     ) -> list[Post]:
         """Up to ``limit`` posts created in [after, before), spread evenly over the range, oldest first.
 
@@ -349,6 +352,11 @@ class ArcticShiftClient:
 
         ``on_posts`` is given each batch of posts as soon as it is downloaded (each slice's, outside top
         mode, where posts can only be ranked at the end), so a caller can show them while the rest comes.
+
+        Slices that run out leave others to make up the difference, a few rounds at most; with
+        ``exhaust`` (not in top mode), rounds go on until every slice has been read to its end or
+        ``limit`` is reached. Afterwards ``self.exhausted`` says whether every slice was read to its end,
+        so the range holds no posts beyond the ones returned and those in ``skip``.
         """
         subreddit = normalize_subreddit(subreddit)
         if error := subreddit_error(subreddit):
@@ -360,6 +368,7 @@ class ArcticShiftClient:
             base["query"] = query
         skip = set(skip)
         self._page_cap = PAGE
+        self.exhausted = False
 
         n = slot_count(after, before, limit, top)
         windows = slices(after, before, n)
@@ -401,8 +410,8 @@ class ArcticShiftClient:
                 progress(f"{what} posts from r/{subreddit}: part {done} of {len(windows)}, {got:,} so far")
 
         # Quiet slices (night hours, a slow week) leave the total short. Share what's missing among the
-        # slices that had more to give, a few rounds at most.
-        for _ in range(3):
+        # slices that had more to give, a few rounds at most (as many as it takes, with exhaust).
+        for _ in itertools.count() if exhaust and not top else range(3):
             short = limit - sum(map(len, picked))
             if top:
                 open_ = [i for i, extra in enumerate(spare) if extra]
@@ -436,6 +445,7 @@ class ArcticShiftClient:
                     on_posts(extra)
         posts = [p for group in picked for p in group]
         posts.sort(key=lambda p: p.created_utc)
+        self.exhausted = not top and not any(more)
         return posts
 
     def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int, int]:
@@ -553,16 +563,25 @@ class ArcticShiftClient:
                    should_stop: StopFn | None = None) -> dict[int, int]:
         """Posts the archive holds for each UTC day in [after, before), as {day start: count}, from its
         aggregate endpoint. The counts include posts later removed on Reddit, which fetching skips. Days
-        the archive couldn't count (it times out on very busy subreddits) are left out."""
+        the archive couldn't count (it times out on very busy subreddits) are left out, not given 0.
+
+        The archive keys each day's bucket at its own midnight, two hours ahead of UTC (22:00Z the day
+        before, while Europe is on summer time), though the bucket holds the UTC day: on r/AskReddit the
+        bucket keyed 2026-10-16T22:00Z held 4,288 posts, exactly the 24 hourly buckets of UTC 17 Oct. So
+        a bucket counts for the UTC day whose midnight is nearest its key."""
         subreddit = normalize_subreddit(subreddit)
         if error := subreddit_error(subreddit):
             raise FetchError(error)
         first, end = int(after // DAY * DAY), int(math.ceil(before / DAY) * DAY)
         todo = [(lo, min(lo + COUNT_CHUNK_DAYS * DAY, end)) for lo in range(first, end, COUNT_CHUNK_DAYS * DAY)]
         out: dict[int, int] = {}
-        while todo:
+        failed: list[int] = []
+        retried = False
+        while todo or (failed and not retried):
             if should_stop and should_stop():
                 break
+            if not todo:  # one more go at the days that timed out, now the archive has had a breather
+                todo, failed, retried = [(d, d + DAY) for d in failed], [], True
             lo, hi = todo.pop(0)
             params = {"subreddit": subreddit, "aggregate": "created_utc", "frequency": "day",
                       "after": lo, "before": hi, "limit": (hi - lo) // DAY + 1}
@@ -571,17 +590,21 @@ class ArcticShiftClient:
             except Stopped:
                 break
             except QueryTimeout:
-                if hi - lo > DAY:  # try the halves; a single day that times out stays unknown
+                if hi - lo > DAY:  # try the halves
                     mid = lo + (hi - lo) // DAY // 2 * DAY
                     todo[:0] = [(lo, mid), (mid, hi)]
+                else:
+                    failed.append(lo)
                 continue
             for day in range(lo, hi, DAY):
                 out[day] = 0  # a day with no bucket had no posts
             for b in buckets:
                 when, n = _bucket_time(b), _number((b or {}).get("count", (b or {}).get("doc_count")), None)
-                if when is not None and n is not None and lo <= when < hi:
-                    day = int(when // DAY * DAY)
-                    out[day] = out.get(day, 0) + int(n)
+                if when is None or n is None:
+                    continue
+                day = int((when + DAY // 2) // DAY * DAY)
+                if lo <= day < hi:
+                    out[day] += int(n)
         return out
 
     # -- comments ---------------------------------------------------------------
