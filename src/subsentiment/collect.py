@@ -144,7 +144,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
 
         # A few posts' comments are fetched at once; each finished one is saved here, on this thread.
         tried: set[str] = set()
-        for p, comments, error in in_parallel(fetch, todo, getattr(client, "workers", 1)):
+        for p, comments, error in in_parallel(fetch, todo, getattr(client, "workers", 1), should_stop):
             if comments is None and error is None:
                 continue
             tried.add(p.id)
@@ -215,7 +215,7 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
 
     # A few posts' threads are fetched at once; each finished one is saved here, on this thread.
     tried: set[str] = set()
-    for p, got, error in in_parallel(fetch, posts, getattr(client, "workers", 1)):
+    for p, got, error in in_parallel(fetch, posts, getattr(client, "workers", 1), should_stop):
         if got is None and error is None:
             continue
         tried.add(p.id)

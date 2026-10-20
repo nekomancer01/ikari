@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import time
 from datetime import datetime, timezone
 from typing import Callable, Collection, Iterable
@@ -638,9 +638,12 @@ class ArcticShiftClient:
         return comments, items, _collapsed(tree)
 
 
-def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS):
+def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS, should_stop: StopFn | None = None):
     """Run fn(item) for each item, up to ``workers`` at once, and yield (item, result, error) as each
-    finishes, on the calling thread. Stopping early (closing the generator) cancels what hasn't started."""
+    finishes, on the calling thread. Stopping early (closing the generator) cancels what hasn't started.
+
+    With ``should_stop``, once it turns true this returns without waiting for calls still running: their
+    results are dropped. For calls that can take long and are cheap to redo, like a big comment tree."""
     items = list(items)
     if workers <= 1 or len(items) <= 1:
         for item in items:
@@ -652,11 +655,18 @@ def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS):
     pool = ThreadPoolExecutor(max_workers=min(workers, len(items)))
     try:
         futures = {pool.submit(fn, item): item for item in items}
-        for f in as_completed(futures):
-            error = f.exception()
-            yield futures[f], None if error else f.result(), error
+        pending = set(futures)
+        while pending:
+            finished, pending = wait(pending, timeout=STOP_POLL if should_stop else None,
+                                     return_when=FIRST_COMPLETED)
+            for f in finished:
+                error = f.exception()
+                yield futures[f], None if error else f.result(), error
+            if should_stop and should_stop():
+                return
     finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+        stopped = bool(should_stop and should_stop())
+        pool.shutdown(wait=not stopped, cancel_futures=True)
 
 
 def _walk(items: list, depth: int = 0):

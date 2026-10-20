@@ -249,3 +249,21 @@ def test_comments_fetched_at_once_still_give_up_after_repeated_failures(tmp_path
     assert collect.GIVE_UP_AFTER <= tried < collect.GIVE_UP_AFTER + c.workers  # only those already under way
     assert result.comment_errors == 20
     assert all(r["comments_ok"] == 0 for r in s.posts_between("python", None, None))
+
+
+def test_stop_doesnt_wait_for_a_comment_tree_still_downloading(tmp_path):
+    # One huge thread takes the archive ages to send; Stop shouldn't sit it out.
+    class HugeThread(SlowClient):
+        def fetch_comments(self, post, limit):
+            if post.id == "p0":
+                time.sleep(3)
+            return super().fetch_comments(post, limit)
+
+    s = store_with(tmp_path, [])
+    stop = threading.Event()
+    threading.Timer(0.3, stop.set).start()
+    start = time.perf_counter()
+    result = collect.run(HugeThread(posts=[mk(i) for i in range(12)]), s, collect.FetchRequest("python"),
+                         should_stop=stop.is_set)
+    assert time.perf_counter() - start < 1.5 and result.stopped
+    assert s.posts("python") and result.comment_errors == 0  # what finished is kept, nothing marked failed
