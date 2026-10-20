@@ -37,6 +37,7 @@ def parse() -> argparse.Namespace:
     ap.add_argument("--live", action="store_true", help="use the real Arctic Shift")
     ap.add_argument("--scale", type=float, default=1.0, help="device pixel ratio, e.g. 1.5 for Windows 150%%")
     ap.add_argument("--screen", default="1920x1200", help="physical screen size")
+    ap.add_argument("--theme", default="dark", choices=["dark", "light", "system"])
     ap.add_argument("--small", default="python", help="a quieter subreddit")
     ap.add_argument("--busy", default="AskReddit", help="a busy subreddit")
     ap.add_argument("--latency", type=float, default=0.6, help="fake archive: seconds per answer")
@@ -70,6 +71,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QPushButto
 
 from subsentiment import arctic_shift, sentiment  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
+from subsentiment.gui import native, theme  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
 import inspect  # noqa: E402
@@ -284,6 +286,11 @@ TMP = Path(tempfile.mkdtemp())
 QSettings.setDefaultFormat(QSettings.Format.IniFormat)
 QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(TMP))
 QSettings().setValue("updates/auto", False)
+QSettings().setValue("ui/theme", ARGS.theme)
+# What gui/app.py does before opening the window: without it the window has no stylesheet or fonts.
+theme.load_fonts(app)
+native.set_appearance(ARGS.theme)
+theme.apply(app, ARGS.theme)
 DB = str(TMP / "qa.db")
 dialogs: list[str] = []
 QMessageBox.warning = lambda *a, **k: dialogs.append(f"warning: {a[1]}: {a[2]}") or QMessageBox.StandardButton.Ok
