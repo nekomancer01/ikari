@@ -204,11 +204,18 @@ def step(name: str):
 
 
 def db_counts(sub: str) -> tuple[int, int]:
-    s = Store(DB)
+    # Read-only and raw: Store.close() runs a TRUNCATE checkpoint, which waits up to 5 s for the fetch's
+    # writes, and those waits on the GUI thread would be the walkthrough's own freezes, not the app's.
+    import sqlite3
+
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=0.5)
     try:
-        return len(s.posts(sub)), len(s.comments(sub))
+        return tuple(con.execute(f"select count(*) from {t} where subreddit = ? collate nocase", (sub,)).fetchone()[0]
+                     for t in ("posts", "comments"))
+    except sqlite3.OperationalError:  # no database yet
+        return 0, 0
     finally:
-        s.close()
+        con.close()
 
 
 def visible(w) -> dict:
