@@ -88,27 +88,27 @@ def test_switching_subreddit_fades_and_counts_to_the_new_values(make_window):
     w = make_window()
     pick(w, "Python")
     pump(motion.DATA_MS + 300)
-    assert w.tiles["count"].value.text() == "40"
-    chart = w.distribution.chart()
+    assert w.overview.tiles["count"].value.text() == "40"
+    chart = w.overview.distribution.chart()
 
     pick(w, "rust")
     # The new values are there at once...
-    assert w.tiles["count"].value.text() == "30" and w.tiles["negative"].value.text() == "83%"
-    assert w.tiles["negative"].meter.share == pytest.approx(25 / 30)
+    assert w.overview.tiles["count"].value.text() == "30" and w.overview.tiles["negative"].value.text() == "83%"
+    assert w.overview.tiles["negative"].meter.share == pytest.approx(25 / 30)
     # ...the old view fades out over them, the cards fade in, and the numbers count down to them.
     assert snapshots(w.content)
-    assert any(isinstance(c.graphicsEffect(), QGraphicsOpacityEffect) for c in w.cards)
+    assert any(isinstance(c.graphicsEffect(), QGraphicsOpacityEffect) for c in w.overview.cards)
     pump(motion.DATA_MS // 3)
-    assert drawn(w.tiles["count"].value) not in ("40", "30")
-    heights = w.distribution.shown_heights()
+    assert drawn(w.overview.tiles["count"].value) not in ("40", "30")
+    heights = w.overview.distribution.shown_heights()
     assert 10 < heights[0] < 25 and 5 < heights[2] < 30  # negative growing, positive shrinking
-    assert w.distribution.chart() is chart  # updated in place, not rebuilt
+    assert w.overview.distribution.chart() is chart  # updated in place, not rebuilt
 
     pump(motion.DATA_MS + 6 * motion.STAGGER_MS + 300)
-    assert drawn(w.tiles["count"].value) == "30" and drawn(w.tiles["negative"].value) == "83%"
-    assert w.distribution.shown_heights() == [25.0, 0.0, 5.0]
+    assert drawn(w.overview.tiles["count"].value) == "30" and drawn(w.overview.tiles["negative"].value) == "83%"
+    assert w.overview.distribution.shown_heights() == [25.0, 0.0, 5.0]
     assert not snapshots(w.content)
-    assert all(c.graphicsEffect() is None for c in w.cards)  # painted plainly again once faded in
+    assert all(c.graphicsEffect() is None for c in w.overview.cards)  # painted plainly again once faded in
 
 
 def test_tabs_crossfade(make_window):
@@ -131,13 +131,13 @@ def test_new_data_while_shown_counts_up_and_new_extremes_fade_in(make_window):
     w.comments = []
     w.posts = w.store.posts("Python")  # what a running fetch's live refresh does, a second's rows at a time
     w._render_overview()
-    assert w.tiles["count"].value.text() == "60"
-    assert snapshots(w.most_negative.viewport())  # its entries changed
-    assert not snapshots(w.most_positive.viewport())  # its entries didn't: left alone
+    assert w.overview.tiles["count"].value.text() == "60"
+    assert snapshots(w.overview.most_negative.viewport())  # its entries changed
+    assert not snapshots(w.overview.most_positive.viewport())  # its entries didn't: left alone
     pump(motion.DATA_MS // 3)
-    assert 40 < int(drawn(w.tiles["count"].value)) < 60
+    assert 40 < int(drawn(w.overview.tiles["count"].value)) < 60
     pump(motion.DATA_MS + 200)
-    assert drawn(w.tiles["count"].value) == "60"
+    assert drawn(w.overview.tiles["count"].value) == "60"
 
 
 def test_a_snapshot_never_outlives_a_resize(make_window):
@@ -157,8 +157,8 @@ def test_reduce_motion_changes_everything_at_once(make_window):
     pick(w, "Python")
     pick(w, "rust")
     assert not snapshots(w.content)
-    assert all(c.graphicsEffect() is None for c in w.cards)
-    assert drawn(w.tiles["count"].value) == "30" and w.distribution.shown_heights() == [25.0, 0.0, 5.0]
+    assert all(c.graphicsEffect() is None for c in w.overview.cards)
+    assert drawn(w.overview.tiles["count"].value) == "30" and w.overview.distribution.shown_heights() == [25.0, 0.0, 5.0]
     w.tabbar.setCurrentIndex(2)
     assert not snapshots(w.content)
     w.close()

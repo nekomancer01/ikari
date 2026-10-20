@@ -15,19 +15,19 @@ from PySide6.QtWidgets import (
 )
 
 from subsentiment import __version__, collect
+from subsentiment.analysis import Analysis
 from subsentiment.gui import days, motion, native, theme
-from subsentiment.gui.charts import DistributionChart, TimelineChart
 from subsentiment.gui.coverage import CoverageWindow
 from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, RowsModel
+from subsentiment.gui.overview import OverviewPage
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.widgets import (
-    ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatTile, StatusLabel, VerticalScrollArea, fit_to_screen, label,
-    panel, plural, section,
+    ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatusLabel, fit_to_screen, label, panel, plural, section,
 )
 from subsentiment.gui.worker import BackgroundJob, FetchWorker
 from subsentiment.reddit import normalize_subreddit, subreddit_error
-from subsentiment.store import Store, daily_means, summarize
+from subsentiment.store import Store
 
 
 # Date ranges the fetch form offers: key -> (label, days back from now). "custom" uses the From/To dates.
@@ -112,6 +112,8 @@ def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
     if not (result.posts or result.updated or result.already):
         if result.stopped:
             return "Stopped before any posts were fetched."
+        if result.timed_out:
+            return f"Arctic Shift timed out on r/{result.subreddit} in this range; try again in a few minutes."
         matching = f" matching \u201c{req.query}\u201d" if req.query else ""
         return f"No new posts found in r/{result.subreddit}{matching} in this date range."
     parts = [f"Added {plural(result.posts, 'new post')}"
@@ -122,6 +124,9 @@ def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
     if result.already:
         parts.append(f"{plural(result.already, 'top post')} {'was' if result.already == 1 else 'were'} "
                      "already saved.")
+    if result.timed_out:
+        parts.append("Arctic Shift timed out on part of the range, so some posts were skipped; "
+                     "fetch again later to fill them in.")
     if result.comment_errors:
         parts.append(f"Comments couldn't be fetched for {plural(result.comment_errors, 'post')}; "
                      "fetch again later to fill them in.")
@@ -595,7 +600,8 @@ class MainWindow(QMainWindow):
         self.tabbar.currentChanged.connect(lambda _: motion.crossfade(content))  # first: the old tab's look
         self.tabbar.currentChanged.connect(self.pages.setCurrentIndex)
         self.tabbar.currentChanged.connect(lambda i: self.scope.setVisible(i == 0))
-        self.pages.addWidget(self._build_overview())
+        self.overview = OverviewPage()
+        self.pages.addWidget(self.overview)
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
         self.comments_tab = TablePage(COMMENT_COLUMNS, stretch_col=2)
         # The post title would otherwise size to its text and squeeze the comment column.
@@ -606,62 +612,6 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.comments_tab)
         lay.addWidget(self.pages, 1)
         return content
-
-    def _build_overview(self) -> QWidget:
-        page = QWidget()
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(14)
-
-        self.tiles = {
-            "count": StatTile("Items analysed"),
-            "mean": StatTile("Mean sentiment"),
-            "positive": StatTile("Positive", meter="positive"),
-            "negative": StatTile("Negative", meter="negative"),
-        }
-        tiles = QHBoxLayout()
-        tiles.setSpacing(14)
-        widest = max(t.minimumSizeHint().width() for t in self.tiles.values())
-        for t in self.tiles.values():
-            t.setMinimumWidth(widest)  # equal widths, whatever the caption length, down to the narrowest window
-            tiles.addWidget(t, 1)
-        lay.addLayout(tiles)
-
-        self.distribution = DistributionChart()
-        self.timeline = TimelineChart()
-        charts = QHBoxLayout()
-        charts.setSpacing(14)
-        for chart, stretch in ((self.distribution, 2), (self.timeline, 3)):
-            card, inner = panel("true", margins=10)
-            inner.addWidget(chart)
-            charts.addWidget(card, stretch)
-        lay.addLayout(charts, 3)
-
-        self.most_positive = QListWidget()
-        self.most_negative = QListWidget()
-        extremes = QHBoxLayout()
-        extremes.setSpacing(14)
-        for title, lw in (("Most positive", self.most_positive), ("Most negative", self.most_negative)):
-            lw.setFrameShape(QFrame.Shape.NoFrame)
-            # Long titles end in "…" (the tooltip has the rest) instead of adding a sideways scrollbar.
-            lw.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            lw.setTextElideMode(Qt.TextElideMode.ElideRight)
-            lw.setUniformItemSizes(True)
-            QuietScrollBars(lw)
-            lw.itemDoubleClicked.connect(
-                lambda item: QDesktopServices.openUrl(QUrl(item.data(Qt.ItemDataRole.UserRole))))
-            card, inner = panel("solid", margins=14, spacing=6)
-            inner.addWidget(label(title, "muted"))
-            inner.addWidget(lw)
-            extremes.addWidget(card)
-        lay.addLayout(extremes, 2)
-        self.cards = [*self.tiles.values(), *(self.distribution.parentWidget(), self.timeline.parentWidget()),
-                      *(lw.parentWidget() for lw in (self.most_positive, self.most_negative))]
-        # On a short window (1366x768 or 1280x800 at 125%) the overview scrolls rather than holding the
-        # window taller than the screen or squeezing the charts.
-        scroll = VerticalScrollArea()
-        scroll.setWidget(page)
-        return scroll
 
     # -- theme ----------------------------------------------------------------
 
@@ -1043,7 +993,7 @@ class MainWindow(QMainWindow):
         self._update_delete_enabled()
         self.coverage_act.setEnabled(bool(self.current))
         if switching and self.pages.currentIndex() == 0:
-            motion.fade_in_all(self.cards)
+            motion.fade_in_all(self.overview.cards)
         if self.coverage is not None:
             self.coverage.set_subreddit(self.current)
 
@@ -1082,42 +1032,10 @@ class MainWindow(QMainWindow):
 
     def _render_overview(self) -> None:
         scope = self.scope.currentText()
-        rows = (list(self.posts) if scope != "Comments only" else []) + \
-               (list(self.comments) if scope != "Posts only" else [])
-        s = summarize(rows)
-        n = s["count"]
-        pos, neg = (s["counts"]["positive"] / n, s["counts"]["negative"] / n) if n else (0.0, 0.0)
-        self.tiles["count"].set_number(n, lambda v: f"{round(v):,}")
-        if n:
-            self.tiles["mean"].set_number(s["mean"], lambda v: f"{v:+.3f}")
-            self.tiles["positive"].set_number(100 * pos, lambda v: f"{v:.0f}%", pos)
-            self.tiles["negative"].set_number(100 * neg, lambda v: f"{v:.0f}%", neg)
-        else:
-            for key in ("mean", "positive", "negative"):
-                self.tiles[key].set("–")
-        self.mood.set_counts(s["counts"]["positive"], s["counts"]["negative"], n)
-        self.distribution.set_counts(s["counts"])
-        self.timeline.set_points(daily_means(rows))
-
-        ranked = sorted(rows, key=lambda r: r["sentiment"])
-        self._fill_extremes(self.most_positive, list(reversed(ranked[-10:])))
-        self._fill_extremes(self.most_negative, ranked[:10])
-
-    @staticmethod
-    def _fill_extremes(widget: QListWidget, rows) -> None:
-        texts = [f"{r['sentiment']:+.2f}    {' '.join(((r['title'] if 'title' in r.keys() else r['body']) or '').split())[:140]}"
-                 for r in rows]
-        if texts == [widget.item(i).text() for i in range(widget.count())]:
-            return  # the same items: nothing to redo (a running fetch asks once a second)
-        motion.crossfade(widget.viewport())
-        widget.clear()
-        for r in rows:
-            text = r["title"] if "title" in r.keys() else r["body"]
-            text = " ".join((text or "").split())
-            item = QListWidgetItem(f"{r['sentiment']:+.2f}    {text[:140]}")
-            item.setToolTip(text[:1000])
-            item.setData(Qt.ItemDataRole.UserRole, r["permalink"])
-            widget.addItem(item)
+        a = Analysis((list(self.posts) if scope != "Comments only" else []) +
+                     (list(self.comments) if scope != "Posts only" else []))
+        self.overview.show_analysis(a)
+        self.mood.set_counts(a.counts["positive"], a.counts["negative"], a.count)
 
     def _delete_dataset(self) -> None:
         if not self.current or self.fetch_job.busy:

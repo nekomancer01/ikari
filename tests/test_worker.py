@@ -98,9 +98,12 @@ def test_a_database_that_cant_be_opened_fails_the_fetch_instead_of_hanging_it(tm
 def test_a_background_job_runs_its_worker_off_the_gui_thread_and_tidies_up():
     import threading
     import time
-    from PySide6.QtCore import QCoreApplication, QObject, Signal, Slot
+    from PySide6.QtCore import QObject, Signal, Slot
+    from PySide6.QtWidgets import QApplication
 
-    app = QCoreApplication.instance() or QCoreApplication([])
+    # A QApplication, not a QCoreApplication: the first app made in a process is the one every later test
+    # gets, and a window built on a QCoreApplication aborts the whole test run.
+    app = QApplication.instance() or QApplication([])
 
     class Worker(QObject):
         finished = Signal(object)

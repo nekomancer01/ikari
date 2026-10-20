@@ -4,7 +4,8 @@ import pytest
 
 from subsentiment import collect
 from subsentiment.reddit import Comment, Post
-from subsentiment.store import Store, daily_means, summarize
+from subsentiment.analysis import Analysis
+from subsentiment.store import Store
 
 
 def make_post(i, sub="Python", ts=1_700_000_000.0):
@@ -31,10 +32,20 @@ def test_summary_and_daily_means():
     rows = [{"label": "positive", "sentiment": 0.8, "created_utc": 0},
             {"label": "negative", "sentiment": -0.4, "created_utc": 3600},
             {"label": "neutral", "sentiment": 0.0, "created_utc": 86400 + 5}]
-    s = summarize(rows)
-    assert s["counts"] == {"negative": 1, "neutral": 1, "positive": 1}
-    assert abs(s["mean"] - 0.4 / 3) < 1e-9
-    assert daily_means(rows) == [(0, 0.2, 2), (86400, 0.0, 1)]
+    s = Analysis(rows)
+    assert s.counts == {"negative": 1, "neutral": 1, "positive": 1}
+    assert abs(s.mean - 0.4 / 3) < 1e-9
+    assert s.daily_means == [(0, 0.2, 2), (86400, 0.0, 1)]
+
+
+def test_strongest_items_match_the_old_sorted_list_ties_included():
+    rows = [{"id": i, "label": "neutral", "sentiment": v, "created_utc": 0}
+            for i, v in enumerate([0.5, -0.2, 0.5, 0.9, -0.2, 0.0, 0.5, -0.7])]
+    ranked = sorted(rows, key=lambda r: r["sentiment"])
+    a = Analysis(rows)
+    for n in (1, 2, 3, 10):
+        assert a.most_positive(n) == list(reversed(ranked[-n:]))
+        assert a.most_negative(n) == ranked[:n]
 
 
 class FakeClient:

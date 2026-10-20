@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS comment_fetches (
     ok INTEGER, settled INTEGER, fetched_at REAL
 );
 -- Ranges whose whole content ikari has fetched: kind "posts" keys a UTC day (its start, in epoch
--- seconds) and kind "comments" keys a post id. Used to show a day or thread as fully downloaded even
+-- seconds) and kind "comments" keys a post id; "comments_so_far" keys a post whose whole thread was fetched
+-- before the archive re-checked it, so more comments may still come. Used to show a day or thread as fully downloaded even
 -- when the archive's totals (which count removed items) are higher than what could be saved.
 CREATE TABLE IF NOT EXISTS complete (
     kind TEXT NOT NULL, subreddit TEXT NOT NULL, key TEXT NOT NULL, fetched_at REAL,  -- subreddit lowercased
@@ -271,23 +272,3 @@ class Store:
         finally:
             part.unlink(missing_ok=True)
         return len(rows)
-
-
-def summarize(rows) -> dict:
-    """Counts per label and mean compound score for a set of post/comment rows."""
-    counts = {"negative": 0, "neutral": 0, "positive": 0}
-    total = 0.0
-    for r in rows:
-        counts[r["label"]] += 1
-        total += r["sentiment"]
-    n = sum(counts.values())
-    return {"count": n, "counts": counts, "mean": total / n if n else 0.0}
-
-
-def daily_means(rows) -> list[tuple[int, float, int]]:
-    """[(day_start_utc, mean_sentiment, n)] sorted by day."""
-    buckets: dict[int, list[float]] = {}
-    for r in rows:
-        day = int(r["created_utc"] // 86400 * 86400)
-        buckets.setdefault(day, []).append(r["sentiment"])
-    return [(d, sum(v) / len(v), len(v)) for d, v in sorted(buckets.items())]
