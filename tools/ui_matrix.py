@@ -222,15 +222,15 @@ def alignment(window) -> list[str]:
     # The content column: heading, subtitle and the page below share a left edge; tabs end at its right.
     page = window.pages.currentWidget()
     if window.tabbar.currentIndex() == 0:
-        tiles = list(window.tiles.values())
+        tiles = list(window.overview.tiles.values())
         body = [_rect(t, window) for t in tiles]
         _same(problems, "content left edges", {"heading": _rect(window.heading, window).left(),
                                                 "subtitle": _rect(window.subheading, window).left(),
                                                 "first tile": body[0].left()})
         _same(problems, "tile widths", {t.findChild(QLabel).text(): t.width() for t in tiles})
         _same(problems, "tile tops", {t.findChild(QLabel).text(): _rect(t, window).top() for t in tiles})
-        cards = [_rect(c.parentWidget(), window) for c in (window.distribution, window.timeline,
-                                                         window.most_positive, window.most_negative)]
+        o = window.overview
+        cards = [_rect(c.parentWidget(), window) for c in (o.distribution, o.timeline, o.most_positive, o.most_negative)]
         _same(problems, "overview left edges", {"tiles": body[0].left(), "charts": cards[0].left(),
                                                  "lists": cards[2].left()})
         _same(problems, "overview right edges", {"tiles": body[-1].right(), "charts": cards[1].right(),
