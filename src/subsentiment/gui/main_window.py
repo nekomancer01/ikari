@@ -1242,6 +1242,8 @@ class MainWindow(QMainWindow):
                 sig.disconnect()
             thread.quit()
             thread.wait(3000)
+        self._live.stop()  # both read the store
+        self._drip.stop()
         self.store.close()
         super().closeEvent(event)
 
