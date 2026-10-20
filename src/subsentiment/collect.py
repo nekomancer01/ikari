@@ -9,7 +9,7 @@ from typing import Callable
 import requests
 
 from subsentiment import sentiment
-from subsentiment.arctic_shift import ArcticShiftClient, in_parallel
+from subsentiment.arctic_shift import ArcticShiftClient, Stopped, in_parallel
 from subsentiment.reddit import FetchError, Post, normalize_subreddit
 from subsentiment.store import Store
 
@@ -55,6 +55,8 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     limiter = getattr(client, "limiter", None)
     if limiter is not None:
         limiter.on_wait = lambda secs, why: note(f"{why}. Waiting {secs:.0f} s before the next request…")
+    if hasattr(client, "should_stop"):
+        client.should_stop = should_stop  # so Stop also cuts short retries and waits inside a request
 
     if req.comment_posts:
         return _all_comments(client, store, req, progress, should_stop, saved)
@@ -128,6 +130,8 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
                 return None  # not tried
             try:
                 comments = client.fetch_comments(p, req.comments_per_post)
+            except Stopped:
+                return None  # not tried
             except (FetchError, requests.RequestException):
                 with lock:
                     streak[0] += 1
@@ -187,23 +191,44 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
             store.save_post(p, *sentiment.score(p.text))
         store.commit()
         posts = [fresh.get(p.id, p) for p in posts]
-    n_comments = errors = failed_in_row = 0
-    for i, p in enumerate(posts, 1):
-        if should_stop():
-            break
-        progress(i - 1, len(posts), f"All comments for post {i}/{len(posts)}: {p.title[:60]}")
+    n_comments = errors = done = 0
+    gave_up = threading.Event()
+    streak = [0]  # failures in a row, counted as they happen so no new requests start after the limit
+    lock = threading.Lock()
+
+    def fetch(p: Post):
+        if should_stop() or gave_up.is_set():
+            return None  # not tried
         try:
-            comments, whole = client.fetch_all_comments(p)
+            got = client.fetch_all_comments(p)
+        except Stopped:
+            return None
         except (FetchError, requests.RequestException):
+            with lock:
+                streak[0] += 1
+                if streak[0] >= GIVE_UP_AFTER:
+                    gave_up.set()
+            raise
+        with lock:
+            streak[0] = 0
+        return got
+
+    # A few posts' threads are fetched at once; each finished one is saved here, on this thread.
+    tried: set[str] = set()
+    for p, got, error in in_parallel(fetch, posts, getattr(client, "workers", 1)):
+        if got is None and error is None:
+            continue
+        tried.add(p.id)
+        done += 1
+        progress(done, len(posts), f"All comments for post {done}/{len(posts)}: {p.title[:60]}")
+        if error is not None:
+            if not isinstance(error, (FetchError, requests.RequestException)):
+                raise error
             store.mark_comments(p.id, ok=False, settled=False)
             store.commit()
             errors += 1
-            failed_in_row += 1
-            if failed_in_row >= GIVE_UP_AFTER:
-                errors += len(posts) - i
-                break
             continue
-        failed_in_row = 0
+        comments, whole = got
         for c in comments:
             store.save_comment(c, *sentiment.score(c.body))
             n_comments += 1
@@ -212,6 +237,8 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
             store.mark_complete("comments", name, p.id)
         store.commit()
         saved()
+    if gave_up.is_set():
+        errors += len([p for p in posts if p.id not in tried])  # not tried: retried next time
     if posts:
         progress(len(posts), len(posts), "Done")
     subreddit = posts[0].subreddit if posts else name

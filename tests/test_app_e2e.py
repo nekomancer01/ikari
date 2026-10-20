@@ -191,6 +191,29 @@ def test_stop_ends_a_fetch_and_frees_the_form(env):
     assert "Stopped" in w.progress_msg.text() or "stopped" in w.progress_msg.text().lower()
 
 
+def test_stop_takes_effect_at_once_even_while_requests_wait_out_timeouts(env, monkeypatch):
+    # Real waits (a timeout costs 2 s, then 4 s): r/AskReddit times out on most pages, so four requests
+    # are sitting in backoffs when Stop is pressed.
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 120.0)
+    w = env.window()
+    w.subreddit.setText("AskReddit")
+    w.include_comments.setChecked(True)
+    w.range.setCurrentIndex(w.range.findData("day"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    pump(1500)
+    assert w.thread is not None
+    QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
+    stopped_at, seen = time.monotonic(), set()
+    while w.thread is not None:
+        assert time.monotonic() - stopped_at < 3, f"still stopping; it said {seen}"
+        seen.add(w.progress_msg.text())
+        QApplication.processEvents()
+        time.sleep(0.01)
+    # Not overwritten by "Waiting 4 s…" from the requests winding down; then the result.
+    assert "Stopping…" in seen and all(t.startswith("Stopp") for t in seen), seen
+    assert not env.warnings
+
+
 def test_archive_slowdowns_are_waited_out(env):
     w = env.window()
     env.archive.fail(SEARCH, (422, {"error": "Timeout. Maybe slow down a bit"}),

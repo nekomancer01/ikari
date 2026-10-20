@@ -428,6 +428,7 @@ class MainWindow(QMainWindow):
         self.updates = UpdateFlow(self, self.settings)
         self.thread: QThread | None = None
         self.worker: FetchWorker | None = None
+        self._stopping = False  # Stop was pressed on the running fetch
         self.current: str | None = None
         self.request: collect.FetchRequest | None = None
         self._live = QTimer(self)
@@ -938,19 +939,25 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.thread.quit)
         self.thread.finished.connect(self._on_thread_done)
         self._set_busy(True)
+        self._stopping = False
         self.progress_msg.setText(message)
         self.thread.start()
 
     def _stop_fetch(self) -> None:
         if self.worker:
             self.worker.stop()
-            self.progress_msg.setText("Stopping after the current request…")
+            self._stopping = True
+            self.progress_msg.setText("Stopping…")
+            if self.coverage is not None:
+                self.coverage.set_progress(0, 0, "Stopping…")
             self.stop_btn.setEnabled(False)
 
     def _on_progress(self, done: int, total: int, msg: str) -> None:
         if total:
             self.progress.setRange(0, total)
             self.progress.setValue(done)
+        if self._stopping:  # what's still finishing ("Waiting 4 s…") would read as Stop being ignored
+            msg = "Stopping…"
         self.progress_msg.setText(msg)
         if self.coverage is not None:
             self.coverage.set_progress(done, total, msg)

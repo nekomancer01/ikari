@@ -63,7 +63,8 @@ class CountWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            counts = ArcticShiftClient(limiter=LIMITER).day_counts(*self.args, should_stop=lambda: self._stop)
+            counts = ArcticShiftClient(limiter=LIMITER, should_stop=lambda: self._stop).day_counts(
+                *self.args, should_stop=lambda: self._stop)
             self.finished.emit(self.args[0], counts)
         except FetchError as e:
             self.failed.emit(str(e))
