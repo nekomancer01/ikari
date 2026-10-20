@@ -598,13 +598,26 @@ def test_slices_are_read_a_few_at_once_with_the_same_result():
 def test_requests_still_start_no_faster_than_the_limiter_allows():
     items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(24)]
     starts = []
-    session = SlowServer(items, delay=0.05)
-    real_get = session.get
-    session.get = lambda *a, **k: (starts.append(time.perf_counter()), real_get(*a, **k))[1]
-    ArcticShiftClient(session=session, limiter=RateLimiter(0.02), workers=4).fetch_posts(
+    limiter = RateLimiter(0.02)
+    real_wait, grab = limiter.wait, threading.Lock()
+
+    def wait():
+        # When the limiter let each request go, by its own clock. Timing anything after that also counts how
+        # late the OS ran each worker thread, which on a busy machine (the suite runs in parallel) bunches
+        # two together. The lock keeps another grant from moving _next before it's read.
+        with grab:
+            real_wait()
+            starts.append(limiter._next - limiter.interval)
+
+    limiter.wait = wait
+    ArcticShiftClient(session=SlowServer(items, delay=0.05), limiter=limiter, workers=4).fetch_posts(
         "python", after=T0, before=T0 + 7 * DAY, limit=28)
+    assert len(starts) >= 28
     gaps = [b - a for a, b in zip(starts, starts[1:])]
-    assert min(gaps) >= 0.018
+    # The limiter's clock (time.monotonic) only ticks every ~16 ms on Windows before Python 3.13, so there a
+    # gap can read up to one tick short of the interval; nothing ever starts together.
+    tick = time.get_clock_info("monotonic").resolution
+    assert min(gaps) >= 0.018 - tick
 
 
 def test_an_error_in_one_slice_stops_the_fetch():
