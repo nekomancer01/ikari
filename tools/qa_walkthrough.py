@@ -221,7 +221,7 @@ def db_counts(sub: str) -> tuple[int, int]:
 def visible(w) -> dict:
     return {"heading": w.heading.text(), "posts_rows": w.posts_tab.view.model().rowCount(),
             "comments_rows": w.comments_tab.view.model().rowCount(), "progress": w.progress_msg.text()[:140],
-            "tab_posts": w.tabbar.tabText(1), "tab_comments": w.tabbar.tabText(2)}
+            "tab_posts": tab_text("posts"), "tab_comments": tab_text("comments")}
 
 
 def busy(job_owner, job="fetch_job", old="thread") -> bool:
@@ -297,6 +297,46 @@ def type_into(widget, text: str) -> None:
 
 def click(button) -> None:
     QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+
+
+# Pages and drawers: a navigation rail since #79 (Fetch and Saved open drawers), tabs and a sidebar before.
+OLD_TABS = ("overview", "posts", "comments")
+
+
+def pages() -> list[str]:
+    return list(w.page_widgets) if hasattr(w, "rail") else list(OLD_TABS)
+
+
+def go(key: str) -> None:
+    """Show a page the way a person would: its rail button, or its tab."""
+    if hasattr(w, "rail"):
+        if w.rail.page() != key:
+            click(w.rail.buttons[key])
+    else:
+        w.tabbar.setCurrentIndex(OLD_TABS.index(key))
+    pump(0.2)
+
+
+def current_page() -> str:
+    return w.rail.page() if hasattr(w, "rail") else OLD_TABS[w.tabbar.currentIndex()]
+
+
+def open_drawer(key: str) -> None:
+    """Open the Fetch or Saved drawer from the rail, if this main has one and it isn't open already."""
+    """("" closes the open one, by clicking its button again.)"""
+    if hasattr(w, "rail") and w._drawer_key() != key:
+        click(w.rail.buttons[key or w._drawer_key()])
+        pump(0.3)
+
+
+def tab_text(key: str) -> str:
+    if hasattr(w, "rail"):
+        return w.rail.buttons[key].text()
+    return w.tabbar.tabText(OLD_TABS.index(key))
+
+
+def timeline_chart():
+    return w.timeline_page.body if hasattr(w, "timeline_page") else w.overview.timeline
 
 
 # -- the walkthrough ---------------------------------------------------------------------------------------
@@ -384,6 +424,7 @@ def first_launch(e):
 def small_fetch(e):
     e["form"] = {"range": F.range.currentText(), "pick": getattr(F, "pick", None) and F.pick.currentText(),
                  "limit": getattr(F, "limit", None) and F.limit.value(), "comments": F.include_comments.isChecked(), "per_post": F.comments_per_post.value()}
+    open_drawer("fetch")
     type_into(F.subreddit, ARGS.small)
     run_fetch(e, w, ARGS.small, lambda: click(w.fetch_btn))
 
@@ -391,6 +432,7 @@ def small_fetch(e):
 @step("busy-fetch: with the first subreddit on screen, fetch a busy one")
 def busy_fetch(e):
     e["showing_before"] = w.heading.text()
+    open_drawer("fetch")
     type_into(F.subreddit, ARGS.busy)
     run_fetch(e, w, ARGS.busy, lambda: click(w.fetch_btn))
     shown = {s["heading"] for s in e["samples"]}
@@ -399,6 +441,7 @@ def busy_fetch(e):
 
 @step("stop: fetch more of the busy subreddit and press Stop partway")
 def stop_midway(e):
+    open_drawer("fetch")
     F.range.setCurrentIndex(list(FORM_MOD.RANGES).index("month"))
     if hasattr(F, "limit"):  # max posts went with #55 (every post in the range)
         F.limit.setValue(300)
@@ -415,6 +458,7 @@ def days_pick(e):
         e["notes"].append("no Days picker on this main")
         return
     from subsentiment.gui import days as dd
+    open_drawer("saved")
     for i in range(w.datasets.count()):
         if (w.datasets.item(i).data(Qt.ItemDataRole.UserRole) or "").lower() == ARGS.small.lower():
             w.datasets.setCurrentRow(i)
@@ -442,8 +486,8 @@ def days_pick(e):
         tile = tiles["count"].value.text() if hasattr(tiles["count"], "value") else ""
         ok = shown == (want_p, want_c)
         e["notes"].append(f"{label}: combo {combo.currentText()!r}, tables {shown[0]}/{shown[1]}, expected "
-                          f"{want_p}/{want_c}{'' if ok else ' MISMATCH'}; items tile {tile}; tabs {w.tabbar.tabText(1)!r} "
-                          f"{w.tabbar.tabText(2)!r}; subtitle {w.subheading.text()!r}")
+                          f"{want_p}/{want_c}{'' if ok else ' MISMATCH'}; items tile {tile}; tabs {tab_text('posts')!r} "
+                          f"{tab_text('comments')!r}; subtitle {w.subheading.text()!r}")
 
     click(picker.none_btn)
     check("None")
@@ -486,10 +530,14 @@ def days_pick(e):
 
 @step("look-around: every tab, scope, theme and View option")
 def look_around(e):
-    for i, name in enumerate(("overview", "posts", "comments")):
-        w.tabbar.setCurrentIndex(i)
-        e["shots"].append(shot(w, f"tab-{name}"))
-    w.tabbar.setCurrentIndex(0)
+    for name in pages():
+        go(name)
+        e["shots"].append(shot(w, f"page-{name}"))
+    go("overview")
+    for name in ("fetch", "saved") if hasattr(w, "rail") else ():
+        open_drawer(name)
+        e["shots"].append(shot(w, f"drawer-{name}"))
+    open_drawer("")
     for i in range(w.scope.count()):
         w.scope.setCurrentIndex(i)
         pump(0.2)
@@ -519,7 +567,7 @@ def motion_check(e):
 
     def try_it(label):
         out = {}
-        for what, act in (("tab", lambda: w.tabbar.setCurrentIndex((w.tabbar.currentIndex() + 1) % w.tabbar.count())),
+        for what, act in (("page", lambda: go(pages()[(pages().index(current_page()) + 1) % len(pages())])),
                           ("theme", lambda: w._set_theme("light" if ARGS.theme == "dark" else "dark")),
                           ("theme back", lambda: w._set_theme(ARGS.theme))):
             t = time.perf_counter()
@@ -554,8 +602,8 @@ def timeline(e):
     from PySide6.QtCore import QPoint, QPointF
     from PySide6.QtGui import QWheelEvent
 
-    t = w.overview.timeline
-    w.tabbar.setCurrentIndex(0)
+    t = timeline_chart()
+    go("timeline" if "timeline" in pages() else "overview")
     pump(0.5)
     if not hasattr(t, "presets"):
         e["notes"].append("no zoomable timeline on this main")
@@ -616,6 +664,7 @@ def export(e):
 def comments_all(e):
     import sqlite3
 
+    open_drawer("fetch")
     F.range.setCurrentIndex(list(FORM_MOD.RANGES).index("day"))
     F.include_comments.setChecked(True)
     F.comments_per_post.setValue(F.comments_per_post.minimum())
@@ -634,6 +683,7 @@ def comments_all(e):
 
 @step("coverage: open View > Download coverage for the busy subreddit")
 def coverage_open(e):
+    open_drawer("saved")
     for i in range(w.datasets.count()):
         if (w.datasets.item(i).data(Qt.ItemDataRole.UserRole) or "").lower() == ARGS.busy.lower():
             w.datasets.setCurrentRow(i)
