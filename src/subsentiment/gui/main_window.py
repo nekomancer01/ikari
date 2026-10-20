@@ -320,7 +320,7 @@ class MainWindow(QMainWindow):
         self.tabbar.setElideMode(Qt.TextElideMode.ElideRight)  # at the narrowest, long counts end in "…"
         for t in ("Overview", "Posts", "Comments"):
             self.tabbar.addTab(t)
-        # What the whole Overview (tiles, charts, strongest lists, mood tint) counts.
+        # What the whole Overview (tiles, charts, mood tint) counts.
         self.scope = mark(ShrinkingComboBox(), "pill", True)
         self.scope.addItems(SCOPES)
         self.scope.setToolTip("Count posts, comments or both on the Overview")

@@ -132,7 +132,7 @@ def test_tabs_crossfade(make_window):
     assert not snapshots(w.content)
 
 
-def test_new_data_while_shown_counts_up_and_new_extremes_fade_in(make_window):
+def test_new_data_while_shown_counts_up(make_window):
     w = make_window()
     pick(w, "Python")
     pump(motion.DATA_MS + 6 * motion.STAGGER_MS + 300)
@@ -144,8 +144,6 @@ def test_new_data_while_shown_counts_up_and_new_extremes_fade_in(make_window):
     w._add_rows("posts", w.posts_tab, new)  # what a running fetch does with the rows it saves
     w._render_overview()
     assert w.overview.tiles["count"].value.text() == "60"
-    assert snapshots(w.overview.most_negative.viewport())  # its entries changed
-    assert not snapshots(w.overview.most_positive.viewport())  # its entries didn't: left alone
     pump(motion.DATA_MS // 3)
     assert 40 < int(drawn(w.overview.tiles["count"].value)) < 60
     pump(motion.DATA_MS + 200)
