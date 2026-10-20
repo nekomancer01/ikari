@@ -731,3 +731,25 @@ def test_a_long_wait_ends_as_soon_as_stop_is_pressed():
     with pytest.raises(Stopped):
         limiter.wait(flag.is_set)
     assert time.perf_counter() - start < 1.0
+
+
+def test_each_answer_is_parsed_once():
+    """A whole comment tree can be megabytes of JSON; reading it twice doubled the time spent on it."""
+    class Counting(FakeResponse):
+        parsed = 0
+
+        def json(self):
+            Counting.parsed += 1
+            return super().json()
+
+    session = FakeSession([Counting(200, {"data": [{"id": "x"}]})])
+    client = ArcticShiftClient(session=session, limiter=RateLimiter(interval=0, sleep=lambda s: None))
+    assert client.get("/api/comments/tree", {"link_id": "abc"}) == [{"id": "x"}]
+    assert Counting.parsed == 1
+
+
+def test_an_ok_answer_that_isnt_json_still_fails():
+    session = FakeSession([FakeResponse(200, None)])
+    client = ArcticShiftClient(session=session, limiter=RateLimiter(interval=0, sleep=lambda s: None))
+    with pytest.raises(ValueError):
+        client.get("/api/posts/search", {"subreddit": "Python"})
