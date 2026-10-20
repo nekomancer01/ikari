@@ -17,7 +17,7 @@ from PySide6.QtCore import QMargins, QPointF, QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QApplication, QGraphicsPathItem, QGraphicsSimpleTextItem, QToolTip
 
-from subsentiment.gui import theme
+from subsentiment.gui import motion, theme
 
 LIGHT = {
     "surface": "#fcfcfb", "text": "#0b0b0b", "muted": "#52514e", "grid": "#e4e3df",
@@ -85,10 +85,25 @@ class DistributionChart(QChartView):
         self._labels: list[tuple[QGraphicsSimpleTextItem, QGraphicsSimpleTextItem, int, float]] = []
         self._bars: list[tuple[QGraphicsPathItem, int, float]] = []
         self._series = None
+        self._colors: dict = {}
+        self._counts: dict[str, int] = {}
+        self._y: QValueAxis | None = None
+        # Bars ease from the heights on screen (_from) to the new counts (_to) as this runs from 0 to 1.
+        self._from: list[float] = []
+        self._to: list[float] = []
+        self._grow = motion.Tween(self._grow_step, self)
         self.set_counts({"negative": 0, "neutral": 0, "positive": 0})
 
     def set_counts(self, counts: dict[str, int]) -> None:
+        """Show new counts. The chart is kept and its bars grow or shrink to the new heights; it's only
+        built again when the theme's colors change."""
         colors = palette()
+        self._counts = dict(counts)
+        if self._series is not None and colors == self._colors:
+            self._update(counts)
+            return
+        self._colors = colors
+        self._grow.stop()
         chart = _base_chart("Sentiment distribution", colors)
         total = sum(counts.values())
         # A stacked series where each set fills only its own category gives one
@@ -105,11 +120,7 @@ class DistributionChart(QChartView):
             s.setColor(Qt.GlobalColor.transparent)
             s.setBorderColor(Qt.GlobalColor.transparent)
             series.append(s)
-        series.hovered.connect(
-            lambda state, index, barset: QToolTip.showText(
-                QCursor.pos(),
-                f"{self.CATEGORIES[index].title()}: {counts.get(self.CATEGORIES[index], 0):,} "
-                f"({100 * counts.get(self.CATEGORIES[index], 0) / (total or 1):.0f}%)") if state else QToolTip.hideText())
+        series.hovered.connect(self._hover)
         chart.addSeries(series)
 
         x = QBarCategoryAxis()
@@ -123,6 +134,7 @@ class DistributionChart(QChartView):
         y = QValueAxis()
         y.setRange(0, max(max(counts.values(), default=0) * 1.16, 1))
         y.setVisible(False)
+        self._y = y
         chart.addAxis(x, Qt.AlignmentFlag.AlignBottom)
         chart.addAxis(y, Qt.AlignmentFlag.AlignLeft)
         series.attachAxis(x)
@@ -157,6 +169,42 @@ class DistributionChart(QChartView):
         if old is not None:
             old.deleteLater()
         self._place_labels()
+
+    def _hover(self, state: bool, index: int, _barset) -> None:
+        if not state:
+            QToolTip.hideText()
+            return
+        n, total = self._counts.get(self.CATEGORIES[index], 0), sum(self._counts.values())
+        QToolTip.showText(QCursor.pos(), f"{self.CATEGORIES[index].title()}: {n:,} ({100 * n / (total or 1):.0f}%)")
+
+    def _update(self, counts: dict[str, int]) -> None:
+        """New counts on the chart already shown: labels change at once, bars and scale ease there."""
+        total = sum(counts.values())
+        new = [float(counts.get(cat, 0)) for cat in self.CATEGORIES]
+        for i, (s, n) in enumerate(zip(self._series.barSets(), new)):
+            s.replace(i, n)  # the invisible bars underneath keep hover in step
+        for count, share, i, _ in self._labels:
+            count.setText(f"{int(new[i]):,}")
+            share.setText(f"{100 * new[i] / total:.0f}%" if total else "")
+        self._from = [v for _, _, v in self._bars] + [self._y.max()]
+        self._to = new + [max(max(new, default=0) * 1.16, 1)]
+        if self._from == self._to:
+            return
+        self._grow.value = 0.0
+        self._grow.set(1.0)
+
+    def _grow_step(self, t: float) -> None:
+        if not self._to:
+            return
+        *heights, top = [a + (b - a) * t for a, b in zip(self._from, self._to)]
+        self._y.setRange(0, top)
+        self._bars = [(bar, i, heights[i]) for bar, i, _ in self._bars]
+        self._labels = [(c, s, i, heights[i]) for c, s, i, _ in self._labels]
+        self._place_labels()
+
+    def shown_heights(self) -> list[float]:
+        """The bar heights drawn right now, in counts (for tests)."""
+        return [v for _, _, v in self._bars]
 
     def _place_labels(self) -> None:
         chart = self.chart()
@@ -231,6 +279,11 @@ class TimelineChart(QChartView):
 
     def set_points(self, points: list[tuple[int, float, int]]) -> None:
         colors = palette()
+        if (points, colors) == getattr(self, "_shown", None):
+            return  # nothing new (a running fetch asks once a second)
+        if getattr(self, "_shown", None) is not None and colors == self._shown[1]:
+            motion.crossfade(self)  # new days or new means: the old line fades into the new one
+        self._shown = (list(points), colors)
         chart = _base_chart("Mean sentiment per day (UTC)", colors)
         pen = QPen(QColor(colors["line"]))
         pen.setWidthF(2.25)

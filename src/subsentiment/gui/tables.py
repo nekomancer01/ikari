@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QHeaderView, QLineEdit, QTableView, QVBoxLayout, QWidget,
 )
 
+from subsentiment.gui import motion
 from subsentiment.gui.charts import palette
 from subsentiment.gui.widgets import label, panel, plural
 
@@ -300,6 +301,7 @@ class TablePage(QWidget):
         self.filter.textChanged.connect(lambda _: self._apply_filters())
         self.label_filter = QComboBox()
         self.label_filter.addItems(["All labels", "Positive", "Neutral", "Negative"])
+        self.label_filter.currentTextChanged.connect(lambda _: motion.crossfade(self.view))  # first: the old rows' look
         self.label_filter.currentTextChanged.connect(lambda _: self._apply_filters())
         self.count = label("", "muted")
 

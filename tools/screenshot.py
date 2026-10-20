@@ -21,7 +21,7 @@ from PySide6.QtWidgets import QApplication
 
 from subsentiment import sentiment
 from subsentiment.arctic_shift import SETTLE_SECONDS
-from subsentiment.gui import native, theme
+from subsentiment.gui import motion, native, theme
 from subsentiment.gui.main_window import MainWindow
 from subsentiment.reddit import Comment, Post
 from subsentiment.store import Store
@@ -112,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
     theme.load_fonts(app)
 
     window = MainWindow(str(db))
+    motion.set_enabled(False)  # stills of the finished state, not mid-fade
     window.resize(1440, 900)
     window.show()
     window._refresh_datasets(SUBREDDIT)
