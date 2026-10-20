@@ -339,6 +339,63 @@ class Store:
         self.db.commit()
         self._compact()
 
+    def import_from(self, path: str | Path) -> tuple[int, int]:
+        """Merge another ikari database into this one: rows this one lacks are added, and a row both have
+        keeps the copy fetched last. Nothing is removed from either file. Returns (new posts, new comments),
+        image posts and their comments left out as they are everywhere.
+        Raises sqlite3.DatabaseError if path isn't an ikari database, ValueError if it is this one,
+        FileNotFoundError if there's no file there."""
+        if not Path(path).is_file():  # ATTACH would create an empty file there
+            raise FileNotFoundError(path)
+        if Path(path).resolve() == self.path.resolve():
+            raise ValueError("That is the database already open.")
+        self.db.commit()
+        self.db.execute("ATTACH DATABASE ? AS other", (str(path),))
+        try:
+            tables = {r[0] for r in self.db.execute("SELECT name FROM other.sqlite_master WHERE type = 'table'")}
+            if not {"posts", "comments"} <= tables:
+                raise sqlite3.DatabaseError("It has no saved posts or comments.")
+            self.db.execute("CREATE TEMP TABLE new_posts AS SELECT id FROM other.posts "
+                            "WHERE id NOT IN (SELECT id FROM main.posts)")
+            self.db.execute("CREATE TEMP TABLE new_comments AS SELECT id FROM other.comments "
+                            "WHERE id NOT IN (SELECT id FROM main.comments)")
+            # A file saved before image posts were marked has no image column; its picture posts are found
+            # the way Store.__init__ finds them, once they're in.
+            flagged = "image" in {r["name"] for r in self.db.execute("PRAGMA other.table_info(posts)")}
+            imported = [] if flagged else [r[0] for r in self.db.execute("SELECT id FROM other.posts")]
+            post_columns = POST_COLUMNS + ("image",) if flagged else POST_COLUMNS
+            for table, key, columns in (("posts", "id", post_columns), ("comments", "id", COMMENT_COLUMNS),
+                                        ("comment_fetches", "post_id", ("post_id", "ok", "settled", "fetched_at"))):
+                if table in tables:
+                    cols = ", ".join(columns)
+                    self.db.execute(
+                        f"INSERT OR REPLACE INTO main.{table} ({cols}) SELECT {cols} FROM other.{table} o "
+                        f"WHERE NOT EXISTS (SELECT 1 FROM main.{table} m WHERE m.{key} = o.{key} "
+                        f"AND COALESCE(m.fetched_at, 0) >= COALESCE(o.fetched_at, 0))")
+            for i in range(0, len(imported), 500):
+                ids = imported[i:i + 500]
+                self.db.executemany("UPDATE posts SET image = 1 WHERE id = ?", [
+                    (r["id"],) for r in self.db.execute(
+                        f"SELECT id, url, selftext FROM main.posts WHERE id IN ({','.join('?' * len(ids))})", ids)
+                    if is_image_post(r["url"], r["selftext"])])
+            for table, cols in (("complete", "kind, subreddit, key, fetched_at"),
+                                ("removed_posts", "id, subreddit, created_utc")):
+                if table in tables:
+                    self.db.execute(f"INSERT OR IGNORE INTO main.{table} ({cols}) SELECT {cols} FROM other.{table}")
+            new_posts = self.db.execute("SELECT COUNT(*) FROM main.posts WHERE image = 0 "
+                                        "AND id IN (SELECT id FROM temp.new_posts)").fetchone()[0]
+            new_comments = self.db.execute(f"SELECT COUNT(*) FROM main.comments c WHERE {NOT_IMAGE} "
+                                           "AND c.id IN (SELECT id FROM temp.new_comments)").fetchone()[0]
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+        finally:
+            self.db.execute("DROP TABLE IF EXISTS temp.new_posts")
+            self.db.execute("DROP TABLE IF EXISTS temp.new_comments")
+            self.db.execute("DETACH DATABASE other")
+        return new_posts, new_comments
+
     def _compact(self) -> None:
         """Give deleted rows' space back to the OS, so deleting data actually frees disk."""
         try:
