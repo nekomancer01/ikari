@@ -1,11 +1,14 @@
 import csv
+import shutil
+import sqlite3
+from pathlib import Path
 
 import pytest
 
-from subsentiment import collect
+from subsentiment import collect, store
 from subsentiment.reddit import Comment, Post
 from subsentiment.analysis import Analysis
-from subsentiment.store import Store
+from subsentiment.store import SCHEMA_VERSION, Store
 
 
 def make_post(i, sub="Python", ts=1_700_000_000.0):
@@ -183,6 +186,123 @@ def test_day_counts_and_exporting_chosen_days(tmp_path):
     assert s.export_csv("python", "comments", out, days=set()) == 0
 
 
+POST_LINK = "https://www.reddit.com/r/Python/comments/p1/a_title/"
+
+
+def test_a_comments_permalink_made_from_its_posts_is_rebuilt_when_read_not_stored(tmp_path):
+    s = Store(tmp_path / "x.db")
+    s.save_post(Post("p1", "Python", "t", "", "a", 1, 0.9, 2, 1_700_000_000, POST_LINK, ""), 0.0, "neutral")
+    s.save_comment(Comment("c1", "p1", "Python", "t3_p1", "b", "hi", 1, 1_700_000_100, 0, POST_LINK + "c1/"), 0.0, "neutral")
+    odd = "https://www.reddit.com/r/Python/comments/p1/_/c2/"
+    s.save_comment(Comment("c2", "p1", "Python", "t3_p1", "b", "yo", 1, 1_700_000_200, 0, odd), 0.0, "neutral")
+    s.commit()
+    stored = dict(s.db.execute("SELECT id, permalink FROM comments"))
+    assert stored == {"c1": None, "c2": odd}
+    expected = {"c1": POST_LINK + "c1/", "c2": odd}
+    assert {r["id"]: r["permalink"] for r in s.comments("python")} == expected
+    assert {r["id"]: r["permalink"] for r in s.comments_since("python", 0)} == expected
+    s.export_csv("python", "comments", tmp_path / "c.csv")
+    assert {r["id"]: r["permalink"] for r in csv.DictReader(open(tmp_path / "c.csv", encoding="utf-8-sig"))} == expected
+
+
+def test_a_comment_keeps_its_permalink_when_its_posts_changes(tmp_path):
+    s = Store(tmp_path / "x.db")
+    post = Post("p1", "Python", "t", "", "a", 1, 0.9, 2, 1_700_000_000, POST_LINK, "")
+    s.save_post(post, 0.0, "neutral")
+    s.save_comment(Comment("c1", "p1", "Python", "t3_p1", "b", "hi", 1, 1_700_000_100, 0, POST_LINK + "c1/"), 0.0, "neutral")
+    s.save_post(post, 0.1, "neutral")  # saved again unchanged: still not stored
+    assert s.db.execute("SELECT permalink FROM comments").fetchone()[0] is None
+    post.permalink = "https://www.reddit.com/r/Python/comments/p1/"  # the archive's record lacked one
+    s.save_post(post, 0.1, "neutral")
+    s.commit()
+    assert s.comments("python")[0]["permalink"] == POST_LINK + "c1/"
+
+
+def test_no_index_repeats_the_start_of_another(tmp_path):
+    s = Store(tmp_path / "x.db")
+    indexes = {}
+    for name, table in s.db.execute("SELECT name, tbl_name FROM sqlite_master WHERE type = 'index'"):
+        columns = [(r["name"], r["coll"]) for r in s.db.execute(f"PRAGMA index_xinfo({name})") if r["key"]]
+        indexes[name] = [table] + columns
+    redundant = [(a, b) for a in indexes for b in indexes
+                 if a != b and indexes[b][:len(indexes[a])] == indexes[a] and not a.startswith("sqlite_autoindex")]
+    assert redundant == []
+
+
+OLD_DB = Path(__file__).parent / "data" / "store-53829f7.db"  # saved by main at 53829f7, before compaction
+
+
+def _contents(path):
+    """Every row of every table as an older ikari reads it, comments with their full permalinks."""
+    db = sqlite3.connect(path)
+    out = {t: sorted(db.execute(f"SELECT * FROM {t}")) for t in ("comment_fetches", "complete", "removed_posts")}
+    out["posts"] = sorted(db.execute(f"SELECT {', '.join(store.POST_COLUMNS)} FROM posts"))
+    out["comments"] = sorted(db.execute(
+        "SELECT c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score, c.created_utc, c.depth, "
+        "COALESCE(c.permalink, p.permalink || c.id || '/'), c.sentiment, c.label, c.fetched_at "
+        "FROM comments c LEFT JOIN posts p ON p.id = c.post_id"))
+    db.close()
+    return out
+
+
+def test_a_database_from_an_older_ikari_is_shrunk_once_and_reads_back_the_same(tmp_path):
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(OLD_DB, path)
+    before = _contents(path)
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert {"posts_sub", "comments_sub"}.isdisjoint(n for (n,) in s.db.execute("SELECT name FROM sqlite_master"))
+    assert s.db.execute("SELECT COUNT(*) FROM comments WHERE permalink IS NULL").fetchone()[0] == 9
+    assert s.db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    s.close()
+    assert _contents(path) == before
+    assert list(tmp_path.iterdir()) == [path]  # its backup is gone once it worked
+    assert path.stat().st_size < OLD_DB.stat().st_size
+
+
+def test_a_migration_that_cant_finish_leaves_the_database_as_it_was_and_runs_at_the_next_start(tmp_path, monkeypatch):
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(OLD_DB, path)
+    before = _contents(path)
+    class FullDisk:  # the backup can't be written
+        def __getattr__(self, name):
+            return getattr(sqlite3, name)
+
+        def connect(self, p, *a, **kw):
+            if str(p).endswith("-before-v1"):
+                raise sqlite3.OperationalError("database or disk is full")
+            return sqlite3.connect(p, *a, **kw)
+    monkeypatch.setattr(store, "sqlite3", FullDisk())
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == 0
+    assert len(s.comments("python")) == 11  # still reads, in the old layout
+    s.close()
+    assert _contents(path) == before
+    assert sqlite3.connect(path).execute("SELECT COUNT(*) FROM comments WHERE permalink IS NULL").fetchone()[0] == 0
+    monkeypatch.undo()
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == 0  # not retried by every fetch's store
+    s.close()
+    Store._migration_tried.clear()  # the next start
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    s.close()
+    assert _contents(path) == before
+
+
+def test_a_migration_whose_result_doesnt_check_out_is_rolled_back(tmp_path, monkeypatch):
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(OLD_DB, path)
+    before = _contents(path)
+    # Rebuilding permalinks wrongly must be caught by the check against the backup, not committed.
+    monkeypatch.setattr(store, "_COMMENT_SELECT", store._COMMENT_SELECT.replace("|| c.id ||", "|| 'x' ||"))
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == 0
+    s.close()
+    assert _contents(path) == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
 def test_import_merges_another_database_keeping_the_copy_fetched_last(tmp_path, monkeypatch):
     import itertools
     import sqlite3
@@ -291,3 +411,17 @@ def test_import_keeps_image_posts_hidden_from_files_old_and_new(tmp_path):
     assert [r["id"] for r in s.posts("python")] == ["c"]
     assert [r["id"] for r in s.posts("rust")] == ["p8"]
     assert "image" not in {r[1] for r in sqlite3.connect(tmp_path / "old.db").execute("PRAGMA table_info(posts)")}
+
+
+@pytest.mark.parametrize("migrated", [False, True])
+def test_importing_an_older_or_a_shrunk_database_keeps_every_comments_link(tmp_path, migrated):
+    other = tmp_path / "other.db"
+    shutil.copy(OLD_DB, other)
+    if migrated:
+        Store(other).close()
+    s = Store(tmp_path / "mine.db")
+    s.import_from(other)
+    old = sqlite3.connect(OLD_DB)
+    expected = dict(old.execute("SELECT id, permalink FROM comments"))
+    old.close()
+    assert {r["id"]: r["permalink"] for r in s.comments("python")} == expected

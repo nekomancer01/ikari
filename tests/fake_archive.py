@@ -77,7 +77,8 @@ def comment_tree(post: dict, limit: int) -> list[dict]:
         data = {"id": f"{post['id']}c{i}", "link_id": "t3_" + post["id"], "parent_id": "t3_" + post["id"],
                 "author": f"c{i}", "body": ["nice", "awful", "ok"][i % 3], "score": i,
                 "created_utc": post["created_utc"] + 60 * (i + 1),
-                "retrieved_on": post["retrieved_on"], "replies": ""}
+                "retrieved_on": post["retrieved_on"], "replies": "",
+                "permalink": post["permalink"] + f"{post['id']}c{i}/"}
         items.append({"kind": "t1", "data": data})
     return items
 
