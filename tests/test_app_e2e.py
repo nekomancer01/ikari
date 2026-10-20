@@ -918,14 +918,16 @@ def test_coverage_follows_a_change_of_date_range_in_the_sidebar(env):
 def test_closing_the_app_while_a_coverage_count_is_out_doesnt_freeze_it(env):
     w = env.window()
     fetch(w, comments=False)
-    env.archive.delays[AGG] = 3
+    env.archive.delays[AGG] = 8
     w.coverage_act.trigger()
     pump(200)
     assert w.coverage.count_job.busy
     start = time.monotonic()
     w.close()
-    assert time.monotonic() - start < 0.5  # it used to wait up to 3 s for the request
-    end = time.monotonic() + 10
+    # It used to wait for the request. Timed against the wall clock this read the store's own close too, which
+    # took 2.5 s on a Windows runner; the request still out afterwards shows nothing waited for it.
+    assert w.coverage.count_job.busy and time.monotonic() - start < 8
+    end = time.monotonic() + 20
     while w.coverage.count_job.busy and time.monotonic() < end:
         pump(20)
     assert not w.coverage.count_job.busy  # the count still ends and is tidied up
