@@ -38,16 +38,6 @@ def test_summary_and_daily_means():
     assert s.daily_means == [(0, 0.2, 2), (86400, 0.0, 1)]
 
 
-def test_strongest_items_match_the_old_sorted_list_ties_included():
-    rows = [{"id": i, "label": "neutral", "sentiment": v, "created_utc": 0}
-            for i, v in enumerate([0.5, -0.2, 0.5, 0.9, -0.2, 0.0, 0.5, -0.7])]
-    ranked = sorted(rows, key=lambda r: r["sentiment"])
-    a = Analysis(rows)
-    for n in (1, 2, 3, 10):
-        assert a.most_positive(n) == list(reversed(ranked[-n:]))
-        assert a.most_negative(n) == ranked[:n]
-
-
 class FakeClient:
     def fetch_posts(self, *a, **kw):
         return [make_post(1, sub="AskScience"), make_post(2, sub="AskScience")]

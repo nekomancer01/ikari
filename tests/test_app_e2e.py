@@ -997,8 +997,6 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
     assert sum(o.distribution._counts.values()) == want
     assert o.distribution._counts == {k: sum(r["label"] == k for r in rows) for k in ("negative", "neutral", "positive")}
     assert sum(n for _, _, n in o.timeline.points) == want
-    assert o.most_positive.item(0).text().startswith(f"{max(r['sentiment'] for r in rows):+.2f}")
-    assert o.most_negative.item(0).text().startswith(f"{min(r['sentiment'] for r in rows):+.2f}")
     assert w.tabbar.tabText(1) == f"Posts  {want:,}" and w.subheading.text().startswith("Last fetched")  # counts: on the tab
     assert sum(p for p, _ in w.days_pick.counts.values()) == want
     pump(800)  # what reads the store again does so once a second

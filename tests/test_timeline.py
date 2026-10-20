@@ -9,7 +9,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QPointF, QSettings, Qt  # noqa: E402
-from PySide6.QtGui import QWheelEvent  # noqa: E402
+from PySide6.QtGui import QFontMetricsF, QWheelEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -100,12 +100,14 @@ def test_it_starts_on_every_day_and_the_range_buttons_show_the_latest_days(windo
 
 def test_the_axis_is_dated_and_steps_from_days_to_weeks_to_months(window):
     tl = window().overview.timeline
-    narrow = tl._ticks(LAST_END - 7 * DAY, LAST_END, 600)
+    # Widths in date labels, so the steps don't depend on the platform's font (Windows draws it wider).
+    label = QFontMetricsF(charts._ui_font(9)).horizontalAdvance("30 Sep") + 20
+    narrow = tl._ticks(LAST_END - 7 * DAY, LAST_END, label * 8)
     assert [text for _, text in narrow] == ["23 Aug", "24 Aug", "25 Aug", "26 Aug", "27 Aug", "28 Aug", "29 Aug"]
-    weekly = tl._ticks(FIRST, LAST_END, 600)
+    weekly = tl._ticks(FIRST, LAST_END, label * 10)  # room for 9 Mondays, not for every other day
     assert [text for _, text in weekly][:3] == ["6 Jul", "13 Jul", "20 Jul"]  # Mondays
     assert all(datetime.fromtimestamp(t, timezone.utc).weekday() == 0 for t, _ in weekly)
-    year = tl._ticks(days.from_date(date(2025, 11, 1)), days.from_date(date(2026, 9, 1)), 600)
+    year = tl._ticks(days.from_date(date(2025, 11, 1)), days.from_date(date(2026, 9, 1)), label * 12)
     assert "2026" in [text for _, text in year] and "Dec" in [text for _, text in year]
 
 
