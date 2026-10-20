@@ -456,6 +456,38 @@ def test_range_presets_keep_the_newest_saved_days(make_window, tmp_path):
     assert again.current == "Python" and len(again.posts) == 8 and again.presets.current() == "week"
 
 
+def test_date_popup_shows_whole_month_and_picks_a_day(make_window):
+    """The From field's calendar pops up as a card holding all six weeks (the stock one cut the last row
+    off), and clicking a day picks it and switches to custom dates."""
+    from PySide6.QtCore import QPoint, QRect, Qt
+    from PySide6.QtTest import QTest
+    from subsentiment.gui.widgets import Calendar
+    w = make_window()
+    w.show()
+    w.set_drawer("fetch")  # the form lives in the Fetch drawer
+    edit = w.fetch_form.date_from
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    if not edit.isVisible():
+        pytest.skip("the date field isn't on screen in this layout")
+    QTest.mouseClick(edit, Qt.MouseButton.LeftButton, pos=QPoint(edit.width() - 10, edit.height() // 2))
+    QApplication.processEvents()
+    cal = edit.calendarWidget()
+    popup = cal.window()
+    assert isinstance(cal, Calendar) and popup.isVisible()
+    view = cal.view
+    last = QRect(view.columnViewportPosition(6), view.rowViewportPosition(5), view.columnWidth(6), view.rowHeight(5))
+    shown = QRect(view.viewport().mapTo(popup, last.topLeft()), last.size())
+    assert popup.rect().contains(shown) and view.viewport().rect().contains(last)
+    model = view.model()
+    cell = next(model.index(r, c) for r in range(2) for c in range(7) if model.index(r, c).data() == 1)
+    first = QDate(cal.yearShown(), cal.monthShown(), 1)  # From is a week back; the 1st of its month is earlier
+    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=view.visualRect(cell).center())
+    QApplication.processEvents()
+    assert edit.date() == first
+    assert not popup.isVisible()
+    assert w.fetch_form.range.currentData() == "custom"
+
+
 def test_import_database_adds_its_subreddits_to_the_list(make_window, tmp_path, monkeypatch):
     other = Store(tmp_path / "other.db")
     other.save_post(Post("q1", "Deltarune", "great", "", "a", 1, 0.9, 0, 1_700_000_000.0, "https://r", ""), 0.6,
