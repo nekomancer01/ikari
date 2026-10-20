@@ -1,4 +1,7 @@
 """The fetch job: what gets refreshed, what gets skipped, and how comment failures are handled."""
+import threading
+import time
+
 from subsentiment import collect
 from subsentiment.reddit import Comment, FetchError, Post
 from subsentiment.store import Store
@@ -205,3 +208,44 @@ def test_today_is_never_marked_complete(tmp_path):
     collect.run(FakeClient(posts=[mk(1)]), s, collect.FetchRequest("python", after=start, before=start + 86400,
                                                                   limit=50, everything=True, include_comments=False))
     assert s.complete_keys("posts", "python") == set()
+
+
+class SlowClient(FakeClient):
+    """Fetches comments for up to ``workers`` posts at once, each taking a moment, like the real client."""
+    workers = 4
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.busy = self.most = 0
+        self.lock = threading.Lock()
+
+    def fetch_comments(self, post, limit):
+        with self.lock:
+            self.busy += 1
+            self.most = max(self.most, self.busy)
+        time.sleep(0.03)
+        try:
+            return super().fetch_comments(post, limit)
+        finally:
+            with self.lock:
+                self.busy -= 1
+
+
+def test_comments_for_several_posts_are_fetched_at_once_and_all_saved(tmp_path):
+    s = store_with(tmp_path, [])  # a SQLite connection only works on its own thread: saving must stay here
+    c = SlowClient(posts=[mk(i) for i in range(12)])
+    result = collect.run(c, s, collect.FetchRequest("python"))
+    assert c.most == 4
+    assert (result.posts, result.comments, result.comment_errors) == (12, 12, 0)
+    assert len(s.comments("python")) == 12
+
+
+def test_comments_fetched_at_once_still_give_up_after_repeated_failures(tmp_path):
+    s = store_with(tmp_path, [])
+    posts = [mk(i) for i in range(20)]
+    c = SlowClient(posts=posts, failing={p.id for p in posts})
+    result = collect.run(c, s, collect.FetchRequest("python"))
+    tried = sum(1 for call in c.calls if call[0] == "comments")
+    assert collect.GIVE_UP_AFTER <= tried < collect.GIVE_UP_AFTER + c.workers  # only those already under way
+    assert result.comment_errors == 20
+    assert all(r["comments_ok"] == 0 for r in s.posts_between("python", None, None))

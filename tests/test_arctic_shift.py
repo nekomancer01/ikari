@@ -1,3 +1,6 @@
+import threading
+import time
+
 import pytest
 import requests
 
@@ -494,3 +497,64 @@ def test_a_post_right_on_a_slice_edge_is_found():
     items = [at(T0 + 6 * 3600, 1), at(T0 + 6 * 3600 + 5, 2)]  # the first sits exactly where slice two starts
     posts = archive(items).fetch_posts("python", after=T0, before=T0 + DAY, limit=4)
     assert [p.id for p in posts] == ["p1", "p2"]
+
+
+class SlowServer(ArchiveSession):
+    """Takes ``delay`` real seconds to answer, and records how many requests were in flight at once."""
+
+    def __init__(self, items, delay):
+        super().__init__(items)
+        self.delay, self.busy, self.most = delay, 0, 0
+        self._lock = threading.Lock()
+
+    def get(self, url, params=None, timeout=None):
+        with self._lock:
+            self.busy += 1
+            self.most = max(self.most, self.busy)
+        time.sleep(self.delay)
+        try:
+            return super().get(url, params, timeout)
+        finally:
+            with self._lock:
+                self.busy -= 1
+
+
+def test_slices_are_read_a_few_at_once_with_the_same_result():
+    items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(24)]
+    got = {}
+    for workers in (1, 4):
+        session = SlowServer(items, delay=0.05)
+        c = ArcticShiftClient(session=session, limiter=RateLimiter(0.0), workers=workers)
+        start = time.perf_counter()
+        seen_on = set()
+        posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=28,
+                              on_posts=lambda batch: seen_on.add(threading.get_ident()))
+        got[workers] = ([p.id for p in posts], time.perf_counter() - start, session.most)
+        assert seen_on == {threading.get_ident()}  # results are handed over on the calling thread
+    assert got[1][0] == got[4][0]
+    assert got[4][2] == 4 and got[1][2] == 1
+    assert got[4][1] < got[1][1] / 2.5  # 28 slices of 50 ms: about 1.4 s one at a time, 0.35 s four at once
+
+
+def test_requests_still_start_no_faster_than_the_limiter_allows():
+    items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(24)]
+    starts = []
+    session = SlowServer(items, delay=0.05)
+    real_get = session.get
+    session.get = lambda *a, **k: (starts.append(time.perf_counter()), real_get(*a, **k))[1]
+    ArcticShiftClient(session=session, limiter=RateLimiter(0.02), workers=4).fetch_posts(
+        "python", after=T0, before=T0 + 7 * DAY, limit=28)
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    assert min(gaps) >= 0.018
+
+
+def test_an_error_in_one_slice_stops_the_fetch():
+    class Broken(ArchiveSession):
+        def get(self, url, params=None, timeout=None):
+            if params["after"] > T0 + 3 * DAY:
+                return FakeResponse(400, {"error": "bad param"})
+            return super().get(url, params, timeout)
+    items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(24)]
+    with pytest.raises(FetchError, match="bad param"):
+        archive([]).__class__(session=Broken(items), limiter=RateLimiter(0.0)).fetch_posts(
+            "python", after=T0, before=T0 + 7 * DAY, limit=28)
