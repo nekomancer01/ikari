@@ -97,49 +97,57 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")  # GUI reads while the fetch thread writes
         fresh = not self.db.execute("SELECT 1 FROM sqlite_master WHERE name = 'posts'").fetchone()
         self.db.executescript(SCHEMA)
-        backup = self.path.with_name(self.path.name + ".backup")
+        backup = Path(str(self.path) + "-before-v1")
         if fresh:
             self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif self.db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        elif (self.db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION
+              and self.path.resolve() not in Store._migration_tried):
+            Store._migration_tried.add(self.path.resolve())  # a failed one waits for the next start, not each fetch
             self._migrate(backup)
-        backup.unlink(missing_ok=True)  # left by a migration that was cut short; the database was untouched
+        try:
+            backup.unlink(missing_ok=True)  # left by a migration that was cut short; the database was untouched
+        except OSError:  # another connection is mid-migration and has it open
+            pass
         self._stamp = 0.0
 
+    _migration_tried: set[Path] = set()
+
     def _migrate(self, backup: Path) -> None:
-        """Shrink a database saved by an older ikari. It's done in one transaction, checked against a copy
-        taken first before it's committed, and skipped (to be tried at the next start) if anything fails,
-        since the older layout reads and saves just as well."""
+        """Shrink a database saved by an older ikari, keeping a copy of it until that's done. It's one
+        transaction, checked row by row against what was there before it's committed, and skipped (to be
+        tried at the next start) if anything fails, since the older layout reads and saves just as well."""
         try:
             copy = sqlite3.connect(backup)
             try:
                 self.db.backup(copy)
             finally:
                 copy.close()
-            self.db.execute("ATTACH ? AS old", (str(backup),))
+            self.db.execute("BEGIN IMMEDIATE")
             try:
-                self.db.execute("BEGIN IMMEDIATE")
-                try:
-                    if self.db.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
-                        self.db.rollback()  # another connection did it meanwhile
-                        return
-                    self.db.execute(
-                        "UPDATE comments SET permalink = NULL WHERE permalink = "
-                        "(SELECT p.permalink FROM posts p WHERE p.id = comments.post_id) || id || '/'")
-                    self.db.execute("DROP INDEX IF EXISTS posts_sub")
-                    self.db.execute("DROP INDEX IF EXISTS comments_sub")
-                    self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-                    lost = self.db.execute(
-                        f"SELECT (SELECT COUNT(*) FROM old.comments) - (SELECT COUNT(*) FROM comments) + "
-                        f"(SELECT COUNT(*) FROM old.comments o JOIN ({_COMMENT_SELECT}) n ON n.id = o.id "
-                        "WHERE n.permalink IS NOT o.permalink)").fetchone()[0]
-                    if lost:
-                        raise sqlite3.DatabaseError(f"{lost} comments would read back differently")
-                    self.db.commit()
-                except BaseException:
-                    self.db.rollback()
-                    raise
+                if self.db.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+                    self.db.rollback()  # another connection did it meanwhile
+                    return
+                # What the comments read as now, taken inside the lock so no other save can slip between.
+                self.db.execute("CREATE TEMP TABLE was AS SELECT id, permalink FROM comments")
+                self.db.execute(
+                    "UPDATE comments SET permalink = NULL WHERE permalink = "
+                    "(SELECT p.permalink FROM posts p WHERE p.id = comments.post_id) || id || '/'")
+                self.db.execute("DROP INDEX IF EXISTS posts_sub")
+                self.db.execute("DROP INDEX IF EXISTS comments_sub")
+                self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                before = self.db.execute("SELECT COUNT(*) FROM temp.was").fetchone()[0]
+                after = self.db.execute("SELECT COUNT(*) FROM main.comments").fetchone()[0]
+                changed = self.db.execute(
+                    f"SELECT COUNT(*) FROM temp.was o JOIN ({_COMMENT_SELECT}) n ON n.id = o.id "
+                    "WHERE n.permalink IS NOT o.permalink").fetchone()[0]
+                if before != after or changed:
+                    raise sqlite3.DatabaseError(f"{changed} of {before} comments would read back differently")
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
             finally:
-                self.db.execute("DETACH old")
+                self.db.execute("DROP TABLE IF EXISTS temp.was")
         except (sqlite3.Error, OSError):
             return
         self._compact()
@@ -165,6 +173,10 @@ class Store:
                   post.upvote_ratio, post.num_comments, post.created_utc, post.permalink, post.url,
                   sentiment, label, self._saved_at())
         values = tuple(map(_storable, values))
+        # Comments whose permalink is rebuilt from this post's get their own copy if it's about to change.
+        self.db.execute("UPDATE comments SET permalink = (SELECT permalink FROM posts WHERE id = :id) || id || '/' "
+                        "WHERE post_id = :id AND permalink IS NULL "
+                        "AND (SELECT permalink FROM posts WHERE id = :id) IS NOT :link", {"id": values[0], "link": values[9]})
         self.db.execute(f"INSERT OR REPLACE INTO posts VALUES ({','.join('?' * len(values))})", values)
 
     def save_comment(self, c: Comment, sentiment: float, label: str) -> None:

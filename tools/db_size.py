@@ -162,7 +162,7 @@ def migrate(path: Path) -> None:
 
     tmp = Path(tempfile.mkdtemp())
     copy = tmp / "subsentiment.db"
-    db, target = sqlite3.connect(path), sqlite3.connect(copy)
+    db, target = sqlite3.connect(f"file:{path}?mode=ro", uri=True), sqlite3.connect(copy)
     db.backup(target)  # with whatever the WAL file holds
     db.close()
     target.close()
@@ -185,6 +185,11 @@ if __name__ == "__main__":
     elif sys.argv[1:2] == ["--build"]:
         build(Path(sys.argv[2]), sys.argv[3] if len(sys.argv) > 3 else "AskReddit",
               int(sys.argv[4]) if len(sys.argv) > 4 else 2, int(sys.argv[5]) if len(sys.argv) > 5 else 300)
-    else:
-        measure(Path(sys.argv[1]))
-        options(Path(sys.argv[1]))
+    else:  # measured on a copy, so even the WAL file is left as it is
+        tmp = Path(tempfile.mkdtemp()) / "copy.db"
+        for suffix in ("", "-wal"):
+            if Path(sys.argv[1] + suffix).exists():
+                shutil.copy(sys.argv[1] + suffix, str(tmp) + suffix)
+        measure(tmp)
+        options(tmp)
+        shutil.rmtree(tmp.parent)
