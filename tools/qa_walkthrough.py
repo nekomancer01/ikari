@@ -502,6 +502,10 @@ def export(e):
 
 @step("coverage: open View > Download coverage for the busy subreddit")
 def coverage_open(e):
+    for i in range(w.datasets.count()):
+        if (w.datasets.item(i).data(Qt.ItemDataRole.UserRole) or "").lower() == ARGS.busy.lower():
+            w.datasets.setCurrentRow(i)
+    pump(0.5)
     w.coverage_act.trigger()
     pump(1)
     c = w.coverage
