@@ -17,6 +17,10 @@ if [ ! -x .venv/bin/python ]; then
         exit 1
     fi
     .venv/bin/python -m pip install --upgrade pip
-    .venv/bin/python -m pip install -e .
+fi
+# Re-sync dependencies whenever pyproject.toml changes (new deps never break a launch).
+if [ ! -f .venv/.deps-stamp ] || [ pyproject.toml -nt .venv/.deps-stamp ]; then
+    echo "Installing ikari dependencies..."
+    .venv/bin/python -m pip install -q -e . && touch .venv/.deps-stamp
 fi
 exec .venv/bin/python -m subsentiment "$@"
