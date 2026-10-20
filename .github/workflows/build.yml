@@ -18,9 +18,9 @@ concurrency:
 
 jobs:
   test:
-    # The required check for pull requests ("Windows x64" in the "Protect main" ruleset): the whole test
+    # The required check for pull requests ("Windows tests" in the "Protect main" ruleset): the whole test
     # suite, e2e and layout included, through the same command contributors run before pushing.
-    name: Windows x64
+    name: Windows tests
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5

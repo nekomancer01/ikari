@@ -1,4 +1,4 @@
-"""Runs exactly what the required "Windows x64" PR check runs: the whole test suite, e2e and layout included.
+"""Runs exactly what the required "Windows tests" PR check runs: the whole test suite, e2e and layout included.
 
 Run from the repo root before every push:  python tools/check.py [extra pytest args]
 It first says whether the branch is behind origin/main (merge main in, then run it again, since main only
