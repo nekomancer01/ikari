@@ -157,7 +157,7 @@ def test_window_fits_a_150_percent_screen():
 
 
 def test_rows_added_during_a_fetch_are_appended_and_fade_in():
-    from subsentiment.gui.models import FADE_SECONDS, POST_COLUMNS, RowsModel
+    from subsentiment.gui.tables import FADE_SECONDS, POST_COLUMNS, RowsModel
     now = [0.0]
     m = RowsModel(POST_COLUMNS, clock=lambda: now[0])
     row = lambda i: {"id": f"p{i}", "sentiment": 0.1, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
@@ -178,7 +178,7 @@ def test_rows_added_during_a_fetch_are_appended_and_fade_in():
 
 
 def test_append_rows_shows_each_new_row_fading_in_and_skips_ones_already_shown():
-    from subsentiment.gui.models import POST_COLUMNS, RowsModel
+    from subsentiment.gui.tables import POST_COLUMNS, RowsModel
     now = [0.0]
     m = RowsModel(POST_COLUMNS, clock=lambda: now[0])
     row = lambda i: {"id": f"p{i}", "sentiment": 0.1, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
@@ -332,7 +332,7 @@ def test_one_row_is_counted_as_one_row(make_window):
 
 
 def test_posts_without_a_score_yet_sort_below_every_real_score(make_window):
-    from subsentiment.gui.models import POST_COLUMNS, RowsModel, SORT_ROLE
+    from subsentiment.gui.tables import POST_COLUMNS, RowsModel, SORT_ROLE
     model = RowsModel(POST_COLUMNS)
     col = next(i for i, c in enumerate(POST_COLUMNS) if c[1] == "score")
     rows = [{"id": i, "score": s, "title": "t", "selftext": "", "label": "neutral"}

@@ -128,7 +128,7 @@ def window_shots(name: str, keep: bool, out: str) -> None:
     from PySide6.QtWidgets import QApplication
 
     import screenshot
-    from subsentiment.gui import main_window, theme
+    from subsentiment.gui import main_window, motion, theme
     if not keep:
         theme.smooth_text = lambda f: f
     db = str(Path(tempfile.mkdtemp(prefix="ikari-text-")) / "sample.db")
@@ -143,6 +143,7 @@ def window_shots(name: str, keep: bool, out: str) -> None:
     theme.load_fonts(app)
     theme.apply(app, "dark")
     window = main_window.MainWindow(db)
+    motion.set_enabled(False)  # text of the finished state, not mid-fade
     window.subreddit.setText(screenshot.SUBREDDIT)
     window.show()
     scale = os.environ.get("QT_SCALE_FACTOR", "1")

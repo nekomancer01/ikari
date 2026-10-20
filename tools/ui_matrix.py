@@ -334,7 +334,7 @@ def child(spec: dict) -> int:
     from PySide6.QtCore import QRect, QSettings, QSize
     from PySide6.QtWidgets import QApplication
 
-    from subsentiment.gui import coverage, main_window, native, theme, widgets
+    from subsentiment.gui import coverage, main_window, motion, native, theme, widgets
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import screenshot  # noqa: E402  (seeds the sample data)
@@ -357,6 +357,7 @@ def child(spec: dict) -> int:
     theme.apply(app, spec["theme"])  # before the window, as the app does, so first sizes are the styled ones
 
     window = main_window.MainWindow(spec["db"])
+    motion.set_enabled(False)  # sizes and stills of the finished state, not mid-fade
     window.subreddit.setText(screenshot.SUBREDDIT)
     window.tabbar.setFocus()
 
