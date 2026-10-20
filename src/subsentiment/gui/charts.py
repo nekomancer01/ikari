@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from PySide6.QtCharts import QAreaSeries, QCategoryAxis, QChart, QChartView, QLineSeries, QScatterSeries
 from PySide6.QtCore import QEvent, QMargins, QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QFontMetrics, QPainter, QPen
+from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QFontMetricsF, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QToolTip, QWidget
 
 from subsentiment.gui import motion, theme
@@ -126,9 +126,9 @@ class DistributionChart(QWidget):
         name_font = QFont(self.font())
         count_font = theme.display_font(self.font().pointSizeF() + 0.5, 600)
         share_font = QFont(self.font())
-        share_w = QFontMetrics(share_font).horizontalAdvance("100%")
-        count_w = max(QFontMetrics(count_font).horizontalAdvance(f"{n:,}") for n in self._counts.values())
         whole = sum(self._counts.values())
+        share_w = QFontMetricsF(share_font).horizontalAdvance("100%")
+        count_w = QFontMetricsF(count_font).horizontalAdvance(f"{whole:,}")  # no count is longer than the whole
         for i, (cat, row) in enumerate(zip(self.CATEGORIES, rows)):
             mid = row.center().y()
             if i:  # a hairline between rows, as in a ruled list
