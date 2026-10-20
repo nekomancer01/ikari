@@ -829,3 +829,51 @@ def test_a_slow_request_still_out_holds_back_the_next_while_the_budget_is_unknow
     other.wait(stopped.is_set)
     stopped.set()  # its job was stopped: nobody waits for that answer any more
     assert other.wait() is not None
+
+
+def test_a_stopped_download_goes_on_from_where_it_got_to():
+    # A stopped Download all, run again, used to page through every post it already had before reaching
+    # new ones: on a busy day that's dozens of requests the archive keeps timing out on, saving nothing.
+    items = busy_day(4000)
+    usable = {d["id"] for d in items if "removed_by_category" not in d}
+    fresh = archive(items)
+    fresh.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True)
+    whole = len(fresh.session.calls)
+
+    c = archive(items)
+    stop = lambda: len(c.session.calls) >= whole // 2  # noqa: E731
+    first = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True, should_stop=stop)
+    assert first and not c.exhausted and c.reached
+    calls, read = len(c.session.calls), c.reached
+    have = {p.id for p in first}
+    rest = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True, skip=have, read=read)
+    assert have | {p.id for p in rest} == usable and not have & {p.id for p in rest} and c.exhausted
+    assert len(c.session.calls) - calls <= whole - calls + 8  # what was read isn't read again (a page a slice spare)
+    # Between them, the two runs read the whole day, each second of it once.
+    seconds = [t for a, b in read + c.reached for t in range(a, b + 1)]
+    assert sorted(seconds) == list(range(T0, T0 + DAY))
+
+    # A keyword search reads only the posts that match, so it says nothing about what was read.
+    c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10, query="post")
+    assert c.reached == []
+
+
+def test_a_query_timeout_pauses_only_its_own_request():
+    # A timing-out count held back every request, so a download beside it waited out each of its timeouts too.
+    slow = FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
+    clock = FakeClock()
+    limiter = RateLimiter(0.5, clock, clock.sleep)
+    waits = []
+
+    def sleep(s):
+        if s == 2.0 and not waits:  # while the timed-out request waits, another one asks to go
+            waits.append(None)
+            start = clock.t
+            limiter.wait()
+            waits[0] = clock.t - start
+        clock.sleep(s)
+
+    limiter._sleep = sleep
+    c = ArcticShiftClient(session=FakeSession([slow, ok([post(1)])]), limiter=limiter)
+    assert len(c.get("/api/posts/search/aggregate", {"limit": 31}, shrink=False)) == 1
+    assert waits == [0.5]  # just the usual spacing, not the timeout's 2 s

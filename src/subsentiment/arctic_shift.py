@@ -58,6 +58,7 @@ MAX_SKIPS = 2  # windows that still time out at MIN_WINDOW skipped in a row befo
 TREE_LIMIT = 300  # comments asked for per thread; big trees are slow for the archive and trip its limits
 TREE_MAX = 25000  # the most comments the tree endpoint returns in one request
 UNKNOWN_THREAD = 1000  # what fetch_all_comments asks for when a post's comment count isn't known yet
+INGEST_LAG = 3600  # seconds; a stretch read more recently than this may still get posts (see fetch_posts)
 COUNT_CHUNK_DAYS = 31  # days per aggregate request; a timing-out chunk is split down to one day
 DAY = 86400
 
@@ -173,6 +174,17 @@ class RateLimiter:
             self._in_flight.remove(flight)
         elif self._in_flight:
             self._in_flight.pop(0)
+
+    def pause(self, seconds: float, should_stop: StopFn | None = None) -> None:
+        """Wait ``seconds`` on this thread only, letting other requests go meanwhile. Raises Stopped if
+        ``should_stop`` turns true."""
+        end = self._clock() + min(seconds, MAX_WAIT)
+        while (left := end - self._clock()) > 0:
+            if should_stop and should_stop():
+                raise Stopped
+            self._sleep(min(left, STOP_POLL) if should_stop else left)
+        if should_stop and should_stop():
+            raise Stopped
 
     def hold(self, seconds: float, reason: str = "Arctic Shift is busy") -> None:
         """Send nothing for the next ``seconds`` (capped at MAX_WAIT)."""
@@ -325,6 +337,9 @@ class ArcticShiftClient:
         self._removed_lock = threading.Lock()
         self.exhausted = False  # whether the last fetch_posts read its whole range (see there)
         self.timed_out = False  # whether it had to skip a stretch the archive kept timing out on
+        # Stretches the last fetch_posts read through, as (first, last) seconds: every post created in them
+        # was returned, skipped as saved, or noted as removed or an image (see there).
+        self.reached: list[tuple[int, int]] = []
         self._skipped_posts = False  # a slice moved past posts it couldn't page through (see _earliest)
 
     # -- HTTP ---------------------------------------------------------------
@@ -377,8 +392,10 @@ class ArcticShiftClient:
                     raise QueryTimeout("Arctic Shift timed out on this query. Try a shorter date range or "
                                        "fewer posts, or try again in a few minutes.")
                 # A timeout is about how heavy the query was, not how often we ask, so it gets a short
-                # pause and a smaller page rather than slowing the whole job down.
-                self.limiter.hold(2.0 * timeouts, "Arctic Shift is slow right now")
+                # pause and a smaller page rather than slowing the whole job down. Only this request waits:
+                # holding every request back made one heavy query (a busy month's count) stall the downloads
+                # beside it, which then said "Arctic Shift is slow" over and over and saved nothing.
+                self.limiter.pause(2.0 * timeouts, stop)
                 limit = params.get("limit")
                 if shrink and "limit" in params:
                     params["limit"] = PAGE // 4 if not isinstance(limit, int) else max(10, limit // 2)
@@ -416,6 +433,7 @@ class ArcticShiftClient:
         should_stop: StopFn | None = None,
         on_posts: Callable[[list[Post]], None] | None = None,
         exhaust: bool = False,
+        read: Iterable[tuple[int, int]] = (),
     ) -> list[Post]:
         """Up to ``limit`` posts created in [after, before), spread evenly over the range, oldest first.
 
@@ -435,6 +453,11 @@ class ArcticShiftClient:
 
         A stretch the archive keeps timing out on, even narrowed to MIN_WINDOW, is skipped rather than
         failing the whole fetch; ``self.timed_out`` then says so, and the range isn't ``exhausted``.
+
+        ``read`` is the stretches an earlier fetch read through (``self.reached`` after it, as (first, last)
+        seconds), whose posts are all in ``skip``: each slice starts after what was read of it, so a download
+        that was stopped picks up where it left off rather than paging through every post it already has.
+        Afterwards ``self.reached`` says what this one read through (nothing for a keyword search or top mode).
         """
         subreddit = normalize_subreddit(subreddit)
         if error := subreddit_error(subreddit):
@@ -447,13 +470,21 @@ class ArcticShiftClient:
         skip = set(skip)
         self._page_cap = PAGE
         self.exhausted = self.timed_out = self._skipped_posts = False
+        self.reached = []
 
         n = slot_count(after, before, limit, top)
         windows = slices(after, before, n)
         picked: list[list[Post]] = [[] for _ in windows]
         spare: list[list] = [[] for _ in windows]  # top mode: ranked candidates not picked yet, best first
-        more = [True] * len(windows)  # the slice may hold posts we haven't read
+        # Where each slice's reading goes on from: the first second whose posts may not all be read yet.
         cursors = [lo for lo, _ in windows]
+        if not (top or query):
+            for i, (lo, _) in enumerate(windows):
+                for first, last in sorted(read):
+                    if first <= cursors[i] <= last:
+                        cursors[i] = last + 1
+        starts = list(cursors)
+        more = [c < hi for c, (_, hi) in zip(cursors, windows)]  # the slice may hold posts we haven't read
         what = "Ranking" if top else "Collecting"
         # What each slice still running has downloaded so far, kept when Stop stops waiting for it.
         partial: dict[int, list[Post]] = {}
@@ -466,7 +497,9 @@ class ArcticShiftClient:
             if top:
                 ranked = sorted(self._top_pool(base, lo, hi, should_stop), key=_light_rank, reverse=True)
                 return self._take_top(ranked, want)
-            return self._earliest(base, lo, hi, want, skip, should_stop, partial.setdefault(i, []))
+            if not more[i]:  # read to its end before
+                return [], hi, False
+            return self._earliest(base, cursors[i], hi, want, skip, should_stop, partial.setdefault(i, []))
 
         # Slices are independent, so a few are read at once. Results are taken here, on the calling
         # thread, so on_posts can save them to a database that belongs to it.
@@ -535,6 +568,14 @@ class ArcticShiftClient:
             picked[i] += extra
             if on_posts and extra:
                 on_posts(extra)
+            # Read in order, so it's read through the second before its newest post (more may share that one).
+            cursors[i] = max([cursors[i]] + [int(p.created_utc) for p in extra])
+        if not (top or query or self.timed_out or self._skipped_posts):
+            # Not past a while ago: the archive takes in new posts within seconds, but not always.
+            now = int(time.time()) - INGEST_LAG
+            self.reached = [(start, min(hi - 1 if not m else c - 1, now))
+                            for start, c, m, (_, hi) in zip(starts, cursors, more, windows)]
+            self.reached = [(a, b) for a, b in self.reached if b >= a]
         posts = [p for group in picked for p in group]
         posts.sort(key=lambda p: p.created_utc)
         self.exhausted = not top and not any(more) and not self._skipped_posts and not self.timed_out

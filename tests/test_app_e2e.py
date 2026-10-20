@@ -459,7 +459,7 @@ def test_fetching_another_subreddit_shows_it_as_it_downloads(env, saved_before):
         fetch(w, comments=False)
     fetch(w, sub="rust", comments=False)
     assert w.current.lower() == "rust"
-    env.archive.delay = 0.1
+    env.archive.delay = 0.5  # a page at a time, so Stop lands partway
     w.fetch_form.subreddit.setText("python")
     w.fetch_form.include_comments.setChecked(True)
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
@@ -620,7 +620,7 @@ def test_switching_subreddit_mid_fetch_keeps_each_table_to_its_own_rows(env):
     w = env.window()
     fetch(w, sub="rust", comments=False)
     fetch(w, sub="python", comments=False)  # python is open, as when fetching more of it
-    env.archive.delay = 0.1
+    env.archive.delay = 0.5  # a page at a time, so Stop lands partway
     w.fetch_form.subreddit.setText("python")
     w.fetch_form.include_comments.setChecked(True)
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
@@ -1228,3 +1228,73 @@ def test_a_fetchs_settled_days_are_packed_and_still_show_what_was_fetched(env, m
         page.view.doubleClicked.emit(page.model.index(i, 0))
     assert sorted(opened) == sorted("https://www.reddit.com" + archive[r["post_id"]]["permalink"] + r["id"] + "/"
                                     for r in s.comments("python"))
+
+
+def test_a_stopped_download_all_goes_on_from_where_it_got_to(env, monkeypatch):
+    # Run again after Stop (or after closing the app), Download all paged through every post it already had
+    # before reaching new ones, so a resumed day took as long as a fresh one and, on a busy subreddit, sat on
+    # "Arctic Shift is slow" for minutes without saving anything.
+    day = busy_day(env, "bigday", 1500)
+    env.archive.posts += [dict(env.archive.posts[-1], id="other", created_utc=NOW - 3600)]
+    w = env.window()
+    fetch(w, sub="bigday", comments=False, rng="day")  # a post from today, so r/bigday is saved
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    cov = open_coverage(w)
+    row = cov.days.index(day)
+    button = lambda: cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn))  # noqa: E731
+    env.archive.delay = 1.0  # a page a second for each part of the day, so Stop lands partway
+    env.archive.clear()
+    QTest.mouseClick(button(), Qt.MouseButton.LeftButton)
+    end = time.monotonic() + 30
+    in_day = lambda: {r["id"] for r in env.store().posts("bigday") if day <= r["created_utc"] < day + DAY}  # noqa: E731
+    while len(env.archive.paths()) < 6 and time.monotonic() < end:  # the first pages are in, the next asked for
+        pump(20)
+    QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    env.archive.delay = 0
+    saved = in_day()
+    assert 300 <= len(saved) < 1500
+    env.archive.clear()
+    QTest.mouseClick(button(), Qt.MouseButton.LeftButton)
+    wait_idle(w, 60)
+    resumed = [q for p, q in env.archive.requests if p == SEARCH]
+    assert len(in_day()) == 1500 and str(day) in env.store().complete_keys("posts", "bigday")
+    # Each part of the day is read on from where the first run got to: the saved posts aren't asked for again.
+    again = 0
+    for q in resumed:
+        rows = sorted(p["created_utc"] for p in env.archive.posts if p["subreddit"] == "bigday"
+                      and float(q["after"]) < p["created_utc"] < float(q["before"]))[:int(q["limit"])]
+        again += sum(1 for p in env.archive.posts if p["subreddit"] == "bigday" and p["created_utc"] in rows
+                     and p["id"] in saved)
+    assert again <= 8  # a post or two where each part left off
+
+
+def test_a_count_that_keeps_timing_out_doesnt_hold_up_a_download(env, monkeypatch):
+    # The Coverage page counts its days while a Download all runs. Each time the count timed out, every request
+    # was held back 2 s, then 4 s, so the download beside it said "Arctic Shift is slow" over and over.
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 120.0)  # the app's real back-offs
+    w = env.window()
+    fetch(w, comments=False, rng="day")
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
+    env.archive.clear()
+    env.archive.fail(AGG, *[SLOW_DOWN] * 100)
+    w.coverage_act.trigger()
+    end = time.monotonic() + 10
+    while not env.archive.paths() and time.monotonic() < end:
+        pump(10)
+    pump(100)  # its answer is in: the count waits out its first timeout
+    assert w.coverage.count_job.busy and env.archive.paths() == [AGG]
+    cov = w.coverage
+    row = next(r for r, d in enumerate(cov.days) if d < coverage.today() - DAY
+               and any(d <= p["created_utc"] < d + DAY for p in env.archive.posts if p["subreddit"] == "Python"))
+    QTest.mouseClick(cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    paths = env.archive.paths()
+    assert SEARCH in paths and paths.count(AGG) == 1  # done within the count's first 2 s pause, not after it
+    assert env.store().posts_per_day("python", cov.days[row], cov.days[row] + DAY)
+    assert w.coverage.count_job.busy  # still waiting out its own timeouts
+    w.close()  # which stops the count: its pause notices within a fraction of a second
+    end = time.monotonic() + 5
+    while w.coverage.count_job.busy and time.monotonic() < end:
+        pump(20)
+    assert not w.coverage.count_job.busy
