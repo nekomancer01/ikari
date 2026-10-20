@@ -836,7 +836,9 @@ def test_stop_in_the_coverage_window_is_disabled_once_pressed(env):
     w = env.window()
     fetch(w, comments=False)
     cov = open_coverage(w)
-    env.archive.delay = 0.15
+    # The day's Download all is four requests sent at once, so at 0.15 s each it was over in about 0.34 s
+    # and Stop was sometimes already off when the test looked at 0.3 s.
+    env.archive.delay = 1.0
     QTest.mouseClick(cov.day_table.cellWidget(1, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     pump(300)
     assert cov.stop_btn.isEnabled()
