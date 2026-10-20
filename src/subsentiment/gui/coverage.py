@@ -28,8 +28,6 @@ from subsentiment.gui.worker import CountWorker
 
 DAY = 86400
 MAX_DAY_POSTS = 10000  # cap on one day's "Download all"
-UNKNOWN_DAY_POSTS = 2000  # what a day's "Download all" asks for when the archive couldn't count it
-SLACK = 25  # extra posts asked for beyond the count, in case it lags the archive
 
 NOTE = ("Totals come from Arctic Shift and include posts and comments later removed from Reddit, which ikari "
         "can't save. A day's share counts the removed posts ikari has seen as checked, and a thread can stop short "
@@ -639,17 +637,11 @@ class CoverageWindow(QDialog):
     def _download_day(self, day: int) -> None:
         if not self.subreddit:
             return
-        total = self.totals.get(self.subreddit.lower(), {}).get(day)
-        store = self.window_.store
-        have = store.posts_per_day(self.subreddit, day, day + DAY).get(day, 0)
-        gone = store.removed_per_day(self.subreddit, day, day + DAY).get(day, 0)
-        if no_total(day, have, total, False):  # no total to go by, so take everything there is
-            limit = MAX_DAY_POSTS
-        else:
-            limit = UNKNOWN_DAY_POSTS if total is None else max(total - have - gone, 0) + SLACK
+        # Everything there is, not the archive's count less what's saved: the count can lag or be off, and
+        # the day is only marked complete when every part of it was read to its end.
         # Posts only: comments are fetched from the posts list, one post or one day at a time, when asked.
         req = collect.FetchRequest(subreddit=self.subreddit, after=day, before=day + DAY,
-                                   limit=min(limit, MAX_DAY_POSTS), include_comments=False, everything=True)
+                                   limit=MAX_DAY_POSTS, include_comments=False, everything=True)
         what = "so far today" if day >= today() else f"from {day_text(day)}"
         self.window_.start_request(req, f"Downloading every post {what} in r/{self.subreddit}…")
 

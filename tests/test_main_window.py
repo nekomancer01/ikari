@@ -225,7 +225,7 @@ def test_coverage_window_lists_days_and_downloads_through_the_fetch_job(make_win
     c.day_table.cellWidget(row, 2).findChild(mw.QPushButton).click()
     req = started[-1]
     assert (req.after, req.before, req.everything, req.subreddit) == (day, day + 86400, True, "Python")
-    assert req.limit == 4 + coverage.SLACK
+    assert req.limit == coverage.MAX_DAY_POSTS  # everything; the day is complete only if the archive ran out
 
     c.day_table.selectRow(row)
     QApplication.processEvents()
