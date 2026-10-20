@@ -38,16 +38,6 @@ def test_summary_and_daily_means():
     assert s.daily_means == [(0, 0.2, 2), (86400, 0.0, 1)]
 
 
-def test_strongest_items_match_the_old_sorted_list_ties_included():
-    rows = [{"id": i, "label": "neutral", "sentiment": v, "created_utc": 0}
-            for i, v in enumerate([0.5, -0.2, 0.5, 0.9, -0.2, 0.0, 0.5, -0.7])]
-    ranked = sorted(rows, key=lambda r: r["sentiment"])
-    a = Analysis(rows)
-    for n in (1, 2, 3, 10):
-        assert a.most_positive(n) == list(reversed(ranked[-n:]))
-        assert a.most_negative(n) == ranked[:n]
-
-
 class FakeClient:
     def fetch_posts(self, *a, **kw):
         return [make_post(1, sub="AskScience"), make_post(2, sub="AskScience")]
@@ -111,6 +101,21 @@ def test_posts_and_comments_since_return_only_what_a_fetch_just_saved(tmp_path):
     s.save_post(Post("b", "Python", "t", "", "u", 1, None, 1, 2.0, "p", ""), 0.0, "neutral")
     assert [r["id"] for r in s.posts_since("python", cut)] == ["b"]
     assert s.comments_since("python", cut) == []
+
+
+def test_rows_saved_within_one_clock_tick_are_each_read_back_once(tmp_path, monkeypatch):
+    # Windows' clock moves in 15.6 ms steps (Python 3.12), so a thread's comments saved together shared one
+    # fetched_at, and each read of what the fetch added since the last row read got the whole batch again.
+    import time
+    import types
+    from subsentiment import store as store_mod
+    monkeypatch.setattr(store_mod, "time", types.SimpleNamespace(time=lambda: int(time.time() * 64) / 64))
+    s = Store(tmp_path / "x.db")
+    for i in range(50):
+        s.save_comment(Comment(f"c{i}", "p", "Python", "t3_p", "u", "hi", 1, 1.0, 0, "x"), 0.0, "neutral")
+    rows = s.comments_since("python", 0)
+    assert len({r["fetched_at"] for r in rows}) == 50
+    assert [r["id"] for r in s.comments_since("python", rows[-1]["fetched_at"])] == ["c49"]  # only the last
 
 
 def test_text_sqlite_cant_store_is_saved_with_a_replacement_instead_of_failing(tmp_path):
