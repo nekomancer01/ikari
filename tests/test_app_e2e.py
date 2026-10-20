@@ -1251,3 +1251,17 @@ def test_a_new_subreddit_that_saves_nothing_goes_back_to_a_saved_one(env):
     fetch(w, comments=False)
     fetch(w, sub="nosuchsub", comments=False)
     assert w.current.lower() == "python" and w.datasets.currentItem() is not None
+
+
+def test_starting_a_saved_subreddit_after_another_switches_to_it_at_once(env):
+    w = env.window()
+    fetch(w, comments=False)
+    fetch(w, sub="rust", comments=False)
+    assert w.current.lower() == "rust"
+    env.archive.delay = 0.5
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(False)
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    assert w.fetch_job.busy and w.current.lower() == "python" and w.posts_tab.model.rowCount() > 0
+    env.archive.delay = 0
+    wait_idle(w)
