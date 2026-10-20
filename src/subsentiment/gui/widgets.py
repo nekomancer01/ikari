@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Callable
 
 from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QLinearGradient, QPainter
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QAbstractScrollArea, QComboBox, QFrame, QLabel, QScrollArea, QVBoxLayout, QWidget,
 )
@@ -30,7 +30,7 @@ def plural(n: int, noun: str) -> str:
 
 
 def panel(kind: str = "true", margins: int = 18, spacing: int = 12) -> tuple[QFrame, QVBoxLayout]:
-    """A rounded panel: kind "true" is glass, "tile" a brighter glass card, "solid" a near-opaque data surface."""
+    """A rounded, outlined panel: kind "true" is a page-level panel, "tile" and "solid" a card on one."""
     frame = mark(QFrame(), "glass", kind)
     lay = QVBoxLayout(frame)
     lay.setContentsMargins(margins, margins, margins, margins)
@@ -43,7 +43,7 @@ def label(text: str, role: str) -> QLabel:
 
 
 def section(text: str) -> QLabel:
-    return label(text.upper(), "section")
+    return label(text, "section")
 
 
 class ElidedLabel(QLabel):
@@ -159,7 +159,7 @@ class QuietScrollBars(QObject):
 class ShareBar(QWidget):
     """Thin rounded bar showing a share from 0 to 1 (None draws the empty track).
 
-    Filled in the palette colour ``color_key`` when one is given, else in the accent gradient; a complete
+    Filled in the palette colour ``color_key`` when one is given, else in the accent; a complete
     bar is green."""
 
     def __init__(self, color_key: str | None = None):
@@ -182,9 +182,7 @@ class ShareBar(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         r = QRectF(self.rect())
         t = theme.tokens()
-        track = QColor(*t["edge"][:3])
-        track.setAlpha(40)
-        p.setBrush(track)
+        p.setBrush(QColor(t["soft"]))
         p.drawRoundedRect(r, 3, 3)
         share = self._drawn.value
         if not share:
@@ -193,10 +191,7 @@ class ShareBar(QWidget):
         if self.complete or self.color_key:
             p.setBrush(QColor(palette()["positive" if self.complete else self.color_key]))
         else:
-            g = QLinearGradient(fill.topLeft(), fill.topRight())
-            g.setColorAt(0, QColor(t["accent"]))
-            g.setColorAt(1, QColor(t["accent2"]))
-            p.setBrush(g)
+            p.setBrush(QColor(t["accent"]))
         p.drawRoundedRect(fill, 3, 3)
 
 
@@ -243,7 +238,7 @@ class StatTile(QFrame):
         lay.setContentsMargins(16, 14, 16, 14)
         lay.setSpacing(4)
         self.value = CountingLabel("–", "value")
-        lay.addWidget(label(caption.upper(), "section"))
+        lay.addWidget(label(caption, "caption"))
         lay.addWidget(self.value)
         # Tiles without a meter keep an empty slot its size, so every caption and value lines up.
         self.meter = ShareBar(meter) if meter else None

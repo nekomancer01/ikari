@@ -11,7 +11,7 @@ N = 1024  # draw large, downsample for smooth edges
 
 # Flat: solid fills only, no gradients, sheen or shadows. Colours match the theme
 # accent and the chart's sentiment colours.
-TILE = (78, 100, 255)  # between the theme's accent and accent2
+TILE = (78, 100, 255)  # the icon tile's blue-violet
 WHITE = (255, 255, 255, 255)
 COLORS = [(227, 73, 72), (138, 137, 132), (42, 120, 214)]  # negative, neutral, positive
 

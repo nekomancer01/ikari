@@ -6,15 +6,16 @@ import time
 from datetime import datetime
 from typing import Any, Callable
 
-from PySide6.QtCore import QAbstractTableModel, QItemSelectionModel, QModelIndex, Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QPixmap
+from PySide6.QtCore import QAbstractTableModel, QItemSelectionModel, QModelIndex, QRectF, QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QHeaderView, QLineEdit, QTableView, QVBoxLayout, QWidget,
+    QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QHeaderView, QLineEdit, QStyle, QStyledItemDelegate,
+    QStyleOptionViewItem, QTableView, QVBoxLayout, QWidget,
 )
 
-from subsentiment.gui import motion
+from subsentiment.gui import motion, theme
 from subsentiment.gui.charts import palette
-from subsentiment.gui.widgets import label, panel, plural
+from subsentiment.gui.widgets import label, mark, plural
 
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1  # the value a column sorts by (the model sorts by it itself)
 NUMERIC = ("sentiment", "score", "num_comments")
@@ -57,10 +58,78 @@ COMMENT_COLUMNS: list[Column] = [
 ]
 
 
-def _swatch(color: str) -> QIcon:
-    pm = QPixmap(10, 10)
-    pm.fill(QColor(color))
-    return QIcon(pm)
+class ChipDelegate(QStyledItemDelegate):
+    """Draws a cell's value in an outlined chip: a pill with a coloured dot for the Label column, a box for
+    the Sentiment column. The row's background, hover, selection and rule are drawn as for any cell, and
+    a row fading in fades its chip too."""
+
+    PAD = 5  # the cell's own padding either side (the stylesheet's item padding)
+    DOT, GAP, INSET = 6, 5, 6  # the pill's dot, the gap after it, and its inner padding
+
+    def __init__(self, kind: str, parent=None):
+        super().__init__(parent)
+        self.kind = kind  # "pill" or "box"
+
+    def _font(self, base: QFont) -> QFont:
+        """The pill's text a step smaller than the table's, the box's value in semibold."""
+        f = QFont(base)
+        if self.kind == "pill":
+            f.setPointSizeF(base.pointSizeF() - 1)
+        else:
+            f.setWeight(QFont.Weight.DemiBold)
+        return f
+
+    def sizeHint(self, option, index) -> QSize:
+        hint = super().sizeHint(option, index)
+        text = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        inner = QFontMetrics(self._font(option.font)).horizontalAdvance(text) + 2 * self.INSET
+        if self.kind == "pill":
+            inner += self.DOT + self.GAP
+        return QSize(2 * self.PAD + inner, hint.height())
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text, opt.text = opt.text, ""
+        style = opt.widget.style() if opt.widget else None
+        if style is not None:
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+        if not text:
+            return
+        ink = opt.palette.color(QPalette.ColorRole.Text)  # carries a fading row's alpha
+        t = theme.tokens()
+        edge = QColor(*t["edge"][:3], round(t["edge"][3] * ink.alphaF()))
+        font = self._font(opt.font)
+        metrics = QFontMetrics(font)
+        cell = QRectF(opt.rect).adjusted(self.PAD, 0, -self.PAD, 0)
+        height = min(cell.height() - 8, QFontMetrics(opt.font).height() + 8)
+        if self.kind == "pill":
+            width = min(cell.width(), self.INSET * 2 + self.DOT + self.GAP + metrics.horizontalAdvance(text))
+        else:
+            width = cell.width()
+        chip = QRectF(cell.left(), cell.center().y() - height / 2, width, height).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(edge, 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        radius = height / 2 if self.kind == "pill" else 6
+        painter.drawRoundedRect(chip, radius, radius)
+        painter.setFont(font)
+        if self.kind == "pill":
+            dot = QColor(index.model().color(index) or ink)
+            dot.setAlphaF(ink.alphaF())
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(dot)
+            painter.drawRoundedRect(QRectF(chip.left() + self.INSET, chip.center().y() - self.DOT / 2,
+                                           self.DOT, self.DOT), 1.5, 1.5)
+            room = chip.adjusted(self.INSET + self.DOT + self.GAP, 0, -self.INSET + 2, 0)
+            painter.setPen(ink)
+            painter.drawText(room, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                             metrics.elidedText(text, Qt.TextElideMode.ElideRight, int(room.width())))
+        else:
+            painter.setPen(ink)
+            painter.drawText(chip, int(Qt.AlignmentFlag.AlignCenter), text)
+        painter.restore()
 
 
 class RowsModel(QAbstractTableModel):
@@ -74,7 +143,6 @@ class RowsModel(QAbstractTableModel):
         self.columns = columns
         self.rows: list = []
         self._ids: set[str] = set()  # the ids in self.rows
-        self._icons: dict[str, QIcon] = {}
         self._colors: dict = {}
         self._clock = clock
         self._sort: tuple[int, bool] | None = None  # (column, descending) once the view has sorted
@@ -121,7 +189,10 @@ class RowsModel(QAbstractTableModel):
 
     def _restyle(self) -> None:
         self._colors = palette()
-        self._icons = {k: _swatch(self._colors[k]) for k in ("positive", "neutral", "negative")}
+
+    def color(self, index: QModelIndex) -> str | None:
+        """The palette colour of the label in this row (for the Label column's dot)."""
+        return self._colors.get(self.rows[index.row()]["label"])
 
     def restyle(self) -> None:
         """Pick up a new theme's colours."""
@@ -255,8 +326,6 @@ class RowsModel(QAbstractTableModel):
             return fmt(value)
         if role == SORT_ROLE:
             return self._key_of(index.column())(row)
-        if role == Qt.ItemDataRole.DecorationRole and key == "label":
-            return self._icons.get(value)
         if role == Qt.ItemDataRole.ToolTipRole and key in PENDING and value is None:
             return PENDING_TIP
         if role == Qt.ItemDataRole.ToolTipRole and key in ("title", "body"):
@@ -281,7 +350,7 @@ class RowsModel(QAbstractTableModel):
 
 
 class TablePage(QWidget):
-    """Filterable, sortable table on a solid panel; double-click opens the item on Reddit."""
+    """Filterable, sortable table in an outlined box; double-click opens the item on Reddit."""
 
     SHRINKS = ("author", "post_title")  # free text that can end in "…" to leave room for the main text
     OPTIONAL = ("author", "post_title", "num_comments")  # hidden in this order when there's still no room
@@ -299,7 +368,7 @@ class TablePage(QWidget):
         self.filter.setPlaceholderText("Filter by text…")
         self.filter.setClearButtonEnabled(True)
         self.filter.textChanged.connect(lambda _: self._apply_filters())
-        self.label_filter = QComboBox()
+        self.label_filter = mark(QComboBox(), "pill", True)
         self.label_filter.addItems(["All labels", "Positive", "Neutral", "Negative"])
         self.label_filter.currentTextChanged.connect(lambda _: motion.crossfade(self.view))  # first: the old rows' look
         self.label_filter.currentTextChanged.connect(lambda _: self._apply_filters())
@@ -315,7 +384,7 @@ class TablePage(QWidget):
         self.view.setShowGrid(False)
         self.view.setMouseTracking(True)
         self.view.verticalHeader().hide()
-        self.view.verticalHeader().setDefaultSectionSize(34)
+        self.view.verticalHeader().setDefaultSectionSize(42)
         self.view.setWordWrap(False)
         self.view.setFrameShape(QFrame.Shape.NoFrame)
         self.stretch_col = stretch_col
@@ -325,18 +394,21 @@ class TablePage(QWidget):
         header.setHighlightSections(False)
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.view.doubleClicked.connect(self._open)
+        keys = [key for _, key, _ in columns]
+        self._chips = [ChipDelegate("box", self.view), ChipDelegate("pill", self.view)]
+        self.view.setItemDelegateForColumn(keys.index("sentiment"), self._chips[0])
+        self.view.setItemDelegateForColumn(keys.index("label"), self._chips[1])
 
-        card, inner = panel("solid", margins=14, spacing=10)
         top = QHBoxLayout()
         top.setSpacing(10)
         top.addWidget(self.filter, 1)
         top.addWidget(self.label_filter)
         top.addWidget(self.count)
-        inner.addLayout(top)
-        inner.addWidget(self.view)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(card)
+        lay.setSpacing(12)
+        lay.addLayout(top)
+        lay.addWidget(self.view)
         for sig in (self.model.rowsInserted, self.model.rowsRemoved, self.model.modelReset):
             sig.connect(self._update_count)
 
@@ -430,9 +502,9 @@ class TablePage(QWidget):
         Qt's own sizing leaves out room for the sort arrow, so a sorted column's title got cut short."""
         self.view.ensurePolished()  # the stylesheet's font and padding, before the window first shows
         header = self.view.horizontalHeader()
-        font = QFont(self.view.font())  # the font the stylesheet draws headers with (8.5pt semibold)
+        font = QFont(self.view.font())  # the font the stylesheet draws headers with (8.5pt medium)
         font.setPointSizeF(8.5)
-        font.setWeight(QFont.Weight.DemiBold)
+        font.setWeight(QFont.Weight.Medium)
         header.setFont(font)  # Qt elides header titles using the widget's font, not the stylesheet's
         metrics = QFontMetrics(font)
         self._widths = {}  # column -> (width for its values, narrowest that still shows its title)
