@@ -1,62 +1,44 @@
-"""QtCharts views for the overview tab.
+"""The overview tab's charts: the label split (painted here) and the daily timeline (QtCharts).
 
-Colors follow the polarity job: blue = positive, red = negative, neutral gray
-midpoint, with separate steps for light and dark surfaces. Red and gray sit
-close together for protan viewers on dark, so every bar is also labelled by
-category on the axis and by value, never by color alone.
+Colors follow the polarity job: blue = positive, orange = negative, neutral gray midpoint, with
+separate steps for light and dark surfaces. Blue and orange stay apart for color-blind viewers, and
+every bar is also labelled by category on the axis and by value, never by color alone.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from PySide6.QtCharts import (
-    QAreaSeries, QBarCategoryAxis, QBarSet, QCategoryAxis, QChart, QChartView, QLineSeries,
-    QScatterSeries, QStackedBarSeries, QValueAxis,
-)
-from PySide6.QtCore import QMargins, QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QApplication, QGraphicsPathItem, QGraphicsSimpleTextItem, QToolTip
+from PySide6.QtCharts import QAreaSeries, QCategoryAxis, QChart, QChartView, QLineSeries, QScatterSeries
+from PySide6.QtCore import QEvent, QMargins, QPointF, QRectF, Qt
+from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QFontMetrics, QPainter, QPen
+from PySide6.QtWidgets import QApplication, QToolTip, QWidget
 
 from subsentiment.gui import motion, theme
 
-LIGHT = {
-    "surface": "#fcfcfb", "text": "#0b0b0b", "muted": "#52514e", "grid": "#e4e3df",
-    "positive": "#2a78d6", "neutral": "#8a8984", "negative": "#e34948", "line": "#2a78d6",
-}
-DARK = {
-    "surface": "#1a1a19", "text": "#f0efec", "muted": "#c3c2b7", "grid": "#383835",
-    "positive": "#3987e5", "neutral": "#8a8984", "negative": "#e66767", "line": "#3987e5",
-}
-
-
-# Approximate color of the glass card behind the charts, for the dots' surface ring.
-CARD = {"light": "#f3f5fc", "dark": "#1b1f2e"}
+LIGHT = {"positive": "#0163ff", "neutral": "#b4b4b8", "negative": "#f28513", "line": "#0163ff"}
+DARK = {"positive": "#3d86ff", "neutral": "#6e6e74", "negative": "#f59a3c", "line": "#3d86ff"}
 
 
 def palette() -> dict:
-    """Validated series colors for the current theme, with text and grid from the theme."""
+    """Series colors for the current theme, with text, grid and card surface from the theme."""
     t = theme.tokens()
-    mode = theme.mode()
     grid = QColor(*t["edge"][:3])
-    grid.setAlpha(min(255, t["edge"][3] * 2))
-    return dict(DARK if mode == "dark" else LIGHT, surface=CARD[mode], text=t["text"], muted=t["muted"],
+    grid.setAlpha(t["edge"][3])
+    return dict(DARK if theme.mode() == "dark" else LIGHT, surface=t["panel"], text=t["text"], muted=t["muted"],
                 grid=grid.name(QColor.NameFormat.HexArgb))
 
 
 def _ui_font(point_size: float) -> QFont:
-    """The app's UI font (Manrope, tabular figures) at a chart-label size."""
+    """The app's UI font (Inter, tabular figures) at a chart-label size."""
     f = QFont(QApplication.font())
     f.setPointSizeF(point_size)
     return f
 
 
-def _base_chart(title: str, colors: dict) -> QChart:
+def _base_chart() -> QChart:
     chart = QChart()
-    chart.setTitle(title)
-    chart.setBackgroundVisible(False)  # the glass card behind shows through
+    chart.setBackgroundVisible(False)  # the card behind shows through; its caption names the chart
     chart.setPlotAreaBackgroundVisible(False)
-    chart.setTitleBrush(QColor(colors["text"]))
-    chart.setTitleFont(theme.display_font(11.5, 600))
     chart.setMargins(QMargins(4, 4, 4, 4))
     chart.legend().hide()
     chart.setAnimationOptions(QChart.AnimationOption.NoAnimation)
@@ -71,177 +53,133 @@ def _style_axis(axis, colors: dict) -> None:
     axis.setLabelsFont(_ui_font(9))
 
 
-class DistributionChart(QChartView):
-    """One bar per sentiment label: count of items, labelled above with count and share."""
+class DistributionChart(QWidget):
+    """How the items split across the labels: one segmented bar for the whole, and a row per label with
+    its count and share. The segments and the rows' bars ease to new counts instead of jumping."""
 
     CATEGORIES = ("negative", "neutral", "positive")
+    BAR, GAP, RADIUS = 40, 4, 6  # the segmented bar's height, the gap between segments, their corners
+    ROW_BAR = 6  # each row's own share bar
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setStyleSheet("background: transparent; border: none;")
-        self.setBackgroundBrush(Qt.GlobalColor.transparent)
         self.setMinimumHeight(200)
-        self._labels: list[tuple[QGraphicsSimpleTextItem, QGraphicsSimpleTextItem, int, float]] = []
-        self._bars: list[tuple[QGraphicsPathItem, int, float]] = []
-        self._series = None
-        self._colors: dict = {}
-        self._counts: dict[str, int] = {}
-        self._y: QValueAxis | None = None
-        # Bars ease from the heights on screen (_from) to the new counts (_to) as this runs from 0 to 1.
-        self._from: list[float] = []
-        self._to: list[float] = []
+        self.setMouseTracking(True)
+        self._counts: dict[str, int] = {c: 0 for c in self.CATEGORIES}
+        # Counts ease from those on screen (_from) to the new ones (_to) as this runs from 0 to 1.
+        self._shown = [0.0] * len(self.CATEGORIES)
+        self._from: list[float] = list(self._shown)
+        self._to: list[float] = list(self._shown)
         self._grow = motion.Tween(self._grow_step, self)
-        self.set_counts({"negative": 0, "neutral": 0, "positive": 0})
 
     def set_counts(self, counts: dict[str, int]) -> None:
-        """Show new counts. The chart is kept and its bars grow or shrink to the new heights; it's only
-        built again when the theme's colors change."""
-        colors = palette()
-        self._counts = dict(counts)
-        if self._series is not None and colors == self._colors:
-            self._update(counts)
-            return
-        self._colors = colors
-        self._grow.stop()
-        chart = _base_chart("Sentiment distribution", colors)
-        total = sum(counts.values())
-        # A stacked series where each set fills only its own category gives one
-        # bar per category, each in its own color, centred on its axis label.
-        series = QStackedBarSeries()
-        series.setBarWidth(0.62)
-        for i, cat in enumerate(self.CATEGORIES):
-            s = QBarSet(cat.title())
-            values = [0.0] * len(self.CATEGORIES)
-            values[i] = float(counts.get(cat, 0))
-            s.append(values)
-            # QtCharts can't round bars, so its own bars are invisible (they still drive
-            # layout and hover) and rounded shapes are drawn over them in _place_labels.
-            s.setColor(Qt.GlobalColor.transparent)
-            s.setBorderColor(Qt.GlobalColor.transparent)
-            series.append(s)
-        series.hovered.connect(self._hover)
-        chart.addSeries(series)
-
-        x = QBarCategoryAxis()
-        x.append([c.title() for c in self.CATEGORIES])
-        _style_axis(x, colors)
-        x.setGridLineVisible(False)
-        x.setLabelsColor(QColor(colors["text"]))
-        x.setTruncateLabels(False)  # Qt cut "Negative" to "Neg..." on a narrow card though the bar had room
-        # Every bar carries its own count and share, so the value axis only sets the
-        # scale: no labels or grid competing with the bars. Headroom for the labels.
-        y = QValueAxis()
-        y.setRange(0, max(max(counts.values(), default=0) * 1.16, 1))
-        y.setVisible(False)
-        self._y = y
-        chart.addAxis(x, Qt.AlignmentFlag.AlignBottom)
-        chart.addAxis(y, Qt.AlignmentFlag.AlignLeft)
-        series.attachAxis(x)
-        series.attachAxis(y)
-
-        # Value labels sit above each bar in the text color, so they stay readable on
-        # every bar color in both themes (QtCharts can't put stacked labels outside).
-        self._bars = []
-        for i, cat in enumerate(self.CATEGORIES):
-            bar = QGraphicsPathItem(chart)
-            bar.setBrush(QColor(colors[cat]))
-            bar.setPen(QPen(Qt.PenStyle.NoPen))
-            bar.setAcceptHoverEvents(False)  # hover goes to the series' own bar underneath
-            bar.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-            self._bars.append((bar, i, float(counts.get(cat, 0))))
-        self._labels = []
-        count_font, share_font = theme.display_font(10.5, 600), _ui_font(9)
-        for i, cat in enumerate(self.CATEGORIES):
-            n = counts.get(cat, 0)
-            count = QGraphicsSimpleTextItem(f"{n:,}", chart)
-            count.setFont(count_font)
-            count.setBrush(QColor(colors["text"]))
-            share = QGraphicsSimpleTextItem(f"{100 * n / total:.0f}%" if total else "", chart)
-            share.setFont(share_font)
-            share.setBrush(QColor(colors["muted"]))
-            self._labels.append((count, share, i, float(n)))
-        self._series = series
-        chart.plotAreaChanged.connect(lambda _area: self._place_labels())
-
-        old = self.chart()
-        self.setChart(chart)
-        if old is not None:
-            old.deleteLater()
-        self._place_labels()
-
-    def _hover(self, state: bool, index: int, _barset) -> None:
-        if not state:
-            QToolTip.hideText()
-            return
-        n, total = self._counts.get(self.CATEGORIES[index], 0), sum(self._counts.values())
-        QToolTip.showText(QCursor.pos(), f"{self.CATEGORIES[index].title()}: {n:,} ({100 * n / (total or 1):.0f}%)")
-
-    def _update(self, counts: dict[str, int]) -> None:
-        """New counts on the chart already shown: labels change at once, bars and scale ease there."""
-        total = sum(counts.values())
-        new = [float(counts.get(cat, 0)) for cat in self.CATEGORIES]
-        for i, (s, n) in enumerate(zip(self._series.barSets(), new)):
-            s.replace(i, n)  # the invisible bars underneath keep hover in step
-        for count, share, i, _ in self._labels:
-            count.setText(f"{int(new[i]):,}")
-            share.setText(f"{100 * new[i] / total:.0f}%" if total else "")
-        self._from = [v for _, _, v in self._bars] + [self._y.max()]
-        self._to = new + [max(max(new, default=0) * 1.16, 1)]
+        """Show new counts: the text changes at once, the bars ease there."""
+        self._counts = {c: int(counts.get(c, 0)) for c in self.CATEGORIES}
+        self._from = list(self._shown)
+        self._to = [float(self._counts[c]) for c in self.CATEGORIES]
         if self._from == self._to:
+            self.update()
             return
         self._grow.value = 0.0
         self._grow.set(1.0)
 
     def _grow_step(self, t: float) -> None:
-        if not self._to:
-            return
-        *heights, top = [a + (b - a) * t for a, b in zip(self._from, self._to)]
-        self._y.setRange(0, top)
-        self._bars = [(bar, i, heights[i]) for bar, i, _ in self._bars]
-        self._labels = [(c, s, i, heights[i]) for c, s, i, _ in self._labels]
-        self._place_labels()
+        self._shown = [a + (b - a) * t for a, b in zip(self._from, self._to)]
+        self.update()
 
     def shown_heights(self) -> list[float]:
-        """The bar heights drawn right now, in counts (for tests)."""
-        return [v for _, _, v in self._bars]
+        """The counts the bars are drawn at right now (for tests)."""
+        return list(self._shown)
 
-    def _place_labels(self) -> None:
-        chart = self.chart()
-        if chart is None or self._series is None:
-            return
-        half = self._series.barWidth() / 2
-        for bar, i, value in self._bars:
-            top_left = chart.mapToPosition(QPointF(i - half, value), self._series)
-            base_right = chart.mapToPosition(QPointF(i + half, 0), self._series)
-            bar.setPath(_rounded_bar(QRectF(top_left, base_right).normalized()))
-        for count, share, i, value in self._labels:
-            top = chart.mapToPosition(QPointF(i, value), self._series)
-            c, sh = count.boundingRect(), share.boundingRect()
-            gap = 5.0 if sh.width() else 0.0
-            left = top.x() - (c.width() + gap + sh.width()) / 2
-            base = top.y() - 4  # count and share share a baseline just above the bar
-            count.setPos(left, base - c.height())
-            share.setPos(left + c.width() + gap, base - c.height() + (c.height() - sh.height()) * 0.72)
+    def _layout(self) -> tuple[list[QRectF], list[QRectF]]:
+        """The bar's segments and the rows below it, in widget coordinates."""
+        r = QRectF(self.rect()).adjusted(0, 6, 0, 0)
+        total = sum(self._shown)
+        room = r.width() - self.GAP * (len(self.CATEGORIES) - 1)
+        segments, x = [], r.left()
+        for v in self._shown:
+            w = room * v / total if total else 0.0
+            segments.append(QRectF(x, r.top(), w, self.BAR))
+            x += w + (self.GAP if w > 0.5 else 0)
+        top = r.top() + self.BAR + 18
+        step = (r.bottom() - top) / len(self.CATEGORIES)
+        rows = [QRectF(r.left(), top + i * step, r.width(), step) for i in range(len(self.CATEGORIES))]
+        return segments, rows
 
+    def paintEvent(self, event) -> None:
+        colors = palette()
+        t = theme.tokens()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        segments, rows = self._layout()
+        total = sum(self._shown)
+        p.setPen(Qt.PenStyle.NoPen)
+        if not total:  # nothing yet: the empty track, so the card isn't blank
+            p.setBrush(QColor(t["soft"]))
+            p.drawRoundedRect(QRectF(0, segments[0].top(), self.width(), self.BAR), self.RADIUS, self.RADIUS)
+        for cat, seg in zip(self.CATEGORIES, segments):
+            if seg.width() > 0.5:
+                rad = min(self.RADIUS, seg.width() / 2)
+                p.setBrush(QColor(colors[cat]))
+                p.drawRoundedRect(seg, rad, rad)
 
-BAR_RADIUS = 9.0  # px at the top corners; the base stays square on the axis
+        name_font = QFont(self.font())
+        count_font = theme.display_font(self.font().pointSizeF() + 0.5, 600)
+        share_font = QFont(self.font())
+        share_w = QFontMetrics(share_font).horizontalAdvance("100%")
+        count_w = max(QFontMetrics(count_font).horizontalAdvance(f"{n:,}") for n in self._counts.values())
+        whole = sum(self._counts.values())
+        for i, (cat, row) in enumerate(zip(self.CATEGORIES, rows)):
+            mid = row.center().y()
+            if i:  # a hairline between rows, as in a ruled list
+                p.setPen(QPen(QColor(*t["edge"]), 1))
+                p.drawLine(QPointF(row.left(), row.top() + 0.5), QPointF(row.right(), row.top() + 0.5))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(colors[cat]))
+            p.drawRoundedRect(QRectF(row.left(), mid - 4, 8, 8), 2.5, 2.5)
+            p.setPen(QColor(t["text"]))
+            p.setFont(name_font)
+            name = QRectF(row.left() + 18, row.top(), 90, row.height())
+            p.drawText(name, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), cat.title())
+            # The share, then the count, at the right; a thin bar of the share between them and the name.
+            right = QRectF(row.right() - share_w, row.top(), share_w, row.height())
+            share = 100 * self._counts[cat] / whole if whole else 0
+            p.setPen(QColor(t["muted"]))
+            p.drawText(right, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+                       f"{share:.0f}%" if whole else "–")
+            count = QRectF(right.left() - 12 - count_w, row.top(), count_w, row.height())
+            p.setPen(QColor(t["text"]))
+            p.setFont(count_font)
+            p.drawText(count, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+                       f"{self._counts[cat]:,}")
+            track = QRectF(name.right() + 8, mid - self.ROW_BAR / 2,
+                           max(0.0, count.left() - 16 - name.right() - 8), self.ROW_BAR)
+            if track.width() > 24:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(t["soft"]))
+                p.drawRoundedRect(track, 3, 3)
+                drawn = self._shown[i] / total if total else 0.0
+                if drawn > 0:
+                    fill = QColor(colors[cat])
+                    p.setBrush(fill)
+                    p.drawRoundedRect(QRectF(track.left(), track.top(), max(track.height(), track.width() * drawn),
+                                             track.height()), 3, 3)
 
-
-def _rounded_bar(r: QRectF) -> QPainterPath:
-    """A bar with rounded top corners, the radius shrinking for short or narrow bars."""
-    path = QPainterPath()
-    if r.height() <= 0 or r.width() <= 0:
-        return path
-    rad = min(BAR_RADIUS, r.width() / 2, r.height())
-    path.moveTo(r.left(), r.bottom())
-    path.lineTo(r.left(), r.top() + rad)
-    path.arcTo(QRectF(r.left(), r.top(), 2 * rad, 2 * rad), 180, -90)
-    path.lineTo(r.right() - rad, r.top())
-    path.arcTo(QRectF(r.right() - 2 * rad, r.top(), 2 * rad, 2 * rad), 90, -90)
-    path.lineTo(r.right(), r.bottom())
-    path.closeSubpath()
-    return path
+    def event(self, e) -> bool:
+        if e.type() == QEvent.Type.ToolTip:
+            segments, rows = self._layout()
+            pos = QPointF(e.pos())
+            hit = next((i for i, r in enumerate(segments) if r.contains(pos)), None)
+            if hit is None:
+                hit = next((i for i, r in enumerate(rows) if r.contains(pos)), None)
+            if hit is None:
+                QToolTip.hideText()
+            else:
+                cat = self.CATEGORIES[hit]
+                n, whole = self._counts[cat], sum(self._counts.values())
+                QToolTip.showText(e.globalPos(), f"{cat.title()}: {n:,} ({100 * n / (whole or 1):.0f}%)", self)
+            return True
+        return super().event(e)
 
 
 # Symmetric y ranges for the timeline: the smallest that fits the data, so day-to-day
@@ -284,7 +222,7 @@ class TimelineChart(QChartView):
         if getattr(self, "_shown", None) is not None and colors == self._shown[1]:
             motion.crossfade(self)  # new days or new means: the old line fades into the new one
         self._shown = (list(points), colors)
-        chart = _base_chart("Mean sentiment per day (UTC)", colors)
+        chart = _base_chart()
         pen = QPen(QColor(colors["line"]))
         pen.setWidthF(2.25)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)

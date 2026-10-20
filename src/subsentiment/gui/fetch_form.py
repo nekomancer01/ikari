@@ -95,7 +95,7 @@ class FetchForm(QObject):
 
         self.layout = form = QFormLayout()
         form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(8)
+        form.setVerticalSpacing(11)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         form.addRow(label("Subreddit", "muted"), self.subreddit)
         form.addRow(label("Search", "muted"), self.query)

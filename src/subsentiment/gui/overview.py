@@ -40,9 +40,11 @@ class OverviewPage(VerticalScrollArea):
         self.timeline = TimelineChart()
         charts = QHBoxLayout()
         charts.setSpacing(14)
-        for chart, stretch in ((self.distribution, 2), (self.timeline, 3)):
-            card, inner = panel("true", margins=10)
-            inner.addWidget(chart)
+        for chart, title, stretch in ((self.distribution, "Sentiment distribution", 2),
+                                      (self.timeline, "Mean sentiment per day (UTC)", 3)):
+            card, inner = panel("tile", margins=14, spacing=4)
+            inner.addWidget(label(title, "caption"))
+            inner.addWidget(chart, 1)
             charts.addWidget(card, stretch)
         lay.addLayout(charts, 3)
 
@@ -60,7 +62,7 @@ class OverviewPage(VerticalScrollArea):
             lw.itemDoubleClicked.connect(
                 lambda item: QDesktopServices.openUrl(QUrl(item.data(Qt.ItemDataRole.UserRole))))
             card, inner = panel("solid", margins=14, spacing=6)
-            inner.addWidget(label(title, "muted"))
+            inner.addWidget(label(title, "caption"))
             inner.addWidget(lw)
             extremes.addWidget(card)
         lay.addLayout(extremes, 2)
