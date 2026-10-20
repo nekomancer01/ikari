@@ -877,3 +877,23 @@ def test_a_query_timeout_pauses_only_its_own_request():
     c = ArcticShiftClient(session=FakeSession([slow, ok([post(1)])]), limiter=limiter)
     assert len(c.get("/api/posts/search/aggregate", {"limit": 31}, shrink=False)) == 1
     assert waits == [0.5]  # just the usual spacing, not the timeout's 2 s
+
+
+def test_a_narrowed_window_full_of_one_seconds_posts_isnt_called_read_to_its_end():
+    # After timeouts the window is narrowed and pages are small. A full page of posts all from one second, seen
+    # already, moved on to the end of the window, past that second's other posts, and still called the day
+    # read through, so neither Download all nor its saved progress would come back for them.
+    same = [at(T0 + 100, k) for k in range(12)]
+    c = archive(same + [at(T0 + 1000, 99)])
+    c._page_cap = 10
+    calls = []
+
+    def page(base, lo, hi, size):
+        calls.append(lo)
+        rows = sorted((d for d in same + [at(T0 + 1000, 99)] if lo < d["created_utc"] < min(hi, lo + 500)),
+                      key=lambda d: d["created_utc"])[:10]
+        return rows, min(hi, lo + 500), 10  # as after a timeout: only the window's first part searched
+
+    c._page = page
+    c.fetch_posts("python", after=T0, before=T0 + 3600, limit=100, exhaust=True)
+    assert not c.exhausted and c.reached == []

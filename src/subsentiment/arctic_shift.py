@@ -479,8 +479,9 @@ class ArcticShiftClient:
         # Where each slice's reading goes on from: the first second whose posts may not all be read yet.
         cursors = [lo for lo, _ in windows]
         if not (top or query):
+            read = sorted(read)
             for i, (lo, _) in enumerate(windows):
-                for first, last in sorted(read):
+                for first, last in read:
                     if first <= cursors[i] <= last:
                         cursors[i] = last + 1
         starts = list(cursors)
@@ -642,6 +643,8 @@ class ArcticShiftClient:
             if len(out) >= want or (should_stop and should_stop()):
                 return out, cursor, True
             if end < hi and (len(page) < size or not new):  # only part of the window was searched
+                if len(page) >= size and not new:  # a full page of repeats: more may share its second
+                    self._skipped_posts = True
                 cursor = end - 1
                 continue
             if len(page) < size:
