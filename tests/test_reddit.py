@@ -1,6 +1,6 @@
 import pytest
 
-from subsentiment.reddit import normalize_subreddit, subreddit_error
+from subsentiment.reddit import is_image_post, normalize_subreddit, subreddit_error
 
 
 @pytest.mark.parametrize("name", ["r/Python", "/r/Python", "/r/Python/", " Python ", "Python/", "R/Python",
@@ -34,3 +34,26 @@ def test_a_users_profile_is_explained_not_fetched_as_a_subreddit(link):
 
 def test_a_link_to_another_site_is_explained():
     assert "doesn't name a subreddit" in subreddit_error(normalize_subreddit("https://redd.it/abc123"))
+
+
+@pytest.mark.parametrize("url, text, hint, gallery, image", [
+    ("https://i.redd.it/abc.jpeg", "", "image", False, True),
+    ("https://i.redd.it/abc.jpeg", "", "", False, True),  # the archive often has no post_hint
+    ("https://i.redd.it/abc.jpeg", "", "link", False, True),
+    ("https://i.imgur.com/x.png", "", "", False, True),
+    ("https://imgur.com/a/xyz", "", "link", False, True),
+    ("https://example.com/pic.WEBP?w=1", "", "", False, True),
+    ("https://www.reddit.com/gallery/abc", "", "", True, True),
+    ("https://www.reddit.com/gallery/abc", "", "", False, True),
+    ("", "", "", True, True),
+    ("", "", "", "True", True),
+    ("https://i.redd.it/abc.jpeg", "what do you think of my desk setup?", "image", False, False),  # real text stays
+    ("https://i.redd.it/abc.jpeg", "   ", "image", False, True),
+    ("https://www.reddit.com/r/Python/comments/p1/x/", "", "self", False, False),  # a text post with no body
+    ("https://apnews.com/article/1", "", "link", False, False),
+    ("https://v.redd.it/abc", "", "hosted:video", False, False),  # videos aren't image posts
+    ("", "", "", False, False),
+    (None, None, "", None, False),
+])
+def test_is_image_post(url, text, hint, gallery, image):
+    assert is_image_post(url, text, hint, gallery) is image
