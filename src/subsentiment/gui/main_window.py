@@ -33,18 +33,11 @@ RANGES = {"day": ("Past 24 hours", 1), "week": ("Past week", 7), "month": ("Past
           "quarter": ("Past 3 months", 91), "year": ("Past year", 365), "custom": ("Custom dates", None)}
 
 # Last-used fetch form, restored at startup. Keys live under "fetch/" in QSettings.
-FETCH_DEFAULTS = {"subreddit": "", "query": "", "range": "week", "from": "", "to": "", "pick": "spread",
-                  "limit": 100, "include_comments": True, "comments_per_post": 50, "refresh_scores": False}
+# A fetch downloads every post in the range, so the old "fetch/pick" and "fetch/limit" keys are no longer read.
+FETCH_DEFAULTS = {"subreddit": "", "query": "", "range": "week", "from": "", "to": "",
+                  "include_comments": True, "comments_per_post": 50, "refresh_scores": False}
 
 SCOPES = ["Posts and comments", "Posts only", "Comments only"]
-
-PICKS = {"spread": ("Spread across days",
-                    "An equal share of posts from each part of the range. Fetching again adds posts you "
-                    "don't have yet."),
-         "top": ("Top by score",
-                 "The highest-scored posts from each part of the range. Scores only exist once the archive "
-                 "re-checks a post (usually 36 hours after posting, sometimes up to a week), so the newest "
-                 "posts can't be ranked yet.")}
 
 
 def range_bounds(key: str, start: QDate, end: QDate, now: datetime | None = None) -> tuple[float, float | None]:
@@ -625,13 +618,6 @@ class MainWindow(QMainWindow):
         self.date_to = date_edit()
         for edit in (self.date_from, self.date_to):
             edit.userDateChanged.connect(self._on_date_edited)
-        self.pick = QComboBox()
-        for i, (key, (text, tip)) in enumerate(PICKS.items()):
-            self.pick.addItem(text, key)
-            self.pick.setItemData(i, tip, Qt.ItemDataRole.ToolTipRole)
-        self.pick.currentIndexChanged.connect(
-            lambda _: self.pick.setToolTip(PICKS[self.pick.currentData()][1]))
-        self.limit = spin_box(1, 1000, 25, FETCH_DEFAULTS["limit"])
         self.include_comments = QCheckBox("Fetch")
         self.comments_per_post = spin_box(1, 500, 10, FETCH_DEFAULTS["comments_per_post"], " per post")
         self.comments_per_post.setMinimumWidth(100)  # its size hint would squeeze the form's labels
@@ -657,8 +643,6 @@ class MainWindow(QMainWindow):
         form.addRow(label("Posted", "muted"), self.range)
         form.addRow(label("From", "muted"), self.date_from)
         form.addRow(label("To", "muted"), self.date_to)
-        form.addRow(label("Pick", "muted"), self.pick)
-        form.addRow(label("Max posts", "muted"), self.limit)
         form.addRow(label("Comments", "muted"), comments_row)
         form.addRow(label("Scores", "muted"), self.refresh_scores)
         lay.addLayout(form)
@@ -902,9 +886,6 @@ class MainWindow(QMainWindow):
                     edit.blockSignals(True)
                     edit.setDate(date)
                     edit.blockSignals(False)
-        self.pick.setCurrentIndex(max(self.pick.findData(v["pick"]), 0))
-        self.pick.setToolTip(PICKS[self.pick.currentData()][1])
-        self.limit.setValue(v["limit"])
         self.include_comments.setChecked(v["include_comments"])
         self.refresh_scores.setChecked(v["refresh_scores"])
         self.comments_per_post.setValue(v["comments_per_post"])
@@ -915,8 +896,7 @@ class MainWindow(QMainWindow):
                      "range": self.range.currentData(),
                      "from": self.date_from.date().toString(Qt.DateFormat.ISODate),
                      "to": self.date_to.date().toString(Qt.DateFormat.ISODate),
-                     "pick": self.pick.currentData(),
-                     "limit": self.limit.value(), "include_comments": self.include_comments.isChecked(),
+                     "include_comments": self.include_comments.isChecked(),
                      "refresh_scores": self.refresh_scores.isChecked(),
                      "comments_per_post": self.comments_per_post.value()}.items():
             self.settings.setValue(f"fetch/{k}", v)
@@ -928,8 +908,8 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(busy)
         if busy:
             self.progress.setRange(0, 0)
-        for w in (self.subreddit, self.query, self.range, self.date_from, self.date_to, self.pick,
-                  self.limit, self.include_comments, self.refresh_scores):
+        for w in (self.subreddit, self.query, self.range, self.date_from, self.date_to,
+                  self.include_comments, self.refresh_scores):
             w.setEnabled(not busy)
         self._update_comments_enabled()
         self._update_delete_enabled()  # don't delete rows the fetch thread is writing
@@ -959,9 +939,9 @@ class MainWindow(QMainWindow):
         self._on_range_changed()  # a preset counts back from now, not from when the app started
         after, before = range_bounds(self.range.currentData(), self.date_from.date(), self.date_to.date())
         req = collect.FetchRequest(
-            subreddit=name, after=after, before=before, limit=self.limit.value(), query=self.query.text().strip(),
+            subreddit=name, after=after, before=before, limit=None, query=self.query.text().strip(),
             include_comments=self.include_comments.isChecked(), refresh_scores=self.refresh_scores.isChecked(),
-            comments_per_post=self.comments_per_post.value(), top=self.pick.currentData() == "top")
+            comments_per_post=self.comments_per_post.value())
         self._launch(req, f"Contacting Arctic Shift for r/{name}…")
 
     def start_request(self, req: collect.FetchRequest, message: str) -> bool:

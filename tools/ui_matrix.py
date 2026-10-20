@@ -178,7 +178,7 @@ def alignment(window) -> list[str]:
     problems = []
     side = window.findChild(QFormLayout).parentWidget()  # the sidebar's scrolling body
     fields = {"subreddit": window.subreddit, "search": window.query, "posted": window.range,
-              "from": window.date_from, "to": window.date_to, "pick": window.pick, "max posts": window.limit,
+              "from": window.date_from, "to": window.date_to,
               "comments": window.comments_per_post.parentWidget()}
     _same(problems, "sidebar field left edges", {k: _rect(w, side).left() for k, w in fields.items()})
     _same(problems, "sidebar field right edges", {k: _rect(w, side).right() for k, w in fields.items()})
@@ -296,7 +296,7 @@ def field_edges(window) -> dict:
     from PySide6.QtWidgets import QFormLayout
     side = window.findChild(QFormLayout).parentWidget()
     return {name: (_rect(w, side).left(), _rect(w, side).right(), _rect(w, window).top())
-            for name, w in (("subreddit", window.subreddit), ("to", window.date_to), ("max posts", window.limit))}
+            for name, w in (("subreddit", window.subreddit), ("to", window.date_to), ("posted", window.range))}
 
 
 # A status line as long as the app writes, during a fetch and after it.

@@ -48,8 +48,6 @@ def test_fetch_form_and_viewed_dataset_are_restored(make_window):
     w.query.setText("black holes")
     w.date_from.setDate(QDate(2026, 3, 1))  # editing a date switches to a custom range
     w.date_to.setDate(QDate(2026, 3, 31))
-    w.pick.setCurrentIndex(w.pick.findData("top"))
-    w.limit.setValue(250)
     w.include_comments.setChecked(False)
     w.comments_per_post.setValue(20)
     assert not w.refresh_scores.isChecked()  # off by default
@@ -62,8 +60,7 @@ def test_fetch_form_and_viewed_dataset_are_restored(make_window):
     assert again.subreddit.text() == "r/AskScience" and again.query.text() == "black holes"
     assert again.range.currentData() == "custom"
     assert (again.date_from.date(), again.date_to.date()) == (QDate(2026, 3, 1), QDate(2026, 3, 31))
-    assert (again.limit.value(), again.include_comments.isChecked(), again.comments_per_post.value()) == (250, False, 20)
-    assert again.pick.currentData() == "top" and "36 hours" in again.pick.toolTip()
+    assert (again.include_comments.isChecked(), again.comments_per_post.value()) == (False, 20)
     assert not again.comments_per_post.isEnabled()
     assert again.refresh_scores.isChecked()
     assert again.current == "Python" and again.tabbar.currentIndex() == 1

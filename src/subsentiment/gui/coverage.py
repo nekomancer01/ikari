@@ -7,7 +7,6 @@ it's recorded as complete and shown with a check mark instead.
 """
 from __future__ import annotations
 
-import math
 import time
 from datetime import datetime, timezone
 
@@ -27,7 +26,8 @@ from subsentiment.gui.theme import paint_backdrop
 from subsentiment.gui.worker import CountWorker
 
 DAY = 86400
-MAX_DAY_POSTS = 10000  # cap on one day's "Download all"
+MAX_DAY_POSTS = collect.MAX_DAY_POSTS
+days_in = collect.days_in  # cap on one day's "Download all"
 
 NOTE = ("Totals come from Arctic Shift and include posts and comments later removed from Reddit, which ikari "
         "can't save. A day's share counts the removed posts ikari has seen as checked, and a thread can stop short "
@@ -47,13 +47,6 @@ def range_text(first: int, last: int) -> str:
     if a.year != b.year:
         return f"{a.day} {a:%b %Y} – {b.day} {b:%b %Y}"
     return f"{a.day} {a:%b} – {b.day} {b:%b %Y}"
-
-
-def days_in(after: float, before: float) -> list[int]:
-    """UTC day starts overlapping [after, before), newest first."""
-    first = int(after // DAY * DAY)
-    last = int(math.ceil(before / DAY) * DAY) - DAY
-    return list(range(last, first - 1, -DAY))
 
 
 def today() -> int:

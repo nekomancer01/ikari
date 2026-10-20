@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, QSize, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox  # noqa: E402
 
 from subsentiment import arctic_shift  # noqa: E402
 from subsentiment.gui import coverage  # noqa: E402
@@ -93,10 +93,17 @@ def env(tmp_path, monkeypatch):
     QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
 
 
-def fetch(w, sub="python", comments=True, limit=100, rng="week", **extra):
+def in_range(env, w, sub="Python") -> int:
+    """The posts the archive has for ``sub`` in the sidebar's range that a fetch can save (not removed)."""
+    after, before = w.fetch_range()
+    return len([p for p in env.archive.posts if p["subreddit"] == sub and after <= p["created_utc"] < before
+                and not p.get("removed_by_category")])
+
+
+def fetch(w, sub="python", comments=True, rng="week", **extra):
+    """A fetch from the sidebar, which downloads every post in the range."""
     w.subreddit.setText(sub)
     w.include_comments.setChecked(comments)
-    w.limit.setValue(limit)
     w.range.setCurrentIndex(w.range.findData(rng))
     for key, value in extra.items():
         getattr(w, key).setChecked(value)
@@ -140,6 +147,33 @@ def test_a_fetch_without_comments_asks_for_no_comments(env):
     assert "Added" in w.progress_msg.text() and w.fetch_btn.isEnabled()
 
 
+def test_a_fetch_downloads_every_post_in_the_range_a_day_at_a_time(env):
+    w = env.window()
+    labels = [lbl.text() for lbl in w.findChildren(QLabel)]
+    assert "Max posts" not in labels and "Pick" not in labels  # nothing to choose: it's the whole range
+    env.archive.delay = 0.02
+    w.subreddit.setText("python")
+    w.include_comments.setChecked(False)
+    w.range.setCurrentIndex(w.range.findData("week"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    bars, lines = set(), set()
+    while w.thread is not None:
+        bars.add((w.progress.value(), w.progress.maximum()))
+        lines.add(w.progress_msg.text())
+        pump(5)
+    pump(50)
+    assert len(env.store().posts("python")) == in_range(env, w) > 30
+    # The bar counts the range's UTC days (eight for a week that doesn't start at midnight), newest first.
+    assert {total for _, total in bars} >= {8} and any(t.startswith("Day 1 of 8") for t in lines), (bars, lines)
+    after = w.fetch_range()[0]
+    whole = {str(d) for d in range(int(after // DAY * DAY) + DAY, coverage.today(), DAY)}
+    assert env.store().complete_keys("posts", "python") == whole  # Download coverage shows them as done
+    env.archive.clear()
+    fetch(w, comments=False)  # again: the complete days aren't asked for, only the two partial ones
+    windows = {(int(q["after"]) + 1) // DAY for p, q in env.archive.requests if p == SEARCH}
+    assert windows <= {int(after // DAY), int(coverage.today() // DAY)}
+
+
 def test_removed_posts_are_not_saved(env):
     w = env.window()
     fetch(w, comments=False)
@@ -150,7 +184,7 @@ def test_removed_posts_are_not_saved(env):
 
 def test_comments_come_with_a_fetch_when_asked(env):
     w = env.window()
-    fetch(w, comments=True, limit=8)
+    fetch(w, comments=True)
     s = env.store()
     with_comments = {r["post_id"] for r in s.comments("python")}
     assert with_comments and with_comments <= {r["id"] for r in s.posts("python")}
@@ -159,17 +193,17 @@ def test_comments_come_with_a_fetch_when_asked(env):
 
 def test_score_recheck_only_runs_when_ticked(env):
     w = env.window()
-    fetch(w, comments=False, limit=40)
+    fetch(w, comments=False)
     stale = {r["id"] for r in env.store().posts("python") if r["score"] is None}
     assert stale  # recent ones aren't settled
 
     def rechecked():
         return {i for p, q in env.archive.requests if p == IDS for i in q["ids"].split(",")} & stale
     env.archive.clear()
-    fetch(w, comments=False, limit=1, refresh_scores=False)
+    fetch(w, comments=False, refresh_scores=False)
     assert not rechecked()
     env.archive.clear()
-    fetch(w, comments=False, limit=1, refresh_scores=True)
+    fetch(w, comments=False, refresh_scores=True)
     assert rechecked() == stale
     w.close()
     assert env.window().refresh_scores.isChecked()  # remembered
@@ -212,8 +246,11 @@ def test_stop_takes_effect_at_once_even_while_requests_wait_out_timeouts(env, mo
         seen.add(w.progress_msg.text())
         QApplication.processEvents()
         time.sleep(0.01)
-    # Not overwritten by "Waiting 4 s…" from the requests winding down; then the result.
-    assert "Stopping…" in seen and all(t.startswith("Stopp") for t in seen), seen
+    # Not overwritten by "Waiting 4 s…" from the requests winding down; then the result. Today is downloaded
+    # first, so the result can name posts it saved before Stop ("… Stopped early.").
+    result = w.progress_msg.text()
+    assert "Stopping…" in seen and seen <= {"Stopping…", result}, seen
+    assert result.startswith("Stopped before") or result.endswith("Stopped early."), result
     assert not env.warnings
 
 
@@ -221,15 +258,15 @@ def test_archive_slowdowns_are_waited_out(env):
     w = env.window()
     env.archive.fail(SEARCH, (422, {"error": "Timeout. Maybe slow down a bit"}),
                      (429, {"error": "Too many requests"}), (500, {}))
-    fetch(w, comments=False, limit=5)
+    fetch(w, comments=False)
     assert not env.warnings
-    assert len(env.store().posts("python")) == 5
+    assert len(env.store().posts("python")) == in_range(env, w)
 
 
 def test_an_archive_that_keeps_failing_shows_one_warning_and_unlocks_the_form(env):
     w = env.window()
     env.archive.fail(SEARCH, *[(400, {"error": "bad request"})] * 3)
-    fetch(w, comments=False, limit=5)
+    fetch(w, comments=False)
     assert len(env.warnings) == 1 and w.fetch_btn.isEnabled()
 
 
@@ -242,9 +279,9 @@ def test_an_empty_range_says_so(env):
 
 def test_fetching_another_subreddit_opens_it_and_keeps_the_first(env):
     w = env.window()
-    fetch(w, comments=False, limit=5)
+    fetch(w, comments=False)
     assert w.current.lower() == "python"
-    fetch(w, sub="rust", comments=False, limit=5)
+    fetch(w, sub="rust", comments=False)
     names = [w.datasets.item(i).data(Qt.ItemDataRole.UserRole).lower() for i in range(w.datasets.count())]
     assert set(names) == {"python", "rust"}
     assert w.current.lower() == "rust" and len(w.posts) == len(env.store().posts("rust"))
@@ -267,13 +304,12 @@ def test_fetching_another_subreddit_shows_it_as_it_downloads(env, saved_before):
     # The window used to stay on whatever was open for the whole fetch, so nothing seemed to happen.
     w = env.window()
     if saved_before:
-        fetch(w, comments=False, limit=2)
-    fetch(w, sub="rust", comments=False, limit=5)
+        fetch(w, comments=False)
+    fetch(w, sub="rust", comments=False)
     assert w.current.lower() == "rust"
     env.archive.delay = 0.1
     w.subreddit.setText("python")
     w.include_comments.setChecked(True)
-    w.limit.setValue(30)
     w.range.setCurrentIndex(w.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     s = env.store()
@@ -307,7 +343,7 @@ def test_closing_mid_fetch_leaves_the_fetch_alone(env, monkeypatch):
 QUIT_MID_FETCH = """
 import os, sys
 from PySide6.QtCore import QSettings, QTimer
-from subsentiment import arctic_shift
+from subsentiment import arctic_shift, collect
 from subsentiment.gui import app, main_window, worker
 arctic_shift.BASE_URL = sys.argv[1]
 worker.LIMITER.base = worker.LIMITER.interval = arctic_shift.BASE_INTERVAL / 10  # as in the other tests
@@ -319,9 +355,6 @@ def window(path):
     w = main_window.MainWindow(path)
     w.subreddit.setText("python")
     w.include_comments.setChecked(True)
-    w.limit.setValue(10)
-    if sys.argv[3] == "top":
-        w.pick.setCurrentIndex(w.pick.findData("top"))
     def close():
         print("saved", len(w.store.posts("python")) + len(w.store.comments("python")), flush=True)
         w.close()  # while a slow request for comments is still out
@@ -335,7 +368,10 @@ def window(path):
             QTimer.singleShot(1500, close)  # the rest of the posts, then the comments start
         else:
             QTimer.singleShot(50, close_once_posts_are_saved)
-    if sys.argv[3] != "idle":
+    if sys.argv[3] == "top":  # the sidebar no longer ranks posts; the client still can
+        QTimer.singleShot(300, lambda: w.start_request(
+            collect.FetchRequest("python", limit=10, top=True), "Ranking posts…"))
+    elif sys.argv[3] != "idle":
         QTimer.singleShot(300, w.fetch_btn.click)
     QTimer.singleShot(400, close_once_posts_are_saved)
     return w
@@ -346,7 +382,7 @@ sys.exit(app.main([]))
 
 # fetch: a comment request is still out at quit. Stop doesn't wait for comment trees, so the fetch ends
 #   when the window closes, and the request left out must not hold up the process.
-# top: Top by score, quitting while the download of a day's ranked picks is out. Stop lets that request
+# top: a ranked fetch (top=True), quitting while the download of a day's ranked picks is out. Stop lets that request
 #   finish, so the fetch is still running when the process ends.
 # idle: quitting with nothing running, for comparison.
 @pytest.mark.parametrize("mode", ["fetch", "top", "idle"])
@@ -387,12 +423,11 @@ def test_about_names_the_bundled_model(env, monkeypatch):
 
 def test_switching_subreddit_mid_fetch_keeps_each_table_to_its_own_rows(env):
     w = env.window()
-    fetch(w, sub="rust", comments=False, limit=5)
-    fetch(w, sub="python", comments=False, limit=2)  # python is open, as when fetching more of it
+    fetch(w, sub="rust", comments=False)
+    fetch(w, sub="python", comments=False)  # python is open, as when fetching more of it
     env.archive.delay = 0.1
     w.subreddit.setText("python")
     w.include_comments.setChecked(True)
-    w.limit.setValue(30)
     w.range.setCurrentIndex(w.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     end = time.monotonic() + 20
@@ -418,7 +453,7 @@ def test_rows_keep_fading_in_while_comments_are_saved_quickly(env):
     # Each save used to restart the fade-in timer, so while comments were saved faster than it ticks,
     # no queued post appeared until the fetch ended.
     w = env.window()
-    fetch(w, comments=False, limit=12)
+    fetch(w, comments=False)
     n = len(w.posts)
     w.posts_tab.load([])
     w.request, w.thread = mw.collect.FetchRequest("python"), object()  # as if python were being fetched
@@ -436,12 +471,12 @@ def test_a_big_download_reads_each_new_row_back_about_once(env, monkeypatch):
     # Every saved row used to re-read all of the fetch's rows so far, which froze the window on a day's
     # Download all (thousands of posts and comments).
     w = env.window()
-    fetch(w, comments=False, limit=2)
+    fetch(w, comments=False)
     read = []
     for name in ("posts_since", "comments_since"):
         original = getattr(w.store, name)
         monkeypatch.setattr(w.store, name, lambda *a, f=original: read.append(len(rows := f(*a))) or rows)
-    fetch(w, comments=True, limit=40, rng="month")
+    fetch(w, comments=True, rng="month")
     s = env.store()
     saved = len(s.posts("python")) + len(s.comments("python"))
     assert saved > 60 and sum(read) < 4 * saved  # linear; it was about saved² / 2
@@ -450,7 +485,7 @@ def test_a_big_download_reads_each_new_row_back_about_once(env, monkeypatch):
 def test_a_busy_subreddit_that_times_out_still_fetches_with_narrower_queries(env, monkeypatch):
     monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.3)  # timeout back-offs, shortened further
     w = env.window()
-    fetch(w, sub="askreddit", comments=False, limit=30, rng="day")
+    fetch(w, sub="askreddit", comments=False, rng="day")
     timeouts = [r for r in env.archive.rejected if r[2] == 422]
     assert timeouts and not env.warnings  # it hit the archive's timeouts and worked around them
     assert len(env.store().posts("askreddit")) >= 20
@@ -460,7 +495,7 @@ def test_a_keyword_search_the_archive_cant_run_says_so_once(env, monkeypatch):
     monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.3)  # timeout back-offs, shortened further
     w = env.window()
     w.query.setText("black holes")
-    fetch(w, sub="askreddit", comments=False, limit=10, rng="day")
+    fetch(w, sub="askreddit", comments=False, rng="day")
     assert len(env.warnings) == 1 and "timed out" in env.warnings[0].lower()
     assert w.fetch_btn.isEnabled()
 
@@ -471,7 +506,7 @@ def test_a_fetch_at_the_apps_real_pace_never_trips_the_rate_limit(env, monkeypat
     monkeypatch.setattr(worker.LIMITER, "interval", arctic_shift.BASE_INTERVAL)
     env.archive.rate = (3, 1.0)
     w = env.window()
-    fetch(w, comments=True, limit=4, rng="day")
+    fetch(w, comments=True, rng="day")
     assert [r for r in env.archive.rejected if r[2] == 429] == []
     assert len(env.archive.paths()) >= 4
 
@@ -479,9 +514,9 @@ def test_a_fetch_at_the_apps_real_pace_never_trips_the_rate_limit(env, monkeypat
 def test_when_the_server_says_no_requests_are_left_the_app_waits_for_the_reset(env):
     w = env.window()
     env.archive.rate = (2, 1.0)  # far below the test pace
-    fetch(w, comments=True, limit=4, rng="day")
+    fetch(w, comments=True, rng="day")
     assert [r for r in env.archive.rejected if r[2] == 429] == []  # it waited instead of hitting the limit
-    assert not env.warnings and len(env.store().posts("python")) == 4
+    assert not env.warnings and len(env.store().posts("python")) == in_range(env, w)
 
 
 def open_coverage(w):
@@ -496,7 +531,7 @@ def open_coverage(w):
 def test_coverage_counts_a_busy_subreddit_without_downloading_anything(env, monkeypatch):
     monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.3)  # timeout back-offs, shortened further
     w = env.window()
-    fetch(w, sub="askreddit", comments=False, limit=5, rng="day")
+    fetch(w, sub="askreddit", comments=False, rng="day")
     env.archive.clear()
     w.range.setCurrentIndex(w.range.findData("month"))
     cov = open_coverage(w)
@@ -519,8 +554,16 @@ def test_coverage_counts_posts_removed_from_reddit_as_checked(env):
     # Every fifth post in the fake archive was removed. A day's count includes them, so once Download all
     # has been through a day, it reads complete, and before that its share counts the removed ones seen.
     w = env.window()
-    fetch(w, comments=False, limit=40)
+    fetch(w, comments=False)
     cov = open_coverage(w)
+    # The sidebar's fetch read every whole past day of the week to its end, so those days already read
+    # complete. Forget that, as for days saved before fetches did, to see a day's share before Download all.
+    whole = [r for r, d in enumerate(cov.days) if d >= w.fetch_range()[0] and d < coverage.today()]
+    assert whole and all(cov.day_table.cellWidget(r, 1).side.text() == "✓ Complete" for r in whole)
+    w.store.db.execute("DELETE FROM complete")
+    w.store.commit()
+    cov.refresh_saved(rebuild=True)
+    pump(50)
     removed = w.store.removed_per_day("python", cov.days[-1], cov.days[0] + DAY)
     assert sum(removed.values()) > 0
     row, day = next((r, d) for r, d in enumerate(cov.days) if removed.get(d) and not no_total_day(cov, d))
@@ -570,7 +613,7 @@ def test_coverage_stays_responsive_while_a_busy_day_downloads(env):
     # A day with 1,500 posts used to rebuild 4,500 widgets on every refresh: 2-3 s frozen each time.
     day = busy_day(env, "bigday", 1500)
     w = env.window()
-    fetch(w, sub="bigday", comments=False, limit=3)
+    fetch(w, sub="bigday", comments=False)
     cov = open_coverage(w)
     row = cov.days.index(day)
     cov.day_table.selectRow(row)
@@ -589,7 +632,7 @@ def test_coverage_stays_responsive_while_a_busy_day_downloads(env):
 
 def test_coverage_downloads_do_only_what_they_say(env):
     w = env.window()
-    fetch(w, comments=False, limit=3)
+    fetch(w, comments=False)
     cov = open_coverage(w)
     day_row = next(r for r, d in enumerate(cov.days) if cov.totals["python"].get(d))
     cov.day_table.selectRow(day_row)
@@ -608,7 +651,7 @@ def test_coverage_downloads_do_only_what_they_say(env):
 
 def test_coverage_keeps_its_place_while_a_download_runs(env):
     w = env.window()
-    fetch(w, comments=False, limit=3)
+    fetch(w, comments=False)
     w.range.setCurrentIndex(w.range.findData("month"))
     cov = open_coverage(w)
     cov.resize(900, 400)
@@ -622,7 +665,6 @@ def test_coverage_keeps_its_place_while_a_download_runs(env):
     env.archive.delay = 0.05
     w.subreddit.setText("python")
     w.include_comments.setChecked(True)
-    w.limit.setValue(20)
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     pump(2500)  # the window refreshes about once a second while rows arrive
     assert cov.day_table.verticalScrollBar().value() == scrolled
