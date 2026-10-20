@@ -41,10 +41,9 @@ def main() -> int:
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(ROOT / "src"), env.get("PYTHONPATH")]))
     if sys.platform.startswith("linux") and "QT_QPA_PLATFORM" not in env:
         env["QT_QPA_PLATFORM"] = "offscreen"
-    # Two workers per core, each taking the next test as it frees up (worksteal). Most of the e2e and layout
-    # tests' time is waiting (on the fake archive's pacing, on the window settling), so a core has room for a
-    # second; three per core starved the timing tests on the 4-core Windows runner.
-    workers = str(2 * (os.cpu_count() or 1))
+    # One worker per core, each taking the next test as it frees up (worksteal). Two or three per core starved
+    # the timing tests (Stop, fetch and close deadlines) on the 4-core Windows runner.
+    workers = str(os.cpu_count() or 1)
     cmd = [sys.executable, "-m", "pytest", "-q", "-n", workers, "--dist", "worksteal", *sys.argv[1:]]
     return subprocess.run(cmd, cwd=ROOT, env=env).returncode
 
