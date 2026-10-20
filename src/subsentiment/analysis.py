@@ -19,6 +19,8 @@ class Analysis:
     def add(self, rows) -> None:
         counts, days = self.counts, self.days
         for r in rows:
+            if r["created_utc"] is None:  # no day to count it on
+                continue
             s = r["sentiment"]
             counts[r["label"]] += 1
             self.total += s

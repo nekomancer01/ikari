@@ -113,7 +113,7 @@ def test_every_view_counts_the_days_the_timeline_shows(window, tmp_path, monkeyp
     pump(400)  # past the tables' settling delay
     assert len(w.posts) == 3 and len(w.comments) == 3
     assert w.posts_tab.model.rowCount() == 3 and w.comments_tab.model.rowCount() == 3
-    assert w.subheading.full_text().endswith("· 3\xa0posts · 3\xa0comments")
+    assert w.subheading.full_text().endswith("· 5 – 7 Oct · 3\xa0posts · 3\xa0comments")
 
     out = tmp_path / "posts.csv"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(out), ""))
@@ -211,8 +211,33 @@ def test_keep_filters_rows_by_the_days_they_were_created_on():
     assert days.keep(rows, days.whole((D2 + DAY, D3))) == []
 
 
+def test_the_span_is_named_briefly():
+    assert days.span_text((D2, D2 + DAY)) == "6 Oct"
+    assert days.span_text((D1, D3 + DAY)) == "5 – 9 Oct"
+    assert days.span_text((D1 - 7 * DAY, D1)) == "28 Sep – 4 Oct"
+    new_year = days.from_date(date(2026, 1, 1))
+    assert days.span_text((new_year - 2 * DAY, new_year + DAY)) == "30 Dec 2025 – 1 Jan 2026"
+
+
 def test_a_day_counts_when_its_point_is_in_view():
     assert days.whole(None) is None
     assert days.whole((D1, D1 + 3 * DAY)) == (D1, D1 + 3 * DAY)  # whole days, as the range buttons show them
     assert days.whole((D1 + 0.4 * DAY, D1 + 3.6 * DAY)) == (D1, D1 + 4 * DAY)
     assert days.whole((D1 + 0.6 * DAY, D1 + 3.4 * DAY)) == (D1 + DAY, D1 + 3 * DAY)
+
+
+def test_switching_the_scope_leaves_the_remembered_span_alone(window):
+    w = window()
+    w.overview.timeline.set_view(D2, D2 + 3 * DAY)
+    key = days.settings_keys("Python")[0]
+    saved = w.settings.value(key)
+    w.scope.setCurrentText("Posts only")
+    w.scope.setCurrentText("Posts and comments")
+    assert w.settings.value(key) == saved
+
+
+def test_rows_without_a_date_are_left_out_of_the_counts():
+    from subsentiment.analysis import Analysis
+    a = Analysis([{"created_utc": None, "sentiment": 0.5, "label": "positive"},
+                  {"created_utc": D1, "sentiment": -0.5, "label": "negative"}])
+    assert a.count == 1 and a.mean == -0.5

@@ -336,3 +336,15 @@ def test_the_timeline_page_shows_the_same_notes_and_adds_them_too(window):
     QTest.mouseClick(dialog.save, Qt.MouseButton.LeftButton)
     pump(50)
     assert w.overview.timeline.notes == tl.notes == {SAVED[10]: ("OV", "from the overview"), SAVED[-3]: ("TL", "")}
+
+
+def test_a_range_button_keeps_the_latest_days_when_the_days_shown_change(window):
+    """A range button marked while it spans every day (a scope with fewer days) still means the latest days
+    once more days are shown: it used to stay on every day with the button still marked."""
+    w = window()
+    tl = w.overview.timeline
+    QTest.mouseClick(tl.presets["1w"], Qt.MouseButton.LeftButton)
+    tl.set_points(tl.points[-4:])  # four days: the week covers them all
+    assert tl.view is None and tl.preset == "1w"
+    tl.set_points([(d, 0.1, 1) for d in SAVED])
+    assert tl.view == (LAST_END - 7 * DAY, LAST_END) and w.span == tl.view

@@ -97,6 +97,16 @@ def short_date(day: int, year: bool = False) -> str:
     return f"{d.day} {d:%b %Y}" if year else f"{d.day} {d:%b}"
 
 
+def span_text(days: tuple[int, int]) -> str:
+    """The days a span counts, briefly: "6 Oct", "5 – 9 Oct", "28 Sep – 6 Oct" or "30 Dec 2025 – 2 Jan 2026"."""
+    a, b = as_date(days[0]), as_date(max(days[0], days[1] - DAY))
+    if a == b:
+        return f"{a.day} {a:%b}"
+    if a.year != b.year:
+        return f"{a.day} {a:%b %Y} – {b.day} {b:%b %Y}"
+    return f"{a.day} – {b.day} {b:%b}" if a.month == b.month else f"{a.day} {a:%b} – {b.day} {b:%b}"
+
+
 def flat_button(text: str) -> QPushButton:
     b = theme.mark(theme.mark(QPushButton(text), "flat", True), "small", True)
     b.setAutoDefault(False)

@@ -380,7 +380,11 @@ class TimelineChart(QWidget):
     def _apply(self, animate: bool, follow: bool = False) -> None:
         """Ease (or jump) to the view. With follow (new data), a zoom that is easing carries on, its start
         moved along with its target, so it neither restarts nor jumps."""
-        if self.view is not None:  # the days may have changed under it
+        if self.preset not in (None, "All"):  # a range button's span is always the latest days there are now
+            a, b = self.domain()
+            days = dict(PRESETS)[self.preset] * DAY
+            self.view = None if days >= b - a else (b - days, b)
+        elif self.view is not None:  # the days may have changed under it
             a, b = self.domain()
             span = min(self.view[1] - self.view[0], b - a)
             lo = min(max(self.view[0], a), b - span)

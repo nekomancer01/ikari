@@ -178,6 +178,7 @@ class MainWindow(QMainWindow):
         self.span: tuple[float, float] | None = None
         self._preset: str | None = "All"
         self._table_days: tuple[int, int] | None = None  # the whole days the tables were filtered to
+        self._following = False  # the timelines are being given new days
         self._known: dict[str, set[str]] = {}  # ids already in _saved and _analysis, once a running fetch is counted in
         self.coverage = None  # the Download coverage window, once opened
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
@@ -738,9 +739,11 @@ class MainWindow(QMainWindow):
             self.subheading.setText(NO_DATA)
             return
         self.heading.setText(f"r/{self.current}")
-        # The day picker says which days; this line says how fresh they are and how much they hold.
-        self.subheading.setText(f"Last fetched {when_text(self._last_fetched)} · {plural(len(self.posts), 'post')}"
-                                f" · {plural(len(self.comments), 'comment')}")
+        # How fresh the data is, which days of it the timeline's span counts (on every page, the tables too),
+        # and how much they hold.
+        span = "" if self._table_days is None else f" · {days.span_text(self._table_days)}"
+        self.subheading.setText(f"Last fetched {when_text(self._last_fetched)}{span} · "
+                                f"{plural(len(self.posts), 'post')} · {plural(len(self.comments), 'comment')}")
 
     def _live_refresh(self) -> None:
         # What reads the store again (the saved-data list, Download coverage) once a second; the overview
@@ -883,7 +886,7 @@ class MainWindow(QMainWindow):
         if (chart.view, chart.preset) == (self.span, self._preset):
             return
         self.span, self._preset = chart.view, chart.preset
-        if self.current:
+        if self.current and not self._following:  # a fetch or the scope moved it, not the user
             days.save_range(self.settings, self.current, self.span, self._preset)
         self._render_span()
         self._span_settled.start()
@@ -927,7 +930,11 @@ class MainWindow(QMainWindow):
             if restore:
                 self._show_span(chart)
             else:  # a fetch adding days can move a span that ends on the latest day: _on_view_changed follows it
-                chart.set_points(self._counted.daily_means)
+                self._following = True
+                try:
+                    chart.set_points(self._counted.daily_means)
+                finally:
+                    self._following = False
         if restore:
             self.span, self._preset = self.overview.timeline.view, self.overview.timeline.preset
         self._render_span()
@@ -993,6 +1000,7 @@ class MainWindow(QMainWindow):
     def _export(self, kind: str) -> None:
         if not self.current:
             return
+        self._apply_span()  # the span in view now, not as it was before the last zoom settled
         path, _ = QFileDialog.getSaveFileName(self, f"Export {kind}", f"{self.current}_{kind}.csv", "CSV files (*.csv)")
         if path:
             try:
