@@ -13,7 +13,8 @@ from datetime import datetime, timezone
 import shiboken6
 from PySide6.QtCore import QEvent, QSize, Qt, Slot
 from PySide6.QtWidgets import (
-    QAbstractItemView, QBoxLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton, QTableWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QBoxLayout, QCheckBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton,
+    QTableWidget, QVBoxLayout, QWidget,
 )
 
 from subsentiment import collect
@@ -27,8 +28,8 @@ days_in = collect.days_in  # cap on one day's "Download all"
 
 NOTE = ("Totals come from Arctic Shift and include posts and comments later removed from Reddit, which ikari "
         "can't save. A day's share counts the removed posts and image posts ikari has seen as checked, and a thread can stop short "
-        "of 100%. A check mark means everything the archive still has is saved. Days are UTC. A day's Download all fetches its posts only; comments download only from the "
-        "buttons in the Posts list.")
+        "of 100%. A check mark means everything the archive still has is saved. Days are UTC. A day's Download all fetches its posts only; comments download "
+        "from the buttons in the Posts list, or with the ticked days when \u201cWith comments\u201d is on.")
 
 
 def day_text(day: int) -> str:
@@ -217,6 +218,8 @@ class CoveragePage(VerticalScrollArea):
         self._comments_done: set[str] = set()
         self._comments_so_far: set[str] = set()
         self._day_rows: list[int] = []
+        self.ticked: set[int] = set()  # days ticked for Download selected
+        self._anchor: int | None = None  # the day last ticked or unticked, where a shift-click range starts
 
         inner = QWidget()
         root = QVBoxLayout(inner)
@@ -242,13 +245,31 @@ class CoveragePage(VerticalScrollArea):
         self.day_table = table(["Day", "Posts saved", ""])
         h = self.day_table.horizontalHeader()
         h.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        h.resizeSection(0, 140)
+        h.resizeSection(0, 168)  # a tick box, then the date
         h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         h.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         h.resizeSection(2, 136)
         self.day_table.itemSelectionChanged.connect(self._load_posts)
+        # Ticked days download together, one after another under one progress bar.
+        self.tick_all = mark_flat(small_button("Select all"))
+        self.tick_all.clicked.connect(self._tick_all)
+        self.tick_all.setText("Select none")
+        self.tick_all.setMinimumWidth(self.tick_all.sizeHint().width())  # doesn't shift as its text changes
+        self.with_comments = QCheckBox("With comments")
+        self.with_comments.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.with_comments.setToolTip("Also download every comment on each ticked day's posts")
+        self.with_comments.setChecked(True)
+        self.with_comments.toggled.connect(self._show_ticked)
+        self.download_ticked = small_button("Download selected")
+        self.download_ticked.clicked.connect(self._download_ticked)
         left, left_lay = panel("solid", margins=14, spacing=8)
-        left_lay.addWidget(section("Days"))
+        days_top = QHBoxLayout()
+        days_top.setSpacing(10)
+        days_top.addWidget(section("Days"), 1)
+        days_top.addWidget(self.tick_all)
+        days_top.addWidget(self.with_comments)
+        days_top.addWidget(self.download_ticked)
+        left_lay.addLayout(days_top)
         left_lay.addWidget(self.day_table, 1)
 
         self.post_table = table(["Post", "Comments saved", ""])
@@ -279,7 +300,7 @@ class CoveragePage(VerticalScrollArea):
             h = t.horizontalHeader()
             t.setMinimumWidth(sum(h.sectionSize(i) for i in fixed) + stretch + 12)
         # Both panels' title rows as tall as the button, so the two tables start level.
-        left_lay.itemAt(0).widget().setMinimumHeight(self.all_comments.sizeHint().height())
+        days_top.itemAt(0).widget().setMinimumHeight(self.all_comments.sizeHint().height())
         right_lay.addWidget(self.post_table, 1)
         right_lay.addWidget(self.posts_empty, 1)
 
@@ -304,6 +325,8 @@ class CoveragePage(VerticalScrollArea):
         if (name or "").lower() != (self.subreddit or "").lower():
             self.subreddit = name
             self.day_table.clearSelection()
+            self.ticked.clear()
+            self._anchor = None
             self.count_error = ""
         if self.isVisible():
             self.refresh_saved(rebuild=True)
@@ -325,6 +348,7 @@ class CoveragePage(VerticalScrollArea):
             self.subtitle.setText("Pick a saved subreddit first.")
             self.days = self._day_rows = []
             self.day_table.setRowCount(0)
+            self._show_ticked()
             self._show_posts(None)
             return
         after, before = self.window_.fetch_form.bounds()
@@ -352,10 +376,21 @@ class CoveragePage(VerticalScrollArea):
             keep = self._selected_day()
             t.setRowCount(0)
             t.setRowCount(len(self.days))
+            self.ticked &= set(self.days)
             for row, day in enumerate(self.days):
-                item_label = QLabel(day_text(day))
-                item_label.setContentsMargins(8, 0, 0, 0)
-                t.setCellWidget(row, 0, item_label)
+                tick = QCheckBox()
+                tick.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                tick.setCursor(Qt.CursorShape.PointingHandCursor)
+                tick.setToolTip("Tick to download with the other ticked days. Shift-click ticks a run of days.")
+                tick.setChecked(day in self.ticked)
+                tick.clicked.connect(lambda on, d=day: self._tick(d, on))
+                box = QWidget()
+                lay = QHBoxLayout(box)
+                lay.setContentsMargins(10, 0, 0, 0)
+                lay.setSpacing(8)
+                lay.addWidget(tick)
+                lay.addWidget(QLabel(day_text(day)), 1)  # a click on the date still picks the row
+                t.setCellWidget(row, 0, box)
                 t.setCellWidget(row, 1, Cell())
                 button = small_button("Download all")
                 button.clicked.connect(lambda _=False, d=day: self._download_day(d))
@@ -363,6 +398,7 @@ class CoveragePage(VerticalScrollArea):
             self._day_rows = list(self.days)
             row = self.days.index(keep) if keep in self.days else 0
             t.selectRow(row)
+        self._show_ticked()
         counting = self.count_job.busy
         current = today()
         for row, day in enumerate(self.days):
@@ -387,6 +423,42 @@ class CoveragePage(VerticalScrollArea):
                 "Look for posts the archive has added since" if full else
                 f"Fetch every post from {day_text(day)}"
                 + (f" (up to {total - n - gone:,} more)" if total and total > n + gone else ""))
+
+    # -- ticked days ----------------------------------------------------------
+
+    def _tick(self, day: int, on: bool) -> None:
+        """A tick box clicked; with Shift held, every day from the last one clicked to this one follows it."""
+        days = [day]
+        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier and self._anchor in self.days:
+            a, b = sorted((self.days.index(self._anchor), self.days.index(day)))
+            days = self.days[a:b + 1]
+        (self.ticked.update if on else self.ticked.difference_update)(days)
+        self._anchor = day
+        self._show_ticked()
+
+    def _tick_all(self) -> None:
+        self.ticked = set() if self.ticked >= set(self.days) else set(self.days)
+        self._show_ticked()
+
+    def untick(self, days) -> None:
+        """Days a Download selected read to the end: ticked no longer."""
+        self.ticked.difference_update(days)
+        self._show_ticked()
+
+    def _show_ticked(self, *_) -> None:
+        """Tick boxes and the buttons above them, from self.ticked."""
+        t = self.day_table
+        for row, day in enumerate(self._day_rows):
+            t.cellWidget(row, 0).findChild(QCheckBox).setChecked(day in self.ticked)
+        n = len(self.ticked)
+        every = bool(self.days) and self.ticked >= set(self.days)
+        self.tick_all.setText("Select none" if every else "Select all")
+        self.tick_all.setEnabled(bool(self._day_rows))
+        self.download_ticked.setText(f"Download {plural(n, 'day')}" if n else "Download selected")
+        self.download_ticked.setEnabled(bool(n) and not self.busy)
+        what = "every post and comment" if self.with_comments.isChecked() else "every post"
+        self.download_ticked.setToolTip(f"Download {what} from the ticked days, newest first" if n
+                                        else "Tick days on the left to download them together")
 
     def _selected_day(self) -> int | None:
         rows = self.day_table.selectionModel().selectedRows() if self.day_table.selectionModel() else []
@@ -590,6 +662,17 @@ class CoveragePage(VerticalScrollArea):
                                    limit=MAX_DAY_POSTS, include_comments=False, everything=True)
         what = "so far today" if day >= today() else f"from {day_text(day)}"
         self.window_.start_request(req, f"Downloading every post {what} in r/{self.subreddit}…")
+
+    def _download_ticked(self) -> None:
+        if not self.subreddit or not self.ticked:
+            return
+        days = tuple(sorted(self.ticked, reverse=True))
+        comments = self.with_comments.isChecked()
+        req = collect.FetchRequest(subreddit=self.subreddit, after=days[-1], before=days[0] + DAY, limit=None,
+                                   include_comments=comments, comments_per_post=0, days=days)
+        what = "post and comment" if comments else "post"
+        # The ticks stay until it ends: unticked once it has read them all, kept if it's stopped.
+        self.window_.start_request(req, f"Downloading every {what} from {plural(len(days), 'day')} in r/{self.subreddit}…")
 
     def _download_comments(self, ids: list[str]) -> None:
         if not self.subreddit or not ids:

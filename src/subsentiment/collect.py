@@ -37,6 +37,9 @@ class FetchRequest:
     everything: bool = False
     # Only fetch every comment on these saved posts; the other fields but subreddit are ignored.
     comment_posts: tuple[str, ...] = ()
+    # With limit None: read exactly these UTC days (day starts, in this order), each in full, even ones already
+    # complete, instead of the days of [after, before). Download coverage's "Download selected" sends these.
+    days: tuple[int, ...] = ()
 
 
 @dataclass
@@ -81,7 +84,9 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         return _all_comments(client, store, req, progress, should_stop, saved)
 
     name = normalize_subreddit(req.subreddit)
-    stored = {r["id"]: r for r in store.posts_between(name, req.after, req.before)}
+    picked_days = set(req.days)
+    stored = {r["id"]: r for r in store.posts_between(name, req.after, req.before)
+              if not picked_days or (r["created_utc"] or 0) // DAY * DAY in picked_days}  # not days between picked ones
 
     # 1. If asked, saved posts from this range whose scores weren't settled yet: re-fetch them in batches.
     stale = [pid for pid, r in stored.items() if r["score"] is None and not r["image"]] if req.refresh_scores else []
@@ -213,7 +218,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     if req.limit is None:
         # A day at a time, newest first: each day's posts, then their comments, so a long fetch fills in as
         # it goes and Stop keeps whole days.
-        days = _days(name, store, req.after, req.before)
+        days = [(d, d + DAY) for d in req.days] if req.days else _days(name, store, req.after, req.before)
         seen: set[str] = set()  # saved posts on the days read, whose comments those days took care of
         for k, (lo, hi) in enumerate(days):
             if should_stop():
