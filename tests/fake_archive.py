@@ -124,6 +124,7 @@ class FakeArchive:
         self.requests: list[tuple[str, dict]] = []
         self.faults: dict[str, list[tuple[int, dict]]] = {}  # path -> responses to give before real ones
         self.delay = 0.0  # seconds each request takes, so a test can stop a fetch midway
+        self.delays: dict[str, float] = {}  # the same for one endpoint only
         self._lock = threading.Lock()
         archive = self
 
@@ -171,8 +172,8 @@ class FakeArchive:
             if fault:
                 status, payload = fault.pop(0)
                 return status, payload, headers
-        if self.delay:
-            time.sleep(self.delay)
+        if self.delays.get(path, self.delay):
+            time.sleep(self.delays.get(path, self.delay))
         try:
             if headers.get("X-RateLimit-Remaining") == "-1":
                 raise Rejected(429, "Too many requests", {"X-RateLimit-Remaining": "0",

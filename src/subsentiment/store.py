@@ -69,6 +69,12 @@ class Store:
         self.db.executescript(SCHEMA)
 
     def close(self) -> None:
+        # Copy what's committed into the main file now, so a process ended right after (see gui.app.end_now)
+        # leaves it there and not only in the WAL file.
+        try:
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:  # busy with a fetch's writes: the WAL file still holds them safely
+            pass
         self.db.close()
 
     def save_post(self, post: Post, sentiment: float, label: str) -> None:

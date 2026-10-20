@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -36,4 +37,25 @@ def main(argv: list[str] | None = None) -> int:
                 settings.value("ui/reduce_transparency", False, bool))
     window = MainWindow(default_db_path())
     window.show()
-    return app.exec()
+    code = app.exec()
+    if window.running_threads():
+        # A request was still out when the window closed. Everything fetched is saved, so don't wait
+        # for it: Qt aborts the process if a running thread is destroyed on the way out.
+        end_now(code)
+    return code
+
+
+def end_now(code: int) -> None:
+    """End the process at once, without Python's or Qt's clean-up."""
+    for stream in (sys.stdout, sys.stderr):  # None in the packaged app, which has no console
+        if stream is not None:
+            stream.flush()
+    if sys.platform == "win32":
+        # os._exit still runs Qt's DLL clean-up, which crashes (an access violation) with a thread running.
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE  # a 64-bit handle, not ctypes' default int
+        kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
+    os._exit(code)

@@ -2,6 +2,9 @@
 talking to a fake Arctic Shift server on localhost. The rule checked throughout: nothing is requested
 unless the user asked for it, and each action requests only what it says."""
 import os
+import sqlite3
+import subprocess
+import sys
 import time
 
 import pytest
@@ -257,6 +260,119 @@ def test_enter_in_the_sidebar_fetches_once(env):
     wait_idle(w)
     pump(300)
     assert w.thread is None and env.archive.paths().count(AGG) == 0
+
+
+@pytest.mark.parametrize("saved_before", [False, True])
+def test_fetching_another_subreddit_shows_it_as_it_downloads(env, saved_before):
+    # The window used to stay on whatever was open for the whole fetch, so nothing seemed to happen.
+    w = env.window()
+    if saved_before:
+        fetch(w, comments=False, limit=2)
+    fetch(w, sub="rust", comments=False, limit=5)
+    assert w.current.lower() == "rust"
+    env.archive.delay = 0.1
+    w.subreddit.setText("python")
+    w.include_comments.setChecked(True)
+    w.limit.setValue(30)
+    w.range.setCurrentIndex(w.range.findData("month"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    s = env.store()
+    end = time.monotonic() + 20
+    while len(s.posts("python")) < 4 + 2 * saved_before and time.monotonic() < end:
+        pump(20)
+    pump(300)  # a few fade-in ticks, well under the 1 s refresh
+    assert w.thread is not None, "the fetch should still be running"
+    assert w.current.lower() == "python"
+    assert w.posts_tab.model.rowCount() > 2 * saved_before
+    wait_idle(w)
+
+
+def test_closing_mid_fetch_leaves_the_fetch_alone(env, monkeypatch):
+    errors = []
+    monkeypatch.setattr(sys, "excepthook", lambda *e: errors.append(e))
+    w = env.window()
+    env.archive.delay = 4  # a request still out when the window closes
+    w.subreddit.setText("python")
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    pump(500)
+    w.close()
+    assert w.running_threads(), "app.main ends the process instead of destroying this thread"
+    end = time.monotonic() + 20
+    while w.thread.isRunning() and time.monotonic() < end:
+        pump(50)
+    pump(200)
+    assert errors == []  # the fetch ending didn't reach for the closed store
+
+
+QUIT_MID_FETCH = """
+import os, sys
+from PySide6.QtCore import QSettings, QTimer
+from subsentiment import arctic_shift
+from subsentiment.gui import app, main_window, worker
+arctic_shift.BASE_URL = sys.argv[1]
+worker.LIMITER.base = worker.LIMITER.interval = arctic_shift.BASE_INTERVAL / 10  # as in the other tests
+QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, sys.argv[2])
+QSettings(app.STORAGE_ORG, app.STORAGE_APP).setValue("updates/auto", False)
+app.default_db_path = lambda: os.path.join(sys.argv[2], "quit.db")
+def window(path):
+    w = main_window.MainWindow(path)
+    w.subreddit.setText("python")
+    w.include_comments.setChecked(True)
+    w.limit.setValue(10)
+    def close():
+        print("saved", len(w.store.posts("python")) + len(w.store.comments("python")), flush=True)
+        w.close()  # while a slow request for comments is still out
+        print("running", bool(w.running_threads()), flush=True)
+    def close_once_posts_are_saved():
+        if sys.argv[3] == "idle":
+            close()
+        elif len(w.store.posts("python")) >= 5:
+            QTimer.singleShot(1500, close)  # the rest of the posts, then the comments start
+        else:
+            QTimer.singleShot(50, close_once_posts_are_saved)
+    if sys.argv[3] == "fetch":
+        QTimer.singleShot(300, w.fetch_btn.click)
+    QTimer.singleShot(400, close_once_posts_are_saved)
+    return w
+app.MainWindow = window
+sys.exit(app.main([]))
+"""
+
+
+@pytest.mark.parametrize("mode", ["fetch", "idle"])  # idle: quitting with nothing running, for comparison
+def test_quitting_mid_fetch_exits_cleanly(env, tmp_path, mode):
+    # Qt aborts the process (an access violation on Windows) when a thread is destroyed while running.
+    # Before, the process also lived on with the fetch after the window had gone, raising in its signals.
+    env.archive.delays[TREE] = 20  # posts come quickly, then a comment request is still out at quit
+    start = time.monotonic()
+    run = subprocess.run([sys.executable, "-X", "faulthandler", "-c", QUIT_MID_FETCH, env.archive.url,
+                          str(tmp_path), mode],
+                         capture_output=True, text=True, timeout=90,
+                         env=dict(os.environ, QT_QPA_PLATFORM="offscreen"))
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert "Traceback" not in run.stderr and "Destroyed while thread" not in run.stderr, run.stderr[-2000:]
+    out = dict(line.split() for line in run.stdout.split("\n") if line.startswith(("saved", "running")))
+    assert out["running"] == str(mode == "fetch")  # the fetch was still going when the process ended
+    assert time.monotonic() - start < 20  # gone without waiting for it
+    # Ending the process skips every clean-up, so check nothing is lost: each row saved before the
+    # window closed is in the database, which is intact, and the form's settings were written.
+    db = tmp_path / "quit.db"
+    with sqlite3.connect(db) as c:
+        assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    s = Store(str(db))
+    assert len(s.posts("python")) + len(s.comments("python")) >= int(out["saved"])
+    s.close()
+    assert not (tmp_path / "quit.db-wal").exists() or (tmp_path / "quit.db-wal").stat().st_size == 0
+    settings = QSettings(str(next(tmp_path.rglob("*.ini"))), QSettings.Format.IniFormat)
+    assert settings.value("fetch/subreddit") == "python"
+
+
+def test_about_names_the_bundled_model(env, monkeypatch):
+    shown = []
+    monkeypatch.setattr(QMessageBox, "about", lambda parent, title, text: shown.append(text))
+    env.window()._show_about()
+    assert shown and "VADER" not in shown[0]
 
 
 def test_switching_subreddit_mid_fetch_keeps_each_table_to_its_own_rows(env):
