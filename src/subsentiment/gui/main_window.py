@@ -858,7 +858,7 @@ class MainWindow(QMainWindow):
         self._drip.stop()
         self._queued = {"posts": [], "comments": []}
         switching = (name or None) != self.current
-        if switching:  # the old subreddit fades out over the new one, whose cards fade in one by one
+        if switching:  # the old subreddit fades out over the new one
             motion.crossfade(self.content)
             for chart in self.timelines:
                 chart.show_every_day()
@@ -873,9 +873,6 @@ class MainWindow(QMainWindow):
         self._apply_days()
         self._show_notes()
         self._update_delete_enabled()
-        page = self.pages.currentWidget()
-        if switching and hasattr(page, "cards"):
-            motion.fade_in_all(page.cards)
         self.coverage.set_subreddit(self.current)
 
     def _refresh_days(self) -> None:
