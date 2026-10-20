@@ -673,8 +673,10 @@ class ArcticShiftClient:
                 todo, failed, retried = [(d, d + DAY) for d in failed], [], True
             lo, hi = todo.pop(0)
             params = {"subreddit": subreddit, "aggregate": "created_utc", "frequency": "day",
-                      # `after` is exclusive (checked live): lo - 1 counts a post made at 00:00:00 too.
-                      "after": lo - 1, "before": hi, "limit": (hi - lo) // DAY + 1}
+                      # Unlike the search, the aggregate lays its buckets out from `after`'s own second, so
+                      # `after` must be the day start (checked live: start - 1 times out, start - 2 gives
+                      # buckets keyed 21:59:58Z holding 0 posts).
+                      "after": lo, "before": hi, "limit": (hi - lo) // DAY + 1}
             try:
                 buckets = self.get("/api/posts/search/aggregate", params, shrink=False)
             except Stopped:
