@@ -49,10 +49,11 @@ def make_posts(subreddit: str, now: float, days: int = 10, per_day=(6, 0, 12), s
     n = 0
     for d in range(days):
         day = today - d * DAY
-        for k in range(per_day[d % len(per_day)]):
-            created = day + 3600 + k * 600
-            if created > now:
-                continue
+        count = per_day[d % len(per_day)]
+        for k in range(count):
+            # Today's posts are spread over the part of the day that has passed, so there are some
+            # whatever the time (at 00:30 UTC they used to all lie in the future).
+            created = day + 3600 + k * 600 if d else day + (now - day) * (k + 1) / (count + 1)
             n += 1
             pid = f"{subreddit[:2].lower()}{n:04d}"
             settled = now - created > 36 * 3600

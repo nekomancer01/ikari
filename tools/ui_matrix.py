@@ -124,15 +124,15 @@ def check(window) -> list[str]:
     for w in [window, *window.findChildren(QWidget)]:
         if not w.isVisible() or w.window() is not window or w.width() <= 0 or w.visibleRegion().isEmpty():
             continue  # hidden, or scrolled out of view (table rows below the fold keep stale sizes)
-        if isinstance(w, QLabel) and w.text() and not w.pixmap() and "<" not in w.text():
+        if isinstance(w, QLabel) and QLabel.text(w) and not w.pixmap() and "<" not in QLabel.text(w):  # shown text
             m = w.fontMetrics()
             room = w.contentsRect()
             if w.wordWrap():
                 need = w.heightForWidth(w.width())
                 if need > w.height() + TOL:
                     problems.append(f"cut off (wrapped text needs {need}px, has {w.height()}): {_name(w)}")
-            elif m.horizontalAdvance(w.text()) > room.width() + TOL:
-                problems.append(f"cut off ({m.horizontalAdvance(w.text())}px text in {room.width()}): {_name(w)}")
+            elif m.horizontalAdvance(QLabel.text(w)) > room.width() + TOL:
+                problems.append(f"cut off ({m.horizontalAdvance(QLabel.text(w))}px text in {room.width()}): {_name(w)}")
         if isinstance(w, (QAbstractButton, QComboBox, QLineEdit, QAbstractSpinBox, QTabBar)):
             hint = w.minimumSizeHint().boundedTo(w.maximumSize())  # a style cap is on purpose
             if w.width() + TOL < hint.width() or w.height() + TOL < hint.height():
@@ -198,9 +198,11 @@ def alignment(window) -> list[str]:
             if dy > TOL:
                 problems.append(f"out of line, form label {text!r} is {dy}px off its field's centre")
     _same(problems, "form label left edges", labels)
-    # Equal margins left and right of the sidebar's contents (inside the scroll bar when there is one).
+    # Equal margins left and right of the sidebar's contents (the scroll bar, when it shows, sits in the right one).
     left = _rect(form.itemAt(0, QFormLayout.ItemRole.LabelRole).widget(), side).left()
     right = side.width() - 1 - max(_rect(w, side).right() for w in [*fields.values(), window.fetch_btn, window.stop_btn])
+    if sidebar_scrolls(window):
+        right += side.parentWidget().parentWidget().verticalScrollBar().width()
     _same(problems, "sidebar margins", {"left": left, "right": right})
     _same(problems, "Fetch row button tops", {"fetch": _rect(window.fetch_btn, side).top(),
                                                "stop": _rect(window.stop_btn, side).top()})
@@ -275,6 +277,31 @@ def coverage_alignment(dialog) -> list[str]:
     _same(problems, "coverage panel bottoms",
           {"days": _rect(panels[0], dialog).bottom(), "posts": _rect(panels[1], dialog).bottom()})
     return problems
+
+
+def table_room(window) -> list[str]:
+    """The Posts or Comments table leaves its main text column (title, comment) real room."""
+    problems = []
+    for name, page in (("posts", window.posts_tab), ("comments", window.comments_tab)):
+        if not page.isVisible() or not page.model.rowCount():
+            continue
+        room = page.view.viewport().width()
+        text = page.view.horizontalHeader().sectionSize(page.stretch_col)
+        if text < room * 0.3:
+            problems.append(f"squashed, the {name} table's text column is {text}px of {room}")
+    return problems
+
+
+def field_edges(window) -> dict:
+    from PySide6.QtWidgets import QFormLayout
+    side = window.findChild(QFormLayout).parentWidget()
+    return {name: (_rect(w, side).left(), _rect(w, side).right(), _rect(w, window).top())
+            for name, w in (("subreddit", window.subreddit), ("to", window.date_to), ("max posts", window.limit))}
+
+
+# A status line as long as the app writes, during a fetch and after it.
+STATUS = ("Added 1,234 new posts and 5,678 comments from r/AskHistorians. Updated scores on 321 saved posts. "
+          "12 top posts were already saved. Comments couldn't be fetched for 3 posts; try again later.")
 
 
 def sidebar_scrolls(window) -> bool:
@@ -378,7 +405,7 @@ def child(spec: dict) -> int:
                 "scrollbars": scrollbars(top), "shot": shot}
 
     def main_rules():
-        found = alignment(window)
+        found = alignment(window) + table_room(window)
         if window.height() >= SIDEBAR_FITS and sidebar_scrolls(window):
             found.append(f"sidebar scrolls on a {window.height()} px tall window")
         return found
@@ -390,6 +417,26 @@ def child(spec: dict) -> int:
             window.tabbar.setCurrentIndex(tab)
             results.append(measure(window, w, h, state + ["", " posts", " comments"][tab], main_rules))
     window.tabbar.setCurrentIndex(0)
+
+    # A status line under Fetch, with and without the progress bar: the sidebar's fields must not move
+    # and it must not start scrolling.
+    for state, w, h in sizes[:2]:
+        window.resize(w, h)
+        settle()
+        idle = field_edges(window)
+        for phase, busy in (("fetching", True), ("finished", False)):
+            window.progress.setVisible(busy)
+            window.progress_msg.setText(STATUS)
+
+            def status_rules():
+                found = main_rules()
+                moved = {k: (idle[k], v) for k, v in field_edges(window).items() if v != idle[k]}
+                if moved:
+                    found.append(f"out of line, sidebar fields move when a status line shows: {moved}")
+                return found
+            results.append(measure(window, w, h, f"{state} {phase}", status_rules))
+        window.progress.setVisible(False)
+        window.progress_msg.setText("")
 
     # The Download coverage window, with made-up archive counts instead of asking the network.
     def fake_count(self, after, before):
