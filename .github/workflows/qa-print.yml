@@ -24,7 +24,3 @@ jobs:
           find qa -type f | sort
           for f in qa/*/walkthrough.md; do echo "=== $f"; cat "$f"; done
           for f in qa/150/*.json; do echo "=== $f"; python3 -c "import json,sys;d=json.load(open('$f'));print(json.dumps({k:d[k] for k in ('info','local','stalls_ms','workarounds')}))"; done
-          for f in qa/exe/ikari-exe-150-screen.png qa/150/01-first-launch-maximized.png qa/150/01-first-launch-maximized-screen.png qa/150/13-tab-overview.png qa/150/19-coverage-open.png; do
-            [ -f "$f" ] || continue
-            echo "=== B64 $f"; base64 -w0 "$f"; echo; echo "=== END"
-          done
