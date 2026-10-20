@@ -148,3 +148,20 @@ def test_a_failed_export_leaves_the_old_file_as_it_was(tmp_path, monkeypatch):
         s.export_csv("Python", "posts", out)
     assert out.read_text() == "earlier export"
     assert list(tmp_path.glob("*.part")) == []
+
+
+def test_day_counts_and_exporting_chosen_days(tmp_path):
+    s = Store(tmp_path / "d.db")
+    day = 1_700_006_400  # a UTC midnight
+    s.save_post(make_post(1, ts=day + 5), 0.5, "positive")
+    s.save_post(make_post(2, ts=day + 86400 + 5), 0.1, "neutral")
+    s.save_post(make_post(3, sub="rust", ts=day + 5), 0.1, "neutral")
+    s.save_comment(Comment("c1", "p1", "Python", "t3_p1", "b", "hi", 1, day + 86400 * 2, 0, "u"), 0.2, "positive")
+    s.commit()
+    # Comments count on the day they were written, not their post's day.
+    assert s.day_counts("python") == {day: (1, 0), day + 86400: (1, 0), day + 2 * 86400: (0, 1)}
+    out = tmp_path / "p.csv"
+    assert s.export_csv("python", "posts", out, days={day + 86400}) == 1
+    assert [r["id"] for r in csv.DictReader(open(out, encoding="utf-8-sig"))] == ["p2"]  # starts with a BOM
+    assert s.export_csv("python", "posts", out) == 2
+    assert s.export_csv("python", "comments", out, days=set()) == 0
