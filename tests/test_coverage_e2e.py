@@ -117,10 +117,10 @@ def click(table, row):
     QTest.mouseClick(table.cellWidget(row, 2).findChild(QPushButton), Qt.MouseButton.LeftButton)
 
 
-def test_browsing_the_window_never_downloads_anything(window):
+def test_browsing_the_page_never_downloads_anything(window):
     w = window
     select(w, "Python")
-    w._show_coverage()
+    w.show_page("coverage")
     c = w.coverage
     settle(w, lambda: c.totals)
     for row in range(c.day_table.rowCount()):  # look at every day
@@ -135,8 +135,8 @@ def test_browsing_the_window_never_downloads_anything(window):
     select(w, "Python")
     c.recount.click()
     settle(w)
-    c.hide()
-    w._show_coverage()  # closed and opened again
+    w.show_page("overview")
+    w.show_page("coverage")  # left and opened again
     settle(w)
     w._apply_theme()
     settle(w)
@@ -147,7 +147,7 @@ def test_browsing_the_window_never_downloads_anything(window):
 def test_a_days_download_all_fetches_that_days_posts_and_no_comments(window):
     w = window
     select(w, "Python")
-    w._show_coverage()
+    w.show_page("coverage")
     c = w.coverage
     settle(w, lambda: c.totals)
     day = TODAY - 3 * DAY
@@ -155,11 +155,11 @@ def test_a_days_download_all_fetches_that_days_posts_and_no_comments(window):
     settle(w, lambda: not w.fetch_job.busy)
     assert downloads() == [("posts", "Python", day, day + DAY)]
     assert w.store.posts_per_day("Python", day, day + DAY) == {day: 5}  # one saved before, four new
-    # Enter afterwards doesn't run it again. In a dialog the last clicked button would otherwise become
-    # the default, so give it focus as a real click does (the offscreen platform doesn't) and press Enter.
+    # Enter afterwards doesn't run it again: give it focus as a real click does (the offscreen platform
+    # doesn't) and press Enter.
     used = c.day_table.cellWidget(c.days.index(day), 2).findChild(QPushButton)
     assert used.focusPolicy() == Qt.FocusPolicy.NoFocus  # a click doesn't leave it focused, so Space can't either
-    c.activateWindow()
+    w.activateWindow()
     used.setFocus(Qt.FocusReason.MouseFocusReason)
     for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
         for target in (c, c.day_table):
@@ -171,7 +171,7 @@ def test_a_days_download_all_fetches_that_days_posts_and_no_comments(window):
 def test_a_posts_download_all_fetches_only_that_posts_comments(window):
     w = window
     select(w, "Python")
-    w._show_coverage()
+    w.show_page("coverage")
     c = w.coverage
     settle(w, lambda: c.totals)
     day = TODAY - DAY  # p0 is on this day
