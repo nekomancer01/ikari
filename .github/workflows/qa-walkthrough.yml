@@ -22,7 +22,8 @@ jobs:
       - name: Screen at 1920x1200
         shell: pwsh
         run: |
-          try { Set-DisplayResolution -Width 1920 -Height 1200 -Force } catch { Write-Host "Set-DisplayResolution failed: $_" }
+          Get-Command Set-DisplayResolution -ErrorAction SilentlyContinue | Format-List Name, Source
+          try { Set-DisplayResolution -Width 1920 -Height 1200 -Force -ErrorAction Stop } catch { Write-Host "Set-DisplayResolution failed: $_" }
           Add-Type -AssemblyName System.Windows.Forms
           [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
       - name: Install
@@ -37,8 +38,10 @@ jobs:
           QT_DEBUG_PLUGINS: "0"
         run: |
           python -c "import PySide6.QtWidgets as w, sys; a = w.QApplication([]); s = a.primaryScreen(); print(a.platformName(), s.geometry(), s.devicePixelRatio(), s.logicalDotsPerInch())"
-          python tools/qa_walkthrough.py --out qa/150 --scale 1.5 --timeout 240 --stop-after 15 --latency 0.6
-          Write-Host "exit code $LASTEXITCODE"
+          python -X faulthandler tools/qa_walkthrough.py --out qa/100 --timeout 120 --stop-after 15 --latency 0.6
+          Write-Host "exit code at 100%: $LASTEXITCODE"
+          python -X faulthandler tools/qa_walkthrough.py --out qa/150 --scale 1.5 --timeout 240 --stop-after 15 --latency 0.6
+          Write-Host "exit code at 150%: $LASTEXITCODE"
       - name: Build and capture ikari.exe at 150%
         shell: pwsh
         run: |

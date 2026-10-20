@@ -279,7 +279,9 @@ def click(button) -> None:
 
 # -- the walkthrough ---------------------------------------------------------------------------------------
 
+print("starting Qt", flush=True)
 app = QApplication([])
+print(f"Qt platform {app.platformName()}, screen {app.primaryScreen().geometry()}", flush=True)
 app.setOrganizationName("ikari-qa")
 app.setApplicationName("ikari-qa")
 TMP = Path(tempfile.mkdtemp())
@@ -329,8 +331,14 @@ heart.setInterval(20)
 heart.timeout.connect(tick)
 heart.start()
 
+if not QGuiApplication.platformName().startswith("offscreen"):
+    # A CI desktop is smaller than the screen being tested: open the window at the size the app would pick there.
+    fw, fh = int(pw / ARGS.scale * 0.94), int((ph / ARGS.scale - 79) * 0.92)
+    mw.fit_to_screen = lambda size, screen: size.boundedTo(size.__class__(fw, fh))
+print("opening the window", flush=True)
 w = mw.MainWindow(DB)
 w.show()
+print("window shown", flush=True)
 pump(0.5)
 screen = QGuiApplication.primaryScreen()
 info = {"live": ARGS.live, "dpr": w.devicePixelRatioF(), "screen_logical": [screen.geometry().width(),
