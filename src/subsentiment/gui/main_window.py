@@ -132,8 +132,8 @@ class MainWindow(QMainWindow):
         self._build_menu()
         backdrop = QWidget()  # transparent: the window paints the backdrop behind menus too
         root = QHBoxLayout(backdrop)
-        root.setContentsMargins(18, 8, 18, 12)
-        root.setSpacing(18)
+        root.setContentsMargins(12, 4, 12, 12)
+        root.setSpacing(12)
         root.addWidget(self._build_sidebar())
         root.addWidget(self._build_content(), 1)
         self.setCentralWidget(backdrop)
@@ -301,10 +301,8 @@ class MainWindow(QMainWindow):
         return side
 
     def _build_content(self) -> QWidget:
-        content = QWidget()
-        lay = QVBoxLayout(content)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(14)
+        # One panel, as the sidebar is: the header on top, a rule under it, then the page.
+        content, lay = panel("true", margins=0, spacing=0)
 
         self.heading = ElidedLabel("No data yet", "heading")
         self.subheading = ElidedLabel("Enter a subreddit on the left and press Fetch and analyse.", "subtitle")
@@ -317,21 +315,22 @@ class MainWindow(QMainWindow):
         for t in ("Overview", "Posts", "Comments"):
             self.tabbar.addTab(t)
         # What the whole Overview (tiles, charts, strongest lists, mood tint) counts.
-        self.scope = ShrinkingComboBox()
+        self.scope = mark(ShrinkingComboBox(), "pill", True)
         self.scope.addItems(SCOPES)
         self.scope.setToolTip("Count posts, comments or both on the Overview")
         saved = self.settings.value("ui/overview_scope", SCOPES[0], str)
         self.scope.setCurrentIndex(max(self.scope.findText(saved), 0))
         self.scope.currentTextChanged.connect(self._on_scope_changed)
         # Which saved days every view counts (the Overview, both tables, CSV export). Picking never fetches.
-        self.days_pick = days.DaysCombo()
+        self.days_pick = mark(days.DaysCombo(), "pill", True)
         self.days_pick.chosen_changed.connect(self._on_days_chosen)
-        self.heading.setMinimumWidth(QFontMetrics(theme.display_font(15, 650)).horizontalAdvance("r/subreddit"))
+        self.heading.setMinimumWidth(QFontMetrics(theme.display_font(14, 600)).horizontalAdvance("r/subreddit"))
         # The title, the Overview's scope picker, the day picker and the tabs share one centre line, and the
         # subtitle runs the full width under them. It used to share a narrow column with the title and wrapped
         # at 150%, cutting off "last fetched". The day picker sits by the tabs, which it filters too, so it
         # stays put when the scope picker hides on the other tabs.
         header = QGridLayout()
+        header.setContentsMargins(16, 12, 12, 12)
         header.setHorizontalSpacing(12)
         header.setVerticalSpacing(2)
         header.addWidget(self.heading, 0, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -341,6 +340,7 @@ class MainWindow(QMainWindow):
         header.addWidget(self.subheading, 1, 0, 1, 4)
         header.setColumnStretch(0, 1)
         lay.addLayout(header)
+        lay.addWidget(mark(QFrame(), "role", "divider"))
 
         self.pages = QStackedWidget()
         self.content = content
@@ -357,7 +357,10 @@ class MainWindow(QMainWindow):
         post_col.resizeSection(4, 180)
         self.pages.addWidget(self.posts_tab)
         self.pages.addWidget(self.comments_tab)
-        lay.addWidget(self.pages, 1)
+        body = QVBoxLayout()
+        body.setContentsMargins(16, 16, 16, 16)
+        body.addWidget(self.pages, 1)
+        lay.addLayout(body, 1)
         return content
 
     # -- theme ----------------------------------------------------------------
@@ -851,7 +854,7 @@ class MainWindow(QMainWindow):
             f"<h3>ikari {__version__}</h3>"
             "<p>Gather subreddit posts and comments and score their sentiment with a model that runs "
             "on this computer.</p>"
-            "<p>Fonts: Manrope and Sora, both under the SIL Open Font License 1.1.</p>"))
+            "<p>Font: Inter, under the SIL Open Font License 1.1.</p>"))
 
     def paintEvent(self, event) -> None:
         paint_backdrop(self, over_native=self._native_backdrop is not None, mood=self.mood.state)

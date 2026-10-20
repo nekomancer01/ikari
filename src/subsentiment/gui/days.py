@@ -16,7 +16,7 @@ import math
 from datetime import date, datetime, timedelta, timezone
 
 from PySide6.QtCore import QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QLinearGradient, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QToolTip, QVBoxLayout, QWidget,
 )
@@ -272,7 +272,7 @@ class DayCalendar(QWidget):
         number = QFont(self.font())
         number.setWeight(QFont.Weight.DemiBold)
         edge = QColor(*t["edge"][:3], min(255, t["edge"][3] * 2))
-        soft = QColor(*t["glass_strong"]) if theme.mode() == "light" else QColor(255, 255, 255, 14)
+        soft = QColor(t["soft"])
         for i, day in enumerate(self.days_shown()):
             if day is None:
                 continue
@@ -282,10 +282,7 @@ class DayCalendar(QWidget):
             path = QPainterPath()
             path.addRoundedRect(r, 9, 9)
             if on:
-                g = QLinearGradient(r.topLeft(), r.bottomRight())
-                g.setColorAt(0, QColor(t["button0"]))
-                g.setColorAt(1, QColor(t["button1"]))
-                p.fillPath(path, g)
+                p.fillPath(path, QColor(t["button"]))
                 if day == self._hover:
                     p.fillPath(path, QColor(255, 255, 255, 30))
             elif saved:

@@ -421,7 +421,7 @@ class CoverageWindow(QDialog):
     def _show_posts(self, day: int | None) -> None:
         t = self.post_table
         if day is None or not self.subreddit:
-            self.posts_title.setText("POSTS")
+            self.posts_title.setText("Posts")
             t.setRowCount(0)
             self._post_ids, self._post_rows, self._built = [], [], {}
             self.all_comments.setEnabled(False)
@@ -433,7 +433,7 @@ class CoverageWindow(QDialog):
         rows = store.comment_coverage(self.subreddit, day, day + DAY)
         complete = store.complete_keys("comments", self.subreddit)
         so_far = store.complete_keys("comments_so_far", self.subreddit)
-        self.posts_title.setText(f"POSTS ON {day_text(day).upper()} · {len(rows):,}")
+        self.posts_title.setText(f"Posts on {day_text(day)} · {len(rows):,}")
         ids = [r["id"] for r in rows]
         if ids != self._post_ids:
             # A busy day has thousands of posts, and three widgets a row took seconds to build; rows get

@@ -236,22 +236,21 @@ Manager, macOS Keychain or Secret Service) under "Subreddit Sentiment", and you 
 ## Design notes
 
 <details>
-<summary>Type, glass and chart colors</summary>
+<summary>Type, panels and chart colors</summary>
 
-- Type: [Manrope](https://fonts.google.com/specimen/Manrope) for the interface and
-  [Sora](https://fonts.google.com/specimen/Sora) for headings and big numbers. Tabular figures are
-  on so numbers line up. Qt's variable-font weight matching is unreliable, so the fonts are bundled
-  as static weights in `src/subsentiment/gui/assets/`.
-- Glass is used for the sidebar, stat tiles and chart cards. Tables and lists sit on near-solid
-  panels so dense text stays readable, and glass is never stacked on glass.
-- Chart colors: blue for positive, red for negative, gray for neutral, checked for color-blind
-  separation. Bars are always labelled, so color is never the only cue.
+- Type: [Inter](https://rsms.me/inter/) throughout, headings in its heavier weights. Tabular figures
+  are on so numbers line up. Qt's variable-font weight matching is unreliable, so the font is bundled
+  as static weights in `src/subsentiment/gui/assets/`, cut down to Latin and common punctuation.
+- A flat, light dashboard look: white panels with hairline borders on a soft gray window, outlined
+  cards, pill buttons and pickers, ruled tables with a tinted header row, one blue accent. Dark mode
+  keeps the same structure on near-black surfaces.
+- Chart colors: blue for positive, orange for negative, gray for neutral, a pair that stays apart
+  for color-blind viewers. Bars are always labelled, so color is never the only cue.
 
 ### Licenses
 
-- Manrope and Sora are licensed under the [SIL Open Font License 1.1](https://openfontlicense.org/).
-  Their license texts ship with the app as `src/subsentiment/gui/assets/Manrope-OFL.txt` and
-  `src/subsentiment/gui/assets/Sora-OFL.txt`.
+- Inter is licensed under the [SIL Open Font License 1.1](https://openfontlicense.org/). Its license
+  text ships with the app as `src/subsentiment/gui/assets/Inter-OFL.txt`.
 
 </details>
 

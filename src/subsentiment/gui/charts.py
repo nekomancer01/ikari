@@ -1,9 +1,8 @@
 """QtCharts views for the overview tab.
 
-Colors follow the polarity job: blue = positive, red = negative, neutral gray
-midpoint, with separate steps for light and dark surfaces. Red and gray sit
-close together for protan viewers on dark, so every bar is also labelled by
-category on the axis and by value, never by color alone.
+Colors follow the polarity job: blue = positive, orange = negative, neutral gray midpoint, with
+separate steps for light and dark surfaces. Blue and orange stay apart for color-blind viewers, and
+every bar is also labelled by category on the axis and by value, never by color alone.
 """
 from __future__ import annotations
 
@@ -19,44 +18,30 @@ from PySide6.QtWidgets import QApplication, QGraphicsPathItem, QGraphicsSimpleTe
 
 from subsentiment.gui import motion, theme
 
-LIGHT = {
-    "surface": "#fcfcfb", "text": "#0b0b0b", "muted": "#52514e", "grid": "#e4e3df",
-    "positive": "#2a78d6", "neutral": "#8a8984", "negative": "#e34948", "line": "#2a78d6",
-}
-DARK = {
-    "surface": "#1a1a19", "text": "#f0efec", "muted": "#c3c2b7", "grid": "#383835",
-    "positive": "#3987e5", "neutral": "#8a8984", "negative": "#e66767", "line": "#3987e5",
-}
-
-
-# Approximate color of the glass card behind the charts, for the dots' surface ring.
-CARD = {"light": "#f3f5fc", "dark": "#1b1f2e"}
+LIGHT = {"positive": "#0163ff", "neutral": "#b4b4b8", "negative": "#f28513", "line": "#0163ff"}
+DARK = {"positive": "#3d86ff", "neutral": "#6e6e74", "negative": "#f59a3c", "line": "#3d86ff"}
 
 
 def palette() -> dict:
-    """Validated series colors for the current theme, with text and grid from the theme."""
+    """Series colors for the current theme, with text, grid and card surface from the theme."""
     t = theme.tokens()
-    mode = theme.mode()
     grid = QColor(*t["edge"][:3])
-    grid.setAlpha(min(255, t["edge"][3] * 2))
-    return dict(DARK if mode == "dark" else LIGHT, surface=CARD[mode], text=t["text"], muted=t["muted"],
+    grid.setAlpha(t["edge"][3])
+    return dict(DARK if theme.mode() == "dark" else LIGHT, surface=t["panel"], text=t["text"], muted=t["muted"],
                 grid=grid.name(QColor.NameFormat.HexArgb))
 
 
 def _ui_font(point_size: float) -> QFont:
-    """The app's UI font (Manrope, tabular figures) at a chart-label size."""
+    """The app's UI font (Inter, tabular figures) at a chart-label size."""
     f = QFont(QApplication.font())
     f.setPointSizeF(point_size)
     return f
 
 
-def _base_chart(title: str, colors: dict) -> QChart:
+def _base_chart() -> QChart:
     chart = QChart()
-    chart.setTitle(title)
-    chart.setBackgroundVisible(False)  # the glass card behind shows through
+    chart.setBackgroundVisible(False)  # the card behind shows through; its caption names the chart
     chart.setPlotAreaBackgroundVisible(False)
-    chart.setTitleBrush(QColor(colors["text"]))
-    chart.setTitleFont(theme.display_font(11.5, 600))
     chart.setMargins(QMargins(4, 4, 4, 4))
     chart.legend().hide()
     chart.setAnimationOptions(QChart.AnimationOption.NoAnimation)
@@ -104,7 +89,7 @@ class DistributionChart(QChartView):
             return
         self._colors = colors
         self._grow.stop()
-        chart = _base_chart("Sentiment distribution", colors)
+        chart = _base_chart()
         total = sum(counts.values())
         # A stacked series where each set fills only its own category gives one
         # bar per category, each in its own color, centred on its axis label.
@@ -225,7 +210,7 @@ class DistributionChart(QChartView):
             share.setPos(left + c.width() + gap, base - c.height() + (c.height() - sh.height()) * 0.72)
 
 
-BAR_RADIUS = 9.0  # px at the top corners; the base stays square on the axis
+BAR_RADIUS = 5.0  # px at the top corners; the base stays square on the axis
 
 
 def _rounded_bar(r: QRectF) -> QPainterPath:
@@ -284,7 +269,7 @@ class TimelineChart(QChartView):
         if getattr(self, "_shown", None) is not None and colors == self._shown[1]:
             motion.crossfade(self)  # new days or new means: the old line fades into the new one
         self._shown = (list(points), colors)
-        chart = _base_chart("Mean sentiment per day (UTC)", colors)
+        chart = _base_chart()
         pen = QPen(QColor(colors["line"]))
         pen.setWidthF(2.25)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
