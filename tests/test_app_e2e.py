@@ -134,8 +134,9 @@ def test_starting_and_browsing_never_downloads_anything(env):
     for row in range(w.datasets.count()):  # switch between subreddits
         w.datasets.setCurrentRow(row)
         pump(50)
-    for page in PAGES:  # every page, and every Overview scope
-        w.show_page(page)
+    for page in PAGES:  # every page but Download coverage, and every Overview scope
+        if page != "coverage":
+            w.show_page(page)
     for i in range(w.scope.count()):
         w.scope.setCurrentIndex(i)
     for size in (QSize(1280, 750), QSize(900, 600), QSize(1900, 1100)):
@@ -144,6 +145,9 @@ def test_starting_and_browsing_never_downloads_anything(env):
     w.showMaximized()
     pump(1200)  # longer than the redraw timer's 1 s
     assert env.archive.paths() == []
+    w.show_page("coverage")  # asks the archive how many posts each day has, and nothing else
+    pump(1200)
+    assert set(env.archive.paths()) == {AGG}
     assert not w.fetch_job.busy
 
 
@@ -860,8 +864,6 @@ def test_coverage_keeps_its_place_while_a_download_runs(env):
     fetch(w, comments=False)
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     cov = open_coverage(w)
-    cov.resize(900, 400)
-    pump(50)
     last = cov.day_table.rowCount() - 1
     cov.day_table.selectRow(last)
     cov.day_table.scrollToBottom()
@@ -872,7 +874,7 @@ def test_coverage_keeps_its_place_while_a_download_runs(env):
     w.fetch_form.subreddit.setText("python")
     w.fetch_form.include_comments.setChecked(True)
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
-    pump(2500)  # the window refreshes about once a second while rows arrive
+    pump(2500)  # the page refreshes about once a second while rows arrive
     assert cov.day_table.verticalScrollBar().value() == scrolled
     assert cov._selected_day() == cov.days[last]
     wait_idle(w)
@@ -913,7 +915,7 @@ def test_coverage_follows_a_change_of_date_range_in_the_sidebar(env):
     assert len(cov.days) == 3
 
 
-def test_closing_coverage_while_a_count_is_out_doesnt_freeze_the_window(env):
+def test_closing_the_app_while_a_coverage_count_is_out_doesnt_freeze_it(env):
     w = env.window()
     fetch(w, comments=False)
     env.archive.delays[AGG] = 3
@@ -921,7 +923,7 @@ def test_closing_coverage_while_a_count_is_out_doesnt_freeze_the_window(env):
     pump(200)
     assert w.coverage.count_job.busy
     start = time.monotonic()
-    w.coverage.close()
+    w.close()
     assert time.monotonic() - start < 0.5  # it used to wait up to 3 s for the request
     end = time.monotonic() + 10
     while w.coverage.count_job.busy and time.monotonic() < end:
@@ -947,7 +949,7 @@ def test_a_fetch_ending_leaves_the_user_on_the_subreddit_they_switched_to(env):
     assert "Added" in w.progress_msg.text()
 
 
-def test_stop_in_the_coverage_window_is_disabled_once_pressed(env):
+def test_stop_on_the_coverage_page_is_disabled_once_pressed(env):
     w = env.window()
     fetch(w, comments=False)
     cov = open_coverage(w)
@@ -956,21 +958,21 @@ def test_stop_in_the_coverage_window_is_disabled_once_pressed(env):
     env.archive.delay = 1.0
     QTest.mouseClick(cov.day_table.cellWidget(1, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     pump(300)
-    assert cov.stop_btn.isEnabled()
-    QTest.mouseClick(cov.stop_btn, Qt.MouseButton.LeftButton)
-    assert not cov.stop_btn.isEnabled() and not w.stop_btn.isEnabled()
-    w.coverage_act.trigger()  # bringing the window forward again while it stops
-    assert not cov.stop_btn.isEnabled()
+    assert cov.isVisible() and w.stop_btn.isVisible() and w.stop_btn.isEnabled()  # the strip under the header
+    QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
+    assert not w.stop_btn.isEnabled()
+    w.coverage_act.trigger()  # opening the page again while it stops
+    assert not w.stop_btn.isEnabled()
     wait_idle(w)
 
 
-def test_coverage_closed_and_opened_again_mid_count_counts_again_without_an_error(env):
+def test_coverage_left_and_opened_again_mid_count_counts_without_an_error(env):
     w = env.window()
     fetch(w, comments=False)
     env.archive.delays[AGG] = 1.5
     w.coverage_act.trigger()
     pump(200)
-    w.coverage.close()  # stops the count; its answer comes back cut short
+    w.show_page("overview")  # the count goes on while another page shows
     w.coverage_act.trigger()
     end = time.monotonic() + 15
     while ("python" not in w.coverage.totals or w.coverage.count_job.busy) and time.monotonic() < end:
@@ -994,9 +996,10 @@ def test_choosing_days_never_downloads_and_a_fetch_only_adds_rows_from_chosen_da
     QTest.mouseClick(cal, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, cal.rect_of(day).center())
     pump(300)  # longer than the picker's settling delay
     w.days_pick.hidePopup()
-    for page in PAGES:
-        w.show_page(page)
-        pump(30)
+    for page in PAGES:  # Download coverage lists the Fetch range, not the chosen days, and asks for counts
+        if page != "coverage":
+            w.show_page(page)
+            pump(30)
     pump(1200)
     assert env.archive.paths() == []  # picking days only filters what's saved
     assert w.chosen_days == {day} and len(w.posts) == saved[day][0]
@@ -1058,8 +1061,8 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
         assert time.monotonic() < end and w.fetch_job.busy, w.posts_tab.model.rowCount()
         if "comments on" in w.progress_msg.text():  # the first day's posts are all saved by now
             want = want or len(store.posts("Burst"))
-        if w.current and w.coverage is None:  # opened with the first rows, to watch the rest come in
-            w._show_coverage()
+        if w.current and not w.coverage.isVisible():  # opened with the first rows, to watch the rest come in
+            w.show_page("coverage")
         pump(5)
     pump(1200)  # past the overview's 250 ms and the saved-data list's 1 s; still waiting on the comments  # a little more than the overview's 250 ms; still waiting on the comments
     assert w.fetch_job.busy and not w.comments_tab.model.rowCount()
