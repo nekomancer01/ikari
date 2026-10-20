@@ -94,7 +94,7 @@ def settle(w, until=lambda: True, timeout=5.0):
     while time.time() < end:
         QApplication.processEvents()
         cov = w.coverage
-        idle = w.thread is None and (cov is None or cov._count_thread is None)
+        idle = not w.fetch_job.busy and (cov is None or not cov.count_job.busy)
         if idle and until():
             break
         time.sleep(0.01)
@@ -141,7 +141,7 @@ def test_browsing_the_window_never_downloads_anything(window):
     w._apply_theme()
     settle(w)
     assert downloads() == []
-    assert w.thread is None
+    assert not w.fetch_job.busy
 
 
 def test_a_days_download_all_fetches_that_days_posts_and_no_comments(window):
@@ -152,7 +152,7 @@ def test_a_days_download_all_fetches_that_days_posts_and_no_comments(window):
     settle(w, lambda: c.totals)
     day = TODAY - 3 * DAY
     click(c.day_table, c.days.index(day))
-    settle(w, lambda: w.thread is None)
+    settle(w, lambda: not w.fetch_job.busy)
     assert downloads() == [("posts", "Python", day, day + DAY)]
     assert w.store.posts_per_day("Python", day, day + DAY) == {day: 5}  # one saved before, four new
     # Enter afterwards doesn't run it again. In a dialog the last clicked button would otherwise become
@@ -179,7 +179,7 @@ def test_a_posts_download_all_fetches_only_that_posts_comments(window):
     settle(w)
     assert c.post_table.rowCount() == 1
     click(c.post_table, 0)
-    settle(w, lambda: w.thread is None)
+    settle(w, lambda: not w.fetch_job.busy)
     assert downloads() == [("all_comments", "p0")]
     cell = c.post_table.cellWidget(0, 1)
     assert cell.main.text() == "5 saved" and "Complete" in cell.side.text()
