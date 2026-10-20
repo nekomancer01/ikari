@@ -289,10 +289,11 @@ class ArcticShiftClient:
                 self.limiter.done()
                 raise
             self.limiter.observe(resp.headers)
-            error = _error_text(resp)
+            payload = _json(resp)  # parsed once: a big comment tree takes a while to parse
+            error = _error_text(payload)
             if resp.status_code == 200 and not error:
                 self.limiter.ok()
-                data = resp.json().get("data")
+                data = (payload if payload is not None else resp.json()).get("data")  # not JSON: raises
                 return data if isinstance(data, list) else []
             if _is_timeout(resp.status_code, error):
                 # The archive answers slow queries with "Query timed out" (HTTP 200) or "Timeout. Maybe
@@ -764,9 +765,13 @@ def _is_timeout(status: int, error: str) -> bool:
     return "timed out" in text or "timeout" in text or (status == 422 and "slow down" in text)
 
 
-def _error_text(resp) -> str:
+def _json(resp):
+    """The response's JSON, or None when it isn't JSON."""
     try:
-        payload = resp.json()
+        return resp.json()
     except Exception:
-        return ""
+        return None
+
+
+def _error_text(payload) -> str:
     return str(payload.get("error") or "") if isinstance(payload, dict) else ""

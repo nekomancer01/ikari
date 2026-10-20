@@ -628,3 +628,44 @@ def test_coverage_keeps_its_place_while_a_download_runs(env):
     assert cov.day_table.verticalScrollBar().value() == scrolled
     assert cov._selected_day() == cov.days[last]
     wait_idle(w)
+
+
+def test_choosing_days_never_downloads_and_a_fetch_only_adds_rows_from_chosen_days(env):
+    w = env.window()
+    fetch(w, comments=False, limit=10)
+    saved = w.store.day_counts("python")
+    day = max(d for d, (posts, _) in saved.items() if posts)
+    env.archive.clear()
+
+    w.days_pick.showPopup()  # open the picker, keep only one day, close it
+    pump(50)
+    w.days_pick.picker.none_btn.click()
+    cal = w.days_pick.picker.calendar
+    QTest.mouseClick(cal, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, cal.rect_of(day).center())
+    pump(300)  # longer than the picker's settling delay
+    w.days_pick.hidePopup()
+    for i in range(3):
+        w.tabbar.setCurrentIndex(i)
+        pump(30)
+    pump(1200)
+    assert env.archive.paths() == []  # picking days only filters what's saved
+    assert w.chosen_days == {day} and len(w.posts) == saved[day][0]
+
+    env.archive.delay = 0.05
+    w.subreddit.setText("python")
+    w.limit.setValue(60)
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    seen = 0
+    while w.thread is not None:  # rows from other days are saved but not shown while the fetch runs
+        QApplication.processEvents()
+        rows = [w.posts_tab.model.row_at(i) for i in range(w.posts_tab.model.rowCount())]
+        assert all(int(r["created_utc"] // DAY * DAY) == day for r in rows)
+        seen = max(seen, len(rows))
+        time.sleep(0.01)
+    pump(50)
+    env.archive.delay = 0
+    on_day = [r for r in env.store().posts("python") if int(r["created_utc"] // DAY * DAY) == day]
+    assert w.posts_tab.model.rowCount() == len(on_day) == len(w.posts)
+    assert len(w.days_pick.counts) > len(saved) or sum(p for p, _ in w.days_pick.counts.values()) > \
+        sum(p for p, _ in saved.values())  # the picker knows about what the fetch added
+    assert w.days_pick.currentText() != "All days"

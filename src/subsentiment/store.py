@@ -219,8 +219,22 @@ class Store:
         except sqlite3.OperationalError:  # another connection is mid-write; space is reused later anyway
             pass
 
-    def export_csv(self, subreddit: str, kind: str, path: str | Path) -> int:
+    def day_counts(self, subreddit: str) -> dict[int, tuple[int, int]]:
+        """Saved posts and comments per UTC day, by when each was created, as {day start: (posts, comments)}."""
+        days: dict[int, list[int]] = {}
+        for i, table in enumerate(("posts", "comments")):
+            for r in self.db.execute(
+                    f"SELECT CAST(created_utc / 86400 AS INTEGER) * 86400 d, COUNT(*) n FROM {table} "
+                    "WHERE subreddit = ? COLLATE NOCASE AND created_utc IS NOT NULL GROUP BY d", (subreddit,)):
+                days.setdefault(r["d"], [0, 0])[i] = r["n"]
+        return {d: (p, c) for d, (p, c) in days.items()}
+
+    def export_csv(self, subreddit: str, kind: str, path: str | Path, days: set[int] | None = None) -> int:
+        """Write a subreddit's posts or comments to a CSV file: only those created on ``days`` (UTC day
+        starts) when given. Returns how many rows were written."""
         rows = self.posts(subreddit) if kind == "posts" else self.comments(subreddit)
+        if days is not None:
+            rows = [r for r in rows if r["created_utc"] is not None and int(r["created_utc"] // 86400 * 86400) in days]
         columns = POST_COLUMNS if kind == "posts" else COMMENT_COLUMNS + ("post_title",)
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)

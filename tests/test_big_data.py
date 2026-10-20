@@ -194,3 +194,26 @@ def test_switching_theme_recolours_without_reading_the_data_again(window, monkey
     window._set_theme("light")
     window._set_theme("dark")
     assert reads == [] and window.comments_tab.model.rowCount() == COMMENTS
+
+
+def test_a_running_fetch_counts_its_rows_into_the_day_picker_without_recounting_every_day(window, monkeypatch):
+    window.thread = object()  # a fetch is "running" on the subreddit shown
+    window.request = mw.collect.FetchRequest("Big")
+    window._since = time.time() - 1
+    window._read_to = {"posts": window._since, "comments": window._since}
+    new_day = int(time.time() // 86400 * 86400) - 90 * 86400  # no saved rows that day yet
+    writer = Store(window.db_path)
+    writer.db.execute("UPDATE posts SET score = 1, fetched_at = ? WHERE id = 'p7'", (time.time(),))  # saved again
+    writer.db.execute("INSERT INTO comments SELECT 'fresh', post_id, subreddit, parent_id, author, 'hi', 1, ?, depth, "
+                      "permalink, 0.1, 'neutral', ? FROM comments WHERE id = 'c1'", (new_day + 60, time.time()))
+    writer.commit()
+    recounts = count_calls(monkeypatch, Store, "day_counts")
+    try:
+        window._queue_new_rows()
+        window._live_refresh()
+        assert recounts == []
+        assert window._day_counts == window.store.day_counts("Big")
+        assert window._day_counts[new_day] == (0, 1)
+    finally:
+        window.thread = None
+        writer.close()
