@@ -527,6 +527,62 @@ def days_pick(e):
     pump(0.5)
 
 
+@step("span: zoom the timeline and check every page counts the days it shows")
+def span_check(e):
+    if not hasattr(w, "span"):
+        e["notes"].append("no timeline span on this main")
+        return
+    from PySide6.QtCore import QPoint, QPointF
+    from PySide6.QtGui import QWheelEvent
+    from subsentiment.gui import days as dd
+
+    open_drawer("saved")
+    for i in range(w.datasets.count()):
+        if (w.datasets.item(i).data(Qt.ItemDataRole.UserRole) or "").lower() == ARGS.small.lower():
+            w.datasets.setCurrentRow(i)
+    open_drawer("")
+    go("overview")
+    pump(0.8)
+    t = w.overview.timeline
+
+    def check(label):
+        pump(0.8)  # the tables follow once the span settles (300 ms)
+        rows_p, rows_c = w.store.posts(w.current), w.store.comments(w.current)
+        want = (len(dd.keep(rows_p, w._table_days)), len(dd.keep(rows_c, w._table_days)))
+        shown = (w.posts_tab.view.model().rowCount(), w.comments_tab.view.model().rowCount())
+        tile = w.overview.tiles["count"].value.text()
+        ok = shown == want and tile.replace(",", "") == str(sum(want))
+        e["notes"].append(f"{label}: span {w._table_days and dd.span_text(w._table_days)!r}, tables {shown[0]}/"
+                          f"{shown[1]}, expected {want[0]}/{want[1]}, items tile {tile}{'' if ok else ' MISMATCH'}; "
+                          f"subtitle {w.subheading.text()!r}")
+        return ok
+
+    click(t.presets["All"])
+    check("All")
+    plot = t._areas()[0]
+    mid = plot.center()
+    for _ in range(4):
+        QApplication.sendEvent(t, QWheelEvent(QPointF(mid), QPointF(t.mapToGlobal(mid.toPoint())), QPoint(0, 0),
+                                              QPoint(0, 120), Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+                                              Qt.ScrollPhase.NoScrollPhase, False))
+        pump(0.1)
+    check("4 wheel notches in")
+    e["shots"].append(shot(w, "span-zoomed-overview"))
+    go("posts")
+    e["shots"].append(shot(w, "span-zoomed-posts"))
+    path = TMP / "span-posts.csv"
+    QFileDialog.getSaveFileName = lambda *a, **k: (str(path), "")
+    w.export_posts.trigger()
+    pump(0.3)
+    import csv
+
+    rows = sum(1 for _ in csv.reader(path.open(encoding="utf-8-sig"))) - 1 if path.exists() else None
+    e["notes"].append(f"export while zoomed: {rows} rows, table shows {w.posts_tab.view.model().rowCount()}")
+    go("overview")
+    QTest.mouseDClick(t, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, mid.toPoint())
+    check("double-click back to every day")
+
+
 @step("look-around: every tab, scope, theme and View option")
 def look_around(e):
     for name in pages():
@@ -734,7 +790,7 @@ def delete(e):
     e["shots"].append(shot(w, "after-delete"))
 
 
-for fn in (first_launch, small_fetch, busy_fetch, stop_midway, days_pick, look_around, motion_check, timeline, export, comments_all, coverage_open, coverage_day,
+for fn in (first_launch, small_fetch, busy_fetch, stop_midway, days_pick, span_check, look_around, motion_check, timeline, export, comments_all, coverage_open, coverage_day,
            coverage_comments, delete):
     fn()
 
