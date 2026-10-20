@@ -157,7 +157,7 @@ def test_a_fetch_downloads_every_post_in_the_range_a_day_at_a_time(env):
     w.range.setCurrentIndex(w.range.findData("week"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     bars, lines = set(), set()
-    while w.thread is not None:
+    while w.fetch_job.busy:
         bars.add((w.progress.value(), w.progress.maximum()))
         lines.add(w.progress_msg.text())
         pump(5)
