@@ -17,8 +17,8 @@ What callers should know:
 from __future__ import annotations
 
 import math
+import queue
 import threading
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import time
 from datetime import datetime, timezone
 from typing import Callable, Collection, Iterable
@@ -640,10 +640,11 @@ class ArcticShiftClient:
 
 def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS, should_stop: StopFn | None = None):
     """Run fn(item) for each item, up to ``workers`` at once, and yield (item, result, error) as each
-    finishes, on the calling thread. Stopping early (closing the generator) cancels what hasn't started.
+    finishes, on the calling thread. Stopping early (closing the generator) starts nothing more.
 
     With ``should_stop``, once it turns true this returns without waiting for calls still running: their
-    results are dropped. For calls that can take long and are cheap to redo, like a big comment tree."""
+    results are dropped. For calls that can take long and are cheap to redo, like a big comment tree.
+    The worker threads are daemons, so one left on a slow request never holds up the app quitting."""
     items = list(items)
     if workers <= 1 or len(items) <= 1:
         for item in items:
@@ -652,21 +653,42 @@ def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS, should_st
             except Exception as e:  # noqa: BLE001 - handed to the caller, like the threaded path
                 yield item, None, e
         return
-    pool = ThreadPoolExecutor(max_workers=min(workers, len(items)))
+    todo, done = queue.SimpleQueue(), queue.SimpleQueue()
+    for item in items:
+        todo.put(item)
+    closed = threading.Event()
+
+    def work():
+        while not closed.is_set():
+            try:
+                item = todo.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                done.put((item, fn(item), None))
+            except Exception as e:  # noqa: BLE001 - handed to the caller
+                done.put((item, None, e))
+
+    threads = [threading.Thread(target=work, daemon=True) for _ in range(min(workers, len(items)))]
+    for t in threads:
+        t.start()
     try:
-        futures = {pool.submit(fn, item): item for item in items}
-        pending = set(futures)
-        while pending:
-            finished, pending = wait(pending, timeout=STOP_POLL if should_stop else None,
-                                     return_when=FIRST_COMPLETED)
-            for f in finished:
-                error = f.exception()
-                yield futures[f], None if error else f.result(), error
+        for _ in items:
+            while True:
+                try:
+                    result = done.get(timeout=STOP_POLL if should_stop else None)
+                    break
+                except queue.Empty:
+                    if should_stop():
+                        return
+            yield result
             if should_stop and should_stop():
                 return
     finally:
-        stopped = bool(should_stop and should_stop())
-        pool.shutdown(wait=not stopped, cancel_futures=True)
+        closed.set()  # nothing new starts
+        if not (should_stop and should_stop()):
+            for t in threads:
+                t.join()
 
 
 def _walk(items: list, depth: int = 0):

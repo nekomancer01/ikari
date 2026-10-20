@@ -320,6 +320,8 @@ def window(path):
     w.subreddit.setText("python")
     w.include_comments.setChecked(True)
     w.limit.setValue(10)
+    if sys.argv[3] == "top":
+        w.pick.setCurrentIndex(w.pick.findData("top"))
     def close():
         print("saved", len(w.store.posts("python")) + len(w.store.comments("python")), flush=True)
         w.close()  # while a slow request for comments is still out
@@ -327,11 +329,13 @@ def window(path):
     def close_once_posts_are_saved():
         if sys.argv[3] == "idle":
             close()
+        elif sys.argv[3] == "top":
+            QTimer.singleShot(1500, close)  # the day's candidates are ranked; the download of the picks is out
         elif len(w.store.posts("python")) >= 5:
             QTimer.singleShot(1500, close)  # the rest of the posts, then the comments start
         else:
             QTimer.singleShot(50, close_once_posts_are_saved)
-    if sys.argv[3] == "fetch":
+    if sys.argv[3] != "idle":
         QTimer.singleShot(300, w.fetch_btn.click)
     QTimer.singleShot(400, close_once_posts_are_saved)
     return w
@@ -340,11 +344,17 @@ sys.exit(app.main([]))
 """
 
 
-@pytest.mark.parametrize("mode", ["fetch", "idle"])  # idle: quitting with nothing running, for comparison
+# fetch: a comment request is still out at quit. Stop doesn't wait for comment trees, so the fetch ends
+#   when the window closes, and the request left out must not hold up the process.
+# top: Top by score, quitting while the download of a day's ranked picks is out. Stop lets that request
+#   finish, so the fetch is still running when the process ends.
+# idle: quitting with nothing running, for comparison.
+@pytest.mark.parametrize("mode", ["fetch", "top", "idle"])
 def test_quitting_mid_fetch_exits_cleanly(env, tmp_path, mode):
     # Qt aborts the process (an access violation on Windows) when a thread is destroyed while running.
     # Before, the process also lived on with the fetch after the window had gone, raising in its signals.
     env.archive.delays[TREE] = 20  # posts come quickly, then a comment request is still out at quit
+    env.archive.delays[IDS] = 20
     start = time.monotonic()
     run = subprocess.run([sys.executable, "-X", "faulthandler", "-c", QUIT_MID_FETCH, env.archive.url,
                           str(tmp_path), mode],
@@ -353,7 +363,7 @@ def test_quitting_mid_fetch_exits_cleanly(env, tmp_path, mode):
     assert run.returncode == 0, run.stderr[-2000:]
     assert "Traceback" not in run.stderr and "Destroyed while thread" not in run.stderr, run.stderr[-2000:]
     out = dict(line.split() for line in run.stdout.split("\n") if line.startswith(("saved", "running")))
-    assert out["running"] == str(mode == "fetch")  # the fetch was still going when the process ended
+    assert out["running"] == str(mode == "top")  # the fetch was still going when the process ended
     assert time.monotonic() - start < 20  # gone without waiting for it
     # Ending the process skips every clean-up, so check nothing is lost: each row saved before the
     # window closed is in the database, which is intact, and the form's settings were written.
