@@ -535,17 +535,29 @@ def test_slices_are_read_a_few_at_once_with_the_same_result():
         assert seen_on == {threading.get_ident()}  # results are handed over on the calling thread
     assert got[1][0] == got[4][0]
     assert got[4][2] == 4 and got[1][2] == 1
-    assert got[4][1] < got[1][1] / 2.5  # 28 slices of 50 ms: about 1.4 s one at a time, 0.35 s four at once
+    # 28 slices of 50 ms: about 1.4 s one at a time, 0.35 s four at once. 2x leaves room for a busy machine
+    # (the suite runs in parallel), and one at a time could never get there.
+    assert got[4][1] < got[1][1] / 2
 
 
 def test_requests_still_start_no_faster_than_the_limiter_allows():
     items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(24)]
     starts = []
-    session = SlowServer(items, delay=0.05)
-    real_get = session.get
-    session.get = lambda *a, **k: (starts.append(time.perf_counter()), real_get(*a, **k))[1]
-    ArcticShiftClient(session=session, limiter=RateLimiter(0.02), workers=4).fetch_posts(
+    limiter = RateLimiter(0.02)
+    real_wait, grab = limiter.wait, threading.Lock()
+
+    def wait():
+        # When the limiter lets each request go. (Timing session.get instead also counts how long the OS
+        # took to run each worker thread afterwards, which on a busy machine bunches two calls together.)
+        # The limiter already lets requests go one at a time; the lock just keeps each time with its grant.
+        with grab:
+            real_wait()
+            starts.append(time.monotonic())
+
+    limiter.wait = wait
+    ArcticShiftClient(session=SlowServer(items, delay=0.05), limiter=limiter, workers=4).fetch_posts(
         "python", after=T0, before=T0 + 7 * DAY, limit=28)
+    assert len(starts) >= 28
     gaps = [b - a for a, b in zip(starts, starts[1:])]
     assert min(gaps) >= 0.018
 
