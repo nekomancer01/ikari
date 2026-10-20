@@ -314,7 +314,6 @@ def go(key: str) -> None:
             click(w.rail.buttons[key])
     else:
         w.tabbar.setCurrentIndex(OLD_TABS.index(key))
-    pump(0.2)
 
 
 def current_page() -> str:
