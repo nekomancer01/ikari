@@ -147,12 +147,13 @@ def options(path: Path) -> None:
 
 
 def migrate(path: Path) -> None:
-    from subsentiment.store import Store
+    from subsentiment.store import POST_COLUMNS, Store
 
     def contents(p: Path) -> dict:
         db = sqlite3.connect(p)
         out = {t: sorted(db.execute(f"SELECT * FROM {t}"), key=repr)
-               for t in ("posts", "comment_fetches", "complete", "removed_posts")}
+               for t in ("comment_fetches", "complete", "removed_posts")}
+        out["posts"] = sorted(db.execute(f"SELECT {', '.join(POST_COLUMNS)} FROM posts"), key=repr)
         out["comments"] = sorted(db.execute(
             "SELECT c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score, c.created_utc, c.depth, "
             "COALESCE(c.permalink, p.permalink || c.id || '/'), c.sentiment, c.label, c.fetched_at "
