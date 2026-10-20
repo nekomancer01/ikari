@@ -6,7 +6,7 @@
 
 <p><b>Read the mood of any subreddit.</b><br>
 Pull posts and comments, score their sentiment offline, and explore the results in a desktop app
-for Windows (macOS and Linux run from source, not released for now).</p>
+for Windows and Linux (macOS runs from source, not released for now).</p>
 
 <p>
   <a href="https://github.com/nekomancer01/ikari/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/nekomancer01/ikari?style=flat-square&color=6C5CE7"></a>
@@ -116,11 +116,12 @@ Ready-made builds for Windows are attached to each
 | OS | Download | How to run |
 |---|---|---|
 | Windows 10/11 (x64) | `ikari-Setup-<version>.exe` | Run the installer. Or unzip `ikari-<version>-windows-x64.zip` and run `ikari.exe`. |
+| Linux (x86_64) | `ikari-<version>-linux-x86_64.AppImage` | `chmod +x` it and run it. Or unpack `ikari-<version>-linux-x86_64.tar.gz` and run `./install.sh`. |
 
 > [!NOTE]
-> **Windows only for now.** macOS and Linux releases are paused while those ports catch up. The
-> code, packaging and CI steps for them are still in the repo, and you can run from source on either
-> (below). Run the *Build* workflow by hand with "all_platforms" ticked to build them.
+> **macOS isn't released for now.** Its releases are paused while that port catches up. The code, packaging
+> and CI steps for it are still in the repo, and you can run from source (below). Run the *Build* workflow
+> by hand with "all_platforms" ticked to build it.
 
 > [!NOTE]
 > The builds aren't code-signed, so the first launch shows a warning.
