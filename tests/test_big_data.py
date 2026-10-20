@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QApplication, QTableView  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import tables  # noqa: E402
 from subsentiment.gui.tables import POST_COLUMNS, RowsModel  # noqa: E402
+from subsentiment.store import POST_COLUMNS as STORE_POST_COLUMNS  # noqa: E402
 from subsentiment.analysis import Analysis  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
@@ -33,7 +34,7 @@ def fill(path, sub="Big"):
     posts = [(f"p{i}", sub, f"title {i}", "", f"author{i % 40}", rng.randint(0, 9000), 0.9, rng.randint(0, 50),
               now - rng.uniform(0, 30 * 86400), f"/r/{sub}/comments/p{i}/", "", rng.uniform(-1, 1),
               LABELS[i % 3], now - 3600) for i in range(POSTS)]
-    db.executemany(f"INSERT INTO posts VALUES ({','.join('?' * 14)})", posts)
+    db.executemany(f"INSERT INTO posts ({','.join(STORE_POST_COLUMNS)}) VALUES ({','.join('?' * 14)})", posts)  # image defaults to 0
     comments = [(f"c{j}", f"p{j % POSTS}", sub, f"t3_p{j % POSTS}", f"user{j % 500}",
                  rng.choice(["Love it", "awful", "fine I guess", "Great work"]) + f" {j}", rng.randint(-5, 900),
                  now - rng.uniform(0, 30 * 86400), 0, f"/r/{sub}/comments/c{j}/", rng.uniform(-1, 1), LABELS[j % 3],
