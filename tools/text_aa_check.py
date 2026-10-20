@@ -206,6 +206,12 @@ def main() -> int:
     if app["screen"]["coloured"] or app["widget"]["coloured"]:
         print("FAIL: the app's text has coloured (ClearType) fringes")
         return 1
+    # The layout checks measure text offscreen; the app's real text must not be much wider, or what passes
+    # there could be cut off here.
+    off = next((r for r in rows if r.get("variant") == "offscreen" and "advance" in r), None)
+    if off and app["advance"] > off["advance"] * 1.02:
+        print(f"FAIL: the app's text is {app['advance'] / off['advance'] - 1:.1%} wider than the layout checks measure")
+        return 1
     print("OK: no coloured fringes in the app's text")
     return 0
 
