@@ -161,9 +161,13 @@ class MainWindow(QMainWindow):
         self._follow = False  # show the subreddit being fetched, until the user picks another one
         self.posts: list = []  # what the analysis counts: the saved rows from the chosen days
         self.comments: list = []
+        self._analysis = {"posts": Analysis(), "comments": Analysis()}  # what the overview counts, kept up as rows arrive
+        self._last_fetched: float | None = None  # newest fetched_at among self.posts
         self._saved: dict[str, list] = {"posts": [], "comments": []}  # every saved row of the subreddit shown
         self._day_counts: dict[int, tuple[int, int]] = {}
         self.chosen_days: set[int] | None = None  # None: every day
+        self._known: dict[str, set[str]] = {}  # ids already in _day_counts, once a running fetch is counted in
+        self._days_changed = False  # _day_counts has days the day picker hasn't been given yet
         self.coverage = None  # the Download coverage window, once opened
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
         # A native material (Mica/Acrylic/vibrancy) needs a translucent window from the start,
@@ -492,7 +496,9 @@ class MainWindow(QMainWindow):
         theme.apply(QApplication.instance(), requested, self.settings.value("ui/reduce_transparency", False, bool))
         self.update()
         self._style_native_frame()
-        self._show_dataset(self.current or "")  # re-pick chart and swatch colors
+        for tab in (self.posts_tab, self.comments_tab):  # re-pick swatch and chart colours
+            tab.model.restyle()
+        self._render_overview()
 
     # -- control state --------------------------------------------------------
 
@@ -679,6 +685,7 @@ class MainWindow(QMainWindow):
             rows = read(name, self._read_to[kind])
             if rows:  # rows saved in the same instant as the last one read come back too; the ids catch them
                 self._read_to[kind] = rows[-1]["fetched_at"]
+                self._count_days(kind, rows)
             for r in days.keep(rows, self.chosen_days):
                 if r["id"] not in self._queued_ids:
                     self._queued_ids.add(r["id"])
@@ -686,22 +693,47 @@ class MainWindow(QMainWindow):
         if any(self._queued.values()) and not self._drip.isActive():  # start() would restart it, and
             self._drip.start()  # comments saved every few ms would then hold every row back
 
+    def _count_days(self, kind: str, rows) -> None:
+        """Count rows the running fetch saved into the day picker's days, so the picker needn't count every
+        saved row again each second (70 ms for 100,000 comments). Rows saved before, saved again with new
+        scores, aren't counted twice."""
+        known = self._known.get(kind)
+        if known is None:
+            known = self._known[kind] = {r["id"] for r in self._saved[kind]}
+        slot = 0 if kind == "posts" else 1
+        for r in rows:
+            if r["id"] not in known and r["created_utc"] is not None:
+                known.add(r["id"])
+                day = days.day_of(r["created_utc"])
+                counts = list(self._day_counts.get(day, (0, 0)))
+                counts[slot] += 1
+                self._day_counts[day] = tuple(counts)
+                self._days_changed = True
+
     def _release_rows(self) -> None:
         """Show the next few queued rows; a long backlog is released faster so it never lags far behind."""
         for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
             queue = self._queued[kind]
             batch, self._queued[kind] = queue[:max(1, len(queue) // 25)], queue[max(1, len(queue) // 25):]
             if batch:
-                tab.add_rows(batch)
+                self._add_rows(kind, tab, batch)
         if not any(self._queued.values()):
             self._drip.stop()
         self._update_dataset_labels()
+
+    def _add_rows(self, kind: str, tab: TablePage, rows) -> None:
+        before = len(tab.all_rows)
+        tab.add_rows(rows)
+        new = tab.all_rows[before:]
+        self._analysis[kind].add(new)
+        if kind == "posts" and new:
+            self._last_fetched = max([self._last_fetched or 0.0] + [r["fetched_at"] for r in new])
 
     def _flush_rows(self) -> None:
         self._drip.stop()
         for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
             if self._queued[kind]:
-                tab.add_rows(self._queued[kind])
+                self._add_rows(kind, tab, self._queued[kind])
             self._queued[kind] = []
         self._queued_ids.clear()
 
@@ -715,21 +747,21 @@ class MainWindow(QMainWindow):
             self.subheading.setText("Enter a subreddit on the left and press Fetch and analyse.")
             return
         self.heading.setText(f"r/{self.current}")
-        fetched = max(max((r["fetched_at"] for r in rows), default=0)
-                      for rows in (self._saved["posts"], self.posts)) or None
         on = ""
         if self.chosen_days is not None:
             n = len(self.chosen_days & set(self._day_counts))
             on = f" on {plural(n, 'chosen day')}"
         self.subheading.setText(f"{plural(len(self.posts), 'post')} and {plural(len(self.comments), 'comment')}{on} · "
-                                f"last fetched {when_text(fetched)}")
+                                f"last fetched {when_text(self._last_fetched)}")
 
     def _live_refresh(self) -> None:
         if not self.fetch_job.busy or self.request is None:
             return
         if self._showing_fetch():
             self._refresh_datasets(reload=False)
-            self._refresh_days()
+            if self._days_changed:
+                self._days_changed = False
+                self.days_pick.set_days(self._day_counts, self.chosen_days)
             self._render_overview()
         elif self._follow:
             self._open_fetched()
@@ -746,11 +778,35 @@ class MainWindow(QMainWindow):
         self._flush_rows()
         if self.current and self.current.lower() == result.subreddit.lower():
             self._refresh_datasets(reload=False)
-            self._show_dataset(self.current, animate=True)  # keeps the tables where they are
+            self._merge_fetched()  # keeps the tables where they are
         elif self._follow and (result.posts or result.updated or result.comments):
             self._refresh_datasets(select=result.subreddit)
         elif not self._follow:  # the user went to look at another subreddit meanwhile: stay there
             self._refresh_datasets(reload=False)
+
+    def _merge_fetched(self) -> None:
+        """Bring what the finished fetch saved into the dataset on screen: rows it saved again (new scores)
+        and any not dripped in yet. Reading back only these, not every saved row, keeps a big subreddit
+        from freezing the window for seconds as the fetch ends."""
+        for kind, read, tab in (("posts", self.store.posts_since, self.posts_tab),
+                                ("comments", self.store.comments_since, self.comments_tab)):
+            rows = read(self.current, self._since)
+            saved = self._saved[kind]
+            where = {r["id"]: i for i, r in enumerate(saved)}
+            for r in rows:
+                if r["id"] in where:
+                    saved[where[r["id"]]] = r
+                else:
+                    saved.append(r)
+            before = len(tab.all_rows)
+            if tab.update_rows(days.keep(rows, self.chosen_days)):
+                self._analysis[kind] = Analysis(tab.all_rows)  # a rescored row changes the totals
+            else:
+                self._analysis[kind].add(tab.all_rows[before:])
+        self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
+        self._refresh_days()
+        self._update_dataset_labels()
+        self._render_overview()
 
     def _on_failed(self, message: str) -> None:
         self._live.stop()
@@ -804,8 +860,8 @@ class MainWindow(QMainWindow):
         if name:
             self.settings.setValue("ui/last_dataset", name)
 
-    def _show_dataset(self, name: str, animate: bool = False) -> None:
-        """Show a saved subreddit. With animate (a fetch adding to it), new rows fade in."""
+    def _show_dataset(self, name: str) -> None:
+        """Show a saved subreddit."""
         # Rows still queued from a running fetch belong to whatever was shown before; the tables are
         # about to be reloaded from the store, which has them anyway.
         self._drip.stop()
@@ -815,7 +871,7 @@ class MainWindow(QMainWindow):
                        "comments": self.store.comments(name) if name else []}
         self.chosen_days = days.load_choice(self.settings, name) if name else None
         self._refresh_days()
-        self._apply_days(animate)
+        self._apply_days()
         self._update_delete_enabled()
         self.coverage_act.setEnabled(bool(self.current))
         if self.coverage is not None:
@@ -824,14 +880,18 @@ class MainWindow(QMainWindow):
     def _refresh_days(self) -> None:
         """Re-read which days have saved data, for the day picker."""
         self._day_counts = self.store.day_counts(self.current) if self.current else {}
+        self._known = {}
+        self._days_changed = False
         self.days_pick.set_days(self._day_counts, self.chosen_days)
 
-    def _apply_days(self, animate: bool = False) -> None:
+    def _apply_days(self) -> None:
         """Point every view at the saved rows from the chosen days."""
         self.posts = days.keep(self._saved["posts"], self.chosen_days)
         self.comments = days.keep(self._saved["comments"], self.chosen_days)
-        self.posts_tab.load(self.posts, animate)
-        self.comments_tab.load(self.comments, animate)
+        self.posts_tab.load(self.posts)
+        self.comments_tab.load(self.comments)
+        self._analysis = {"posts": Analysis(self.posts), "comments": Analysis(self.comments)}
+        self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
         self._update_dataset_labels()
         self._render_overview()
 
@@ -854,8 +914,8 @@ class MainWindow(QMainWindow):
 
     def _render_overview(self) -> None:
         scope = self.scope.currentText()
-        a = Analysis((list(self.posts) if scope != "Comments only" else []) +
-                     (list(self.comments) if scope != "Posts only" else []))
+        a = Analysis.combined(*[self._analysis[k] for k, skip in (("posts", "Comments only"), ("comments", "Posts only"))
+                                if scope != skip])
         self.overview.show_analysis(a)
         self.mood.set_counts(a.counts["positive"], a.counts["negative"], a.count)
 
