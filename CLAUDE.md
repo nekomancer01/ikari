@@ -11,6 +11,8 @@ archive and scores sentiment offline. The owner runs current `main` from source 
   `--no-verify`.
 - Never delete, skip or loosen an existing test to get green. If a test is wrong, say so in the PR.
 - After three failed attempts at the same failure, stop and report what fails and why.
+- If `main` itself is red, the pre-push check blocks every branch. The thread whose PR broke it fixes `main`
+  first; everyone else waits for that fix rather than pushing around the check.
 
 ## Doing the work
 - Reproduce a reported bug on current `main` first. If it happens there, it's a `main` bug, never the
