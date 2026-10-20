@@ -220,6 +220,8 @@ QPushButton[primary="true"]:focus {{ border-color: {QColor(t['button']).darker(1
 QPushButton[primary="true"]:disabled {{ color: rgba(255, 255, 255, 190); background: {t['faint']}; border-color: {t['faint']}; }}
 QPushButton[flat="true"] {{ background: transparent; border: 1px solid transparent; color: {t['muted']}; }}
 QPushButton[flat="true"]:hover {{ background: {soft}; color: {t['text']}; }}
+QPushButton[flat="true"]:checked {{ background: {panel}; border-color: {edge}; color: {t['text']}; }}  /* like a chosen tab */
+QPushButton[flat="true"]:disabled {{ color: {t['faint']}; }}
 QPushButton[small="true"] {{ padding: 3px 9px; border-radius: 8px; font-size: 9pt; }}
 
 QProgressBar {{ background: {soft}; border: none; border-radius: 3px; max-height: 6px; min-height: 6px; text-align: center; color: transparent; }}

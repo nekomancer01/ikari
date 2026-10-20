@@ -206,6 +206,36 @@ def test_removed_posts_are_not_saved(env):
     assert saved and not saved & removed
 
 
+def test_image_posts_are_skipped_hidden_and_count_as_checked(env):
+    # Some of the archive's posts are pictures: they aren't shown, scored, exported or given comments, but the
+    # archive's day counts include them, so coverage counts them as checked and a day can still read complete.
+    w = env.window()
+    after, before = w.fetch_form.bounds()
+    pics = [p for p in env.archive.posts if p["subreddit"] == "Python" and after <= p["created_utc"] < before
+            and not p.get("removed_by_category")][::3]
+    for p in pics:
+        p.update(url="https://i.redd.it/x.jpeg", selftext="", post_hint="image")
+    with_words = pics[0]
+    with_words["selftext"] = "my desk, details below"  # a picture with real text stays
+    ids = {p["id"] for p in pics[1:]}
+    fetch(w, comments=True)
+    s = env.store()
+    saved = {r["id"] for r in s.posts("python")}
+    assert saved and not saved & ids and with_words["id"] in saved
+    assert not [c for c in s.comments("python") if c["post_id"] in ids]
+    assert w.store.datasets()[0]["posts"] == len(saved)
+    csv_path = os.path.join(os.path.dirname(env.db), "p.csv")
+    s.export_csv("python", "posts", csv_path)
+    assert not any(i in open(csv_path, encoding="utf-8-sig").read() for i in ids)
+    cov = open_coverage(w)
+    skipped = w.store.posts_per_day("python", cov.days[-1], cov.days[0] + DAY, images=True)
+    assert sum(skipped.values()) == len(ids)
+    assert all(cov.day_table.cellWidget(r, 1).side.text() == "✓ Complete"
+               for r, d in enumerate(cov.days) if d >= w.fetch_form.bounds()[0] and d < coverage.today())
+    fetch(w, comments=False)  # a repeat fetch doesn't save them either
+    assert not {r["id"] for r in env.store().posts("python")} & ids
+
+
 def test_all_comments_fetches_each_whole_thread_and_is_remembered(env):
     w = env.window()
     w.fetch_form.comments_per_post.setValue(0)
@@ -1008,7 +1038,7 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
     assert o.tiles["count"].value.text() == f"{want:,}"
     assert sum(o.distribution._counts.values()) == want
     assert o.distribution._counts == {k: sum(r["label"] == k for r in rows) for k in ("negative", "neutral", "positive")}
-    assert sum(n for _, _, n in o.timeline._shown[0]) == want
+    assert sum(n for _, _, n in o.timeline.points) == want
     assert w.tabbar.tabText(1) == f"Posts  {want:,}" and w.subheading.text().startswith("Last fetched")  # counts: on the tab
     assert sum(p for p, _ in w.days_pick.counts.values()) == want
     pump(800)  # what reads the store again does so once a second
@@ -1021,3 +1051,27 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
         assert int(re.match(r"[\d,]*", shown).group().replace(",", "") or 0) == saved.get(day, 0), (day, shown)
     w._stop_fetch()
     wait_idle(w)
+
+
+def test_a_zoomed_timeline_keeps_up_with_a_fetch(env):
+    """The timeline stays live while zoomed: "1w" picked mid-fetch still shows the latest week once every day
+    is in, and the navigator under it every day."""
+    w = env.window()
+    env.archive.posts += make_posts("Zoom", NOW, days=20, per_day=(5,), seed=6)
+    w.fetch_form.subreddit.setText("Zoom")
+    w.fetch_form.include_comments.setChecked(False)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    tl = w.overview.timeline
+    end = time.monotonic() + 20
+    while not tl.presets["1w"].isEnabled():
+        assert time.monotonic() < end and w.fetch_job.busy, len(tl.points)
+        pump(5)
+    QTest.mouseClick(tl.presets["1w"], Qt.MouseButton.LeftButton)
+    assert tl.preset == "1w"
+    wait_idle(w)
+    pump(400)  # the overview's last 250 ms refresh
+    saved = {int(r["created_utc"] // DAY * DAY) for r in env.store().posts("Zoom")}
+    assert [d for d, _, _ in tl.points] == sorted(saved)
+    a, b = tl.domain()
+    assert tl.view == (b - 7 * DAY, b) and tl.preset == "1w" and (a, b) == (min(saved), max(saved) + DAY)
