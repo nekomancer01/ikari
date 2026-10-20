@@ -1290,7 +1290,13 @@ class MainWindow(QMainWindow):
             return
         path, _ = QFileDialog.getSaveFileName(self, f"Export {kind}", f"{self.current}_{kind}.csv", "CSV files (*.csv)")
         if path:
-            n = self.store.export_csv(self.current, kind, path, days=self.chosen_days)
+            try:
+                n = self.store.export_csv(self.current, kind, path, days=self.chosen_days)
+            except OSError as e:  # on Windows, usually the file is still open in Excel
+                QMessageBox.warning(self, "Export failed",
+                                    f"Couldn't save {path}.\n\n{e.strerror or e}\n\n"
+                                    "If the file is open in another program, close it and try again.")
+                return
             n_days = len(self.chosen_days & set(self._day_counts)) if self.chosen_days is not None else 0
             on = "" if self.chosen_days is None else f" from {plural(n_days, 'chosen day')}"
             self.statusBar().showMessage(f"Exported {n:,} {kind}{on} to {path}", 8000)

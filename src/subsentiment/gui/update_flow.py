@@ -36,8 +36,8 @@ class UpdateFlow(QObject):
         def run():
             try:
                 result = updater.latest_release()
-            except updater.UpdateError as e:
-                result = e
+            except Exception as e:  # anything else would leave _busy set and the menu item dead
+                result = e if isinstance(e, updater.UpdateError) else updater.UpdateError(f"Couldn't check: {e}")
             self._checked.emit(result, silent)
         threading.Thread(target=run, daemon=True).start()
 
@@ -93,8 +93,8 @@ class UpdateFlow(QObject):
             try:
                 path = updater.download(rel, dest, progress=self._progress.emit,
                                         should_stop=lambda: self._cancel)
-            except updater.UpdateError as e:
-                path = e
+            except Exception as e:  # a file the antivirus holds, a full disk
+                path = e if isinstance(e, updater.UpdateError) else updater.UpdateError(f"Download failed: {e}")
             self._downloaded.emit(path)
         threading.Thread(target=run, daemon=True).start()
 
@@ -104,11 +104,13 @@ class UpdateFlow(QObject):
 
     def _on_downloaded(self, result) -> None:
         self._busy = False
+        cancelled = self._cancel  # closing the dialog emits canceled, which would set it
         if self._dialog:
+            self._dialog.canceled.disconnect()
             self._dialog.close()
             self._dialog = None
         if isinstance(result, updater.UpdateError):
-            if not self._cancel:
+            if not cancelled:
                 QMessageBox.warning(self.window, "Update failed", str(result))
             return
         try:
