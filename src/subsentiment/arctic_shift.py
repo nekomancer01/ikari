@@ -447,6 +447,8 @@ class ArcticShiftClient:
         more = [True] * len(windows)  # the slice may hold posts we haven't read
         cursors = [lo for lo, _ in windows]
         what = "Ranking" if top else "Collecting"
+        # What each slice still running has downloaded so far, kept when Stop stops waiting for it.
+        partial: dict[int, list[Post]] = {}
 
         def read_slice(job):
             i, want = job
@@ -456,19 +458,20 @@ class ArcticShiftClient:
             if top:
                 ranked = sorted(self._top_pool(base, lo, hi, should_stop), key=_light_rank, reverse=True)
                 return self._take_top(ranked, want)
-            return self._earliest(base, lo, hi, want, skip, should_stop)
+            return self._earliest(base, lo, hi, want, skip, should_stop, partial.setdefault(i, []))
 
         # Slices are independent, so a few are read at once. Results are taken here, on the calling
         # thread, so on_posts can save them to a database that belongs to it.
         done = 0
         # Outside top mode, Stop returns at once rather than waiting out searches still in flight (up to a
-        # minute for a slow one); what they'd bring is dropped, as nothing of it was shown or saved yet.
+        # minute for a slow one); the posts those slices had already downloaded are kept (see the end).
         # Top mode keeps a slice it has ranked (see _take_top), so it waits for that.
         for (i, want), result, error in in_parallel(read_slice, enumerate(quotas(limit, len(windows))),
                                                    self.workers, None if top else should_stop):
             if error:
                 raise error
             done += 1
+            partial.pop(i, None)
             if result is None:
                 continue
             if top:
@@ -507,15 +510,23 @@ class ArcticShiftClient:
             def read_more(job):
                 i, want = job
                 have = skip | {p.id for p in picked[i]}
-                return self._earliest(base, cursors[i], windows[i][1], want, have, should_stop)
+                return self._earliest(base, cursors[i], windows[i][1], want, have, should_stop,
+                                      partial.setdefault(i, []))
 
             for (i, _), result, error in in_parallel(read_more, shares, self.workers, should_stop):
                 if error:
                     raise error
+                partial.pop(i, None)
                 extra, cursors[i], more[i] = result
                 picked[i] += extra
                 if on_posts and extra:
                     on_posts(extra)
+        # Slices Stop left running: what they had is used, and they may hold more.
+        for i, extra in list(partial.items()):
+            extra = list(extra)  # the slice's thread may still be adding to it
+            picked[i] += extra
+            if on_posts and extra:
+                on_posts(extra)
         posts = [p for group in picked for p in group]
         posts.sort(key=lambda p: p.created_utc)
         self.exhausted = not top and not any(more) and not self._skipped_posts and not self.timed_out
@@ -534,10 +545,12 @@ class ArcticShiftClient:
                     raise
                 hi = lo + (hi - lo) // 2
 
-    def _earliest(self, base, lo, hi, want, skip, should_stop) -> tuple[list[Post], int, bool]:
+    def _earliest(self, base, lo, hi, want, skip, should_stop, out: list[Post] | None = None
+                  ) -> tuple[list[Post], int, bool]:
         """The first ``want`` usable posts in [lo, hi) that aren't in ``skip``, where to carry on
-        reading from, and whether the slice may hold more."""
-        out: list[Post] = []
+        reading from, and whether the slice may hold more. Posts are added to ``out`` as they come, so a
+        caller that stops waiting still has the ones already downloaded."""
+        out = [] if out is None else out
         seen: set[str] = set()
         cursor = lo - 1  # `after` is exclusive; this way a post right on the slice's start isn't lost
         skipped = 0  # windows skipped in a row
