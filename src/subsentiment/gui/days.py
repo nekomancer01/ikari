@@ -22,9 +22,9 @@ from PySide6.QtWidgets import (
 )
 
 from subsentiment.gui import theme
-from subsentiment.gui.widgets import WEEKDAYS
 
 DAY = 86400
+WEEKDAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
 SETTINGS_GROUP = "analysis_days"  # QSettings: analysis_days/<subreddit, lowercased> = "2026-10-17,2026-10-18"
 
 

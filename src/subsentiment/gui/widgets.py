@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 
 from subsentiment.gui import motion, theme
 from subsentiment.gui.charts import palette
+from subsentiment.gui.days import WEEKDAYS
 from subsentiment.gui.theme import mark
 
 
@@ -262,8 +263,6 @@ class StatTile(QFrame):
         if self.meter is not None:
             self.meter.set(share or 0.0, animate=True)
 
-
-WEEKDAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
 
 
 class Calendar(QCalendarWidget):
