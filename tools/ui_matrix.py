@@ -11,7 +11,7 @@ point size smaller on a Mac). The taskbar, Dock, menu bar and title bar are take
 hand, since the offscreen platform has none. Restored is the size the app opens at; maximized is the free
 area; the sweep drags the window from maximized down to its minimum size in a few steps.
 
-Checks on every size, for the main window and the Download coverage window: the window can't shrink to fit
+Checks on every size, for the main window and each of its pages and drawers: the window can't shrink to fit
 the screen; a label's text is cut off; a field or button is squashed below what its text needs; a widget
 sticks out of its parent or overlaps a neighbour; the Fetch drawer's fields, form labels, header, tiles and cards
 are out of line; the Fetch drawer scrolls on a window tall enough not to need it. It also notes which scroll bars
@@ -233,10 +233,8 @@ def alignment(window) -> list[str]:
     elif drawer == "saved":
         side = window.datasets.parentWidget()
         _same(problems, "saved drawer left edges", {"list": _rect(window.datasets, side).left(),
-                                                   "coverage": _rect(window.coverage_btn, side).left(),
                                                    "storage line": _rect(window.storage_info, side).left()})
         _same(problems, "saved drawer right edges", {"list": _rect(window.datasets, side).right(),
-                                                    "coverage": _rect(window.coverage_btn, side).right(),
                                                     "delete all": _rect(window.delete_all_btn, side).right()})
 
     # The content column: heading, subtitle and the page below share a left edge; the scope ends at its right.
@@ -259,6 +257,8 @@ def alignment(window) -> list[str]:
         _same(problems, "bottom card heights", {"distribution": dist.height(), "words": words.height()})
         content_right = body[-1].right()
     else:
+        if page is window.coverage:
+            problems += coverage_alignment(page)
         content_right = _rect(page, window).right()
         _same(problems, "content left edges", {"heading": _rect(window.heading, window).left(),
                                                 "subtitle": _rect(window.subheading, window).left(),
@@ -290,14 +290,23 @@ def alignment(window) -> list[str]:
     return problems
 
 
-def coverage_alignment(dialog) -> list[str]:
+def coverage_alignment(page) -> list[str]:
     problems = []
-    panels = [dialog.day_table.parentWidget(), dialog.post_table.parentWidget()]
-    _same(problems, "coverage panel tops", {"days": _rect(panels[0], dialog).top(), "posts": _rect(panels[1], dialog).top()})
-    _same(problems, "coverage table tops", {"days": _rect(dialog.day_table, dialog).top(),
-                                             "posts": _rect(dialog.post_table, dialog).top()})
-    _same(problems, "coverage panel bottoms",
-          {"days": _rect(panels[0], dialog).bottom(), "posts": _rect(panels[1], dialog).bottom()})
+    panels = [page.day_table.parentWidget(), page.post_table.parentWidget()]
+    if page.body.direction() == page.body.Direction.LeftToRight:
+        _same(problems, "coverage panel tops", {"days": _rect(panels[0], page).top(), "posts": _rect(panels[1], page).top()})
+        _same(problems, "coverage table tops", {"days": _rect(page.day_table, page).top(),
+                                                 "posts": _rect(page.post_table, page).top()})
+        _same(problems, "coverage panel bottoms",
+              {"days": _rect(panels[0], page).bottom(), "posts": _rect(panels[1], page).bottom()})
+    else:  # Posts under Days, on a narrow window
+        _same(problems, "coverage panel left edges", {"days": _rect(panels[0], page).left(), "posts": _rect(panels[1], page).left()})
+        _same(problems, "coverage panel right edges",
+              {"days": _rect(panels[0], page).right(), "posts": _rect(panels[1], page).right()})
+    _same(problems, "coverage left edges", {"title": _rect(page.subtitle, page).left(),
+                                             "days panel": _rect(panels[0], page).left()})
+    _same(problems, "coverage right edges", {"posts panel": _rect(panels[1], page).right(),
+                                              "page": page.widget().width() - 1})
     return problems
 
 
@@ -387,8 +396,14 @@ def child(spec: dict) -> int:
     theme.load_fonts(app)
     theme.apply(app, spec["theme"])  # before the window, as the app does, so first sizes are the styled ones
 
+    # Download coverage's archive counts are made up instead of asked of the network.
+    def fake_count(self, after, before):
+        self._on_counts(self.subreddit, {d: 12 for d in range(int(after), int(before), 86400)})
+    coverage.CoveragePage._count = fake_count
+
     window = main_window.MainWindow(spec["db"])
-    motion.set_enabled(False)  # sizes and stills of the finished state, not mid-fade
+    motion.set_enabled(False)
+    window.fetch_form.range.setCurrentIndex(window.fetch_form.range.findData("month"))  # coverage lists 31 days  # sizes and stills of the finished state, not mid-fade
     window.fetch_form.subreddit.setText(screenshot.SUBREDDIT)
     window.rail.setFocus()
 
@@ -450,6 +465,8 @@ def child(spec: dict) -> int:
         views = [("", "fetch", "overview")]
         if state in ("restored", "maximized"):
             views += [(f" {page}", "", page) for page in PAGES] + [(" saved", "saved", "overview")]
+        else:  # Download coverage's two tables side by side are the widest page: every size, as its window had
+            views.append((" coverage", "", "coverage"))
         for name, drawer, page in views:
             window.set_drawer(drawer)
             window.show_page(page)
@@ -477,22 +494,6 @@ def child(spec: dict) -> int:
         window.fetch_strip.set_busy(False)
         window.progress_msg.setText("")
 
-    # The Download coverage window, with made-up archive counts instead of asking the network.
-    def fake_count(self, after, before):
-        self._on_counts(self.subreddit, {d: 12 for d in range(int(after), int(before), 86400)})
-    coverage.CoverageWindow._count = fake_count
-    window.fetch_form.range.setCurrentIndex(window.fetch_form.range.findData("month"))
-    window._show_coverage()
-    dialog = window.coverage
-    if dialog is None:
-        results.append({"state": "coverage", "size": [0, 0], "asked": [0, 0], "scrollbars": [], "shot": "",
-                        "problems": ["the Download coverage window didn't open"]})
-    else:
-        dialog.day_table.selectRow(0)
-        cov_min, cov_sizes = sizes_for(dialog, widgets.fit_to_screen(QSize(1120, 720), Free(fw, fh)))
-        for state, w, h in cov_sizes:
-            results.append(measure(dialog, w, h, f"coverage {state}", lambda: coverage_alignment(dialog)))
-        dialog.close()
     print(json.dumps({"tag": spec["tag"], "minimum": [minimum.width(), minimum.height()], "results": results}))
     window.close()
     return 0
