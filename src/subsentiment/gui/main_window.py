@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
 import time
 from datetime import datetime
 
-from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThread, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QFontMetrics, QGuiApplication, QIcon, QKeySequence
+from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThread, QTimer, QUrl
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QFontMetrics, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QTabBar,
@@ -168,6 +169,14 @@ class MainWindow(QMainWindow):
         self.delete_all_act = QAction("Delete all saved data…", self, triggered=self._delete_all)
         file_menu.addAction(self.delete_act)
         file_menu.addAction(self.delete_all_act)
+        # Says which database is open: one started under another home (sudo, a Flatpak IDE) is a different file.
+        file_menu.addSeparator()
+        self.import_act = QAction("Import database…", self, triggered=self._import_database)
+        file_menu.addAction(self.import_act)
+        self.data_folder_act = QAction("Open data folder", self, statusTip=str(self.store.path),
+                                       triggered=lambda: QDesktopServices.openUrl(
+                                           QUrl.fromLocalFile(str(self.store.path.parent))))
+        file_menu.addAction(self.data_folder_act)
         file_menu.addSeparator()
         # On macOS Qt moves the Quit and About roles into the application menu.
         file_menu.addAction(QAction("Quit", self, shortcut=QKeySequence.StandardKey.Quit,
@@ -302,7 +311,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.datasets, 1)
         self.storage_info = label("", "muted")
         self.storage_info.setWordWrap(True)
-        self.storage_info.setToolTip("Saved on this computer, kept between sessions")
+        self.storage_info.setToolTip(f"Saved on this computer, kept between sessions, in {self.store.path}")
         lay.addWidget(self.storage_info)
         return side
 
@@ -460,6 +469,7 @@ class MainWindow(QMainWindow):
         self.delete_act.setEnabled(idle and bool(self.current))
         self.delete_all_btn.setEnabled(idle and self.datasets.count() > 0)
         self.delete_all_act.setEnabled(idle and self.datasets.count() > 0)
+        self.import_act.setEnabled(idle)
 
     # -- fetching -------------------------------------------------------------
 
@@ -849,6 +859,25 @@ class MainWindow(QMainWindow):
             n_days = len(self.chosen_days & set(self._day_counts)) if self.chosen_days is not None else 0
             on = "" if self.chosen_days is None else f" from {plural(n_days, 'chosen day')}"
             self.statusBar().showMessage(f"Exported {n:,} {kind}{on} to {path}", 8000)
+
+    def _import_database(self) -> None:
+        """Merge another ikari database (one saved under another account or computer) into this one."""
+        if self.fetch_job.busy:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Import database", str(self.store.path.parent),
+                                              "ikari databases (*.db);;All files (*)")
+        if not path:
+            return
+        try:
+            posts, comments = self.store.import_from(path)
+        except (sqlite3.DatabaseError, OSError, ValueError) as e:
+            QMessageBox.warning(self, "Import failed", f"Couldn't import {path}.\n\n{e}")
+            return
+        self.statusBar().showMessage(
+            f"Imported {plural(posts, 'new post')} and {plural(comments, 'new comment')} from {path}", 8000)
+        self._refresh_datasets()
+        if self.coverage is not None:
+            self.coverage.refresh_saved()
 
     def _show_coverage(self) -> None:
         if not self.current:
