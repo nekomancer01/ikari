@@ -41,5 +41,18 @@ def main(argv: list[str] | None = None) -> int:
     if window.running_threads():
         # A request was still out when the window closed. Everything fetched is saved, so don't wait
         # for it: Qt aborts the process if a running thread is destroyed on the way out.
-        os._exit(code)
+        end_now(code)
     return code
+
+
+def end_now(code: int) -> None:
+    """End the process at once, without Python's or Qt's clean-up."""
+    for stream in (sys.stdout, sys.stderr):  # None in the packaged app, which has no console
+        if stream is not None:
+            stream.flush()
+    if sys.platform == "win32":
+        # os._exit still runs Qt's DLL clean-up, which crashes (an access violation) with a thread running.
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
+    os._exit(code)
