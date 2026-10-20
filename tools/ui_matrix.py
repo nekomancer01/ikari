@@ -263,17 +263,19 @@ def alignment(window) -> list[str]:
         _same(problems, "content left edges", {"heading": _rect(window.heading, window).left(),
                                                 "subtitle": _rect(window.subheading, window).left(),
                                                 "page": _rect(page, window).left()})
-    # The header's last control (the Overview and Timeline's scope) ends where the content does, and sits
-    # level with the heading.
-    if window.scope.isVisible():
-        scope_right = _rect(window.scope, window).right()
+    # The header's last control (the score filter, on every page) ends where the content does, and the
+    # header's controls sit level with the heading.
+    last = window.score_pick
+    if last.isVisible():
+        last_right = _rect(last, window).right()
         slack = TOL
         bar = page.verticalScrollBar() if hasattr(page, "verticalScrollBar") else None
         if bar is not None and bar.isVisible():
             slack += bar.width()  # a scrolling overview gives its scroll bar the last few pixels
-        if abs(scope_right - content_right) > slack:
-            problems.append(f"out of line, the scope ends at {scope_right} but the content ends at {content_right}")
-        mids = {"scope": _rect(window.scope, window).center().y(), "heading": _rect(window.heading, window).center().y()}
+        if abs(last_right - content_right) > slack:
+            problems.append(f"out of line, the score filter ends at {last_right} but the content ends at {content_right}")
+        mids = {name: _rect(w, window).center().y() for name, w in
+                (("score", last), ("scope", window.scope), ("heading", window.heading)) if w.isVisible()}
         if max(mids.values()) - min(mids.values()) > 2:
             problems.append(f"out of line, header centres {mids}")
     # The rail's buttons share a centre line and fit inside it.

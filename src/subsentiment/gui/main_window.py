@@ -30,10 +30,13 @@ from subsentiment.gui.widgets import (
 )
 from subsentiment.gui.worker import BackgroundJob, FetchWorker
 from subsentiment.reddit import normalize_subreddit, subreddit_error
-from subsentiment.store import Store
+from subsentiment.store import Store, scoring_at_least
 
 
 SCOPES = ["Posts and comments", "Posts only", "Comments only"]
+# The header's score filter: label -> the lowest post score shown (None for any). Comments follow their post.
+MIN_SCORES = {"Any score": None, "Score 1+": 1, "Score 10+": 10, "Score 50+": 50, "Score 100+": 100,
+              "Score 500+": 500, "Score 1,000+": 1000}
 DRAWER_WIDTH = 318
 NO_DATA = "Open Fetch on the left, enter a subreddit and press Fetch and analyse."
 
@@ -392,6 +395,13 @@ class MainWindow(QMainWindow):
         saved = self.settings.value("ui/overview_scope", SCOPES[0], str)
         self.scope.setCurrentIndex(max(self.scope.findText(saved), 0))
         self.scope.currentTextChanged.connect(self._on_scope_changed)
+        # Which posts every page counts by score, and the comments on them. It only hides, never deletes.
+        self.score_pick = mark(ShrinkingComboBox(), "pill", True)
+        for text, value in MIN_SCORES.items():
+            self.score_pick.addItem(text, value)
+        self.score_pick.setToolTip("Count only posts scoring at least this much, and the comments on them")
+        self.score_pick.setCurrentIndex(max(self.score_pick.findText(self.settings.value("ui/min_score", "", str)), 0))
+        self.score_pick.currentIndexChanged.connect(self._on_min_score)
         self.heading.setMinimumWidth(QFontMetrics(theme.display_font(14, 600)).horizontalAdvance("r/subreddit"))
 
         # The fetch running, or what the last one did, on every page: the drawer it started from closes.
@@ -405,7 +415,13 @@ class MainWindow(QMainWindow):
         header.setHorizontalSpacing(12)
         header.setVerticalSpacing(2)
         header.addWidget(self.heading, 0, 0, Qt.AlignmentFlag.AlignVCenter)
-        header.addWidget(self.scope, 0, 1, Qt.AlignmentFlag.AlignVCenter)
+        # The scope shows on the Overview and Timeline only; a row keeps the score filter at the right edge
+        # without a hidden column's spacing.
+        controls = QHBoxLayout()
+        controls.setSpacing(12)
+        controls.addWidget(self.scope)
+        controls.addWidget(self.score_pick)
+        header.addLayout(controls, 0, 1, Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.subheading, 1, 0, 1, 2)
         header.addWidget(self.fetch_strip, 2, 0, 1, 2)
         header.setColumnStretch(0, 1)
@@ -686,6 +702,7 @@ class MainWindow(QMainWindow):
             rows = read(name, self._read_to[kind])
             if rows:  # rows saved in the same instant as the last one read come back too; the ids catch them
                 self._read_to[kind] = rows[-1]["fetched_at"]
+                rows = scoring_at_least(rows, self.min_score)
                 self._count_new(kind, rows)
             for r in days.keep(rows, self._table_days):
                 if r["id"] not in self._queued_ids:
@@ -782,10 +799,15 @@ class MainWindow(QMainWindow):
         """Bring what the finished fetch saved into the dataset on screen: rows it saved again (new scores)
         and any not dripped in yet. Reading back only these, not every saved row, keeps a big subreddit
         from freezing the window for seconds as the fetch ends."""
+        dropped: set[str] = set()
         for kind, read, tab in (("posts", self.store.posts_since, self.posts_tab),
                                 ("comments", self.store.comments_since, self.comments_tab)):
             rows = read(self.current, self._since)
-            saved = self._saved[kind]
+            # A post rescored below the score filter leaves, with its comments (posts come first).
+            dropped |= {r["id"] for r in rows} - {r["id"] for r in scoring_at_least(rows, self.min_score)}
+            owner = "id" if kind == "posts" else "post_id"
+            rows = [r for r in rows if r["id"] not in dropped and r[owner] not in dropped]
+            saved = self._saved[kind] = [r for r in self._saved[kind] if r["id"] not in dropped and r[owner] not in dropped]
             where = {r["id"]: i for i, r in enumerate(saved)}
             for r in rows:
                 if r["id"] in where:
@@ -797,6 +819,8 @@ class MainWindow(QMainWindow):
             tab.update_rows(days.keep(rows, self._table_days))
         self._known = {}
         self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
+        if dropped:  # the tables only add and replace rows
+            self._apply_span(reload=True)
         self._update_dataset_labels()
         self._render_overview()
 
@@ -865,8 +889,8 @@ class MainWindow(QMainWindow):
             motion.crossfade(self.content)
         self.current = name or None
         with self.store.snapshot():
-            self._saved = {"posts": self.store.posts(name) if name else [],
-                           "comments": self.store.comments(name) if name else []}
+            self._saved = {"posts": scoring_at_least(self.store.posts(name) if name else [], self.min_score),
+                           "comments": scoring_at_least(self.store.comments(name) if name else [], self.min_score)}
         self._known = {}
         self._analysis = {k: Analysis(rows) for k, rows in self._saved.items()}
         self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
@@ -918,6 +942,20 @@ class MainWindow(QMainWindow):
         self.comments_tab.load(self.comments)
         self.word_tally.count(self.posts, self.comments)
         self._update_dataset_labels()
+
+    @property
+    def min_score(self) -> int | None:
+        return self.score_pick.currentData()
+
+    def _on_min_score(self) -> None:
+        self.settings.setValue("ui/min_score", self.score_pick.currentText())
+        if not self.current:
+            return
+        motion.crossfade(self.content)
+        self._flush_rows()
+        self._show_dataset(self.current)
+        if self.fetch_job.busy and self._showing_fetch():  # read the running fetch's rows from here on
+            self._read_to = {k: max([self._since] + [r["fetched_at"] for r in self._saved[k]]) for k in self._saved}
 
     def _on_scope_changed(self, text: str) -> None:
         self.settings.setValue("ui/overview_scope", text)
@@ -1022,7 +1060,7 @@ class MainWindow(QMainWindow):
             try:
                 chosen = None if self._table_days is None else {
                     d for d in range(*self._table_days, days.DAY)}
-                n = self.store.export_csv(self.current, kind, path, days=chosen)
+                n = self.store.export_csv(self.current, kind, path, days=chosen, min_score=self.min_score)
             except OSError as e:  # on Windows, usually the file is still open in Excel
                 QMessageBox.warning(self, "Export failed",
                                     f"Couldn't save {path}.\n\n{e.strerror or e}\n\n"
@@ -1030,6 +1068,8 @@ class MainWindow(QMainWindow):
                 return
             on = "" if chosen is None else (f" from {days.short_date(self._table_days[0], True)} to "
                                             f"{days.short_date(self._table_days[1] - days.DAY, True)}")
+            if self.min_score is not None:
+                on += f" scoring {self.min_score:,}+" if kind == "posts" else f" on posts scoring {self.min_score:,}+"
             self.statusBar().showMessage(f"Exported {n:,} {kind}{on} to {path}", 8000)
 
     def _import_database(self) -> None:
