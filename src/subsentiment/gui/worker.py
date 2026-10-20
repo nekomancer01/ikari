@@ -39,8 +39,9 @@ class FetchWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        store = Store(self.db_path)  # sqlite connections can't cross threads
+        store = None
         try:
+            store = Store(self.db_path)  # sqlite connections can't cross threads; opening can fail too
             result = collect.run(ArcticShiftClient(limiter=LIMITER), store, self.request,
                                  progress=self.progress.emit, should_stop=lambda: self._stop,
                                  saved=self.saved.emit)
@@ -49,7 +50,8 @@ class FetchWorker(QObject):
             self.failed.emit(failure_text(e))
         finally:
             LIMITER.on_wait = None  # collect.run pointed it at this worker, which is about to go
-            store.close()
+            if store is not None:
+                store.close()
 
 
 class CountWorker(QObject):

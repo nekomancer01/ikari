@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -60,6 +61,27 @@ COMMENT_COLUMNS = ("id", "post_id", "subreddit", "parent_id", "author", "body", 
                    "created_utc", "depth", "permalink", "sentiment", "label", "fetched_at")
 
 
+def _storable(value):
+    """``value``, with any text SQLite can't store made safe. The archive's JSON can hold a lone half of an
+    emoji ("\\ud83d", from a title cut short), which SQLite refuses, failing the whole fetch."""
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return value.encode("utf-8", "replace").decode("utf-8")
+    return value
+
+
+# A spreadsheet runs a cell starting with one of these as a formula ("=HYPERLINK(...)" in a post title).
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(value):
+    if isinstance(value, str) and value.startswith(_FORMULA_START):
+        return "'" + value
+    return value
+
+
 class Store:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -82,11 +104,13 @@ class Store:
         values = (post.id, post.subreddit, post.title, post.selftext, post.author, post.score,
                   post.upvote_ratio, post.num_comments, post.created_utc, post.permalink, post.url,
                   sentiment, label, time.time())
+        values = tuple(map(_storable, values))
         self.db.execute(f"INSERT OR REPLACE INTO posts VALUES ({','.join('?' * len(values))})", values)
 
     def save_comment(self, c: Comment, sentiment: float, label: str) -> None:
         values = (c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score,
                   c.created_utc, c.depth, c.permalink, sentiment, label, time.time())
+        values = tuple(map(_storable, values))
         self.db.execute(f"INSERT OR REPLACE INTO comments VALUES ({','.join('?' * len(values))})", values)
 
     def posts_between(self, subreddit: str, after: float | None = None,
@@ -235,11 +259,18 @@ class Store:
         if days is not None:
             rows = [r for r in rows if r["created_utc"] is not None and int(r["created_utc"] // 86400 * 86400) in days]
         columns = POST_COLUMNS if kind == "posts" else COMMENT_COLUMNS + ("post_title",)
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(columns)
-            for r in rows:
-                w.writerow([r[c] for c in columns])
+        # Written beside the target and then swapped in, so a failure never leaves a half-written file.
+        # The byte-order mark makes Excel on Windows read the file as UTF-8, not mangle emoji and accents.
+        part = Path(str(path) + ".part")
+        try:
+            with open(part, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(columns)
+                for r in rows:
+                    w.writerow([_csv_cell(r[c]) for c in columns])
+            os.replace(part, path)
+        finally:
+            part.unlink(missing_ok=True)
         return len(rows)
 
 

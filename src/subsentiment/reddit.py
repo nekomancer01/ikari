@@ -49,18 +49,33 @@ class Comment:
     permalink: str
 
 
+_INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))  # come along with pasted text
+
+
 def normalize_subreddit(name: str) -> str:
-    """Turn "r/Python", "/r/Python/" or a pasted subreddit URL into "Python"; "" when nothing is left."""
-    name = _SUBREDDIT_URL.sub("", name.strip()).lstrip("/")
-    if name.lower().startswith("r/"):
-        name = name[2:]
-    return name.split("/", 1)[0].strip()
+    """Turn "r/Python", "/r/Python/" or a pasted subreddit URL (share links' ?utm_… included) into
+    "Python"; "" when nothing is left. A user's profile comes back as "u/name", which subreddit_error
+    explains, rather than as the subreddit "user"."""
+    name = _SUBREDDIT_URL.sub("", name.translate(_INVISIBLE).strip()).lstrip("/")
+    name = re.split(r"[?#]", name, maxsplit=1)[0]
+    if "://" in name:
+        return name  # a link to another site (a redd.it short link has no subreddit in it)
+    head, _, rest = name.partition("/")
+    if head.lower() in ("u", "user") and rest.strip("/"):
+        return "u/" + rest.split("/", 1)[0]
+    if head.lower() == "r":
+        head = rest.split("/", 1)[0]
+    return head.strip()
 
 
 def subreddit_error(name: str) -> str | None:
     """Why a normalised name can't be fetched, or None when it looks valid."""
     if not name:
         return "Enter a subreddit name."
+    if name.startswith("u/"):
+        return f"“{name}” is a user's profile, not a subreddit."
+    if "://" in name:
+        return "That link doesn't name a subreddit. Enter the subreddit's name, like python."
     if not _SUBREDDIT_NAME.fullmatch(name):
         return f"“{name}” isn't a valid subreddit name: use 2–21 letters, digits or underscores."
     return None
