@@ -485,6 +485,41 @@ def look_around(e):
     e["notes"].append(f"about box: {dialogs[-1][:160] if dialogs else ''}")
 
 
+@step("motion: fades with motion on, none with View > Reduce motion")
+def motion_check(e):
+    from PySide6.QtWidgets import QLabel
+
+    def fades():
+        return [c for c in w.findChildren(QLabel) if c.objectName() == "motion-snapshot"]
+
+    def try_it(label):
+        out = {}
+        for what, act in (("tab", lambda: w.tabbar.setCurrentIndex((w.tabbar.currentIndex() + 1) % w.tabbar.count())),
+                          ("theme", lambda: w._set_theme("light" if ARGS.theme == "dark" else "dark")),
+                          ("theme back", lambda: w._set_theme(ARGS.theme))):
+            t = time.perf_counter()
+            act()
+            took = time.perf_counter() - t
+            started = len(fades())
+            pump(0.1)
+            if what == "theme" and label == "on":
+                path = OUT / f"{len(list(OUT.glob('*.png'))):02d}-motion-theme-mid-fade.png"
+                w.grab().save(str(path))
+                e["shots"].append(path.name)
+            pump(1.0)
+            out[what] = f"{started} fading, {len(fades())} left after 1.1s, call {took * 1000:.0f} ms"
+        e["notes"].append(f"motion {label}: " + "; ".join(f"{k} {v}" for k, v in out.items()))
+
+    e["notes"].append(f"Reduce motion starts {'on' if w.motion_act.isChecked() else 'off'}")
+    try_it("on")
+    w.motion_act.setChecked(True)
+    pump(0.2)
+    try_it("off (Reduce motion checked)")
+    w.motion_act.setChecked(False)
+    pump(0.2)
+    e["notes"].append(f"setting saved as {QSettings().value('ui/reduce_motion')!r} after unchecking")
+
+
 @step("export: File > Export posts and comments as CSV")
 def export(e):
     for kind, act, view in (("posts", w.export_posts, w.posts_tab), ("comments", w.export_comments, w.comments_tab)):
@@ -553,7 +588,7 @@ def delete(e):
     e["shots"].append(shot(w, "after-delete"))
 
 
-for fn in (first_launch, small_fetch, busy_fetch, stop_midway, days_pick, look_around, export, coverage_open, coverage_day,
+for fn in (first_launch, small_fetch, busy_fetch, stop_midway, days_pick, look_around, motion_check, export, coverage_open, coverage_day,
            coverage_comments, delete):
     fn()
 
