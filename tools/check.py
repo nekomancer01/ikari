@@ -39,7 +39,10 @@ def main() -> int:
     env = dict(os.environ)
     if sys.platform.startswith("linux") and "QT_QPA_PLATFORM" not in env:
         env["QT_QPA_PLATFORM"] = "offscreen"
-    return subprocess.run([sys.executable, "-m", "pytest", "-q", *sys.argv[1:]], cwd=ROOT, env=env).returncode
+    # One worker per core; each test file stays on one worker, so the layout matrix (one long render) runs
+    # alongside the e2e files instead of before them.
+    cmd = [sys.executable, "-m", "pytest", "-q", "-n", "auto", "--dist", "loadfile", *sys.argv[1:]]
+    return subprocess.run(cmd, cwd=ROOT, env=env).returncode
 
 
 if __name__ == "__main__":

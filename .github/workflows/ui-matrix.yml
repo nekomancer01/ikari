@@ -1,15 +1,15 @@
 name: UI matrix
 
 # Renders the main window on common screens and scalings with each OS's own font engine and uploads the
-# screenshots and report (tools/ui_matrix.py). Report only: it never blocks a merge.
+# screenshots and report (tools/ui_matrix.py), for looking at by hand. Run it from the Actions tab. The layout
+# checks themselves already run in the required "Windows tests" check (tests/test_layout.py).
 on:
-  pull_request:
-    paths:
-      - "src/subsentiment/gui/**"
-      - "tools/ui_matrix.py"
-      - "tools/screenshot.py"
-      - ".github/workflows/ui-matrix.yml"
   workflow_dispatch:
+    inputs:
+      all_platforms:
+        description: "Also render on macOS (not supported for now, so off by default)"
+        type: boolean
+        default: false
 
 concurrency:
   group: ui-matrix-${{ github.ref }}
@@ -22,9 +22,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { name: Windows, os: windows-latest, screens: win- }
-          - { name: macOS, os: macos-15, screens: mac- }
+        include: >-
+          ${{ fromJSON(inputs.all_platforms && '[{"name": "Windows", "os": "windows-latest", "screens": "win-"}, {"name": "macOS", "os": "macos-15", "screens": "mac-"}]' || '[{"name": "Windows", "os": "windows-latest", "screens": "win-"}]') }}
     steps:
       - uses: actions/checkout@v5
 
