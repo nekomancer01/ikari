@@ -118,6 +118,8 @@ def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
     if not (result.posts or result.updated or result.already):
         if result.stopped:
             return "Stopped before any posts were fetched."
+        if result.timed_out:
+            return f"Arctic Shift timed out on r/{result.subreddit} in this range; try again in a few minutes."
         matching = f" matching \u201c{req.query}\u201d" if req.query else ""
         return f"No new posts found in r/{result.subreddit}{matching} in this date range."
     parts = [f"Added {plural(result.posts, 'new post')}"
@@ -128,6 +130,9 @@ def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
     if result.already:
         parts.append(f"{plural(result.already, 'top post')} {'was' if result.already == 1 else 'were'} "
                      "already saved.")
+    if result.timed_out:
+        parts.append("Arctic Shift timed out on part of the range, so some posts were skipped; "
+                     "fetch again later to fill them in.")
     if result.comment_errors:
         parts.append(f"Comments couldn't be fetched for {plural(result.comment_errors, 'post')}; "
                      "fetch again later to fill them in.")

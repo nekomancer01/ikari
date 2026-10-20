@@ -43,6 +43,7 @@ class FetchResult:
     updated: int = 0  # saved posts whose scores were re-fetched
     already: int = 0  # posts picked that were already saved with settled scores
     comment_errors: int = 0  # posts whose comments couldn't be fetched (or were skipped after errors)
+    timed_out: bool = False  # part of the range was skipped: the archive kept timing out on it
 
 
 def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
@@ -145,7 +146,8 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         if todo:
             progress(len(todo), len(todo), "Done")
     return FetchResult(subreddit, len(new), n_comments, should_stop(), updated=len(updated),
-                       already=len(picked) - len(new), comment_errors=errors)
+                       already=len(picked) - len(new), comment_errors=errors,
+                       timed_out=bool(getattr(client, "timed_out", False)))
 
 
 def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, progress, should_stop,

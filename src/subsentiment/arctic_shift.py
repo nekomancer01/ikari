@@ -263,6 +263,7 @@ class ArcticShiftClient:
         # but the archive's daily counts include them, so Download coverage counts them as checked.
         self.removed: dict[str, float] = {}
         self.exhausted = False  # whether the last fetch_posts read its whole range (see there)
+        self.timed_out = False  # whether it had to skip a stretch the archive kept timing out on
 
     # -- HTTP ---------------------------------------------------------------
 
@@ -358,6 +359,9 @@ class ArcticShiftClient:
         ``exhaust`` (not in top mode), rounds go on until every slice has been read to its end or
         ``limit`` is reached. Afterwards ``self.exhausted`` says whether every slice was read to its end,
         so the range holds no posts beyond the ones returned and those in ``skip``.
+
+        A stretch the archive keeps timing out on, even narrowed to MIN_WINDOW, is skipped rather than
+        failing the whole fetch; ``self.timed_out`` then says so, and the range isn't ``exhausted``.
         """
         subreddit = normalize_subreddit(subreddit)
         if error := subreddit_error(subreddit):
@@ -369,7 +373,7 @@ class ArcticShiftClient:
             base["query"] = query
         skip = set(skip)
         self._page_cap = PAGE
-        self.exhausted = False
+        self.exhausted = self.timed_out = False
 
         n = slot_count(after, before, limit, top)
         windows = slices(after, before, n)
@@ -446,7 +450,7 @@ class ArcticShiftClient:
                     on_posts(extra)
         posts = [p for group in picked for p in group]
         posts.sort(key=lambda p: p.created_utc)
-        self.exhausted = not top and not any(more)
+        self.exhausted = not top and not any(more) and not self.timed_out
         return posts
 
     def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int, int]:
@@ -476,6 +480,12 @@ class ArcticShiftClient:
                 page, end, sent = self._page(base, cursor, hi, size)
             except Stopped:
                 return out, cursor, True
+            except QueryTimeout:  # even the narrowest window: skip it, and say the range wasn't all read
+                self.timed_out = True
+                cursor += MIN_WINDOW
+                if cursor >= hi - 1:
+                    return out, cursor, False
+                continue
             if sent < size:
                 self._page_cap = sent
             size = sent  # a page shrunk after a timeout is full at this size, not at the size asked for

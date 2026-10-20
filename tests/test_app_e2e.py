@@ -613,6 +613,28 @@ def test_download_all_comments_on_new_posts_says_what_it_got_and_doesnt_offer_th
     assert [p for p, _ in env.archive.requests if p == TREE] == [TREE]  # Check again still fetches it
 
 
+def test_a_days_download_all_that_hits_a_window_the_archive_cant_answer_saves_the_rest(env, monkeypatch):
+    # Live on Sat 17 Oct, one window kept timing out however narrow, and Download all ended in a "Fetch
+    # failed" error box with 69% of the day saved. Now the rest of the day is read, there's no box, the
+    # day isn't called complete, and the line under the bar says what happened.
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.2)  # timeout back-offs, shortened further
+    w = env.window()
+    fetch(w, comments=False, limit=3)
+    cov = open_coverage(w)
+    row, day = next((r, d) for r, d in enumerate(cov.days) if cov.totals["python"].get(d) and d < coverage.today())
+    in_day = sorted(p["created_utc"] for p in env.archive.posts
+                    if p["subreddit"] == "Python" and day <= p["created_utc"] < day + DAY)
+    env.archive.stuck = [in_day[len(in_day) // 2] - 1]
+    QTest.mouseClick(cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    pump(100)
+    assert env.warnings == []
+    assert "timed out" in w.progress_msg.text() and "Fetch failed" not in w.progress_msg.text()
+    assert cov.day_table.cellWidget(row, 1).side.text() != "✓ Complete"
+    saved = {r["created_utc"] for r in w.store.posts("python")}
+    assert in_day[0] in saved and in_day[-1] in saved  # both ends of the day were still read
+
+
 def test_coverage_downloads_do_only_what_they_say(env):
     w = env.window()
     fetch(w, comments=False, limit=3)
