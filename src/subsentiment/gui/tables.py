@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import heapq
+import sqlite3
 import time
+from operator import itemgetter
 from datetime import datetime
 from typing import Any, Callable
 
@@ -132,6 +134,14 @@ class ChipDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+def column(rows: list, key: str):
+    """Every row's ``key``, quickly: a saved row (sqlite3.Row) finds a column by name by comparing it with each
+    name in turn, so it's read by position instead."""
+    if rows and set(map(type, rows)) == {sqlite3.Row}:  # rows a fetch adds can be dicts
+        return map(itemgetter(rows[0].keys().index(key)), rows)
+    return map(itemgetter(key), rows)
+
+
 class RowsModel(QAbstractTableModel):
     """The rows a table shows, sorted here in Python.
 
@@ -165,7 +175,9 @@ class RowsModel(QAbstractTableModel):
             self._keys = []
             return list(rows)
         if keys is None:
-            keys = list(map(self._key_of(self._sort[0]), rows))
+            key = self.columns[self._sort[0]][1]
+            missing = float("-inf") if key in NUMERIC or key == "created_utc" else ""
+            keys = [missing if v is None else v for v in column(rows, key)]  # as _key_of, without a call a row
         order = sorted(range(len(rows)), key=keys.__getitem__, reverse=self._sort[1])
         self._keys = [keys[i] for i in order]
         return [rows[i] for i in order]
@@ -208,7 +220,7 @@ class RowsModel(QAbstractTableModel):
             return
         self.beginResetModel()
         self.rows = self._sorted(rows)
-        self._ids = {r["id"] for r in self.rows}
+        self._ids = set(map(itemgetter("id"), self.rows))
         self._born.clear()
         self._fade.stop()
         self._restyle()
@@ -389,6 +401,7 @@ class TablePage(QWidget):
         self.view.setFrameShape(QFrame.Shape.NoFrame)
         self.view.viewport().installEventFilter(self)
         self.stretch_col = stretch_col
+        self._fit_due = False  # the rows changed while the page was out of sight: size the columns on show
         header = self.view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(stretch_col, QHeaderView.ResizeMode.Stretch)
@@ -420,7 +433,7 @@ class TablePage(QWidget):
 
     def load(self, rows) -> None:
         self._all_rows = rows
-        self._ids = {r["id"] for r in rows}
+        self._ids = set(map(itemgetter("id"), rows))
         self._haystacks = {}
         self._apply_filters()
 
@@ -494,13 +507,21 @@ class TablePage(QWidget):
                         self.model.index(i, 0),
                         QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
         if not self.filter.text():  # typing a filter keeps the columns as they are
-            self._fit_columns()
+            self._fit_due = True
+            if self.isVisible():  # a page out of sight sizes them when it next shows
+                self._fit_columns()
         self._update_count()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._fit_due:
+            self._fit_columns()
 
     def _fit_columns(self) -> None:
         """Size each column to its values and its full header title, leaving the rest to the text column.
 
         Qt's own sizing leaves out room for the sort arrow, so a sorted column's title got cut short."""
+        self._fit_due = False
         self.view.ensurePolished()  # the stylesheet's font and padding, before the window first shows
         header = self.view.horizontalHeader()
         font = QFont(self.view.font())  # the font the stylesheet draws headers with (8.5pt medium)
@@ -526,12 +547,18 @@ class TablePage(QWidget):
             return 0
         _, key, fmt = self.model.columns[col]
         if key in self.FIXED:  # every value is written the same length: sample both ends of the sort order,
-            values = {r[key] for r in rows[:150] + rows[-150:]}  # so both signs and many digits are measured
+            values = {r[key] for r in rows[:30] + rows[-30:]}  # so both signs and many digits are measured
         else:
-            values = {r[key] for r in rows}
-            if len(values) > 300:  # numbers, names, titles: the widest are among the longest written ones
-                values = heapq.nlargest(300, values, key=lambda v: len(str(v)) if v is not None else 1)
-        texts = [fmt(v) if v is not None else ("–" if key in PENDING else "") for v in values]
+            # Every row up to 10,000, then an even spread of them: going through 50,000 sorted rows took 20 ms a
+            # column, and a widest value that common turns up in the spread too.
+            values = set(column(rows if len(rows) <= 10000 else rows[::len(rows) // 10000 + 1], key))
+            if len(values) > 100:  # numbers, names, titles: the widest are among the longest written ones
+                values.discard(None)
+                longest = len if isinstance(next(iter(values)), str) else abs  # for numbers: the most digits
+                values = heapq.nlargest(100, values, key=longest) + [None]
+        # A comment runs to thousands of characters, and laying one out takes a millisecond; a column never
+        # needs more room than the first 160 characters take.
+        texts = [fmt(v)[:160] if v is not None else ("–" if key in PENDING else "") for v in values]
         metrics = QFontMetrics(self.view.font())
         cell = self.view.sizeHintForIndex(self.model.index(0, col)).width()
         padding = cell - metrics.horizontalAdvance(self.model.data(self.model.index(0, col)) or "")
