@@ -81,7 +81,7 @@ def window(tmp_path, monkeypatch):
     # A failed fetch would open a modal box and hang the test; fail fast instead.
     monkeypatch.setattr(mw.QMessageBox, "warning", lambda *a: pytest.fail(f"fetch failed: {a[-1]}"))
     w = mw.MainWindow(str(db))
-    w.range.setCurrentIndex(w.range.findData("week"))
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
     w.show()
     yield w
     w.close()

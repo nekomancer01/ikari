@@ -345,7 +345,7 @@ class CoverageWindow(QDialog):
             self.day_table.setRowCount(0)
             self._show_posts(None)
             return
-        after, before = self.window_.fetch_range()
+        after, before = self.window_.fetch_form.bounds()
         days = days_in(after, before)
         if days != self.days:
             self.days, rebuild = days, True

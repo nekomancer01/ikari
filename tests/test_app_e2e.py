@@ -96,18 +96,18 @@ def env(tmp_path, monkeypatch):
 
 def in_range(env, w, sub="Python") -> int:
     """The posts the archive has for ``sub`` in the sidebar's range that a fetch can save (not removed)."""
-    after, before = w.fetch_range()
+    after, before = w.fetch_form.bounds()
     return len([p for p in env.archive.posts if p["subreddit"] == sub and after <= p["created_utc"] < before
                 and not p.get("removed_by_category")])
 
 
 def fetch(w, sub="python", comments=True, rng="week", **extra):
     """A fetch from the sidebar, which downloads every post in the range."""
-    w.subreddit.setText(sub)
-    w.include_comments.setChecked(comments)
-    w.range.setCurrentIndex(w.range.findData(rng))
+    w.fetch_form.subreddit.setText(sub)
+    w.fetch_form.include_comments.setChecked(comments)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData(rng))
     for key, value in extra.items():
-        getattr(w, key).setChecked(value)
+        getattr(w.fetch_form, key).setChecked(value)
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     wait_idle(w)
 
@@ -153,9 +153,9 @@ def test_a_fetch_downloads_every_post_in_the_range_a_day_at_a_time(env):
     labels = [lbl.text() for lbl in w.findChildren(QLabel)]
     assert "Max posts" not in labels and "Pick" not in labels  # nothing to choose: it's the whole range
     env.archive.delay = 0.02
-    w.subreddit.setText("python")
-    w.include_comments.setChecked(False)
-    w.range.setCurrentIndex(w.range.findData("week"))
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(False)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     bars, lines = set(), set()
     while w.fetch_job.busy:
@@ -166,7 +166,7 @@ def test_a_fetch_downloads_every_post_in_the_range_a_day_at_a_time(env):
     assert len(env.store().posts("python")) == in_range(env, w) > 30
     # The bar counts the range's UTC days (eight for a week that doesn't start at midnight), newest first.
     assert {total for _, total in bars} >= {8} and any(t.startswith("Day 1 of 8") for t in lines), (bars, lines)
-    after = w.fetch_range()[0]
+    after = w.fetch_form.bounds()[0]
     whole = {str(d) for d in range(int(after // DAY * DAY) + DAY, coverage.today(), DAY)}
     assert env.store().complete_keys("posts", "python") == whole  # Download coverage shows them as done
     env.archive.clear()
@@ -185,12 +185,12 @@ def test_removed_posts_are_not_saved(env):
 
 def test_all_comments_fetches_each_whole_thread_and_is_remembered(env):
     w = env.window()
-    w.comments_per_post.setValue(0)
-    assert w.comments_per_post.text() == "All"
-    w.comments_per_post.setValue(50)
+    w.fetch_form.comments_per_post.setValue(0)
+    assert w.fetch_form.comments_per_post.text() == "All"
+    w.fetch_form.comments_per_post.setValue(50)
     for _ in range(5):  # 40, 30, 20, 10, then All
-        QTest.keyClick(w.comments_per_post, Qt.Key.Key_Down)
-    assert w.comments_per_post.value() == 0 and w.comments_per_post.text() == "All"  # spinning down past 1
+        QTest.keyClick(w.fetch_form.comments_per_post, Qt.Key.Key_Down)
+    assert w.fetch_form.comments_per_post.value() == 0 and w.fetch_form.comments_per_post.text() == "All"  # spinning down past 1
     fetch(w, comments=True)
     s = env.store()
     posts = {r["id"]: r for r in s.posts("python")}
@@ -204,7 +204,7 @@ def test_all_comments_fetches_each_whole_thread_and_is_remembered(env):
     asked = {q["link_id"] for p, q in env.archive.requests if p == TREE}
     assert asked and not asked & settled  # only the threads that can still grow are asked again
     w.close()
-    assert env.window().comments_per_post.value() == 0  # remembered
+    assert env.window().fetch_form.comments_per_post.value() == 0  # remembered
 
 
 def test_comments_come_with_a_fetch_when_asked(env):
@@ -231,15 +231,15 @@ def test_score_recheck_only_runs_when_ticked(env):
     fetch(w, comments=False, refresh_scores=True)
     assert rechecked() == stale
     w.close()
-    assert env.window().refresh_scores.isChecked()  # remembered
+    assert env.window().fetch_form.refresh_scores.isChecked()  # remembered
 
 
 def test_stop_ends_a_fetch_and_frees_the_form(env):
     w = env.window()
     env.archive.delay = 0.15
-    w.subreddit.setText("python")
-    w.include_comments.setChecked(True)
-    w.range.setCurrentIndex(w.range.findData("month"))
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(True)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     pump(400)
     assert w.fetch_job.busy and w.stop_btn.isEnabled() and not w.fetch_btn.isEnabled()
@@ -249,7 +249,7 @@ def test_stop_ends_a_fetch_and_frees_the_form(env):
     n = len(env.archive.paths())
     pump(600)
     assert len(env.archive.paths()) == n  # nothing carries on after Stop
-    assert w.fetch_btn.isEnabled() and not w.stop_btn.isEnabled() and w.subreddit.isEnabled()
+    assert w.fetch_btn.isEnabled() and not w.stop_btn.isEnabled() and w.fetch_form.subreddit.isEnabled()
     assert "Stopped" in w.progress_msg.text() or "stopped" in w.progress_msg.text().lower()
 
 
@@ -258,9 +258,9 @@ def test_stop_takes_effect_at_once_even_while_requests_wait_out_timeouts(env, mo
     # are sitting in backoffs when Stop is pressed.
     monkeypatch.setattr(arctic_shift, "MAX_WAIT", 120.0)
     w = env.window()
-    w.subreddit.setText("AskReddit")
-    w.include_comments.setChecked(True)
-    w.range.setCurrentIndex(w.range.findData("day"))
+    w.fetch_form.subreddit.setText("AskReddit")
+    w.fetch_form.include_comments.setChecked(True)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("day"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     pump(1500)
     assert w.fetch_job.busy
@@ -314,11 +314,11 @@ def test_fetching_another_subreddit_opens_it_and_keeps_the_first(env):
 
 def test_enter_in_the_sidebar_fetches_once(env):
     w = env.window()
-    w.subreddit.setText("python")
-    w.include_comments.setChecked(False)
-    w.subreddit.setFocus()
-    QTest.keyClick(w.subreddit, Qt.Key.Key_Return)
-    QTest.keyClick(w.subreddit, Qt.Key.Key_Return)  # a second Enter while busy is ignored
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(False)
+    w.fetch_form.subreddit.setFocus()
+    QTest.keyClick(w.fetch_form.subreddit, Qt.Key.Key_Return)
+    QTest.keyClick(w.fetch_form.subreddit, Qt.Key.Key_Return)  # a second Enter while busy is ignored
     wait_idle(w)
     pump(300)
     assert not w.fetch_job.busy and env.archive.paths().count(AGG) == 0
@@ -333,9 +333,9 @@ def test_fetching_another_subreddit_shows_it_as_it_downloads(env, saved_before):
     fetch(w, sub="rust", comments=False)
     assert w.current.lower() == "rust"
     env.archive.delay = 0.1
-    w.subreddit.setText("python")
-    w.include_comments.setChecked(True)
-    w.range.setCurrentIndex(w.range.findData("month"))
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(True)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     s = env.store()
     end = time.monotonic() + 20
@@ -373,7 +373,7 @@ def test_closing_while_a_search_is_out_ends_the_fetch_at_once(env, monkeypatch):
     monkeypatch.setattr(sys, "excepthook", lambda *e: errors.append(e))
     w = env.window()
     env.archive.delay = 4  # a request still out when the window closes
-    w.subreddit.setText("python")
+    w.fetch_form.subreddit.setText("python")
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     pump(500)
     start = time.monotonic()
@@ -396,8 +396,8 @@ QSettings(app.STORAGE_ORG, app.STORAGE_APP).setValue("updates/auto", False)
 app.default_db_path = lambda: os.path.join(sys.argv[2], "quit.db")
 def window(path):
     w = main_window.MainWindow(path)
-    w.subreddit.setText("python")
-    w.include_comments.setChecked(True)
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(True)
     def close():
         print("saved", len(w.store.posts("python")) + len(w.store.comments("python")), flush=True)
         w.close()  # while a slow request for comments is still out
@@ -469,9 +469,9 @@ def test_switching_subreddit_mid_fetch_keeps_each_table_to_its_own_rows(env):
     fetch(w, sub="rust", comments=False)
     fetch(w, sub="python", comments=False)  # python is open, as when fetching more of it
     env.archive.delay = 0.1
-    w.subreddit.setText("python")
-    w.include_comments.setChecked(True)
-    w.range.setCurrentIndex(w.range.findData("month"))
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(True)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     end = time.monotonic() + 20
     while w.posts_tab.model.rowCount() < 4 and time.monotonic() < end:  # until new rows show up
@@ -538,7 +538,7 @@ def test_a_busy_subreddit_that_times_out_still_fetches_with_narrower_queries(env
 def test_a_keyword_search_the_archive_cant_run_says_so_once(env, monkeypatch):
     monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.3)  # timeout back-offs, shortened further
     w = env.window()
-    w.query.setText("black holes")
+    w.fetch_form.query.setText("black holes")
     fetch(w, sub="askreddit", comments=False, rng="day")
     assert len(env.warnings) == 1 and "timed out" in env.warnings[0].lower()
     assert w.fetch_btn.isEnabled()
@@ -577,14 +577,14 @@ def test_coverage_counts_a_busy_subreddit_without_downloading_anything(env, monk
     w = env.window()
     fetch(w, sub="askreddit", comments=False, rng="day")
     env.archive.clear()
-    w.range.setCurrentIndex(w.range.findData("month"))
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     cov = open_coverage(w)
     paths = set(env.archive.paths())
     assert paths == {AGG}  # only counts; the month-long count timed out and was split, never refused
     assert [r for r in env.archive.rejected if r[2] == 422]
     totals = cov.totals["askreddit"]
     assert sum(totals.values()) == len([p for p in env.archive.posts if p["subreddit"] == "AskReddit"
-                                        and p["created_utc"] >= w.fetch_range()[0]])
+                                        and p["created_utc"] >= w.fetch_form.bounds()[0]])
     for row in range(min(5, cov.day_table.rowCount())):  # browsing days and posts
         cov.day_table.selectRow(row)
         pump(30)
@@ -602,7 +602,7 @@ def test_coverage_counts_posts_removed_from_reddit_as_checked(env):
     cov = open_coverage(w)
     # The sidebar's fetch read every whole past day of the week to its end, so those days already read
     # complete. Forget that, as for days saved before fetches did, to see a day's share before Download all.
-    whole = [r for r, d in enumerate(cov.days) if d >= w.fetch_range()[0] and d < coverage.today()]
+    whole = [r for r, d in enumerate(cov.days) if d >= w.fetch_form.bounds()[0] and d < coverage.today()]
     assert whole and all(cov.day_table.cellWidget(r, 1).side.text() == "✓ Complete" for r in whole)
     w.store.db.execute("DELETE FROM complete")
     w.store.commit()
@@ -744,7 +744,7 @@ def test_coverage_downloads_do_only_what_they_say(env):
 def test_coverage_keeps_its_place_while_a_download_runs(env):
     w = env.window()
     fetch(w, comments=False)
-    w.range.setCurrentIndex(w.range.findData("month"))
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     cov = open_coverage(w)
     cov.resize(900, 400)
     pump(50)
@@ -755,8 +755,8 @@ def test_coverage_keeps_its_place_while_a_download_runs(env):
     scrolled = cov.day_table.verticalScrollBar().value()
     assert scrolled > 0
     env.archive.delay = 0.05
-    w.subreddit.setText("python")
-    w.include_comments.setChecked(True)
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(True)
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     pump(2500)  # the window refreshes about once a second while rows arrive
     assert cov.day_table.verticalScrollBar().value() == scrolled
@@ -791,10 +791,10 @@ def test_coverage_follows_a_change_of_date_range_in_the_sidebar(env):
     fetch(w, comments=False)
     cov = open_coverage(w)
     assert len(cov.days) == 8
-    w.range.setCurrentIndex(w.range.findData("month"))
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     pump(500)
     assert len(cov.days) == 31 and cov.day_table.rowCount() == 31
-    w.date_from.setDate(w.date_to.date().addDays(-2))  # typing a date: a custom range
+    w.fetch_form.date_from.setDate(w.fetch_form.date_to.date().addDays(-2))  # typing a date: a custom range
     pump(500)
     assert len(cov.days) == 3
 
@@ -820,8 +820,8 @@ def test_a_fetch_ending_leaves_the_user_on_the_subreddit_they_switched_to(env):
     fetch(w, sub="rust", comments=False)
     fetch(w, comments=False)
     env.archive.delay = 0.15
-    w.subreddit.setText("python")
-    w.range.setCurrentIndex(w.range.findData("month"))
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     pump(600)
     w.datasets.setCurrentRow(next(i for i in range(w.datasets.count())
@@ -837,7 +837,9 @@ def test_stop_in_the_coverage_window_is_disabled_once_pressed(env):
     w = env.window()
     fetch(w, comments=False)
     cov = open_coverage(w)
-    env.archive.delay = 0.15
+    # The day's Download all is four requests sent at once, so at 0.15 s each it was over in about 0.34 s
+    # and Stop was sometimes already off when the test looked at 0.3 s.
+    env.archive.delay = 1.0
     QTest.mouseClick(cov.day_table.cellWidget(1, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     pump(300)
     assert cov.stop_btn.isEnabled()
@@ -886,8 +888,8 @@ def test_choosing_days_never_downloads_and_a_fetch_only_adds_rows_from_chosen_da
     assert w.chosen_days == {day} and len(w.posts) == saved[day][0]
 
     env.archive.delay = 0.05
-    w.subreddit.setText("python")
-    w.range.setCurrentIndex(w.range.findData("month"))
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     seen = 0
     while w.fetch_job.busy:  # rows from other days are saved but not shown while the fetch runs
