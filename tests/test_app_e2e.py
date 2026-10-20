@@ -293,7 +293,8 @@ app.default_db_path = lambda: os.path.join(sys.argv[2], "quit.db")
 def window(path):
     w = main_window.MainWindow(path)
     w.subreddit.setText("python")
-    QTimer.singleShot(300, w.fetch_btn.click)
+    if sys.argv[3] == "fetch":
+        QTimer.singleShot(300, w.fetch_btn.click)
     QTimer.singleShot(1100, w.close)  # while a slow request is still out
     return w
 app.MainWindow = window
@@ -301,12 +302,14 @@ sys.exit(app.main([]))
 """
 
 
-def test_quitting_mid_fetch_exits_cleanly(env, tmp_path):
+@pytest.mark.parametrize("mode", ["fetch", "idle"])  # idle: quitting with nothing running, for comparison
+def test_quitting_mid_fetch_exits_cleanly(env, tmp_path, mode):
     # Qt aborts the process (an access violation on Windows) when a thread is destroyed while running.
     # Before, the process also lived on with the fetch after the window had gone, raising in its signals.
     env.archive.delay = 15
     start = time.monotonic()
-    run = subprocess.run([sys.executable, "-c", QUIT_MID_FETCH, env.archive.url, str(tmp_path)],
+    run = subprocess.run([sys.executable, "-X", "faulthandler", "-c", QUIT_MID_FETCH, env.archive.url,
+                          str(tmp_path), mode],
                          capture_output=True, text=True, timeout=90,
                          env=dict(os.environ, QT_QPA_PLATFORM="offscreen"))
     assert run.returncode == 0, run.stderr[-2000:]
