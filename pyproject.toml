@@ -13,6 +13,7 @@ dependencies = [
     "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",
     "requests>=2.31",
     "vaderSentiment>=3.3.2",
+    "zstandard>=0.22",
 ]
 
 [project.optional-dependencies]

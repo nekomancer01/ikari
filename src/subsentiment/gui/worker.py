@@ -95,6 +95,10 @@ class FetchWorker(QObject):
         finally:
             LIMITER.on_wait = None  # collect.run pointed it at this worker, which is about to go
             if store is not None:
+                try:
+                    store.pack_settled()  # days that have settled since get their text compressed (store.PACKED)
+                except Exception:  # never worth failing a fetch for: the rows stay as they are, packed next time
+                    pass
                 store.close()
 
 

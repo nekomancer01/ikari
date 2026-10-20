@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication, QTableView  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import tables  # noqa: E402
 from subsentiment.gui.tables import POST_COLUMNS, RowsModel  # noqa: E402
-from subsentiment.store import POST_COLUMNS as STORE_POST_COLUMNS  # noqa: E402
+from subsentiment.store import COMMENT_COLUMNS, POST_COLUMNS as STORE_POST_COLUMNS  # noqa: E402
 from subsentiment.analysis import Analysis  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
@@ -39,7 +39,7 @@ def fill(path, sub="Big"):
                  rng.choice(["Love it", "awful", "fine I guess", "Great work"]) + f" {j}", rng.randint(-5, 900),
                  now - rng.uniform(0, 30 * 86400), 0, f"/r/{sub}/comments/c{j}/", rng.uniform(-1, 1), LABELS[j % 3],
                  now - 3600) for j in range(COMMENTS)]
-    db.executemany(f"INSERT INTO comments VALUES ({','.join('?' * 13)})", comments)
+    db.executemany(f"INSERT INTO comments ({','.join(COMMENT_COLUMNS)}) VALUES ({','.join('?' * 13)})", comments)
     db.commit()
     db.close()
 
@@ -177,7 +177,7 @@ def test_the_end_of_a_fetch_reads_back_only_what_it_saved(window, monkeypatch):
     writer = Store(window.db_path)
     db = writer.db
     db.execute("UPDATE posts SET score = 12345, fetched_at = ? WHERE id = 'p5'", (time.time(),))  # a new score
-    db.execute("INSERT INTO comments SELECT 'fresh', post_id, subreddit, parent_id, author, 'a fresh comment', 1, "
+    db.execute(f"INSERT INTO comments ({','.join(COMMENT_COLUMNS)}) SELECT 'fresh', post_id, subreddit, parent_id, author, 'a fresh comment', 1, "
                "created_utc, depth, permalink, 0.9, 'positive', ? FROM comments WHERE id = 'c1'", (time.time(),))
     writer.commit()
     writer.close()
@@ -207,7 +207,7 @@ def test_a_running_fetch_counts_its_rows_into_the_overview_without_reading_every
     new_day = int(time.time() // 86400 * 86400) - 90 * 86400  # no saved rows that day yet
     writer = Store(window.db_path)
     writer.db.execute("UPDATE posts SET score = 1, fetched_at = ? WHERE id = 'p7'", (time.time(),))  # saved again
-    writer.db.execute("INSERT INTO comments SELECT 'fresh', post_id, subreddit, parent_id, author, 'hi', 1, ?, depth, "
+    writer.db.execute(f"INSERT INTO comments ({','.join(COMMENT_COLUMNS)}) SELECT 'fresh', post_id, subreddit, parent_id, author, 'hi', 1, ?, depth, "
                       "permalink, 0.1, 'neutral', ? FROM comments WHERE id = 'c1'", (new_day + 60, time.time()))
     writer.commit()
     recounts = [count_calls(monkeypatch, Store, name) for name in ("posts", "comments", "day_counts")]
