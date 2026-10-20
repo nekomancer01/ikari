@@ -334,7 +334,7 @@ def child(spec: dict) -> int:
     from PySide6.QtCore import QRect, QSettings, QSize
     from PySide6.QtWidgets import QApplication
 
-    from subsentiment.gui import coverage, main_window, native, theme
+    from subsentiment.gui import coverage, main_window, native, theme, widgets
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import screenshot  # noqa: E402  (seeds the sample data)
@@ -411,7 +411,7 @@ def child(spec: dict) -> int:
         return found
 
     results = []
-    minimum, sizes = sizes_for(window, main_window.fit_to_screen(QSize(1320, 860), Free(fw, fh)))
+    minimum, sizes = sizes_for(window, widgets.fit_to_screen(QSize(1320, 860), Free(fw, fh)))
     for state, w, h in sizes:
         for tab in ([0, 1, 2] if state in ("restored", "maximized") else [0]):
             window.tabbar.setCurrentIndex(tab)
@@ -450,7 +450,7 @@ def child(spec: dict) -> int:
                         "problems": ["the Download coverage window didn't open"]})
     else:
         dialog.day_table.selectRow(0)
-        cov_min, cov_sizes = sizes_for(dialog, main_window.fit_to_screen(QSize(1120, 720), Free(fw, fh)))
+        cov_min, cov_sizes = sizes_for(dialog, widgets.fit_to_screen(QSize(1120, 720), Free(fw, fh)))
         for state, w, h in cov_sizes:
             results.append(measure(dialog, w, h, f"coverage {state}", lambda: coverage_alignment(dialog)))
         dialog.close()
