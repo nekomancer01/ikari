@@ -166,3 +166,41 @@ def test_day_counts_and_exporting_chosen_days(tmp_path):
     assert [r["id"] for r in csv.DictReader(open(out, encoding="utf-8-sig"))] == ["p2"]  # starts with a BOM
     assert s.export_csv("python", "posts", out) == 2
     assert s.export_csv("python", "comments", out, days=set()) == 0
+
+
+def test_import_merges_another_database_keeping_the_copy_fetched_last(tmp_path, monkeypatch):
+    import itertools
+    import sqlite3
+    import time as clock
+    from subsentiment import store as store_mod
+    when = itertools.count(100.0, 100.0)  # each save is fetched later than the one before
+    monkeypatch.setattr(store_mod.time, "time", lambda: next(when))
+    mine, theirs = Store(tmp_path / "mine.db"), Store(tmp_path / "theirs.db")
+    mine.save_post(make_post(1), 0.1, "neutral")           # fetched at 100: older than theirs
+    theirs.save_post(make_post(1), 0.9, "positive")        # 200
+    theirs.save_post(make_post(2, sub="rust"), 0.5, "positive")  # 300, only theirs has it
+    mine.save_post(make_post(3), -0.5, "negative")         # 400, only mine has it
+    theirs.save_comment(Comment("c1", "p2", "rust", "t3_p2", "b", "hi", 1, 1_700_000_100, 0, "u"), 0.2, "positive")
+    theirs.mark_complete("posts", "rust", "1699920000")
+    theirs.save_removed("rust", {"gone": 1_700_000_000.0})
+    mine.commit()
+    theirs.commit()
+    theirs.close()
+    monkeypatch.setattr(store_mod.time, "time", clock.time)
+
+    assert mine.import_from(tmp_path / "theirs.db") == (1, 1)
+    assert {r["id"]: r["sentiment"] for r in mine.db.execute("SELECT * FROM posts")} == {"p1": 0.9, "p2": 0.5, "p3": -0.5}
+    assert [r["body"] for r in mine.comments("rust")] == ["hi"]
+    assert mine.complete_keys("posts", "rust") == {"1699920000"}
+    assert mine.import_from(tmp_path / "theirs.db") == (0, 0)  # importing again adds nothing
+    assert len(Store(tmp_path / "theirs.db").posts("rust")) == 1  # the imported file is left as it was
+
+    (tmp_path / "junk.db").write_bytes(b"not a database at all" * 100)
+    with pytest.raises(sqlite3.DatabaseError):
+        mine.import_from(tmp_path / "junk.db")
+    with pytest.raises(ValueError):
+        mine.import_from(tmp_path / "mine.db")
+    with pytest.raises(FileNotFoundError):
+        mine.import_from(tmp_path / "missing.db")
+    assert not (tmp_path / "missing.db").exists()
+    assert len(mine.subreddits()) == 2  # a failed import changes nothing and the store still works

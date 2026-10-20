@@ -251,6 +251,43 @@ class Store:
         self.db.commit()
         self._compact()
 
+    def import_from(self, path: str | Path) -> tuple[int, int]:
+        """Merge another ikari database into this one: rows this one lacks are added, and a row both have
+        keeps the copy fetched last. Nothing is removed from either file. Returns (new posts, new comments).
+        Raises sqlite3.DatabaseError if path isn't an ikari database, ValueError if it is this one,
+        FileNotFoundError if there's no file there."""
+        if not Path(path).is_file():  # ATTACH would create an empty file there
+            raise FileNotFoundError(path)
+        if Path(path).resolve() == self.path.resolve():
+            raise ValueError("That is the database already open.")
+        self.db.commit()
+        self.db.execute("ATTACH DATABASE ? AS other", (str(path),))
+        try:
+            tables = {r[0] for r in self.db.execute("SELECT name FROM other.sqlite_master WHERE type = 'table'")}
+            if not {"posts", "comments"} <= tables:
+                raise sqlite3.DatabaseError("It has no saved posts or comments.")
+            new = [self.db.execute(f"SELECT COUNT(*) FROM other.{t} o WHERE o.id NOT IN (SELECT id FROM main.{t})")
+                   .fetchone()[0] for t in ("posts", "comments")]
+            for table, key, columns in (("posts", "id", POST_COLUMNS), ("comments", "id", COMMENT_COLUMNS),
+                                        ("comment_fetches", "post_id", ("post_id", "ok", "settled", "fetched_at"))):
+                if table in tables:
+                    cols = ", ".join(columns)
+                    self.db.execute(
+                        f"INSERT OR REPLACE INTO main.{table} ({cols}) SELECT {cols} FROM other.{table} o "
+                        f"WHERE NOT EXISTS (SELECT 1 FROM main.{table} m WHERE m.{key} = o.{key} "
+                        f"AND COALESCE(m.fetched_at, 0) >= COALESCE(o.fetched_at, 0))")
+            for table, cols in (("complete", "kind, subreddit, key, fetched_at"),
+                                ("removed_posts", "id, subreddit, created_utc")):
+                if table in tables:
+                    self.db.execute(f"INSERT OR IGNORE INTO main.{table} ({cols}) SELECT {cols} FROM other.{table}")
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+        finally:
+            self.db.execute("DETACH DATABASE other")
+        return new[0], new[1]
+
     def _compact(self) -> None:
         """Give deleted rows' space back to the OS, so deleting data actually frees disk."""
         try:

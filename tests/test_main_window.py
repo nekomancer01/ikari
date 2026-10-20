@@ -383,3 +383,22 @@ def test_bundled_fonts_are_weights_of_the_families_the_theme_asks_for():
         families = QFontDatabase.applicationFontFamilies(QFontDatabase.addApplicationFont(str(path)))
         wanted = theme.DISPLAY_FAMILY if path.name.startswith("InterDisplay") else theme.UI_FAMILIES[0]
         assert wanted in families, f"{path.name} registers as {families}, not as a weight of {wanted}"
+
+
+def test_import_database_adds_its_subreddits_to_the_list(make_window, tmp_path, monkeypatch):
+    other = Store(tmp_path / "other.db")
+    other.save_post(Post("q1", "Deltarune", "great", "", "a", 1, 0.9, 0, 1_700_000_000.0, "https://r", ""), 0.6,
+                    "positive")
+    other.commit()
+    other.close()
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", lambda *a, **k: (str(tmp_path / "other.db"), ""))
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a))
+    w = make_window()
+    assert w.import_act.isEnabled()
+    w.import_act.trigger()
+    assert sorted(w.datasets.item(i).text() for i in range(w.datasets.count())) == ["r/Deltarune", "r/Python", "r/rust"]
+    assert "Imported 1\xa0new post" in w.statusBar().currentMessage()
+    (tmp_path / "other.db").write_bytes(b"junk" * 1000)
+    w.import_act.trigger()
+    assert len(warnings) == 1 and w.datasets.count() == 3
