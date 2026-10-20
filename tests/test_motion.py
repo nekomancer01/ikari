@@ -29,6 +29,15 @@ def pump(ms: int) -> None:
         time.sleep(0.005)
 
 
+def pump_eased(tween: motion.Tween, ms: int) -> None:
+    """Pump until the tween's own clock reaches ms. A busy runner can stall the first frame for longer than
+    a wall-clock wait, and Qt's animation clock only starts on that frame."""
+    end = time.monotonic() + 5
+    while tween._anim.currentTime() < ms and time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.005)
+
+
 def snapshots(widget) -> list:
     return [c for c in widget.findChildren(QLabel, options=Qt.FindChildOption.FindDirectChildrenOnly)
             if c.objectName() == "motion-snapshot" and c.isVisible()]
@@ -100,7 +109,7 @@ def test_switching_subreddit_fades_and_counts_to_the_new_values(make_window):
     # ...the old view fades out over them, the cards fade in, and the numbers count down to them.
     assert snapshots(w.content)
     assert any(isinstance(c.graphicsEffect(), QGraphicsOpacityEffect) for c in w.overview.cards)
-    pump(motion.DATA_MS // 3)
+    pump_eased(w.overview.tiles["count"].value._count, motion.DATA_MS // 3)
     assert drawn(w.overview.tiles["count"].value) not in ("40", "30")
     heights = w.overview.distribution.shown_heights()
     assert 10 < heights[0] < 25 and 5 < heights[2] < 30  # negative growing, positive shrinking
