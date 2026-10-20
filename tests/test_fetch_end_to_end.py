@@ -91,7 +91,6 @@ def test_rows_arrive_one_by_one_fading_in_and_only_for_the_fetched_posts(tmp_pat
     try:
         assert not hasattr(w, "live_btn")
         w.subreddit.setText("Python")
-        w.limit.setValue(6)
         fg = Qt.ItemDataRole.ForegroundRole
         steps, fading = [], 0
         w._start_fetch()
@@ -109,13 +108,13 @@ def test_rows_arrive_one_by_one_fading_in_and_only_for_the_fetched_posts(tmp_pat
             time.sleep(0.01)
         assert not w.fetch_job.busy
         posts_seen = sorted({p for p, _ in steps})
-        assert posts_seen[-1] == 16 and len(posts_seen) >= 4  # grew in several steps, not one jump
+        assert posts_seen[-1] == 40 and len(posts_seen) >= 4  # grew in several steps, not one jump
         assert len({c for _, c in steps}) >= 4  # so did the comments
         assert fading >= 1  # rows were mid-fade while they arrived
         comment_requests = [q["link_id"] for path, q in server if path == "/api/comments/tree"]
-        assert len(comment_requests) == 6 and not any(i.startswith("old") for i in comment_requests)
+        assert len(comment_requests) == 30 and not any(i.startswith("old") for i in comment_requests)
         assert not (w._live.isActive() or w._drip.isActive() or w.posts_tab.model._fade.isActive())
-        assert len(w.store.posts("Python")) == 16 and len(w.store.comments("Python")) == 18
+        assert len(w.store.posts("Python")) == 40 and len(w.store.comments("Python")) == 90  # every post in range
     finally:
         w.close()
         QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
