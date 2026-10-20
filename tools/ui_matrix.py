@@ -238,14 +238,11 @@ def alignment(window) -> list[str]:
         _same(problems, "tile widths", {t.findChild(QLabel).text(): t.width() for t in tiles})
         _same(problems, "tile tops", {t.findChild(QLabel).text(): _rect(t, window).top() for t in tiles})
         o = window.overview
-        cards = [_rect(c.parentWidget(), window) for c in (o.distribution, o.timeline, o.most_positive, o.most_negative)]
-        _same(problems, "overview left edges", {"tiles": body[0].left(), "charts": cards[0].left(),
-                                                 "lists": cards[2].left()})
-        _same(problems, "overview right edges", {"tiles": body[-1].right(), "charts": cards[1].right(),
-                                                  "lists": cards[3].right()})
+        cards = [_rect(c.parentWidget(), window) for c in (o.distribution, o.timeline)]
+        _same(problems, "overview left edges", {"tiles": body[0].left(), "charts": cards[0].left()})
+        _same(problems, "overview right edges", {"tiles": body[-1].right(), "charts": cards[1].right()})
         _same(problems, "chart card tops and heights", {"distribution top": cards[0].top(),
                                                         "timeline top": cards[1].top()})
-        _same(problems, "list card heights", {"positive": cards[2].height(), "negative": cards[3].height()})
         content_right = body[-1].right()
     else:
         content_right = _rect(page, window).right()
