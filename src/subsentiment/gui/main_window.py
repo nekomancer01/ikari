@@ -751,6 +751,7 @@ class MainWindow(QMainWindow):
         switching = (name or None) != self.current
         if switching:  # the old subreddit fades out over the new one, whose cards fade in one by one
             motion.crossfade(self.content)
+            self.overview.timeline.show_every_day()
         self.current = name or None
         self.chosen_days = days.load_choice(self.settings, name) if name else None
         # One snapshot, so a row a running fetch saves meanwhile isn't in the day counts without being in the
@@ -791,6 +792,7 @@ class MainWindow(QMainWindow):
         chosen = days.save_choice(self.settings, self.current, chosen, self._day_counts)
         if chosen != self.chosen_days:
             motion.crossfade(self.content)
+            self.overview.timeline.show_every_day()  # other days: the chart starts from all of them
         self.chosen_days = chosen
         if self.fetch_job.busy and self._showing_fetch():
             # A running fetch has added rows since the subreddit was loaded: read them all again.
