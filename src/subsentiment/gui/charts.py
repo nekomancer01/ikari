@@ -21,17 +21,13 @@ from PySide6.QtWidgets import (
 from subsentiment.gui import motion, theme
 from subsentiment.gui.days import DAY, flat_button, short_date
 
-LIGHT = {"positive": "#0163ff", "neutral": "#b4b4b8", "negative": "#f28513", "line": "#0163ff"}
-DARK = {"positive": "#3d86ff", "neutral": "#6e6e74", "negative": "#f59a3c", "line": "#3d86ff"}
-
-
 def palette() -> dict:
-    """Series colors for the current theme, with text, grid and card surface from the theme."""
+    """Series colors, text, grid and card surface, all from the current theme."""
     t = theme.tokens()
     grid = QColor(*t["edge"][:3])
     grid.setAlpha(t["edge"][3])
-    return dict(DARK if theme.mode() == "dark" else LIGHT, surface=t["panel"], text=t["text"], muted=t["muted"],
-                grid=grid.name(QColor.NameFormat.HexArgb))
+    return {"positive": t["positive"], "neutral": t["neutral"], "negative": t["negative"], "line": t["positive"],
+            "surface": t["panel"], "text": t["text"], "muted": t["muted"], "grid": grid.name(QColor.NameFormat.HexArgb)}
 
 
 def _ui_font(point_size: float) -> QFont:

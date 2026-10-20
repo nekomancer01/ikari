@@ -3,7 +3,7 @@ cards inside them are outlined rather than shaded, buttons and header pickers ar
 accent is a clear blue. Dark mode keeps the same structure on near-black surfaces.
 
 The window background can carry the mood of the subreddit on screen: MoodTint pulls a soft wash toward
-green when it skews positive, white when it's neutral and red when it skews negative, easing between
+the positive blue when it skews positive, white when it's neutral and the negative orange when it skews negative, easing between
 subreddits. It shows around the panels, so panel and text contrast hold.
 
 Type: Inter (SIL Open Font License, bundled in assets/), medium for primary text and regular for secondary,
@@ -34,6 +34,8 @@ THEMES = {
         "text": "#1f1f1f", "muted": "#737373", "faint": "#a3a3a3",
         "accent": "#0163ff", "on_accent": "#ffffff", "button": "#0163ff",
         "selection": (1, 99, 255, 26), "menu": "#ffffff", "shadow": (0, 0, 0, 40),
+        # Sentiment colors, shared by the charts, tables and the background's mood wash.
+        "positive": "#0163ff", "neutral": "#b4b4b8", "negative": "#f28513",
     },
     "dark": {
         "bg0": "#0e0e10",
@@ -43,16 +45,18 @@ THEMES = {
         "accent": "#3d86ff", "on_accent": "#ffffff",
         "button": "#2f74f0",  # a little deeper than the accent so white text keeps contrast
         "selection": (61, 134, 255, 52), "menu": "#1e1e22", "shadow": (0, 0, 0, 120),
+        "positive": "#3d86ff", "neutral": "#6e6e74", "negative": "#f59a3c",
     },
 }
 
 UI_FAMILIES = ["Inter", "Segoe UI Variable Text", "SF Pro Text", "Segoe UI", "Noto Sans"]
 DISPLAY_FAMILY = "Inter Display"  # Inter cut for larger sizes: tighter spacing, finer details
 
-# Sentiment wash over the window background: (rgb, peak alpha) per mood.
+# Sentiment wash over the window background: peak alpha per mood. Positive and negative take their color from
+# the theme's sentiment tokens; the neutral wash is a soft white.
 MOOD = {
-    "light": {"positive": ((46, 196, 108), 70), "neutral": ((255, 255, 255), 120), "negative": ((236, 72, 72), 66)},
-    "dark": {"positive": ((34, 170, 92), 60), "neutral": ((214, 222, 240), 22), "negative": ((214, 52, 60), 64)},
+    "light": {"positive": 96, "neutral": ((255, 255, 255), 120), "negative": 120},
+    "dark": {"positive": 96, "neutral": ((214, 222, 240), 22), "negative": 104},
 }
 
 _mode = "light"
@@ -357,12 +361,14 @@ def _mix(a: QColor, b: QColor, f: float) -> QColor:
 
 
 def mood_color(score: float) -> tuple[QColor, float]:
-    """The wash for a mood score in -1..1: green, white or red (alpha carries its strength), and its weight 0..1."""
+    """The wash for a mood score in -1..1: the positive color, white or the negative color (alpha carries its
+    strength), and its weight 0..1."""
     m = MOOD[_mode]
     white, wa = m["neutral"]
-    far, fa = m["positive" if score >= 0 else "negative"]
+    key = "positive" if score >= 0 else "negative"
+    fa = m[key]
     f = abs(score)
-    c = _mix(QColor(*white), QColor(*far), f)
+    c = _mix(QColor(*white), QColor(tokens()[key]), f)
     c.setAlpha(round(wa + (fa - wa) * f))
     return c, f
 
