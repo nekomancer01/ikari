@@ -52,12 +52,12 @@ class WordTally(QObject):
 
     def count(self, posts: list, comments: list) -> None:
         self._recount += 1
+        self._pending = {k: [] for k in KINDS}  # rows added for an earlier count's rows don't carry over
         rows = {"posts": list(posts), "comments": list(comments)}
         if len(rows["posts"]) + len(rows["comments"]) < self.THREAD_FROM:
             self._on_counted(self._recount, {k: WordCounts(k, rows[k]) for k in KINDS})
             return
         self.ready = False
-        self._pending = {k: [] for k in KINDS}
         threading.Thread(target=self._count, args=(self._recount, rows), daemon=True).start()
 
     def _count(self, recount: int, rows: dict) -> None:

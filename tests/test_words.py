@@ -121,3 +121,18 @@ def test_the_words_page_shows_the_saved_words_and_follows_scope_and_days(window)
     w.days_pick.set_days(w._day_counts, {int(1_700_000_000 // 86400 * 86400)})
     w._on_days_chosen({int(1_700_000_000 // 86400 * 86400)})  # only the newest day
     assert shown() == {"harbour": 1, "festival": 2, "tonight": 1, "lights": 1, "lovely": 1}
+
+
+def test_a_small_recount_drops_rows_added_for_a_big_one_still_running(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(WordTally, "THREAD_FROM", 10)
+    tally = WordTally()
+    tally.count([], [comment(i, "river market") for i in range(2000)])
+    tally.add("comments", [comment(5000, "river bridge")])  # saved for the big subreddit meanwhile
+    tally.count([], [comment(1, "quiet lane")])  # then a small one is chosen: counted at once
+    assert tally.ready and [w for w, *_ in tally.top(["comments"])] == ["lane", "quiet"]
+    end = time.monotonic() + 3
+    while time.monotonic() < end:  # the big count ends and is let go
+        app.processEvents()
+        time.sleep(0.01)
+    assert [w for w, *_ in tally.top(["comments"])] == ["lane", "quiet"]
