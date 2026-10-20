@@ -196,3 +196,13 @@ def test_a_theme_switch_restyles_only_the_window_and_fades_two_pictures(window, 
     assert w.styleSheet() == theme.stylesheet(theme.tokens())
     # Each switch paints the timeline once into the new look's picture, then once more when the fade is gone.
     assert len(painted) <= 4
+
+
+def test_a_theme_switch_during_a_page_fade_doesnt_hold_that_fade_still(window, monkeypatch):
+    w = window
+    monkeypatch.setattr(motion, "_os_allows", True)
+    monkeypatch.setattr(motion, "_wanted", True)
+    w.show_page("words")  # crossfades the content area
+    assert motion.fading(w.content)
+    w._set_theme("dark")  # the theme's picture already has the page fade's frame; that fade stops
+    assert not motion.fading(w.content)

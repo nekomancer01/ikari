@@ -128,7 +128,8 @@ def _picture(window: QWidget, rect: QRect) -> QPixmap:
     dpr = window.devicePixelRatioF()
     r = QRectF(rect)
     device = QRectF(r.topLeft() * dpr, r.size() * dpr).toAlignedRect()
-    if isinstance(image, QImage) and abs(image.width() - window.width() * dpr) < 1 and image.rect().contains(device):
+    if (isinstance(image, QImage) and abs(image.width() - window.width() * dpr) < 1
+            and abs(image.height() - window.height() * dpr) < 1 and image.rect().contains(device)):
         picture = QPixmap.fromImage(image.copy(device))
         picture.setDevicePixelRatio(dpr)
         return picture
@@ -167,8 +168,11 @@ def crossfade(target: QWidget, ms: int = VIEW_MS, still_under: bool = False) -> 
         if not target.isWindow():
             fade_in(target, ms)
         return
-    for old in target.findChildren(_Snapshot, options=Qt.FindChildOption.FindDirectChildrenOnly):
-        # A fade already running: start from what's on screen now, not from the picture before it.
+    # A fade already running: start from what's on screen now, not from the picture before it. A still new look
+    # would hold any fade inside target at its current frame too, so those go as well.
+    deep = Qt.FindChildOption.FindChildrenRecursively if still_under else Qt.FindChildOption.FindDirectChildrenOnly
+    for old in target.findChildren(_Snapshot, options=deep):
+        old.anim.stop()
         old.hide()
         old.deleteLater()
     _Snapshot(target, ms, still_under)
