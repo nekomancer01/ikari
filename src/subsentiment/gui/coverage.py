@@ -61,14 +61,11 @@ def today() -> int:
     return int(time.time() // DAY * DAY)
 
 
-COUNT_LAG_DAYS = 1  # days before today whose archive count is still filling in
-
-
 def no_total(day: int, saved: int, total: int | None, complete: bool) -> bool:
-    """True for a day whose archive count can't be shown: today (not over yet), the day before (the
-    archive's daily counts lag by more than a day: on 19 Oct at 18:00 UTC, 18 Oct read about 55% of a
-    normal day while 17 Oct was settled), or any day whose count is below what's already saved."""
-    if day >= today() - COUNT_LAG_DAYS * DAY:
+    """True for a day whose archive count can't be shown: today (not over yet), or any day whose count
+    is below what's already saved. Yesterday's count is already whole: on 20 Oct, r/AskReddit's 19 Oct
+    read 4,517, the same as the sum of its 24 hourly counts."""
+    if day >= today():
         return True
     return not complete and total is not None and total < saved
 
@@ -153,7 +150,7 @@ class Cell(QWidget):
         self.bar.setSizePolicy(keep)
         lay.addWidget(self.bar)
         # An open day has no bar, so its side text goes on its own line there: side by side,
-        # "1,234 saved so far" and "Still counting" don't fit the column at 150%.
+        # "1,234 saved so far" and "No usable count" don't fit the column at 150%.
         self.note = label("", "muted")
         self.note.setVisible(False)
         lay.addWidget(self.note)
@@ -169,19 +166,16 @@ class Cell(QWidget):
 
     def set_open(self, saved: int, why: str = "today", total: int | None = None) -> None:
         """A day without a usable total: just what's saved so far, no share or estimate. ``why`` is
-        "today" (not over yet), "counting" (the archive's count lags) or "wrong" (a settled day whose
-        count is below what's saved, as when the archive answers a busy day's count with 0)."""
+        "today" (not over yet) or "wrong" (a day whose count is below what's saved)."""
         self.main.setText(f"{saved:,} saved so far")
         self.side.setText("")
-        self.note.setText({"today": "Today", "counting": "Still counting"}.get(why, "No usable count"))
+        self.note.setText("Today" if why == "today" else "No usable count")
         self.bar.setVisible(False)  # an empty bar would read as 0%
         self.note.setVisible(True)
         self._pad(open_day=True)
         self.setToolTip(
             "Today isn't over, so there's no total yet. Download all fetches everything posted today so far."
             if why == "today" else
-            "Arctic Shift's count for this day is still filling in, so there's no total yet. "
-            "Download all fetches everything posted that day." if why == "counting" else
             f"Arctic Shift counted {total or 0:,} posts for this day, fewer than are already saved, so the "
             "count can't be right. Download all fetches everything posted that day.")
 
@@ -461,8 +455,7 @@ class CoverageWindow(QDialog):
             cell: Cell = t.cellWidget(row, 1)
             button: QPushButton = t.cellWidget(row, 2).findChild(QPushButton)
             if no_total(day, n, total, done):
-                lagging = day >= current - COUNT_LAG_DAYS * DAY
-                cell.set_open(n, "today" if day >= current else "counting" if lagging else "wrong", total)
+                cell.set_open(n, "today" if day >= current else "wrong", total)
                 button.setText("Download all")
                 button.setEnabled(not self.busy)
                 button.setToolTip("Fetch everything posted today so far" if day >= current

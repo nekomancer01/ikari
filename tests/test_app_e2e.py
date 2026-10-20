@@ -388,7 +388,7 @@ def test_coverage_counts_posts_removed_from_reddit_as_checked(env):
 
 
 def no_total_day(cov, day):
-    return day >= coverage.today() - coverage.COUNT_LAG_DAYS * DAY
+    return day >= coverage.today()
 
 
 def busy_day(env, sub: str, n: int) -> int:

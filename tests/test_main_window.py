@@ -295,11 +295,11 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     c.close()
 
 
-def test_recent_days_and_lagging_counts_show_no_total(make_window, monkeypatch):
+def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypatch):
     from subsentiment.gui import coverage
     yesterday, older = coverage.today() - 86400, coverage.today() - 3 * 86400
 
-    def count(self, after, before):  # 3 days ago the count is below what's saved; yesterday's is partial
+    def count(self, after, before):  # 3 days ago the count is below what's saved
         self._on_counts(self.subreddit, {d: (1 if d == older else 9) for d in range(int(after), int(before), 86400)})
     monkeypatch.setattr(coverage.CoverageWindow, "_count", count)
     w = make_window()
@@ -313,10 +313,11 @@ def test_recent_days_and_lagging_counts_show_no_total(make_window, monkeypatch):
     w._show_coverage()
     c = w.coverage
     c.refresh_saved()
-    # Yesterday's count (9) is above the 3 saved but isn't shown yet; the older day's count (1) can't be right.
-    for day, note in ((yesterday, "Still counting"), (older, "No usable count")):
-        cell = c.day_table.cellWidget(c.days.index(day), 1)
-        assert (cell.main.text(), cell.note.text()) == ("3 saved so far", note)
+    # The older day's count (1) can't be right; yesterday's is whole and shown.
+    cell = c.day_table.cellWidget(c.days.index(older), 1)
+    assert (cell.main.text(), cell.note.text()) == ("3 saved so far", "No usable count")
+    cell = c.day_table.cellWidget(c.days.index(yesterday), 1)
+    assert (cell.main.text(), cell.side.text()) == ("3 of 9", "33%")
     cell = c.day_table.cellWidget(c.days.index(older + 86400), 1)
     assert (cell.main.text(), cell.side.text()) == ("0 of 9", "0%")  # a settled day keeps its total
     c.close()
