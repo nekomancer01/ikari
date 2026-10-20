@@ -144,3 +144,20 @@ def test_numeric_ids_and_infinite_numbers_are_read(archive):
     c = arctic_shift.ArcticShiftClient(limiter=arctic_shift.RateLimiter(0), workers=1)
     got = {p.id: p for p in c.fetch_posts("Sub", DAY0, DAY0 + DAY, limit=10, skip={"12345"})}
     assert set(got) == {"p2"} and got["p2"].upvote_ratio == 0.0  # the saved one is recognised and skipped
+
+
+def test_stop_keeps_the_posts_a_slow_slice_already_downloaded(archive, tmp_path):
+    # A busy day downloads slowly, a page at a time. Stop stopped waiting for the slices still running and
+    # dropped everything they had, so a Download all stopped after minutes saved nothing.
+    # 8 slices of 300 posts, 3 pages each; Stop comes while the first four are on their third page
+    a = archive([post(f"p{n}", DAY0 + n * 72) for n in range(2400)])
+    a.delays["/api/posts/search"] = 1.0
+    stop = threading.Event()
+    threading.Timer(2.5, stop.set).start()
+    store = Store(tmp_path / "s.db")
+    result = collect.run(arctic_shift.ArcticShiftClient(limiter=arctic_shift.RateLimiter(0)), store,
+                         collect.FetchRequest("Sub", after=DAY0, before=DAY0 + 2 * DAY, limit=2400,
+                                              include_comments=False), should_stop=stop.is_set)
+    assert result.stopped
+    assert result.posts >= 400  # the slices running had at least their first page each
+    assert len(store.posts("Sub")) == result.posts
