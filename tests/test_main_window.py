@@ -582,14 +582,14 @@ def test_score_filter_hides_low_posts_and_their_comments_everywhere_and_is_remem
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     assert w.score_pick.currentText() == "Any score" and len(w.posts) == 5 and len(w.comments) == 4
     w.score_pick.setCurrentIndex(w.score_pick.findText("Score 10+"))
-    # p0 (score 1) and "low" go, with low's comment; a score the archive hasn't filled in yet isn't held against it.
-    assert sorted(r["id"] for r in w.posts) == ["high", "mid", "pending"]
-    assert sorted(r["id"] for r in w.comments) == ["c-high", "c-mid", "c-pending"]
-    assert w.posts_tab.model.rowCount() == 3 and w.comments_tab.model.rowCount() == 3
-    assert w._counted.count == 6  # the Overview and Timeline count what the tables show
-    assert "3\xa0posts" in w.subheading.text()
+    # p0 (score 1) and "low" go, with low's comment; a post with no score yet is left out too (with its comment).
+    assert sorted(r["id"] for r in w.posts) == ["high", "mid"]
+    assert sorted(r["id"] for r in w.comments) == ["c-high", "c-mid"]
+    assert w.posts_tab.model.rowCount() == 2 and w.comments_tab.model.rowCount() == 2
+    assert w._counted.count == 4  # the Overview and Timeline count what the tables show
+    assert "2\xa0posts" in w.subheading.text()
     out = tmp_path / "p.csv"
-    assert w.store.export_csv("Python", "comments", out, min_score=w.min_score) == 3
+    assert w.store.export_csv("Python", "comments", out, min_score=w.min_score) == 2
 
     # A running fetch's rows go through the same filter as they arrive.
     w.fetch_job.qthread = object()
@@ -602,7 +602,7 @@ def test_score_filter_hides_low_posts_and_their_comments_everywhere_and_is_remem
     w._queue_new_rows()
     w._flush_rows()
     w.fetch_job.qthread = None
-    assert sorted(r["id"] for r in w.posts_tab.all_rows) == ["high", "mid", "new-high", "pending"]
+    assert sorted(r["id"] for r in w.posts_tab.all_rows) == ["high", "mid", "new-high"]
     assert "c-new-low" not in {r["id"] for r in w.comments_tab.all_rows}
     # The finished fetch rescored "high" below the filter: it leaves every page, and so does its comment.
     w.store.save_post(Post("high", "Python", "high", "", "a", 4, 0.9, 1, ts, "https://r/high/", ""), 0.5, "positive")
@@ -613,7 +613,7 @@ def test_score_filter_hides_low_posts_and_their_comments_everywhere_and_is_remem
     w.close()
 
     again = make_window()
-    assert again.score_pick.currentText() == "Score 10+" and len(again.posts) == 3
+    assert again.score_pick.currentText() == "Score 10+" and len(again.posts) == 2
     again.score_pick.setCurrentIndex(again.score_pick.findText("Any score"))
     assert len(again.posts) == 7 and len(again.comments) == 5
 
