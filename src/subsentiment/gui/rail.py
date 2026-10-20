@@ -1,6 +1,6 @@
 """The navigation rail down the window's left edge.
 
-The rail has one button per page (Overview, Timeline, Words, Posts, Comments) and two that open a drawer
+The rail has one button per page (Overview, Timeline, Words, Posts, Comments, Coverage) and two that open a drawer
 beside it instead of a page: Fetch at the top and Saved at the bottom. Icons are drawn here, in the theme's
 colours, so they follow light and dark without image files.
 """
@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QAbstractButton, QButtonGroup, QFrame, QSizePolicy, QVBoxLayout
+from PySide6.QtWidgets import QAbstractButton, QButtonGroup, QFrame, QSizePolicy, QSpacerItem, QVBoxLayout
 
 from subsentiment.gui import theme
 from subsentiment.gui.theme import mark
 from subsentiment.gui.widgets import label
 
-PAGES = {"overview": "Overview", "timeline": "Timeline", "words": "Words", "posts": "Posts", "comments": "Comments"}
+PAGES = {"overview": "Overview", "timeline": "Timeline", "words": "Words", "posts": "Posts", "comments": "Comments",
+         "coverage": "Coverage"}
 DRAWERS = {"fetch": "Fetch", "saved": "Saved"}
 
 
@@ -31,6 +32,9 @@ class RailButton(QAbstractButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip(text)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+        policy = self.sizePolicy()
+        policy.setVerticalPolicy(QSizePolicy.Policy.Preferred)  # down to minimumSizeHint on a short window
+        self.setSizePolicy(policy)
 
     def _caption_font(self) -> QFont:
         f = QFont(self.font())
@@ -43,7 +47,9 @@ class RailButton(QAbstractButton):
         return QSize(max(60, m.horizontalAdvance(self.text()) + 10), 34 + m.height() + 6)
 
     def minimumSizeHint(self) -> QSize:
-        return self.sizeHint()
+        # On a short window it gives up the padding under its name.
+        hint = self.sizeHint()
+        return QSize(hint.width(), hint.height() - 5)
 
     def set_busy(self, busy: bool) -> None:
         self.busy = busy
@@ -106,6 +112,10 @@ class RailButton(QAbstractButton):
         elif k == "comments":
             p.drawRoundedRect(QRectF(c.x() - 8, c.y() - 7, 16, 11), 3, 3)
             p.drawLine(c + QPointF(-3, 4), c + QPointF(-5, 8))
+        elif k == "coverage":  # an arrow down into a tray
+            p.drawLine(c + QPointF(0, -8), c + QPointF(0, 2))
+            p.drawPolyline([c + QPointF(-4, -2), c + QPointF(0, 2), c + QPointF(4, -2)])
+            p.drawPolyline([c + QPointF(-8, 2), c + QPointF(-8, 7), c + QPointF(8, 7), c + QPointF(8, 2)])
         elif k == "saved":
             p.drawEllipse(QRectF(c.x() - 7, c.y() - 8, 14, 5))
             p.drawLine(c + QPointF(-7, -5.5), c + QPointF(-7, 6))
@@ -125,14 +135,18 @@ class NavRail(QFrame):
         mark(self, "glass", "true")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(6, 14, 6, 8)
-        lay.setSpacing(4)
+        lay.setSpacing(0)
         logo = label("ikari", "title")
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(logo)
-        lay.addSpacing(10)
+        # The gaps close up on a short window (1366x768 at 125%), so every button still fits.
+        gap = lambda h: lay.addSpacerItem(QSpacerItem(0, h, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Maximum))  # noqa: E731
+        gap(14)  # under the logo
         self.buttons: dict[str, RailButton] = {}
         self._pages = QButtonGroup(self)
-        for key, text in [("fetch", DRAWERS["fetch"]), *PAGES.items()]:
+        for i, (key, text) in enumerate([("fetch", DRAWERS["fetch"]), *PAGES.items()]):
+            if i:
+                gap(4)
             lay.addWidget(self._add(key, text))
         lay.addStretch(1)
         lay.addWidget(self._add("saved", DRAWERS["saved"]))

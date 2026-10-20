@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 from subsentiment import __version__, collect
 from subsentiment.analysis import Analysis
 from subsentiment.gui import days, motion, native, theme
-from subsentiment.gui.coverage import CoverageWindow
+from subsentiment.gui.coverage import CoveragePage
 from subsentiment.gui.fetch_form import FetchForm
 from subsentiment.gui.charts import NoteDialog, TimelineChart
 from subsentiment.gui.overview import CardPage, OverviewPage
@@ -30,10 +30,13 @@ from subsentiment.gui.widgets import (
 )
 from subsentiment.gui.worker import BackgroundJob, FetchWorker
 from subsentiment.reddit import normalize_subreddit, subreddit_error
-from subsentiment.store import Store
+from subsentiment.store import Store, scoring_at_least
 
 
 SCOPES = ["Posts and comments", "Posts only", "Comments only"]
+# The header's score filter: label -> the lowest post score shown (None for any). Comments follow their post.
+MIN_SCORES = {"Any score": None, "Score 1+": 1, "Score 10+": 10, "Score 50+": 50, "Score 100+": 100,
+              "Score 500+": 500, "Score 1,000+": 1000}
 DRAWER_WIDTH = 318
 NO_DATA = "Open Fetch on the left, enter a subreddit and press Fetch and analyse."
 
@@ -181,7 +184,6 @@ class MainWindow(QMainWindow):
         self._table_days: tuple[int, int] | None = None  # the whole days the tables were filtered to
         self._following = False  # the timelines are being given new days
         self._known: dict[str, set[str]] = {}  # ids already in _saved and _analysis, once a running fetch is counted in
-        self.coverage = None  # the Download coverage window, once opened
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
         # A native material (Mica/Acrylic/vibrancy) needs a translucent window from the start,
         # so a change applies on next launch.
@@ -267,8 +269,8 @@ class MainWindow(QMainWindow):
         self.mood_act.toggled.connect(self._set_mood_tint)
         view.addAction(self.mood_act)
         view.addSeparator()
-        self.coverage_act = QAction("Download coverage…", self, shortcut=QKeySequence("Ctrl+D"),
-                                    triggered=self._show_coverage)
+        self.coverage_act = QAction("Download coverage", self, shortcut=QKeySequence("Ctrl+D"),
+                                    triggered=lambda: self.show_page("coverage"))
         self.coverage_act.setToolTip("How much of each day's posts, and each post's comments, is saved")
         view.addAction(self.coverage_act)
 
@@ -342,10 +344,6 @@ class MainWindow(QMainWindow):
         QuietScrollBars(self.datasets)
         self.datasets.currentItemChanged.connect(self._on_dataset_selected)
         lay.addWidget(self.datasets, 1)
-        self.coverage_btn = QPushButton("Download coverage…")
-        self.coverage_btn.setToolTip("How much of each day's posts, and each post's comments, is saved")
-        self.coverage_btn.clicked.connect(self._show_coverage)
-        lay.addWidget(self.coverage_btn)
         self.storage_info = label("", "muted")
         self.storage_info.setWordWrap(True)
         self.storage_info.setToolTip(f"Saved on this computer, kept between sessions, in {self.store.path}")
@@ -392,6 +390,13 @@ class MainWindow(QMainWindow):
         saved = self.settings.value("ui/overview_scope", SCOPES[0], str)
         self.scope.setCurrentIndex(max(self.scope.findText(saved), 0))
         self.scope.currentTextChanged.connect(self._on_scope_changed)
+        # Which posts every page counts by score, and the comments on them. It only hides, never deletes.
+        self.score_pick = mark(ShrinkingComboBox(), "pill", True)
+        for text, value in MIN_SCORES.items():
+            self.score_pick.addItem(text, value)
+        self.score_pick.setToolTip("Count only posts scoring at least this much, and the comments on them")
+        self.score_pick.setCurrentIndex(max(self.score_pick.findText(self.settings.value("ui/min_score", "", str)), 0))
+        self.score_pick.currentIndexChanged.connect(self._on_min_score)
         self.heading.setMinimumWidth(QFontMetrics(theme.display_font(14, 600)).horizontalAdvance("r/subreddit"))
 
         # The fetch running, or what the last one did, on every page: the drawer it started from closes.
@@ -405,7 +410,13 @@ class MainWindow(QMainWindow):
         header.setHorizontalSpacing(12)
         header.setVerticalSpacing(2)
         header.addWidget(self.heading, 0, 0, Qt.AlignmentFlag.AlignVCenter)
-        header.addWidget(self.scope, 0, 1, Qt.AlignmentFlag.AlignVCenter)
+        # The scope shows on the Overview and Timeline only; a row keeps the score filter at the right edge
+        # without a hidden column's spacing.
+        controls = QHBoxLayout()
+        controls.setSpacing(12)
+        controls.addWidget(self.scope)
+        controls.addWidget(self.score_pick)
+        header.addLayout(controls, 0, 1, Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.subheading, 1, 0, 1, 2)
         header.addWidget(self.fetch_strip, 2, 0, 1, 2)
         header.setColumnStretch(0, 1)
@@ -430,8 +441,9 @@ class MainWindow(QMainWindow):
         post_col = self.comments_tab.view.horizontalHeader()
         post_col.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
         post_col.resizeSection(4, 180)
+        self.coverage = CoveragePage(self)
         self.page_widgets = {"overview": self.overview, "timeline": self.timeline_page, "words": self.words_page,
-                             "posts": self.posts_tab, "comments": self.comments_tab}
+                             "posts": self.posts_tab, "comments": self.comments_tab, "coverage": self.coverage}
         for key in PAGES:
             self.pages.addWidget(self.page_widgets[key])
         body = QVBoxLayout()
@@ -451,6 +463,7 @@ class MainWindow(QMainWindow):
         self.rail.set_page(key)
         self.pages.setCurrentWidget(self.page_widgets[key])
         self.scope.setVisible(key in ("overview", "timeline", "words"))
+        self.score_pick.setVisible(key != "coverage")  # Download coverage counts every saved post
         self.settings.setValue("ui/page", key)
         if key == "timeline":  # kept up only while it shows
             self._show_span(self.timeline_page.body)
@@ -564,14 +577,13 @@ class MainWindow(QMainWindow):
     # -- control state --------------------------------------------------------
 
     def _range_moved(self) -> None:
-        """The Download coverage window lists the sidebar's range, so it follows a change: shortly after
-        it, so holding an arrow key on a date doesn't rebuild the window (and ask for counts) per step."""
-        if getattr(self, "coverage", None) is not None and self.coverage.isVisible():
+        """The Download coverage page lists Fetch's range, so it follows a change: shortly after it, so
+        holding an arrow key on a date doesn't rebuild the page (and ask for counts) per step."""
+        if getattr(self, "coverage", None) is not None and self.coverage.isVisible():  # the form moves as it's built
             self._range_timer.start()
 
     def _refresh_coverage_range(self) -> None:
-        if self.coverage is not None and self.coverage.isVisible():
-            self.coverage.refresh_saved()
+        self.coverage.refresh_saved()
 
     def _set_busy(self, busy: bool) -> None:
         # Called after the fetch job starts (busy) or ends (idle); the update helpers read it.
@@ -583,8 +595,7 @@ class MainWindow(QMainWindow):
             motion.fade_in(self.progress)
         self.fetch_form.set_busy(busy)
         self._update_delete_enabled()  # don't delete rows the fetch thread is writing
-        if self.coverage is not None:
-            self.coverage.set_busy(busy)
+        self.coverage.set_busy(busy)
 
     def _update_delete_enabled(self) -> None:
         idle = not self.fetch_job.busy
@@ -639,9 +650,6 @@ class MainWindow(QMainWindow):
             self.fetch_job.stop()
             self._stopping = True
             self.progress_msg.setText("Stopping…")
-            if self.coverage is not None:
-                self.coverage.set_progress(0, 0, "Stopping…")
-                self.coverage.stop_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
 
     def _on_progress(self, done: int, total: int, msg: str) -> None:
@@ -651,8 +659,6 @@ class MainWindow(QMainWindow):
         if self._stopping:  # what's still finishing ("Waiting 4 s…") would read as Stop being ignored
             msg = "Stopping…"
         self.progress_msg.setText(msg)
-        if self.coverage is not None:
-            self.coverage.set_progress(done, total, msg)
 
     def _on_saved(self) -> None:
         # A row was committed: queue it for the tables right away, and refresh the sidebar list and
@@ -686,6 +692,7 @@ class MainWindow(QMainWindow):
             rows = read(name, self._read_to[kind])
             if rows:  # rows saved in the same instant as the last one read come back too; the ids catch them
                 self._read_to[kind] = rows[-1]["fetched_at"]
+                rows = scoring_at_least(rows, self.min_score)
                 self._count_new(kind, rows)
             for r in days.keep(rows, self._table_days):
                 if r["id"] not in self._queued_ids:
@@ -761,13 +768,10 @@ class MainWindow(QMainWindow):
             self._open_fetched()
         else:
             self._refresh_datasets(reload=False)
-        if self.coverage is not None:
-            self.coverage.refresh_saved()
+        self.coverage.refresh_saved()
 
     def _on_finished(self, result: collect.FetchResult) -> None:
         self.progress_msg.setText(finish_text(result, self.request))
-        if self.coverage is not None:
-            self.coverage.set_progress(0, 0, self.progress_msg.text())
         self._live.stop()
         self._flush_rows()
         if self.current and self.current.lower() == result.subreddit.lower():
@@ -782,10 +786,15 @@ class MainWindow(QMainWindow):
         """Bring what the finished fetch saved into the dataset on screen: rows it saved again (new scores)
         and any not dripped in yet. Reading back only these, not every saved row, keeps a big subreddit
         from freezing the window for seconds as the fetch ends."""
+        dropped: set[str] = set()
         for kind, read, tab in (("posts", self.store.posts_since, self.posts_tab),
                                 ("comments", self.store.comments_since, self.comments_tab)):
             rows = read(self.current, self._since)
-            saved = self._saved[kind]
+            # A post rescored below the score filter leaves, with its comments (posts come first).
+            dropped |= {r["id"] for r in rows} - {r["id"] for r in scoring_at_least(rows, self.min_score)}
+            owner = "id" if kind == "posts" else "post_id"
+            rows = [r for r in rows if r["id"] not in dropped and r[owner] not in dropped]
+            saved = self._saved[kind] = [r for r in self._saved[kind] if r["id"] not in dropped and r[owner] not in dropped]
             where = {r["id"]: i for i, r in enumerate(saved)}
             for r in rows:
                 if r["id"] in where:
@@ -797,6 +806,8 @@ class MainWindow(QMainWindow):
             tab.update_rows(days.keep(rows, self._table_days))
         self._known = {}
         self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
+        if dropped:  # the tables only add and replace rows
+            self._apply_span(reload=True)
         self._update_dataset_labels()
         self._render_overview()
 
@@ -812,8 +823,6 @@ class MainWindow(QMainWindow):
 
     def _on_fetch_ended(self) -> None:
         self._set_busy(False)
-        if self.coverage is not None:
-            self.coverage.refresh_saved()
 
     # -- datasets -------------------------------------------------------------
 
@@ -865,8 +874,8 @@ class MainWindow(QMainWindow):
             motion.crossfade(self.content)
         self.current = name or None
         with self.store.snapshot():
-            self._saved = {"posts": self.store.posts(name) if name else [],
-                           "comments": self.store.comments(name) if name else []}
+            self._saved = {"posts": scoring_at_least(self.store.posts(name) if name else [], self.min_score),
+                           "comments": scoring_at_least(self.store.comments(name) if name else [], self.min_score)}
         self._known = {}
         self._analysis = {k: Analysis(rows) for k, rows in self._saved.items()}
         self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
@@ -876,10 +885,7 @@ class MainWindow(QMainWindow):
         self._apply_span(reload=True)
         self._show_notes()
         self._update_delete_enabled()
-        self.coverage_act.setEnabled(bool(self.current))
-        self.coverage_btn.setEnabled(bool(self.current))
-        if self.coverage is not None:
-            self.coverage.set_subreddit(self.current)
+        self.coverage.set_subreddit(self.current)
 
     def _on_view_changed(self, chart: TimelineChart) -> None:
         """A timeline was zoomed, dragged or set to a range button: every page now counts its span."""
@@ -918,6 +924,20 @@ class MainWindow(QMainWindow):
         self.comments_tab.load(self.comments)
         self.word_tally.count(self.posts, self.comments)
         self._update_dataset_labels()
+
+    @property
+    def min_score(self) -> int | None:
+        return self.score_pick.currentData()
+
+    def _on_min_score(self) -> None:
+        self.settings.setValue("ui/min_score", self.score_pick.currentText())
+        if not self.current:
+            return
+        motion.crossfade(self.content)
+        self._flush_rows()
+        self._show_dataset(self.current)
+        if self.fetch_job.busy and self._showing_fetch():  # read the running fetch's rows from here on
+            self._read_to = {k: max([self._since] + [r["fetched_at"] for r in self._saved[k]]) for k in self._saved}
 
     def _on_scope_changed(self, text: str) -> None:
         self.settings.setValue("ui/overview_scope", text)
@@ -1022,7 +1042,7 @@ class MainWindow(QMainWindow):
             try:
                 chosen = None if self._table_days is None else {
                     d for d in range(*self._table_days, days.DAY)}
-                n = self.store.export_csv(self.current, kind, path, days=chosen)
+                n = self.store.export_csv(self.current, kind, path, days=chosen, min_score=self.min_score)
             except OSError as e:  # on Windows, usually the file is still open in Excel
                 QMessageBox.warning(self, "Export failed",
                                     f"Couldn't save {path}.\n\n{e.strerror or e}\n\n"
@@ -1030,6 +1050,8 @@ class MainWindow(QMainWindow):
                 return
             on = "" if chosen is None else (f" from {days.short_date(self._table_days[0], True)} to "
                                             f"{days.short_date(self._table_days[1] - days.DAY, True)}")
+            if self.min_score is not None:
+                on += f" scoring {self.min_score:,}+" if kind == "posts" else f" on posts scoring {self.min_score:,}+"
             self.statusBar().showMessage(f"Exported {n:,} {kind}{on} to {path}", 8000)
 
     def _import_database(self) -> None:
@@ -1048,22 +1070,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Imported {plural(posts, 'new post')} and {plural(comments, 'new comment')} from {path}", 8000)
         self._refresh_datasets()
-        if self.coverage is not None:
-            self.coverage.refresh_saved()
-
-    def _show_coverage(self) -> None:
-        if not self.current:
-            return
-        if self.coverage is None:
-            self.coverage = CoverageWindow(self)
-        self.coverage.set_subreddit(self.current)
-        self.coverage.set_busy(self.fetch_job.busy)
-        opening = not self.coverage.isVisible()
-        self.coverage.show()
-        if opening:
-            motion.fade_window(self.coverage)
-        self.coverage.raise_()
-        self.coverage.activateWindow()
+        self.coverage.refresh_saved()
 
     def _show_about(self) -> None:
         QMessageBox.about(self, "About ikari", (
@@ -1077,8 +1084,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.fetch_form.save()
-        if self.coverage is not None:
-            self.coverage.close()
+        self.coverage.stop_count()
         self.settings.sync()  # app.main may end the process without Qt's usual clean-up
         if self.fetch_job.busy:
             # A fetch ending after this must not touch the closed store, so nothing it sends is handled.
@@ -1100,5 +1106,4 @@ class MainWindow(QMainWindow):
     def running_threads(self) -> list[QThread]:
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
-        jobs = [self.fetch_job, self.coverage and self.coverage.count_job]
-        return [j.qthread for j in jobs if j and j.running()]
+        return [j.qthread for j in (self.fetch_job, self.coverage.count_job) if j.running()]
