@@ -24,10 +24,14 @@ ROOT = Path(__file__).resolve().parents[1]
 # name: (extra environment, keep the app's text settings)
 VARIANTS = {
     "app": ({}, True),
-    "cleartype": ({}, False),
+    "cleartype": ({"QT_QPA_PLATFORM": "windows"}, False),  # before: DirectWrite, ClearType
+    "directwrite": ({"QT_QPA_PLATFORM": "windows"}, True),  # DirectWrite with the app's grayscale request
     "freetype": ({"QT_QPA_PLATFORM": "windows:fontengine=freetype"}, True),
     "gdi": ({"QT_QPA_PLATFORM": "windows:fontengine=gdi"}, True),
+    "freetype-nohint": ({"QT_QPA_PLATFORM": "windows:fontengine=freetype", "TEXT_AA_NOHINT": "1"}, True),
+    "offscreen": ({"QT_QPA_PLATFORM": "offscreen"}, True),  # what tools/ui_matrix.py measures layouts with
 }
+SAMPLE = "Saved data 1,234 posts, 56,789 comments · 12.3 MB"
 
 
 def fringe(img, box) -> tuple[int, int]:
@@ -60,8 +64,12 @@ def child(name: str, keep: bool, out: str | None) -> dict:
     from subsentiment.gui import theme
     if not keep:
         theme.smooth_text = lambda f: f
-    app = QApplication(["text_aa_check"])
+    app = QApplication(theme.qt_args(["text_aa_check"]))
     theme.load_fonts(app)
+    if os.environ.get("TEXT_AA_NOHINT"):
+        f = app.font()
+        f.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+        app.setFont(f)
     theme.apply(app, "dark")
 
     panel = QFrame()
@@ -93,7 +101,8 @@ def child(name: str, keep: bool, out: str | None) -> dict:
                round((tl.x() + edit.width()) * dpr), round((tl.y() + edit.height()) * dpr)]
         f = app.font()
         result.update(variant=name, qt=__import__("PySide6").__version__, platform=app.platformName(),
-                      dpr=dpr, strategy=int(f.styleStrategy().value),
+                      dpr=dpr, strategy=int(f.styleStrategy().value), advance=date.fontMetrics().horizontalAdvance(SAMPLE),
+                      engine=os.environ.get("QT_QPA_PLATFORM", ""), hinting=str(f.hintingPreference()),
                       no_subpixel=bool(f.styleStrategy() & QFont.StyleStrategy.NoSubpixelAntialias))
         for kind, img in shots.items():
             img = img.convertToFormat(img.Format.Format_RGB32)
@@ -138,18 +147,18 @@ def main() -> int:
             rows.append(json.loads(line))
         except json.JSONDecodeError:
             rows.append({"variant": name, "error": (p.stderr or p.stdout)[-800:]})
-    print("| variant | platform | dpr | screen coloured/text | widget coloured/text |")
-    print("|---|---|---|---|---|")
+    print("| variant | platform | dpr | sample width | screen coloured/text | widget coloured/text |")
+    print("|---|---|---|---|---|---|")
     for r in rows:
         if "error" in r:
-            print(f"| {r['variant']} | failed | | {r['error']!r} | |")
+            print(f"| {r['variant']} | failed | | | {r['error']!r} | |")
             continue
         s, w = r["screen"], r["widget"]
-        print(f"| {r['variant']} | {r['platform']} | {r['dpr']} | {s['coloured']}/{s['text']} | "
+        print(f"| {r['variant']} | {r['platform']} | {r['dpr']} | {r['advance']} | {s['coloured']}/{s['text']} | "
               f"{w['coloured']}/{w['text']} |")
     for r in rows:
         for kind in ("screen", "widget"):
-            if kind in r:
+            if kind in r and kind == "screen" and r["variant"] != "offscreen":
                 print(f"PNG {r['variant']}-{kind} {r[kind].pop('png')}")
     app = next((r for r in rows if r.get("variant") == "app" and "screen" in r), None)
     if app is None:
