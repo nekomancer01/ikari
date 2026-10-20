@@ -130,7 +130,7 @@ class Cell(QWidget):
     def __init__(self):
         super().__init__()
         self.lay = lay = QVBoxLayout(self)
-        self._fit(open_day=False)
+        self._pad(open_day=False)
         top = QHBoxLayout()
         top.setSpacing(8)
         self.main = QLabel()
@@ -150,7 +150,7 @@ class Cell(QWidget):
         self.note.setVisible(False)
         lay.addWidget(self.note)
 
-    def _fit(self, open_day: bool) -> None:
+    def _pad(self, open_day: bool) -> None:
         # The bar keeps its room when hidden, so an open day trades the padding for its second line.
         bar = self.bar.sizePolicy() if hasattr(self, "bar") else None
         if bar is not None:
@@ -166,7 +166,7 @@ class Cell(QWidget):
         self.note.setText("Today" if is_today else "Still counting")
         self.bar.setVisible(False)  # an empty bar would read as 0%
         self.note.setVisible(True)
-        self._fit(open_day=True)
+        self._pad(open_day=True)
         self.setToolTip("Today isn't over, so there's no total yet. Download all fetches everything "
                         "posted today so far." if is_today else
                         "Arctic Shift's count for this day is still filling in, so there's no total yet. "
@@ -176,7 +176,7 @@ class Cell(QWidget):
         main, side, share, tip = share_text(saved, total, complete, noun)
         self.bar.setVisible(True)
         self.note.setVisible(False)
-        self._fit(open_day=False)
+        self._pad(open_day=False)
         self.main.setText(main)
         self.side.setText(side)
         self.bar.set(share, complete)
@@ -374,6 +374,8 @@ class CoverageWindow(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        # The footer stays as tall as with Stop showing, so the tables don't shift when a download starts.
+        self.status.setMinimumHeight(max(self.stop_btn.sizeHint().height(), self.status.fontMetrics().lineSpacing()))
         self.refresh_saved(rebuild=True)
         # Qt sizes a window's minimum without its wrapped text (the note, an empty table's hint), so at the
         # narrowest width that text would squeeze the panels. Hold the minimum to what that width needs.
@@ -470,6 +472,11 @@ class CoverageWindow(QDialog):
     def _load_posts(self) -> None:
         self._show_posts(self._selected_day())
 
+    def _empty(self, text: str) -> None:
+        # Two lines' room: in the narrowest window the hint wraps, and the squeezed panel would cut its second line.
+        self.posts_empty.setText(text)
+        self.posts_empty.setMinimumHeight(self.posts_empty.fontMetrics().lineSpacing() * 2 + 4)
+
     def _show_posts(self, day: int | None) -> None:
         t = self.post_table
         if day is None or not self.subreddit:
@@ -478,7 +485,7 @@ class CoverageWindow(QDialog):
             self._post_ids = []
             self._post_rows = []
             self.all_comments.setEnabled(False)
-            self.posts_empty.setText("Pick a day to see its posts.")
+            self._empty("Pick a day to see its posts.")
             self.posts_empty.setVisible(True)
             t.setVisible(False)
             return
@@ -520,7 +527,7 @@ class CoverageWindow(QDialog):
         self._todo_comments = todo
         self.all_comments.setText(f"Download all comments ({len(todo):,} posts)" if todo else "Download all comments")
         self.all_comments.setEnabled(not self.busy and bool(todo))
-        self.posts_empty.setText("No posts from this day are saved yet. Use Download all on the left.")
+        self._empty("No posts from this day are saved yet. Use Download all on the left.")
         self.posts_empty.setVisible(not rows)
         t.setVisible(bool(rows))
 

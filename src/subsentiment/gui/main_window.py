@@ -1025,8 +1025,8 @@ class MainWindow(QMainWindow):
                 if r["id"] not in self._queued_ids:
                     self._queued_ids.add(r["id"])
                     self._queued[kind].append(r)
-        if any(self._queued.values()):
-            self._drip.start()
+        if any(self._queued.values()) and not self._drip.isActive():  # start() would restart it, and
+            self._drip.start()  # comments saved every few ms would then hold every row back
 
     def _release_rows(self) -> None:
         """Show the next few queued rows; a long backlog is released faster so it never lags far behind."""

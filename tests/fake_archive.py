@@ -39,9 +39,10 @@ CLOCK_SLACK = 0.03
 SLOW_DOWN = (422, {"error": "Timeout. Maybe slow down a bit"})
 
 
-def make_posts(subreddit: str, now: float, days: int = 10, per_day=(6, 0, 12), seed: int = 1) -> list[dict]:
+def make_posts(subreddit: str, now: float, days: int = 10, per_day=(6, 12, 0), seed: int = 1) -> list[dict]:
     """Posts for the ``days`` UTC days up to now: per_day cycles through how many each day has (0 is an
-    empty day). Every fifth post is removed; posts under 36 hours old aren't settled yet."""
+    empty day). Yesterday always has posts, so "Past 24 hours" finds some even just after midnight UTC,
+    when today has none yet. Every fifth post is removed; posts under 36 hours old aren't settled yet."""
     rng = random.Random(seed)
     today = int(now // DAY * DAY)
     words = ["love this", "great update", "terrible bug", "so annoying", "works fine", "meh", "thanks all"]
