@@ -8,6 +8,7 @@ on:
       - "src/subsentiment/gui/**"
       - "tools/ui_matrix.py"
       - "tools/screenshot.py"
+      - "tools/text_aa_check.py"
       - ".github/workflows/ui-matrix.yml"
   workflow_dispatch:
 
@@ -50,7 +51,13 @@ jobs:
           fi
           cat ui-matrix/dark/report.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Text edges at a real 150%
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python tools/text_aa_check.py --out ui-matrix/text-edges | tee -a "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ui-matrix-${{ matrix.name }}
           path: ui-matrix
