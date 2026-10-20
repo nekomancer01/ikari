@@ -106,7 +106,8 @@ class RateLimiter:
         self._sleep = sleep
         self._wall = wall
         self._next = 0.0  # earliest time the next request may go out
-        self.on_wait: WaitFn | None = None  # told about long pauses, so the UI can say why it's idle
+        # Told about long pauses, so the UI can say why it's idle, and told (0, "") when one is over.
+        self.on_wait: WaitFn | None = None
         self._lock = threading.Condition()  # one limiter can be shared by jobs on several threads
         # With several requests in flight, "X-RateLimit-Remaining: 2" on one answer says nothing about
         # the requests already sent. So the limiter counts what's in flight, keeps the remaining budget
@@ -150,7 +151,11 @@ class RateLimiter:
                         self._sleep(STOP_POLL)  # then look again: Stop may have been pressed
                         continue
                     self._sleep(delay)
+                    if should_stop and should_stop():  # pressed during that last short wait
+                        raise Stopped
                 self._next = self._clock() + self.interval
+                if announced and self.on_wait:
+                    self.on_wait(0.0, "")  # over: the UI goes back to what the job is doing
                 flight = _Flight(should_stop)
                 self._in_flight.append(flight)
                 if self._budget is not None:

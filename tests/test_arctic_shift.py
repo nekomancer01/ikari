@@ -350,7 +350,7 @@ def test_long_waits_are_announced():
     told = []
     c.limiter.on_wait = lambda secs, why: told.append((round(secs), why))
     c.get(*SEARCH)
-    assert told == [(30, "Arctic Shift asked ikari to slow down")]
+    assert told == [(30, "Arctic Shift asked ikari to slow down"), (0, "")]  # and when the wait is over
 
 
 def test_running_out_of_requests_pauses_before_the_next_one():
@@ -772,6 +772,16 @@ def test_a_long_wait_ends_as_soon_as_stop_is_pressed():
     with pytest.raises(Stopped):
         limiter.wait(flag.is_set)
     assert time.perf_counter() - start < 1.0
+
+
+def test_stop_pressed_during_the_last_short_wait_sends_nothing():
+    # Waits under STOP_POLL weren't checked again for Stop, so a request went out after Stop was pressed
+    # (seen on Windows CI: test_stop_ends_a_fetch_and_frees_the_form found a search arrive after it).
+    flag = threading.Event()
+    limiter = RateLimiter(0.1, sleep=lambda s: flag.set())  # Stop is pressed while it sleeps
+    limiter.observe({}, limiter.wait())  # one request out and answered: the next waits 0.1 s
+    with pytest.raises(Stopped):
+        limiter.wait(flag.is_set)
 
 
 def test_each_answer_is_parsed_once():
