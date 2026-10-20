@@ -181,13 +181,13 @@ class Cell(QWidget):
         self.side.setText(side)
         self.bar.set(share, complete)
         self.setToolTip(tip if tip else (f"{main}, {side}" if side else main))
-        self._fit_side()
+        self._fit()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._fit_side()
+        self._fit()
 
-    def _fit_side(self) -> None:
+    def _fit(self) -> None:
         """In a narrow column the right-hand note ("total unknown", "40%") steps aside rather than being cut
         off; the bar and the tooltip still say it."""
         m = self.layout().contentsMargins()
@@ -377,11 +377,6 @@ class CoverageWindow(QDialog):
         # The footer stays as tall as with Stop showing, so the tables don't shift when a download starts.
         self.status.setMinimumHeight(max(self.stop_btn.sizeHint().height(), self.status.fontMetrics().lineSpacing()))
         self.refresh_saved(rebuild=True)
-        # Qt sizes a window's minimum without its wrapped text (the note, an empty table's hint), so at the
-        # narrowest width that text would squeeze the panels. Hold the minimum to what that width needs.
-        lay = self.layout()
-        lay.activate()
-        self.setMinimumHeight(lay.minimumHeightForWidth(lay.minimumSize().width()))
 
     def set_busy(self, busy: bool) -> None:
         self.busy = busy
