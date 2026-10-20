@@ -471,3 +471,20 @@ def test_a_database_from_an_older_ikari_gets_notes_and_imports_without_them(tmp_
     s.import_from(tmp_path / "old.db")  # an older file has no notes table
     s.close()
     assert Store(path).notes("python") == {0: ("X", "kept")}
+
+
+def test_score_filter_goes_by_the_post_score(tmp_path):
+    from subsentiment.store import scoring_at_least
+    s = Store(tmp_path / "s.db")
+    day = 1_700_006_400.0 // 86400 * 86400
+    s.save_post(make_post(10, ts=day + 5), 0.5, "positive")  # scores 10
+    s.save_comment(Comment("c1", "p10", "Python", "t3_p10", "b", "hi", -4, day + 86400, 0, "u"), 0.2, "positive")
+    s.commit()
+    posts, comments = s.posts("python"), s.comments("python")
+    assert posts[0]["score"] == 10 and comments[0]["post_score"] == 10
+    assert len(scoring_at_least(posts, 10)) == 1 and scoring_at_least(posts, 11) == []
+    assert len(scoring_at_least(comments, 10)) == 1  # a comment goes by its post's score, not its own -4
+    assert scoring_at_least(comments, 11) == [] and len(scoring_at_least(comments, None)) == 1
+    out = tmp_path / "c.csv"
+    assert s.export_csv("python", "comments", out, min_score=11) == 0
+    assert s.export_csv("python", "posts", out, days={int(day)}, min_score=10) == 1

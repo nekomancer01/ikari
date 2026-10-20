@@ -70,12 +70,23 @@ COMMENT_COLUMNS = ("id", "post_id", "subreddit", "parent_id", "author", "body", 
 # saved per comment, so it's stored as NULL then and rebuilt when read.
 _COMMENT_SELECT = "SELECT " + ", ".join(
     "COALESCE(c.permalink, p.permalink || c.id || '/') AS permalink" if col == "permalink" else "c." + col
-    for col in COMMENT_COLUMNS) + ", p.title AS post_title FROM comments c LEFT JOIN posts p ON p.id = c.post_id"
+    for col in COMMENT_COLUMNS) + ", p.title AS post_title, p.score AS post_score FROM comments c LEFT JOIN posts p ON p.id = c.post_id"
 SCHEMA_VERSION = 1  # 1: derivable comment permalinks not stored, posts_sub and comments_sub indexes dropped
 
 
 # Comments on image posts are hidden along with the posts (``c`` is the comments table).
 NOT_IMAGE = "c.post_id NOT IN (SELECT id FROM posts WHERE image = 1)"
+
+
+def scoring_at_least(rows, min_score: int | None) -> list:
+    """The posts scoring at least ``min_score``, or the comments on them (a comment goes by its post's score,
+    so it shows with its post); every row when None. A score Arctic Shift hasn't filled in yet (None, for
+    about 36 hours) isn't held against a row. Always a new list."""
+    rows = list(rows)
+    if min_score is None or not rows:
+        return rows
+    col = "post_score" if "post_score" in rows[0].keys() else "score"
+    return [r for r in rows if r[col] is None or r[col] >= min_score]
 
 
 def _storable(value):
@@ -444,10 +455,12 @@ class Store:
                 days.setdefault(r["d"], [0, 0])[i] = r["n"]
         return {d: (p, c) for d, (p, c) in days.items()}
 
-    def export_csv(self, subreddit: str, kind: str, path: str | Path, days: set[int] | None = None) -> int:
+    def export_csv(self, subreddit: str, kind: str, path: str | Path, days: set[int] | None = None,
+                   min_score: int | None = None) -> int:
         """Write a subreddit's posts or comments to a CSV file: only those created on ``days`` (UTC day
-        starts) when given. Returns how many rows were written."""
-        rows = self.posts(subreddit) if kind == "posts" else self.comments(subreddit)
+        starts) when given, and only posts scoring ``min_score`` or more and their comments (see
+        `scoring_at_least`). Returns how many rows were written."""
+        rows = scoring_at_least(self.posts(subreddit) if kind == "posts" else self.comments(subreddit), min_score)
         if days is not None:
             rows = [r for r in rows if r["created_utc"] is not None and int(r["created_utc"] // 86400 * 86400) in days]
         columns = POST_COLUMNS if kind == "posts" else COMMENT_COLUMNS + ("post_title",)
