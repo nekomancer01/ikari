@@ -5,6 +5,7 @@ import csv
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from subsentiment.reddit import Comment, Post
@@ -176,6 +177,15 @@ class Store:
 
     def commit(self) -> None:
         self.db.commit()
+
+    @contextmanager
+    def snapshot(self):
+        """Reads inside see the database as it was at the first one, whatever another connection saves meanwhile."""
+        self.db.execute("BEGIN")
+        try:
+            yield
+        finally:
+            self.db.commit()
 
     def subreddits(self) -> list[str]:
         rows = self.db.execute(
