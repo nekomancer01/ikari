@@ -12,8 +12,8 @@ import time
 from datetime import datetime, timezone
 
 import shiboken6
-from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QThread, Slot
-from PySide6.QtGui import QColor, QGuiApplication, QLinearGradient, QPainter
+from PySide6.QtCore import QEvent, QSize, Qt, QThread, Slot
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton,
     QTableWidget, QVBoxLayout, QWidget,
@@ -21,8 +21,7 @@ from PySide6.QtWidgets import (
 
 from subsentiment import collect
 from subsentiment.gui import theme
-from subsentiment.gui.charts import palette
-from subsentiment.gui.main_window import fit_to_screen, label, panel, plural, section
+from subsentiment.gui.widgets import ElidedLabel, ShareBar, fit_to_screen, label, panel, plural, section
 from subsentiment.gui.theme import paint_backdrop
 from subsentiment.gui.worker import CountWorker
 
@@ -94,41 +93,6 @@ def share_text(saved: int, total: int | None, complete: bool, noun: str,
     return f"{saved:,} of {total:,}", f"{100 * share:.0f}%", share, ""
 
 
-class Bar(QWidget):
-    """Thin rounded bar in the accent gradient; green once complete."""
-
-    def __init__(self):
-        super().__init__()
-        self.share: float | None = None
-        self.complete = False
-        self.setFixedHeight(6)
-
-    def set(self, share: float | None, complete: bool) -> None:
-        self.share, self.complete = share, complete
-        self.update()
-
-    def paintEvent(self, event) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
-        r = QRectF(self.rect())
-        track = QColor(*theme.tokens()["edge"][:3])
-        track.setAlpha(40)
-        p.setBrush(track)
-        p.drawRoundedRect(r, 3, 3)
-        if self.share:
-            t = theme.tokens()
-            fill = QRectF(r.x(), r.y(), max(r.height(), r.width() * self.share), r.height())
-            if self.complete:
-                p.setBrush(QColor(palette()["positive"]))
-            else:
-                g = QLinearGradient(fill.topLeft(), fill.topRight())
-                g.setColorAt(0, QColor(t["accent"]))
-                g.setColorAt(1, QColor(t["accent2"]))
-                p.setBrush(g)
-            p.drawRoundedRect(fill, 3, 3)
-
-
 class Cell(QWidget):
     """"12 of 340 ........ 4%" over a bar."""
 
@@ -144,7 +108,7 @@ class Cell(QWidget):
         top.addStretch(1)
         top.addWidget(self.side)
         lay.addLayout(top)
-        self.bar = Bar()
+        self.bar = ShareBar()
         keep = self.bar.sizePolicy()
         keep.setRetainSizeWhenHidden(True)  # rows stay the same height with or without a bar
         self.bar.setSizePolicy(keep)
@@ -201,35 +165,6 @@ class Cell(QWidget):
         room = self.width() - m.left() - m.right()
         need = self.main.sizeHint().width() + 8 + self.side.sizeHint().width()
         self.side.setVisible(bool(self.side.text()) and need <= room)
-
-
-class ElidedLabel(QLabel):
-    """One line of text that ends in "…" when it doesn't fit; the tooltip has all of it."""
-
-    def __init__(self, text: str = ""):
-        super().__init__()
-        self.setMinimumWidth(40)
-        self.set_full(text)
-
-    def set_full(self, text: str) -> None:
-        self.full = text
-        self.setToolTip(text)
-        self._elide()
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._elide()
-
-    def _elide(self) -> None:
-        margins = self.contentsMargins()
-        width = self.width() - margins.left() - margins.right()
-        super().setText(self.fontMetrics().elidedText(self.full, Qt.TextElideMode.ElideRight, max(20, width)))
-
-    def minimumSizeHint(self) -> QSize:
-        return QSize(40, super().minimumSizeHint().height())
-
-    def sizeHint(self) -> QSize:
-        return QSize(40, super().sizeHint().height())
 
 
 def small_button(text: str) -> QPushButton:
@@ -565,7 +500,7 @@ class CoverageWindow(QDialog):
             t.setCellWidget(i, 2, centred(button))
         self._built[i] = state
         total = r["num_comments"]
-        t.cellWidget(i, 0).set_full(" ".join((r["title"] or "").split()))
+        t.cellWidget(i, 0).setText(" ".join((r["title"] or "").split()))
         cell: Cell = t.cellWidget(i, 1)
         cell.set(r["saved_comments"], total, done, "comment")
         if so_far and not done:
