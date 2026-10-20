@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import heapq
 import re
+import sys
 from collections import Counter
+from itertools import chain
 
 LABELS = ("negative", "neutral", "positive")
 
@@ -115,27 +117,56 @@ class WordCounts:
     """How many posts or comments use each word, and how many of those are positive and negative, so the cloud
     can size a word by how often it comes up and colour it by which way the items using it lean.
 
-    Rows are kept by id: a fetch that rescores or edits a saved row replaces what that row counted."""
+    Rows are kept by id: a fetch that rescores or edits a saved row replaces what that row counted. ``seen``
+    ({id: (text, words)}) can be shared between counts of the same rows, so each text is split into words
+    once, not again every time another span of days is counted."""
 
-    def __init__(self, kind: str, rows=()):
+    def __init__(self, kind: str, rows=(), seen: dict | None = None):
         self.fields = _TEXT[kind]
         self.counts = {"all": Counter(), "positive": Counter(), "negative": Counter()}
-        self._rows: dict[str, tuple[str, set[str]]] = {}
+        self._rows: dict[str, tuple[str, tuple[str, ...]]] = {}
+        self.seen = {} if seen is None else seen
         self.add(rows)
 
     def add(self, rows) -> None:
-        counts = self.counts
+        counts, seen, fields, kept = self.counts, self.seen, self.fields, self._rows
+        added = {"all": [], "positive": [], "negative": []}  # counted in at the end, in one go each
         for r in rows:
-            words = words_in(" ".join(r[f] or "" for f in self.fields))
-            old = self._rows.get(r["id"])
+            text = (r[fields[0]] or "") if len(fields) == 1 else " ".join(r[f] or "" for f in fields)
+            hit = seen.get(r["id"])
+            if hit is not None and hit[0] == text:
+                words = hit[1]
+            else:
+                words = tuple(map(sys.intern, words_in(text)))  # a word's text is kept once, however many use it
+                seen[r["id"]] = (text, words)
+            old = kept.get(r["id"])
             if old is not None:
                 counts["all"].subtract(old[1])
                 if old[0] in counts:
                     counts[old[0]].subtract(old[1])
-            self._rows[r["id"]] = (r["label"], words)
-            counts["all"].update(words)
-            if r["label"] in counts:
-                counts[r["label"]].update(words)
+            label = r["label"]
+            kept[r["id"]] = (label, words)
+            added["all"].append(words)
+            if label in added:
+                added[label].append(words)
+        for key, lists in added.items():
+            counts[key].update(chain.from_iterable(lists))
+
+    def remove(self, ids) -> None:
+        """Stop counting the rows with these ids (ones never counted are skipped)."""
+        gone = {"all": [], "positive": [], "negative": []}
+        for i in ids:
+            row = self._rows.pop(i, None)
+            if row is not None:
+                gone["all"].append(row[1])
+                if row[0] in gone:
+                    gone[row[0]].append(row[1])
+        for key, lists in gone.items():
+            if lists:
+                self.counts[key].subtract(Counter(chain.from_iterable(lists)))
+
+    def ids(self):
+        return self._rows.keys()
 
     @staticmethod
     def top(*parts: WordCounts, n: int = 100) -> list[tuple[str, int, float]]:
