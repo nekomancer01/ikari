@@ -1,8 +1,9 @@
 """Runs the real app window (offscreen) against the live Arctic Shift API and reports what happened.
 
 Run from the repo root:  QT_QPA_PLATFORM=offscreen python tools/live_gui_check.py [subreddit]
-Does a normal fetch, a whole day's Download all and that day's Download all comments, into a throwaway
-database and settings folder. Prints every HTTP status the archive sent, any 4xx/5xx, warning dialogs,
+Does a normal fetch, then opens View > Download coverage, prints each day's row once the archive's counts
+are in, and clicks that window's own Download all for one day and Download all comments for it, all into a
+throwaway database and settings folder. Prints every HTTP status the archive sent, any 4xx/5xx, warning dialogs,
 how long the window spent reading fetched rows back, and which subreddits the tables showed.
 """
 from __future__ import annotations
@@ -21,8 +22,9 @@ import requests  # noqa: E402
 from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
-from subsentiment import collect  # noqa: E402
-from subsentiment.gui import main_window as mw  # noqa: E402
+from PySide6.QtWidgets import QPushButton  # noqa: E402
+
+from subsentiment.gui import coverage, main_window as mw  # noqa: E402
 
 statuses: collections.Counter = collections.Counter()
 bad: list = []
@@ -76,14 +78,36 @@ def main() -> None:
 
     w.subreddit.setText(sub)
     w.limit.setValue(50)
-    w.include_comments.setChecked(True)
-    run("Fetch, past week, 50 posts with comments", w._start_fetch)
-    day = int((time.time() - 3 * 86400) // 86400 * 86400)
-    run("Download all, one day", lambda: w.start_request(collect.FetchRequest(
-        sub, after=day, before=day + 86400, limit=10000, include_comments=False, everything=True), "day"))
-    ids = tuple(r["id"] for r in w.store.posts(sub) if day <= r["created_utc"] < day + 86400)[:40]
-    run(f"Download all comments, {len(ids)} posts", lambda: w.start_request(
-        collect.FetchRequest(sub, comment_posts=ids), "comments"))
+    w.include_comments.setChecked(False)  # comments come from the coverage window below
+    run("Fetch, past week, 50 posts", w._start_fetch)
+    w.coverage_act.trigger()
+    cov = w.coverage
+    t0 = time.time()
+    while (cov._count_thread is not None or not cov.days) and time.time() - t0 < 180:
+        app.processEvents()
+        time.sleep(0.01)
+
+    def rows():
+        for row, d in enumerate(cov.days):
+            cell = cov.day_table.cellWidget(row, 1)
+            side = cell.note.text() if cell.note.isVisible() else cell.side.text()
+            print(f"  {coverage.day_text(d)}: {cell.main.text()} | {side} | "
+                  f"archive count {cov.totals.get(sub.lower(), {}).get(d)}")
+    print(f"Coverage window: counts in after {time.time() - t0:.0f} s, error: {cov.count_error or 'none'}")
+    rows()
+    row = 3  # a settled day, three days back
+    day = cov.days[row]
+    cov.day_table.selectRow(row)
+    run(f"Coverage Download all, {coverage.day_text(day)}",
+        cov.day_table.cellWidget(row, 2).findChild(QPushButton).click)
+    cov.day_table.selectRow(row)
+    app.processEvents()
+    if cov.all_comments.isEnabled():
+        run(f"Coverage {cov.all_comments.text()}", cov.all_comments.click)
+    else:
+        print(f"Coverage {cov.all_comments.text()}: disabled, nothing to download")
+    print("Coverage after:")
+    rows()
     print(f"Saved {len(w.store.posts(sub))} posts and {len(w.store.comments(sub))} comments")
     print("HTTP statuses:", dict(statuses))
     print("4xx/5xx:", bad[:10] or "none")
