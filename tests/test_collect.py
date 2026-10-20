@@ -286,3 +286,79 @@ def test_stop_doesnt_wait_for_a_comment_tree_still_downloading(tmp_path):
                          should_stop=stop.is_set)
     assert time.perf_counter() - start < 1.5 and result.stopped
     assert s.posts("python") and result.comment_errors == 0  # what finished is kept, nothing marked failed
+
+
+D0 = int(T // 86400 * 86400)  # a UTC midnight, long past
+
+
+class DayClient(FakeClient):
+    """Posts spread over several UTC days; each fetch_posts call returns the ones in its window."""
+
+    def __init__(self, per_day=3, days=4, stop_after=None):
+        super().__init__([Post(f"d{d}p{k}", "Python", "t", "", "a", 5, 0.9, 0, D0 + d * 86400 + 3600 * (k + 1),
+                               "x", "") for d in range(days) for k in range(per_day)])
+        self.windows = []
+        self.stop_after = stop_after
+
+    def fetch_posts(self, subreddit, after, before, limit, query, top=False, skip=(), progress=None,
+                    should_stop=None, on_posts=None, exhaust=False):
+        self.windows.append((after, before, limit, exhaust))
+        if progress:
+            progress("Collecting posts")
+        got = [p for p in self.posts if after <= p.created_utc < before and p.id not in skip][:limit]
+        self.exhausted = True
+        for p in got:
+            on_posts([p])
+        return got
+
+
+def test_a_whole_range_is_downloaded_a_day_at_a_time_like_download_all(tmp_path):
+    s = store_with(tmp_path, [])
+    c = DayClient()
+    shown = []
+    result = collect.run(c, s, collect.FetchRequest("python", after=D0 + 7200, before=D0 + 4 * 86400, limit=None,
+                                                    include_comments=False),
+                         progress=lambda done, total, msg: shown.append((done, total, msg)))
+    # Newest day first, every post of each (to Download all's cap), the first day only from 02:00.
+    assert c.windows == [(D0 + d * 86400, D0 + (d + 1) * 86400, collect.MAX_DAY_POSTS, True) for d in (3, 2, 1)] \
+        + [(D0 + 7200, D0 + 86400, collect.MAX_DAY_POSTS, True)]
+    assert result.posts == 11 and len(s.posts("python")) == 11  # all but d0p0, posted at 01:00
+    # The three whole days read to their end show as complete in Download coverage; the cut one doesn't.
+    assert s.complete_keys("posts", "python") == {str(D0 + d * 86400) for d in (1, 2, 3)}
+    days = [(done, total) for done, total, msg in shown if total]
+    assert days[0] == (0, 4) and days[-1] == (4, 4) and shown[0][2].startswith("Day 1 of 4, ")
+
+
+def test_days_already_downloaded_in_full_are_not_asked_for_again(tmp_path):
+    s = store_with(tmp_path, [])
+    s.mark_complete("posts", "python", str(D0 + 86400))
+    s.commit()
+    c = DayClient()
+    collect.run(c, s, collect.FetchRequest("python", after=D0, before=D0 + 3 * 86400, limit=None,
+                                           include_comments=False))
+    assert [w[0] for w in c.windows] == [D0 + 2 * 86400, D0]
+
+
+def test_a_keyword_search_of_a_whole_range_marks_no_day_complete(tmp_path):
+    s = store_with(tmp_path, [])
+    collect.run(DayClient(), s, collect.FetchRequest("python", after=D0, before=D0 + 2 * 86400, limit=None,
+                                                     query="title", include_comments=False))
+    assert s.complete_keys("posts", "python") == set()
+
+
+def test_stopping_a_whole_range_keeps_what_was_saved_and_asks_for_no_more_days(tmp_path):
+    s = store_with(tmp_path, [])
+    c = DayClient()
+    stop = threading.Event()
+    on_posts_saved = []
+
+    def saved():
+        on_posts_saved.append(1)
+        if len(on_posts_saved) == 2:  # Stop pressed partway through the newest day
+            stop.set()
+    result = collect.run(c, s, collect.FetchRequest("python", after=D0, before=D0 + 4 * 86400, limit=None),
+                         should_stop=stop.is_set, saved=saved)
+    assert len(c.windows) == 1 and result.stopped
+    assert len(s.posts("python")) == 3  # the newest day's posts, all saved before the fetch wound down
+    assert s.complete_keys("posts", "python") == set()  # stopped, so not known to be complete
+    assert not any(call[0] == "comments" for call in c.calls)

@@ -85,9 +85,8 @@ def main() -> None:
               f"tables show {sorted(subs)}; {w.progress_msg.text()}")
 
     w.subreddit.setText(sub)
-    w.limit.setValue(50)
     w.include_comments.setChecked(False)  # comments come from the coverage window below
-    run("Fetch, past week, 50 posts", w._start_fetch)
+    run("Fetch, past week, every post", w._start_fetch)
     w.coverage_act.trigger()
     cov = w.coverage
     t0 = time.time()

@@ -1,10 +1,11 @@
 """One fetch job: pull posts (and optionally comments), score them, store them."""
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Collection
 
 import requests
 
@@ -14,6 +15,8 @@ from subsentiment.reddit import FetchError, Post, normalize_subreddit
 from subsentiment.store import Store
 
 GIVE_UP_AFTER = 5  # consecutive posts whose comments couldn't be fetched before the rest are skipped
+DAY = 86400
+MAX_DAY_POSTS = 10000  # cap on one UTC day when downloading everything (busy subreddits post ~4,500 a day)
 
 
 @dataclass
@@ -21,7 +24,9 @@ class FetchRequest:
     subreddit: str
     after: float | None = None  # epoch seconds, inclusive
     before: float | None = None  # epoch seconds, exclusive
-    limit: int = 100
+    # How many posts to pick; None means every post in the range, downloaded one UTC day at a time like
+    # Download coverage's "Download all", so each past day read to its end is recorded as complete.
+    limit: int | None = 100
     query: str = ""
     include_comments: bool = True
     comments_per_post: int = 50
@@ -90,15 +95,44 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
                 streamed.add(p.id)
                 saved()
 
-    picked = client.fetch_posts(name, req.after, req.before, req.limit, req.query, top=req.top,
-                                skip=() if req.top else stored.keys(),
-                                progress=note, should_stop=should_stop, on_posts=save_streamed,
-                                exhaust=req.everything)
-    # Taken, not read and cleared: after Stop, slice threads still running may be adding to it.
-    take = getattr(client, "take_removed", None)
-    removed = take() if take else {}
-    if removed:  # the archive's daily counts include these, so Download coverage counts them as checked
-        store.save_removed(name, removed)
+    def read(after, before, limit: int, everything: bool, say, whole_day: bool = True,
+             skip: Collection[str] = stored.keys()) -> list[Post]:
+        got = client.fetch_posts(name, after, before, limit, req.query, top=req.top,
+                                 skip=() if req.top else skip,
+                                 progress=say, should_stop=should_stop, on_posts=save_streamed,
+                                 exhaust=everything)
+        # Taken, not read and cleared: after Stop, slice threads still running may be adding to it.
+        take = getattr(client, "take_removed", None)
+        removed = take() if take else {}
+        if removed:  # the archive's daily counts include these, so Download coverage counts them as checked
+            store.save_removed(name, removed)
+        # Complete only when every part of the day was read to its end: a fetch that stopped at the limit, or
+        # was stopped, may have missed posts. A day that isn't over yet can still get posts, so it never is,
+        # and a keyword search only reads the posts that match.
+        if (everything and whole_day and after is not None and before is not None and before <= time.time()
+                and not req.query and not should_stop() and getattr(client, "exhausted", False)):
+            store.mark_complete("posts", name, str(int(after)))
+        return got
+
+    if req.limit is None:
+        picked = []
+        days = _days(name, store, req.after, req.before)
+        for k, (lo, hi) in enumerate(days):
+            if should_stop():
+                break
+            whole = hi - lo == DAY and lo % DAY == 0
+            when = time.strftime("%a %d %b", time.gmtime(lo))
+
+            def say(_msg, k=k, when=when):
+                # Short, as the window shows one line: the bar counts days, this says which and how many.
+                progress(k, len(days), f"Day {k + 1} of {len(days)}, {when}: {len(streamed):,} new posts")
+            say("")
+            saved_that_day = [pid for pid, r in stored.items() if lo <= (r["created_utc"] or 0) < hi]
+            picked += read(lo, hi, MAX_DAY_POSTS, True, say, whole_day=whole, skip=saved_that_day)
+        if days:
+            progress(len(days), len(days), f"{len(streamed):,} new posts from r/{name}")
+    else:
+        picked = read(req.after, req.before, req.limit, req.everything, note)
     new = [p for p in picked if p.id not in stored]
     for p in new:
         if p.id not in streamed:
@@ -111,11 +145,6 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     for p in settled:
         store.save_post(p, *sentiment.score(p.text))
     updated += settled
-    # Complete only when every part of the day was read to its end: a fetch that stopped at the limit, or
-    # was stopped, may have missed posts. A day that isn't over yet can still get posts, so it never is.
-    if (req.everything and req.after is not None and req.before is not None and req.before <= time.time()
-            and not should_stop() and getattr(client, "exhausted", False)):
-        store.mark_complete("posts", name, str(int(req.after)))
     store.commit()
     saved()
     first = (new or updated or picked or [None])[0]
@@ -241,6 +270,23 @@ def _each_thread(posts: list[Post], get: Callable, save: Callable, what: str, st
             continue
         save(p, got)
     return errors, tried, gave_up.is_set()
+
+
+def days_in(after: float, before: float) -> list[int]:
+    """UTC day starts overlapping [after, before), newest first."""
+    first = int(after // DAY * DAY)
+    last = int(math.ceil(before / DAY) * DAY) - DAY
+    return list(range(last, first - 1, -DAY))
+
+
+def _days(name: str, store: Store, after: float | None, before: float | None) -> list[tuple[float, float]]:
+    """[after, before) as UTC days, newest first, each clipped to the range; past days already downloaded
+    in full are left out, as they hold nothing new."""
+    before = time.time() if before is None else before
+    after = before - 7 * DAY if after is None else after
+    done = store.complete_keys("posts", name)
+    return [(max(day, after), min(day + DAY, before)) for day in days_in(after, before)
+            if str(day) not in done and min(day + DAY, before) > max(day, after)]
 
 
 def _comments_missing(r) -> bool:
