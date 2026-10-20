@@ -197,7 +197,7 @@ def test_switching_theme_recolours_without_reading_the_data_again(window, monkey
 
 
 def test_a_running_fetch_counts_its_rows_into_the_day_picker_without_recounting_every_day(window, monkeypatch):
-    window.thread = object()  # a fetch is "running" on the subreddit shown
+    window.fetch_job.qthread = object()  # a fetch is "running" on the subreddit shown
     window.request = mw.collect.FetchRequest("Big")
     window._since = time.time() - 1
     window._read_to = {"posts": window._since, "comments": window._since}
@@ -215,7 +215,7 @@ def test_a_running_fetch_counts_its_rows_into_the_day_picker_without_recounting_
         assert window._day_counts == window.store.day_counts("Big")
         assert window._day_counts[new_day] == (0, 1)
     finally:
-        window.thread = None
+        window.fetch_job.qthread = None
         writer.close()
 
 
