@@ -644,6 +644,7 @@ def look_around(e):
     w.mood_act.setChecked(True)
     doing[0] = "theme dark"
     w._set_theme("dark")
+    pump(0.5)  # a person doesn't restore the window in the same instant
     doing[0] = "restore"
     w.showNormal()
     pump(0.5)
