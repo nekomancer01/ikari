@@ -52,8 +52,9 @@ def test_a_burst_of_posts_in_one_second_doesnt_end_the_day_early(archive):
 
 
 def test_a_post_made_at_midnight_is_counted_and_can_be_a_top_post(archive):
-    # The archive's `after` is exclusive (checked live): asking for after=<midnight> leaves out a post
-    # made at 00:00:00, so the day's count was one short and top mode never saw it.
+    # The search's `after` is exclusive (checked live): asking it for after=<midnight> leaves out a post
+    # made at 00:00:00, so top mode never saw it. The day counts must still ask from midnight itself, or
+    # the archive's buckets come back empty.
     archive([post("midnight", DAY0, score=999), post("noon", DAY0 + 43200, score=3),
              post("evening", DAY0 + 70000, score=2)])
     c = arctic_shift.ArcticShiftClient(limiter=arctic_shift.RateLimiter(0), workers=1)
