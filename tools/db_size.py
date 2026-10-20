@@ -147,17 +147,30 @@ def options(path: Path) -> None:
 
 
 def migrate(path: Path) -> None:
-    from subsentiment.store import POST_COLUMNS, Store
+    from subsentiment.store import COMMENT_COLUMNS, POST_COLUMNS, Store, _unpack
 
     def contents(p: Path) -> dict:
+        """Every row as an older ikari stored it: packed text filled back in, comment permalinks in full."""
         db = sqlite3.connect(p)
-        out = {t: sorted(db.execute(f"SELECT * FROM {t}"), key=repr)
+        db.row_factory = sqlite3.Row
+        out = {t: sorted(map(tuple, db.execute(f"SELECT * FROM {t}")), key=repr)
                for t in ("comment_fetches", "complete", "removed_posts")}
-        out["posts"] = sorted(db.execute(f"SELECT {', '.join(POST_COLUMNS)} FROM posts"), key=repr)
-        out["comments"] = sorted(db.execute(
-            "SELECT c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score, c.created_utc, c.depth, "
-            "COALESCE(c.permalink, p.permalink || c.id || '/'), c.sentiment, c.label, c.fetched_at "
-            "FROM comments c LEFT JOIN posts p ON p.id = c.post_id"), key=repr)
+        packs = {}
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'packs'").fetchone():
+            for kind, blob in db.execute("SELECT kind, data FROM packs"):
+                data = _unpack(blob)
+                for i, values in data["rows"].items():
+                    packs[kind, i] = dict(zip(data["columns"], values))
+        for t, cols in (("posts", POST_COLUMNS), ("comments", COMMENT_COLUMNS)):
+            sql = f"SELECT {', '.join(cols)} FROM {t}" if t == "posts" else (
+                "SELECT c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score, c.created_utc, "
+                "c.depth, COALESCE(c.permalink, p.permalink || c.id || '/') AS permalink, c.sentiment, c.label, "
+                "c.fetched_at FROM comments c LEFT JOIN posts p ON p.id = c.post_id")
+            rows = [{**dict(r), **packs.get((t, r["id"]), {})} for r in db.execute(sql)]
+            for r in rows if t == "comments" else ():  # a packed post's permalink is in its pack
+                if r["permalink"] is None and ("posts", r["post_id"]) in packs:
+                    r["permalink"] = packs["posts", r["post_id"]]["permalink"] + r["id"] + "/"
+            out[t] = sorted((tuple(r[c] for c in cols) for r in rows), key=repr)
         db.close()
         return out
 

@@ -233,14 +233,28 @@ OLD_DB = Path(__file__).parent / "data" / "store-53829f7.db"  # saved by main at
 
 
 def _contents(path):
-    """Every row of every table as an older ikari reads it, comments with their full permalinks."""
+    """Every row of every table as an older ikari reads it, comments with their full permalinks and packed
+    text filled back in from its day's pack."""
     db = sqlite3.connect(path)
-    out = {t: sorted(db.execute(f"SELECT * FROM {t}")) for t in ("comment_fetches", "complete", "removed_posts")}
-    out["posts"] = sorted(db.execute(f"SELECT {', '.join(store.POST_COLUMNS)} FROM posts"))
-    out["comments"] = sorted(db.execute(
-        "SELECT c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score, c.created_utc, c.depth, "
-        "COALESCE(c.permalink, p.permalink || c.id || '/'), c.sentiment, c.label, c.fetched_at "
-        "FROM comments c LEFT JOIN posts p ON p.id = c.post_id"))
+    db.row_factory = sqlite3.Row
+    out = {t: sorted(map(tuple, db.execute(f"SELECT * FROM {t}"))) for t in ("comment_fetches", "complete", "removed_posts")}
+    packs = {}
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'packs'").fetchone():
+        for r in db.execute("SELECT kind, data FROM packs"):
+            data = store._unpack(r["data"])
+            for i, values in data["rows"].items():
+                packs[r["kind"], i] = dict(zip(data["columns"], values))
+    for t, cols in (("posts", store.POST_COLUMNS), ("comments", store.COMMENT_COLUMNS)):
+        sql = f"SELECT {', '.join(cols)} FROM {t}" if t == "posts" else (
+            "SELECT c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score, c.created_utc, c.depth, "
+            "COALESCE(c.permalink, p.permalink || c.id || '/') AS permalink, c.sentiment, c.label, c.fetched_at "
+            "FROM comments c LEFT JOIN posts p ON p.id = c.post_id")
+        rows = [{**dict(r), **packs.get((t, r["id"]), {})} for r in db.execute(sql)]
+        if t == "comments":  # a packed post's permalink is in its pack
+            for r in rows:
+                if r["permalink"] is None and ("posts", r["post_id"]) in packs:
+                    r["permalink"] = packs["posts", r["post_id"]]["permalink"] + r["id"] + "/"
+        out[t] = sorted(tuple(r[c] for c in cols) for r in rows)
     db.close()
     return out
 
@@ -257,7 +271,80 @@ def test_a_database_from_an_older_ikari_is_shrunk_once_and_reads_back_the_same(t
     s.close()
     assert _contents(path) == before
     assert list(tmp_path.iterdir()) == [path]  # its backup is gone once it worked
-    assert path.stat().st_size < OLD_DB.stat().st_size
+    db = sqlite3.connect(path)
+    assert db.execute("SELECT COUNT(*) FROM posts WHERE packed = 0").fetchone()[0] == 0  # all from 2023: settled
+    assert db.execute("SELECT COUNT(*) FROM comments WHERE body IS NOT NULL").fetchone()[0] == 0
+    db.close()
+
+
+WORDS = ("the game update finally fixed my save file and honestly I love the new music but the boss fight on "
+         "chapter four is way too hard, anyone else think the devs should nerf it a little before the next patch").split()
+
+
+def _chatter(rng, n):
+    return " ".join(rng.choice(WORDS) for _ in range(n))
+
+
+def test_settled_days_are_packed_smaller_and_read_back_the_same(tmp_path):
+    import random
+    rng = random.Random(4)
+    s = Store(tmp_path / "x.db")
+    day0 = 1_700_000_000 // 86400 * 86400
+    for i in range(300):
+        created = day0 + (i % 5) * 86400 + i
+        link = f"https://www.reddit.com/r/Deltarune/comments/p{i}/{_chatter(rng, 4).replace(' ', '_')}/"
+        s.save_post(Post(f"p{i}", "Deltarune", _chatter(rng, 8), _chatter(rng, rng.randint(0, 120)), f"user{rng.randint(1, 900)}",
+                         5, 0.9, 10, created, link, link), 0.1, "positive")
+        for j in range(10):
+            s.save_comment(Comment(f"c{i}_{j}", f"p{i}", "Deltarune", f"t3_p{i}", f"user{rng.randint(1, 900)}",
+                                   _chatter(rng, rng.randint(3, 40)), 1, created + 60 * j, 0, link + f"c{i}_{j}/"), 0.0, "neutral")
+    s.commit()
+    s._compact()
+    before_rows = (s.posts("deltarune"), s.comments("deltarune"), s.posts_by_ids(["p7", "p8"]),
+                   s.posts_between("deltarune", day0, day0 + 86400), s.comment_coverage("deltarune", day0, day0 + 86400))
+    plain = s.size_bytes()
+    assert s.pack_settled() == 10  # five days of posts and five of comments
+    assert s.pack_settled() == 0  # nothing left to do
+    s._compact()
+    assert s.size_bytes() < plain * 0.7  # the text is packed; ids, scores and indexes stay as rows
+    strip = lambda rows: [{k: v for k, v in r.items() if k != "packed"} for r in rows]
+    after = (s.posts("deltarune"), s.comments("deltarune"), s.posts_by_ids(["p7", "p8"]),
+             s.posts_between("deltarune", day0, day0 + 86400), s.comment_coverage("deltarune", day0, day0 + 86400))
+    for b, a in zip(before_rows, after):
+        assert strip(a) == strip(b)
+
+
+def test_a_row_saved_again_after_its_day_was_packed_reads_its_new_text_and_is_packed_again(tmp_path):
+    s = Store(tmp_path / "x.db")
+    post = Post("p1", "Python", "old title", "old text", "a", 1, 0.9, 2, 1_700_000_000, POST_LINK, "")
+    s.save_post(post, 0.0, "neutral")
+    s.save_comment(Comment("c1", "p1", "Python", "t3_p1", "b", "hi", 1, 1_700_000_100, 0, POST_LINK + "c1/"), 0.0, "neutral")
+    s.commit()
+    assert s.pack_settled() == 2
+    assert s.comments("python")[0]["post_title"] == "old title"  # the post's title comes from its pack too
+    post.title, post.selftext = "new title", "new text"
+    s.save_post(post, 0.2, "positive")  # a score re-check saves it again
+    s.save_comment(Comment("c2", "p1", "Python", "t3_p1", "b", "late reply", 1, 1_700_000_200, 0, POST_LINK + "c2/"), 0.0, "neutral")
+    s.commit()
+    assert [(r["title"], r["selftext"]) for r in s.posts("python")] == [("new title", "new text")]
+    assert {r["id"]: r["body"] for r in s.comments("python")} == {"c1": "hi", "c2": "late reply"}
+    assert s.pack_settled() == 2  # both days again, merged with what was packed
+    assert s.db.execute("SELECT COUNT(*) FROM packs").fetchone()[0] == 2
+    assert [(r["title"], r["selftext"]) for r in s.posts("python")] == [("new title", "new text")]
+    assert {r["id"]: (r["body"], r["post_title"]) for r in s.comments("python")} == {
+        "c1": ("hi", "new title"), "c2": ("late reply", "new title")}
+
+
+def test_recent_days_stay_unpacked_and_deleting_a_subreddit_removes_its_packs(tmp_path):
+    import time as clock
+    s = Store(tmp_path / "x.db")
+    s.save_post(Post("old", "Python", "t", "", "a", 1, 0.9, 2, 1_700_000_000, POST_LINK, ""), 0.0, "neutral")
+    s.save_post(Post("new", "Python", "t", "", "a", 1, 0.9, 2, clock.time() - 3600, POST_LINK, ""), 0.0, "neutral")
+    s.commit()
+    assert s.pack_settled() == 1
+    assert dict(s.db.execute("SELECT id, packed FROM posts")) == {"old": 1, "new": 0}
+    s.delete_subreddit("python")
+    assert s.db.execute("SELECT COUNT(*) FROM packs").fetchone()[0] == 0
 
 
 def test_a_migration_that_cant_finish_leaves_the_database_as_it_was_and_runs_at_the_next_start(tmp_path, monkeypatch):

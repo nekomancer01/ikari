@@ -1142,11 +1142,21 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
 
 def test_data_saved_by_an_older_ikari_opens_shrunk_and_still_links_each_comment(env, monkeypatch):
     shutil.copy(Path(__file__).parent / "data" / "store-53829f7.db", env.db)
-    before = os.path.getsize(env.db)
+    # Its text is packed into compressed day packs. The file is a few pages, one per table, so its size
+    # can't show that (the packs table adds a page); the bytes of text stored can.
+    text = ("SELECT (SELECT SUM(LENGTH(CAST(title || selftext || author || IFNULL(permalink, '') || IFNULL(url, '')"
+            " AS BLOB))) FROM posts) + (SELECT SUM(LENGTH(CAST(IFNULL(parent_id, '') || author || body AS BLOB)))"
+            " FROM comments)")
+    db = sqlite3.connect(env.db)
+    before = db.execute(text).fetchone()[0]
+    db.close()
     opened = []
     monkeypatch.setattr(tables.QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
     w = env.window()
-    assert os.path.getsize(env.db) < before
+    db = sqlite3.connect(env.db)
+    assert db.execute("SELECT COUNT(*) FROM posts WHERE title IS NOT NULL").fetchone()[0] == 0
+    assert db.execute("SELECT SUM(LENGTH(data)) FROM packs").fetchone()[0] < before * 0.6
+    db.close()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     w.show_page("comments")
     page = w.comments_tab
@@ -1190,3 +1200,30 @@ def test_a_zoomed_timeline_keeps_up_with_a_fetch(env):
     assert w.overview.tiles["count"].value.text() == f"{len(week):,}"  # the tiles count the week in view
     pump(400)  # the tables' settling delay
     assert len(w.posts) == w.posts_tab.model.rowCount() == len(week)
+
+
+def test_a_fetchs_settled_days_are_packed_and_still_show_what_was_fetched(env, monkeypatch):
+    opened = []
+    monkeypatch.setattr(tables.QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
+    w = env.window()
+    fetch(w, comments=True)
+    w.close()
+    s = env.store()
+    packed = dict(s.db.execute("SELECT packed, COUNT(*) FROM posts GROUP BY packed"))
+    assert packed.get(1) and packed.get(0)  # days older than two are packed, the last two are left plain
+    assert s.db.execute("SELECT COUNT(*) FROM comments WHERE packed = 1 AND body IS NULL").fetchone()[0]
+    archive = {p["id"]: p for p in env.archive.posts}
+
+    w = env.window()  # a restart reads the packed days back
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
+    w.show_page("posts")
+    saved = lambda p: (p["title"], p["selftext"].replace("[removed]", ""), p["author"])  # noqa: E731
+    assert w.posts and all(saved(r) == saved(archive[r["id"]]) for r in w.posts)
+    w.show_page("comments")
+    page = w.comments_tab
+    assert page.model.rowCount() == len(s.comments("python")) > 0
+    assert {r["body"] for r in s.comments("python")} == {"nice", "awful", "ok"}
+    for i in range(page.model.rowCount()):
+        page.view.doubleClicked.emit(page.model.index(i, 0))
+    assert sorted(opened) == sorted("https://www.reddit.com" + archive[r["post_id"]]["permalink"] + r["id"] + "/"
+                                    for r in s.comments("python"))
