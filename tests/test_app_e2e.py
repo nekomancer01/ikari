@@ -933,9 +933,9 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
     # Each day's posts come at once, more than the tables show in a second; then a long wait on comments.
     env.archive.posts += make_posts("Burst", NOW, days=3, per_day=(80,), seed=4)
     env.archive.delays[TREE] = 6.0
-    w.subreddit.setText("Burst")
-    w.include_comments.setChecked(True)
-    w.range.setCurrentIndex(w.range.findData("week"))
+    w.fetch_form.subreddit.setText("Burst")
+    w.fetch_form.include_comments.setChecked(True)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     want = in_range(env, w, "Burst")
     end = time.monotonic() + 20
