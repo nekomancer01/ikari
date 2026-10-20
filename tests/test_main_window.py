@@ -141,6 +141,9 @@ def test_finish_text_says_what_the_fetch_did():
                     "3 top posts were already saved. Comments couldn't be fetched for 2 posts; "
                     "fetch again later to fill them in.")
     assert mw.finish_text(mw.collect.FetchResult("Python", 0, 0, False), req).startswith("No new posts found")
+    gap = mw.collect.FetchResult("Python", 40, 0, False, timed_out=True)
+    assert "timed out on part of the range" in mw.finish_text(gap, req)
+    assert "timed out" in mw.finish_text(mw.collect.FetchResult("Python", 0, 0, False, timed_out=True), req)
 
 
 def test_window_fits_a_150_percent_screen():

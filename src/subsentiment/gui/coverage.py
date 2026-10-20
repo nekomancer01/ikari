@@ -224,6 +224,7 @@ class CoverageWindow(QDialog):
         self._post_ids: list[str] = []
         self._built: dict[int, tuple] = {}  # post rows with widgets, and what they last showed
         self._comments_done: set[str] = set()
+        self._comments_so_far: set[str] = set()
         self._day_rows: list[int] = []
 
         root = QVBoxLayout(self)
@@ -438,6 +439,7 @@ class CoverageWindow(QDialog):
         store = self.window_.store
         rows = store.comment_coverage(self.subreddit, day, day + DAY)
         complete = store.complete_keys("comments", self.subreddit)
+        so_far = store.complete_keys("comments_so_far", self.subreddit)
         self.posts_title.setText(f"POSTS ON {day_text(day).upper()} · {len(rows):,}")
         ids = [r["id"] for r in rows]
         if ids != self._post_ids:
@@ -449,11 +451,14 @@ class CoverageWindow(QDialog):
             self._post_ids, self._built = ids, {}
             t.verticalScrollBar().setValue(keep)
         self._post_rows = rows
-        self._comments_done = complete
+        self._comments_done, self._comments_so_far = complete, so_far
+        # Not offered again: threads saved whole, or saved whole before the archive counted them (until it
+        # has, there's nothing to say more came; once it has, a count above what's saved brings them back).
         todo = []
         for r in rows:
             total = r["num_comments"]
-            if total != 0 and not (r["id"] in complete or (bool(total) and r["saved_comments"] >= total)):
+            if total != 0 and not (r["id"] in complete or (total is None and r["id"] in so_far)
+                                   or (bool(total) and r["saved_comments"] >= total)):
                 todo.append(r["id"])
         self._fill_visible()
         self._todo_comments = todo
@@ -481,7 +486,8 @@ class CoverageWindow(QDialog):
     def _fill_post_row(self, i: int) -> None:
         t, r = self.post_table, self._post_rows[i]
         done = r["id"] in self._comments_done
-        state = (r["title"], r["saved_comments"], r["num_comments"], done, self.busy)
+        so_far = r["num_comments"] is None and r["id"] in self._comments_so_far
+        state = (r["title"], r["saved_comments"], r["num_comments"], done, so_far, self.busy)
         if self._built.get(i) == state:
             return
         if i not in self._built:
@@ -497,11 +503,17 @@ class CoverageWindow(QDialog):
         t.cellWidget(i, 0).setText(" ".join((r["title"] or "").split()))
         cell: Cell = t.cellWidget(i, 1)
         cell.set(r["saved_comments"], total, done, "comment")
-        if total is None and not done:
+        if so_far and not done:
+            cell.side.setText("all so far")
+            cell.bar.set(1.0, False)  # full, but not the green of a thread that can't grow any more
+            cell.setToolTip("Every comment the archive had on this post when it was downloaded is saved. Arctic "
+                            "Shift counts a post's comments when it re-checks the post, usually about 36 hours "
+                            "after posting; Check again fetches any that came since.")
+        elif total is None and not done:
             cell.side.setText("not counted yet")
             cell.setToolTip("Arctic Shift counts a post's comments when it re-checks the post, usually "
                             "about 36 hours after posting. Downloading still fetches what's there now.")
-        full = done or (bool(total) and r["saved_comments"] >= total)
+        full = done or so_far or (bool(total) and r["saved_comments"] >= total)
         button: QPushButton = t.cellWidget(i, 2).findChild(QPushButton)
         button.setText("Check again" if full else "Download all")
         button.setEnabled(not self.busy and (total != 0 or done))
