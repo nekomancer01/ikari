@@ -216,7 +216,8 @@ Things to know about the archive:
   of 500. It's off by default because it adds requests to every fetch.
 - **Requests are rate limited and shared.** Every request in a fetch (posts, score updates and
   comments) goes through one limiter, at most about two and a half a second (the archive's docs say "a few
-  requests per second is fine"). When the archive says to slow down
+  requests per second is fine"). The archive takes a second or two to answer each one, so up to four
+  are in flight at once, for different days or different posts. When the archive says to slow down
   (HTTP 429) ikari waits as long as it asks and spaces later requests further apart; it also backs
   off on server and network errors. When a query times out ("Timeout. Maybe slow down a bit"), it
   waits, asks for a smaller page, then searches a narrower slice of time. The status line says when
@@ -224,7 +225,7 @@ Things to know about the archive:
 - **Comments take one request per post.** ikari asks for each post's whole comment tree at once and
   keeps the highest-scored. If a post's comments can't be fetched, it moves on to the next; after
   five failures in a row it stops asking, and the next fetch of the range picks up the posts that
-  are still missing comments. 100 posts with comments take about a minute.
+  are still missing comments.
 - **It's a volunteer service** with no uptime guarantee. Items that were removed or deleted on Reddit
   are skipped.
 
@@ -257,8 +258,13 @@ Manager, macOS Keychain or Secret Service) under "Subreddit Sentiment", and you 
 ## Development
 
 ```bash
-.venv/bin/pytest
+python tools/check.py                # the whole suite, exactly as the required PR check runs it
+git config core.hooksPath .githooks  # optional: run it before every git push
 ```
+
+`tools/check.py` first stops if the branch is behind `origin/main` (merge it in, then run it again),
+since `main` only takes branches that are up to date. Extra arguments go to pytest
+(`python tools/check.py tests/test_store.py -x`).
 
 Layout:
 

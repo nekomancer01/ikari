@@ -264,6 +264,24 @@ def test_switching_subreddit_mid_fetch_keeps_each_table_to_its_own_rows(env):
     wait_idle(w)
 
 
+def test_rows_keep_fading_in_while_comments_are_saved_quickly(env):
+    # Each save used to restart the fade-in timer, so while comments were saved faster than it ticks,
+    # no queued post appeared until the fetch ended.
+    w = env.window()
+    fetch(w, comments=False, limit=12)
+    n = len(w.posts)
+    w.posts_tab.load([])
+    w.request, w.thread = mw.collect.FetchRequest("python"), object()  # as if python were being fetched
+    w._read_to = {"posts": 0.0, "comments": 0.0}
+    end = time.monotonic() + 1.5
+    while w.posts_tab.model.rowCount() < n and time.monotonic() < end:
+        w._on_saved()  # a comment saved every 10 ms
+        pump(10)
+    w._live.stop()
+    w.thread = None
+    assert w.posts_tab.model.rowCount() == n
+
+
 def test_a_big_download_reads_each_new_row_back_about_once(env, monkeypatch):
     # Every saved row used to re-read all of the fetch's rows so far, which froze the window on a day's
     # Download all (thousands of posts and comments).

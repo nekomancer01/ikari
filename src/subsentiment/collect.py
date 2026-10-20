@@ -1,6 +1,7 @@
 """One fetch job: pull posts (and optionally comments), score them, store them."""
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -8,7 +9,7 @@ from typing import Callable
 import requests
 
 from subsentiment import sentiment
-from subsentiment.arctic_shift import ArcticShiftClient
+from subsentiment.arctic_shift import ArcticShiftClient, in_parallel
 from subsentiment.reddit import FetchError, Post, normalize_subreddit
 from subsentiment.store import Store
 
@@ -113,32 +114,53 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
                                 if pid not in refreshed and (_comments_missing(r)
                                                              or (pid in repicked and _never_asked(r)))]
         todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up
-        failed_in_row = 0
-        for i, p in enumerate(todo, 1):
-            if should_stop():
-                break
-            progress(i - 1, len(todo), f"Comments for post {i}/{len(todo)}: {p.title[:60]}")
+        done = 0
+        gave_up = threading.Event()
+        streak = [0]  # failures in a row, counted as they happen so no new requests start after the limit
+        lock = threading.Lock()
+
+        def fetch(p: Post):
+            if should_stop() or gave_up.is_set():
+                return None  # not tried
             try:
                 comments = client.fetch_comments(p, req.comments_per_post)
             except (FetchError, requests.RequestException):
+                with lock:
+                    streak[0] += 1
+                    if streak[0] >= GIVE_UP_AFTER:  # the archive is struggling; don't hammer it
+                        gave_up.set()
+                raise
+            with lock:
+                streak[0] = 0
+            return comments
+
+        # A few posts' comments are fetched at once; each finished one is saved here, on this thread.
+        tried: set[str] = set()
+        for p, comments, error in in_parallel(fetch, todo, getattr(client, "workers", 1)):
+            if comments is None and error is None:
+                continue
+            tried.add(p.id)
+            done += 1
+            progress(done, len(todo), f"Comments for post {done}/{len(todo)}: {p.title[:60]}")
+            if error is not None:
+                if not isinstance(error, (FetchError, requests.RequestException)):
+                    raise error
                 store.mark_comments(p.id, ok=False, settled=False)
                 store.commit()
                 errors += 1
-                failed_in_row += 1
-                if failed_in_row >= GIVE_UP_AFTER:  # the archive is struggling; don't hammer it
-                    errors += len(todo) - i
-                    for rest in todo[i:]:  # not tried this time: retried on the next fetch
-                        store.mark_comments(rest.id, ok=False, settled=False)
-                    store.commit()
-                    break
                 continue
-            failed_in_row = 0
             for c in comments:
                 store.save_comment(c, *sentiment.score(c.body))
-                store.commit()
                 n_comments += 1
-                saved()
             store.mark_comments(p.id, ok=True, settled=p.score is not None)
+            store.commit()
+            if comments:
+                saved()
+        if gave_up.is_set():
+            rest = [p for p in todo if p.id not in tried]  # not tried this time: retried on the next fetch
+            errors += len(rest)
+            for p in rest:
+                store.mark_comments(p.id, ok=False, settled=False)
             store.commit()
         if todo:
             progress(len(todo), len(todo), "Done")
