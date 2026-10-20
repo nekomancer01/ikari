@@ -82,14 +82,23 @@ def test_stop_doesnt_wait_for_a_slow_search(archive, tmp_path):
     a = archive(make_posts("python", time.time(), days=10))
     a.delays["/api/posts/search"] = 8.0
     stop = threading.Event()
-    threading.Timer(1.0, stop.set).start()
-    start = time.monotonic()
+    pressed = []
+
+    def press_once_a_search_is_out():
+        # Pressed while a search is in flight, timed from the press: a fixed 1 s timer timed from before the
+        # store was made counted a busy Windows runner's setup as waiting.
+        deadline = time.monotonic() + 20
+        while "/api/posts/search" not in a.paths() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        pressed.append(time.monotonic())
+        stop.set()
+    threading.Thread(target=press_once_a_search_is_out, daemon=True).start()
     result = collect.run(arctic_shift.ArcticShiftClient(limiter=arctic_shift.RateLimiter(0.05)),
                          Store(tmp_path / "s.db"),
                          collect.FetchRequest("python", after=time.time() - 7 * DAY, limit=100,
                                               include_comments=False), should_stop=stop.is_set)
-    assert result.stopped
-    assert time.monotonic() - start < 4  # 8 s before: it waited for every search in flight
+    assert result.stopped and "/api/posts/search" in a.paths()
+    assert time.monotonic() - pressed[0] < 3  # 8 s before: it waited for every search in flight
 
 
 def test_requests_left_out_by_stop_dont_hold_up_the_next_job(archive, tmp_path):
