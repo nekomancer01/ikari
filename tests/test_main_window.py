@@ -418,18 +418,27 @@ def test_saved_drawer_switches_subreddit_and_escape_closes_it(make_window):
 def test_the_drawer_floats_over_the_page_on_a_narrow_window(make_window):
     w = make_window()
     w.show()
-    w.resize(1280, 720)
+    w.resize(1, 600)  # as narrow as the page lets it go, with no drawer open
+    QApplication.processEvents()
+    narrowest = w.width()
+    root = w.centralWidget().layout()
+    m = root.contentsMargins()
+    # Wide enough for the drawer beside the page, measured: Windows' fonts make the page wider than here.
+    wide = (m.left() + w.rail.sizeHint().width() + 2 * root.spacing() + mw.DRAWER_WIDTH
+            + w.content.minimumSizeHint().width() + m.right() + 40)
+    w.resize(wide, 720)
     w.set_drawer("fetch")
     QApplication.processEvents()
-    assert w.centralWidget().layout().indexOf(w.drawer) >= 0  # room for both: the page moves over
+    assert root.indexOf(w.drawer) >= 0  # room for both: the page moves over
     assert w.drawer.geometry().right() < w.content.geometry().left()
-    w.resize(900, 600)
+    for _ in range(3):  # the first lets the drawer out of the layout; the window's minimum catches up after
+        w.resize(1, 600)
+        QApplication.processEvents()
+    assert root.indexOf(w.drawer) < 0 and w.drawer.width() == mw.DRAWER_WIDTH
+    assert w.content.width() >= w.content.minimumSizeHint().width() and w.width() <= narrowest
+    w.resize(wide, 720)
     QApplication.processEvents()
-    assert w.centralWidget().layout().indexOf(w.drawer) < 0 and w.drawer.width() == mw.DRAWER_WIDTH
-    assert w.content.width() >= w.content.minimumSizeHint().width() and w.width() <= 900
-    w.resize(1280, 720)
-    QApplication.processEvents()
-    assert w.centralWidget().layout().indexOf(w.drawer) >= 0
+    assert root.indexOf(w.drawer) >= 0
 
 
 def test_range_presets_keep_the_newest_saved_days(make_window, tmp_path):
