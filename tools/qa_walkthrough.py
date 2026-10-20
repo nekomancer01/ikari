@@ -172,6 +172,10 @@ def shot(widget, name: str) -> str:
     pump(0.3)
     path = OUT / f"{len(list(OUT.glob('*.png'))):02d}-{name}.png"
     widget.grab().save(str(path))
+    if not QGuiApplication.platformName().startswith("offscreen"):  # what the screen really shows
+        widget.window().raise_()
+        pump(0.2)
+        QGuiApplication.primaryScreen().grabWindow(0).save(str(path.with_name(path.stem + "-screen.png")))
     return path.name
 
 

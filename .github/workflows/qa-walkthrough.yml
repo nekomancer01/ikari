@@ -1,0 +1,53 @@
+name: QA walkthrough
+
+# The walkthrough (tools/qa_walkthrough.py) on a real Windows desktop: real DirectWrite text, a real window
+# manager and a real 150% device pixel ratio, plus a screen capture of the built ikari.exe as the owner runs it.
+# Report only; it never blocks a merge.
+on:
+  push:
+    branches: ["claude/project-thread-7rn2xq"]
+  workflow_dispatch:
+
+jobs:
+  walkthrough:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Screen at 1920x1200
+        shell: pwsh
+        run: |
+          try { Set-DisplayResolution -Width 1920 -Height 1200 -Force } catch { Write-Host "Set-DisplayResolution failed: $_" }
+          Add-Type -AssemblyName System.Windows.Forms
+          [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" pyinstaller
+      - name: Walkthrough at 150%
+        shell: bash
+        run: python tools/qa_walkthrough.py --out qa/150 --scale 1.5 --timeout 240 --stop-after 15 --latency 0.6
+      - name: Build and capture ikari.exe at 150%
+        shell: pwsh
+        run: |
+          python packaging/build.py --quick
+          $env:QT_SCALE_FACTOR = "1.5"
+          $p = Start-Process dist\ikari\ikari.exe -PassThru
+          Start-Sleep -Seconds 12
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          New-Item -ItemType Directory -Force qa\exe | Out-Null
+          $bmp.Save("qa\exe\ikari-exe-150-screen.png")
+          Stop-Process -Id $p.Id
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa-walkthrough-windows
+          path: qa
