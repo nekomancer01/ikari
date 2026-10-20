@@ -110,17 +110,18 @@ class RateLimiter:
                 if self._budget is not None and self._budget <= 0:
                     self.hold(self._budget_until - now, "Arctic Shift's request limit was reached")
                     self._budget = None
-                start = max(now, self._next)
-                self._next = start + self.interval
+                # Sleeping with the lock held keeps starts ``interval`` apart by the clock even when a
+                # sleep overshoots (Windows' timer is coarse); planning start times ahead doesn't.
+                delay = self._next - now
+                if delay > 0:
+                    if delay >= 3 and self.on_wait:
+                        self.on_wait(delay, self._reason)
+                    self._sleep(delay)
+                self._next = self._clock() + self.interval
                 self._in_flight += 1
                 if self._budget is not None:
                     self._budget -= 1
-                delay, reason = start - now, self._reason
-                break
-        if delay > 0:
-            if delay >= 3 and self.on_wait:
-                self.on_wait(delay, reason)
-            self._sleep(delay)
+                return
 
     def done(self) -> None:
         """A request ``wait`` let out got no answer (a network error)."""
