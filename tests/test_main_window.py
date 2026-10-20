@@ -391,7 +391,7 @@ def test_each_rail_button_opens_its_page_and_the_last_one_is_reopened(make_windo
     for page in ("timeline", "words", "posts", "comments", "overview", "timeline"):
         w.rail.buttons[page].click()
         assert w.page() == page and w.pages.currentWidget() is w.page_widgets[page]
-        assert w.scope.isVisibleTo(w) == (page in ("overview", "timeline"))  # what it counts shows there
+        assert w.scope.isVisibleTo(w) == (page in ("overview", "timeline", "words"))  # what it counts shows there
     assert w.timeline_page.body.points == w.overview.timeline.points != []  # the same days, on its own page
     w.close()
     assert make_window().page() == "timeline"

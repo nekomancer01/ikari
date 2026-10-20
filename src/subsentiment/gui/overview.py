@@ -2,11 +2,11 @@
 the single-card pages beside it in the rail: Timeline and Words."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
 
 from subsentiment.analysis import Analysis
 from subsentiment.gui.charts import DistributionChart, TimelineChart
+from subsentiment.gui.words import WordCloud
 from subsentiment.gui.widgets import ElidedLabel, StatTile, VerticalScrollArea, label, panel
 
 
@@ -36,12 +36,6 @@ class CardPage(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(card(title, body, extra), 1)
         self.cards = [body.parentWidget()]
-
-
-def coming_soon(text: str) -> QLabel:
-    note = label(text, "muted")
-    note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    return note
 
 
 class OverviewPage(VerticalScrollArea):
@@ -74,7 +68,7 @@ class OverviewPage(VerticalScrollArea):
         # Shorter than on a page of their own, so the whole Overview fits a 1920x1200 150% window unscrolled.
         self.timeline.setMinimumHeight(170)
         self.distribution.setMinimumHeight(120)
-        self.words = coming_soon("The word cloud goes here.")
+        self.words = WordCloud()
         lay.addWidget(card("Mean sentiment per day (UTC)", self.timeline, self.timeline.toolbar), 5)
         bottom = QHBoxLayout()
         bottom.setSpacing(14)

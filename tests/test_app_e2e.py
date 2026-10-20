@@ -1072,6 +1072,10 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
     assert sum(n for _, _, n in o.timeline.points) == want
     assert f"· {want:,}\xa0posts ·" in w.subheading.full_text() and w.subheading.text().startswith("Last fetched")
     assert sum(p for p, _ in w.days_pick.counts.values()) == want
+    words = {word: n for word, n, _ in w.word_tally.top(["posts", "comments"], 500)}
+    for word in ("bug", "update", "thanks"):  # the cloud counts the posts using each word as they're shown
+        assert words.get(word, 0) == sum(word in r["title"].split() for r in rows) > 0, word
+    assert {word for _, word, *_ in o.words.placed()} <= set(words) and o.words.placed()
     pump(800)  # what reads the store again does so once a second
     assert w.fetch_job.busy
     assert w.storage_info.text().startswith(f"{want}\xa0posts")
