@@ -29,6 +29,14 @@ def pump(ms: int) -> None:
         time.sleep(0.005)
 
 
+def ease_to(ms: int, *tweens: motion.Tween) -> None:
+    """Move running tweens to ms into their ease. Waiting for it by the clock failed on a busy runner,
+    whose frames stalled past a third of the ease, and once past all of it."""
+    for tween in tweens:
+        assert tween.running()
+        tween._anim.setCurrentTime(ms)
+
+
 def snapshots(widget) -> list:
     return [c for c in widget.findChildren(QLabel, options=Qt.FindChildOption.FindDirectChildrenOnly)
             if c.objectName() == "motion-snapshot" and c.isVisible()]
@@ -100,18 +108,10 @@ def test_switching_subreddit_fades_and_counts_to_the_new_values(make_window):
     # ...the old view fades out over them, the cards fade in, and the numbers count down to them.
     assert snapshots(w.content)
     assert any(isinstance(c.graphicsEffect(), QGraphicsOpacityEffect) for c in w.overview.cards)
-    # Sampled on every frame up to a third of the way: on a loaded runner one slow frame can carry the
-    # animation's clock from before that point to its end, so a single look after it can miss the middle.
-    middle = []
-    count = w.overview.tiles["count"].value
-    end = time.monotonic() + 5
-    while count._count._anim.currentTime() < motion.DATA_MS // 3 and time.monotonic() < end:
-        QApplication.processEvents()
-        heights = w.overview.distribution.shown_heights()
-        if drawn(count) not in ("40", "30") and 10 < heights[0] < 25 and 5 < heights[2] < 30:
-            middle.append((drawn(count), heights))  # counting down; negative growing, positive shrinking
-        time.sleep(0.005)
-    assert middle
+    ease_to(motion.DATA_MS // 3, w.overview.tiles["count"].value._count, w.overview.distribution._grow)
+    assert drawn(w.overview.tiles["count"].value) not in ("40", "30")
+    heights = w.overview.distribution.shown_heights()
+    assert 10 < heights[0] < 25 and 5 < heights[2] < 30  # negative growing, positive shrinking
     assert w.overview.distribution is chart  # updated in place, not rebuilt
 
     pump(motion.DATA_MS + 6 * motion.STAGGER_MS + 300)
