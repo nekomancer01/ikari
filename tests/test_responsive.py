@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from subsentiment import analysis  # noqa: E402
 from subsentiment.analysis import WordCounts  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
-from subsentiment.gui import motion  # noqa: E402
+from subsentiment.gui import motion, theme  # noqa: E402
 from subsentiment.gui.charts import TimelineChart  # noqa: E402
 from subsentiment.gui.words import WordCloud, WordTally  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
@@ -175,3 +175,34 @@ def test_rows_saved_again_with_a_new_label_are_counted_again_when_the_span_reloa
     tally.count([{"id": "a", "title": "happy banana", "selftext": "", "label": "positive"}], [])
     tally.count([{"id": "a", "title": "sad banana", "selftext": "", "label": "negative"}], [], fresh=True)
     assert tally.top(["posts"]) == [("banana", 1, -1.0), ("sad", 1, -1.0)]
+
+
+def test_a_theme_switch_restyles_only_the_window_and_fades_two_pictures(window, monkeypatch):
+    # Restyling every widget the app has (a new app style sheet, or setting the style again) took ~0.4 s at
+    # Ame's size, and each frame of the fade then repainted the whole window under the old look's picture.
+    w, app = window, QApplication.instance()
+    monkeypatch.setattr(motion, "_os_allows", True)
+    monkeypatch.setattr(motion, "_wanted", True)
+    w.show_page("timeline")
+    until(lambda: w.timeline_page.isVisible())
+    w._set_theme("dark")  # the first switch in a run sets the app's style; the app has done so at start
+    until(lambda: not motion.fading(w))
+    sheet, style = app.styleSheet(), app.style()
+    painted = count_calls(monkeypatch, TimelineChart, "paintEvent")
+    for key in ("light", "dark"):
+        w._set_theme(key)
+        until(lambda: not motion.fading(w))
+    assert app.styleSheet() == sheet and app.style() is style
+    assert w.styleSheet() == theme.stylesheet(theme.tokens())
+    # Each switch paints the timeline once into the new look's picture, then once more when the fade is gone.
+    assert len(painted) <= 4
+
+
+def test_a_theme_switch_during_a_page_fade_doesnt_hold_that_fade_still(window, monkeypatch):
+    w = window
+    monkeypatch.setattr(motion, "_os_allows", True)
+    monkeypatch.setattr(motion, "_wanted", True)
+    w.show_page("words")  # crossfades the content area
+    assert motion.fading(w.content)
+    w._set_theme("dark")  # the theme's picture already has the page fade's frame; that fade stops
+    assert not motion.fading(w.content)

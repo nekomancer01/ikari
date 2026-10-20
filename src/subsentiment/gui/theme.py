@@ -151,7 +151,9 @@ def _icons(t: dict) -> Path:
         "check": chevron.format(d="2.5 6.2 L5 8.6 L9.6 3.6", c=t["on_accent"]),
     }
     for name, svg in files.items():
-        (_icon_dir / f"{_mode}-{name}.svg").write_text(svg)
+        path = _icon_dir / f"{_mode}-{name}.svg"
+        if not path.is_file() or path.read_text() != svg:  # a theme switch needn't write them again
+            path.write_text(svg)
     return _icon_dir
 
 
@@ -308,13 +310,18 @@ QMessageBox, QFileDialog {{ background: {t['menu']}; }}
 """
 
 
-def apply(app: QApplication, requested: str = "system", reduce_transparency: bool = False) -> None:
-    """requested is "system", "light" or "dark"."""
+def apply(app: QApplication, requested: str = "system", reduce_transparency: bool = False,
+          window: QWidget | None = None) -> None:
+    """requested is "system", "light" or "dark". Given the main window (a switch while the app runs), the style
+    sheet goes on it: Qt restyles every widget in the app when the app's sheet changes, about three times what
+    restyling the window's own widgets takes, and the window's sheet wins over the app's one set at start."""
     global _mode, _reduce
     _mode = system_mode() if requested == "system" else requested
     _reduce = reduce_transparency
     t = tokens()
-    app.setStyle("Fusion")
+    if app.property("fusion") is not True:  # setting it again restyles every widget for nothing
+        app.setStyle("Fusion")
+        app.setProperty("fusion", True)
     pal = QPalette()
     for role, color in [
         (QPalette.ColorRole.Window, t["bg0"]), (QPalette.ColorRole.WindowText, t["text"]),
@@ -329,7 +336,7 @@ def apply(app: QApplication, requested: str = "system", reduce_transparency: boo
     for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
         pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(t["faint"]))
     app.setPalette(pal)
-    app.setStyleSheet(stylesheet(t))
+    (window or app).setStyleSheet(stylesheet(t))
 
 
 def mark(widget: QWidget, prop: str, value) -> QWidget:

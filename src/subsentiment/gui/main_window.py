@@ -579,10 +579,11 @@ class MainWindow(QMainWindow):
             self._style_native_frame()
 
     def _apply_theme(self) -> None:
-        motion.crossfade(self, motion.THEME_MS)
+        motion.crossfade(self, motion.THEME_MS, still_under=True)
         requested = self.settings.value("ui/theme", "system", str)
         native.set_appearance(requested)
-        theme.apply(QApplication.instance(), requested, self.settings.value("ui/reduce_transparency", False, bool))
+        theme.apply(QApplication.instance(), requested, self.settings.value("ui/reduce_transparency", False, bool),
+                    self)
         self.update()
         self._style_native_frame()
         for tab in (self.posts_tab, self.comments_tab):  # re-pick swatch and chart colours
