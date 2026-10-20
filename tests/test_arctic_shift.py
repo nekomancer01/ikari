@@ -5,7 +5,7 @@ import pytest
 import requests
 
 from subsentiment.arctic_shift import (
-    BASE_URL, SETTLE_SECONDS, TOP_PAGES, ArcticShiftClient, QueryTimeout, RateLimiter, quotas, slices, slot_count,
+    BASE_URL, SETTLE_SECONDS, TOP_PAGES, ArcticShiftClient, QueryTimeout, RateLimiter, Stopped, quotas, slices, slot_count,
 )
 from subsentiment.reddit import FetchError, Post
 
@@ -544,12 +544,12 @@ def test_requests_still_start_no_faster_than_the_limiter_allows():
     limiter = RateLimiter(0.02)
     real_wait, grab = limiter.wait, threading.Lock()
 
-    def wait():
+    def wait(should_stop=None):
         # When the limiter let each request go, by its own clock. Timing anything after that also counts how
         # late the OS ran each worker thread, which on a busy machine (the suite runs in parallel) bunches
         # two together. The lock keeps another grant from moving _next before it's read.
         with grab:
-            real_wait()
+            real_wait(should_stop)
             starts.append(limiter._next - limiter.interval)
 
     limiter.wait = wait
@@ -632,3 +632,45 @@ def test_a_request_that_never_got_an_answer_frees_its_slot():
     finished = threading.Event()
     threading.Thread(target=lambda: (limiter.wait(), finished.set()), daemon=True).start()
     assert finished.wait(0.5)
+
+
+def test_stop_cuts_short_the_retries_and_waits_of_requests_in_flight():
+    # Every page times out, so each request backs off 2 s, then 4 s, then the window is halved and so on.
+    class AlwaysSlow(ArchiveSession):
+        def get(self, url, params=None, timeout=None):
+            time.sleep(0.02)
+            return FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
+
+    flag = threading.Event()
+    c = ArcticShiftClient(session=AlwaysSlow([]), limiter=RateLimiter(0.0), should_stop=flag.is_set)
+    threading.Timer(0.3, flag.set).start()
+    start = time.perf_counter()
+    assert c.fetch_posts("python", after=T0, before=T0 + DAY, limit=40, should_stop=flag.is_set) == []
+    assert time.perf_counter() - start < 1.0
+
+
+def test_stop_keeps_what_finished_slices_found():
+    items = [at(T0 + 3600 * h, h) for h in range(24)]
+    session = SlowServer(items, delay=0.05)
+    flag = threading.Event()
+    c = ArcticShiftClient(session=session, limiter=RateLimiter(0.0), workers=1, should_stop=flag.is_set)
+    got = []
+
+    def on_posts(batch):
+        got.extend(batch)
+        flag.set()  # Stop right after the first slice is in
+
+    posts = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=24, should_stop=flag.is_set,
+                          on_posts=on_posts)
+    assert posts == got and 0 < len(posts) < 24
+
+
+def test_a_long_wait_ends_as_soon_as_stop_is_pressed():
+    limiter = RateLimiter(0.0)
+    limiter.hold(30)
+    flag = threading.Event()
+    threading.Timer(0.2, flag.set).start()
+    start = time.perf_counter()
+    with pytest.raises(Stopped):
+        limiter.wait(flag.is_set)
+    assert time.perf_counter() - start < 1.0
