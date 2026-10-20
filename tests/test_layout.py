@@ -1,6 +1,6 @@
 """Layout checks on every common screen and scaling: nothing cut off, squashed, overlapping or out of line.
 
-Renders the real main window and Download coverage window offscreen with tools/ui_matrix.py (16:9, 16:10 and
+Renders the real main window, each of its pages and drawers, offscreen with tools/ui_matrix.py (16:9, 16:10 and
 MacBook sizes at their usual scalings; restored, maximized and dragged down to the minimum) and fails with
 every problem it finds, one test and one render per screen, so the screens spread over the test workers.
 To see what a failure looks like:

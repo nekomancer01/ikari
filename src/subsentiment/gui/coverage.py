@@ -1,4 +1,4 @@
-"""The Download coverage window: how much of each day's posts, and each post's comments, is saved.
+"""The Download coverage page: how much of each day's posts, and each post's comments, is saved.
 
 Day totals come from the archive's aggregate counts (asked once per day and kept for the session),
 comment totals from each post's own num_comments. Both count items later removed on Reddit, which
@@ -12,16 +12,13 @@ from datetime import datetime, timezone
 
 import shiboken6
 from PySide6.QtCore import QEvent, QSize, Qt, Slot
-from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton,
-    QTableWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QBoxLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton, QTableWidget, QVBoxLayout, QWidget,
 )
 
 from subsentiment import collect
 from subsentiment.gui import theme
-from subsentiment.gui.widgets import ElidedLabel, ShareBar, fit_to_screen, label, panel, plural, section
-from subsentiment.gui.theme import paint_backdrop
+from subsentiment.gui.widgets import ElidedLabel, ShareBar, VerticalScrollArea, label, panel, plural, section
 from subsentiment.gui.worker import BackgroundJob, CountWorker
 
 DAY = 86400
@@ -31,7 +28,7 @@ days_in = collect.days_in  # cap on one day's "Download all"
 NOTE = ("Totals come from Arctic Shift and include posts and comments later removed from Reddit, which ikari "
         "can't save. A day's share counts the removed posts and image posts ikari has seen as checked, and a thread can stop short "
         "of 100%. A check mark means everything the archive still has is saved. Days are UTC. A day's Download all fetches its posts only; comments download only from the "
-        "buttons on the right.")
+        "buttons in the Posts list.")
 
 
 def day_text(day: int) -> str:
@@ -197,13 +194,14 @@ def centred(w: QWidget) -> QWidget:
     return box
 
 
-class CoverageWindow(QDialog):
+class CoveragePage(VerticalScrollArea):
+    """A page in the rail. It lists the days in the Fetch drawer's range, so a change there shows here; the
+    running fetch's progress and Stop are in the strip under the header, as on every page. On a short window it
+    scrolls, as the Overview does, rather than holding the window taller than the screen."""
+
     def __init__(self, window):
-        super().__init__(window)
+        super().__init__()
         self.window_ = window
-        self.setWindowTitle("Download coverage")
-        self.setModal(False)
-        self.resize(fit_to_screen(QSize(1120, 720), QGuiApplication.primaryScreen()))
         self.subreddit: str | None = None
         self.busy = False
         self.days: list[int] = []
@@ -212,7 +210,7 @@ class CoverageWindow(QDialog):
         self.count_job = BackgroundJob(self)
         self.count_job.ended.connect(self._on_count_done)
         self._counting: tuple[str, float, float] = ("", 0.0, 0.0)  # what the running count asked for
-        self._count_stopped = False  # the window closed while it ran, so its answer may be cut short
+        self._count_stopped = False  # the app closed while it ran, so its answer may be cut short
         self._post_rows: list = []
         self._post_ids: list[str] = []
         self._built: dict[int, tuple] = {}  # post rows with widgets, and what they last showed
@@ -220,21 +218,22 @@ class CoverageWindow(QDialog):
         self._comments_so_far: set[str] = set()
         self._day_rows: list[int] = []
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(22, 18, 22, 18)
+        inner = QWidget()
+        root = QVBoxLayout(inner)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
         titles = QVBoxLayout()
         titles.setSpacing(2)
-        titles.addWidget(label("Download coverage", "heading"))
-        self.subtitle = label("", "subtitle")
+        titles.addWidget(label("Download coverage", "caption"))
+        self.subtitle = ElidedLabel("", "subtitle")
         titles.addWidget(self.subtitle)
         self.recount = mark_flat(small_button("Recount"))
         self.recount.setToolTip("Ask Arctic Shift for each day's post count again")
         self.recount.clicked.connect(self._recount)
         header = QHBoxLayout()
         header.addLayout(titles, 1)
-        header.addWidget(self.recount, 0, Qt.AlignmentFlag.AlignBottom)
+        header.addWidget(self.recount, 0, Qt.AlignmentFlag.AlignVCenter)
         root.addLayout(header)
         note = label(NOTE, "muted")
         note.setWordWrap(True)
@@ -284,26 +283,20 @@ class CoverageWindow(QDialog):
         right_lay.addWidget(self.post_table, 1)
         right_lay.addWidget(self.posts_empty, 1)
 
-        body = QHBoxLayout()
-        body.setSpacing(14)
-        body.addWidget(left, 5)
-        body.addWidget(right, 6)
-        root.addLayout(body, 1)
+        self.body = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self.body.setSpacing(14)
+        self.body.addWidget(left, 5)
+        self.body.addWidget(right, 6)
+        self.panels = (left, right)
+        root.addLayout(self.body, 1)
 
-        self.progress = QProgressBar()
-        self.progress.setFixedWidth(160)
-        self.progress.setVisible(False)
+        # What the archive counts are doing: asking, or why they failed. One line's room even when empty, so
+        # the tables don't shift when it says something.
         self.status = label("", "muted")
         self.status.setWordWrap(True)
-        self.stop_btn = small_button("Stop")
-        self.stop_btn.setVisible(False)
-        self.stop_btn.clicked.connect(self.window_._stop_fetch)
-        footer = QHBoxLayout()
-        footer.setSpacing(12)
-        footer.addWidget(self.status, 1)
-        footer.addWidget(self.progress, 0, Qt.AlignmentFlag.AlignVCenter)
-        footer.addWidget(self.stop_btn)
-        root.addLayout(footer)
+        self.status.setMinimumHeight(self.status.fontMetrics().lineSpacing())
+        root.addWidget(self.status)
+        self.setWidget(inner)
 
     # -- what's shown ---------------------------------------------------------
 
@@ -317,28 +310,17 @@ class CoverageWindow(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        # The footer stays as tall as with Stop showing, so the tables don't shift when a download starts.
-        self.status.setMinimumHeight(max(self.stop_btn.sizeHint().height(), self.status.fontMetrics().lineSpacing()))
         self.refresh_saved(rebuild=True)
 
     def set_busy(self, busy: bool) -> None:
         self.busy = busy
-        self.stop_btn.setVisible(busy)
-        self.stop_btn.setEnabled(busy and not self.window_._stopping)  # pressed already: stays off
-        self.progress.setVisible(busy)
-        if busy:
-            self.progress.setRange(0, 0)
-        if self.isVisible():
-            self.refresh_saved()
-
-    def set_progress(self, done: int, total: int, msg: str) -> None:
-        if total:
-            self.progress.setRange(0, total)
-            self.progress.setValue(done)
-        self.status.setText(msg)
+        self.refresh_saved()
 
     def refresh_saved(self, rebuild: bool = False) -> None:
-        """Re-read what's saved (a fetch may have added some) and redraw both lists."""
+        """Re-read what's saved (a fetch may have added some) and redraw both lists. Only while the page
+        shows: showing it does this anyway."""
+        if not self.isVisible():
+            return
         if not self.subreddit:
             self.subtitle.setText("Pick a saved subreddit first.")
             self.days = self._day_rows = []
@@ -349,8 +331,8 @@ class CoverageWindow(QDialog):
         days = days_in(after, before)
         if days != self.days:
             self.days, rebuild = days, True
-        self.subtitle.setText(f"r/{self.subreddit} · {range_text(days[-1], days[0])} · "
-                              f"{plural(len(days), 'day')}")
+        # The heading above names the subreddit.
+        self.subtitle.setText(f"{range_text(days[-1], days[0])} · {plural(len(days), 'day')} · the dates set in Fetch")
         totals = self.totals.get(self.subreddit.lower(), {})
         missing = [d for d in days if d not in totals]
         if missing and not self.count_job.busy and not self.count_error:
@@ -513,6 +495,25 @@ class CoverageWindow(QDialog):
         button.setText("Check again" if full else "Download all")
         button.setEnabled(not self.busy and (total != 0 or done))
 
+    # -- layout ---------------------------------------------------------------
+
+    def minimumSizeHint(self) -> QSize:
+        """As narrow as the wider panel: where the two don't fit side by side (1280x800 at 125%), Posts go
+        under Days rather than holding the window wider than the screen."""
+        hint = super().minimumSizeHint()
+        bar = self.verticalScrollBar().sizeHint().width()
+        hint.setWidth(min(hint.width(), max(p.minimumSizeHint().width() for p in self.panels) + bar))
+        return hint
+
+    def resizeEvent(self, event) -> None:
+        left, right = self.panels
+        need = left.minimumSizeHint().width() + self.body.spacing() + right.minimumSizeHint().width()
+        wide = self.viewport().width() >= need
+        direction = QBoxLayout.Direction.LeftToRight if wide else QBoxLayout.Direction.TopToBottom
+        if self.body.direction() != direction:
+            self.body.setDirection(direction)
+        super().resizeEvent(event)
+
     def eventFilter(self, obj, event) -> bool:
         if (obj is self._post_viewport and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)
                 and shiboken6.isValid(self.post_table)):  # not while the window is being torn down
@@ -537,8 +538,7 @@ class CoverageWindow(QDialog):
         self.totals.setdefault(sub.lower(), {}).update(counts)
         if not self._count_is_current():
             return  # stopped, or for a subreddit no longer shown: not this one's error
-        if not self.busy:
-            self.status.setText("")
+        self.status.setText("")
         if not counts:
             self.count_error = "Arctic Shift couldn't count these days."
             self.status.setText(self.count_error + " Press Recount to try again.")
@@ -556,9 +556,9 @@ class CoverageWindow(QDialog):
     @Slot()
     def _on_count_done(self) -> None:
         if not (self.subreddit and self.days and self.isVisible()):
-            return  # closed meanwhile (the store may be too); showing it again counts what's missing
+            return  # left meanwhile (or the app closed, and the store too); showing it again counts what's missing
         sub, after, before = self._counting
-        if self._count_stopped:  # closed and opened again while it ran: its answer may be cut short
+        if self._count_stopped:  # stopped while it ran: its answer may be cut short
             self.refresh_saved()
             return
         totals = self.totals.get(self.subreddit.lower(), {})
@@ -600,18 +600,12 @@ class CoverageWindow(QDialog):
     def _download_day_comments(self) -> None:
         self._download_comments(list(getattr(self, "_todo_comments", [])))
 
-    # -- look -----------------------------------------------------------------
-
-    def paintEvent(self, event) -> None:
-        paint_backdrop(self)
-
-    def closeEvent(self, event) -> None:
+    def stop_count(self) -> None:
+        """As the app closes. Not waited for: a request still out held the app's close for up to 3 s. It ends
+        by itself; app.main ends the process if it still runs when the app quits."""
         if self.count_job.busy:
-            # Not waited for: a request still out held the window (and the app's own close) for up to
-            # 3 s. It ends by itself; app.main ends the process if it still runs when the app quits.
             self.count_job.stop()
             self._count_stopped = True
-        super().closeEvent(event)
 
 
 def mark_flat(button: QPushButton) -> QPushButton:

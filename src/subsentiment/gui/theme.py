@@ -3,7 +3,7 @@ cards inside them are outlined rather than shaded, buttons and header pickers ar
 accent is a clear blue. Dark mode keeps the same structure on near-black surfaces.
 
 The window background can carry the mood of the subreddit on screen: MoodTint pulls a soft wash toward
-green when it skews positive, white when it's neutral and red when it skews negative, easing between
+the positive blue when it skews positive, white when it's neutral and the negative orange when it skews negative, easing between
 subreddits. It shows around the panels, so panel and text contrast hold.
 
 Type: Inter (SIL Open Font License, bundled in assets/), medium for primary text and regular for secondary,
@@ -34,6 +34,8 @@ THEMES = {
         "text": "#1f1f1f", "muted": "#737373", "faint": "#a3a3a3",
         "accent": "#0163ff", "on_accent": "#ffffff", "button": "#0163ff",
         "selection": (1, 99, 255, 26), "menu": "#ffffff", "shadow": (0, 0, 0, 40),
+        # Sentiment colors, shared by the charts, tables and the background's mood wash.
+        "positive": "#0163ff", "neutral": "#b4b4b8", "negative": "#f28513",
     },
     "dark": {
         "bg0": "#0e0e10",
@@ -43,16 +45,18 @@ THEMES = {
         "accent": "#3d86ff", "on_accent": "#ffffff",
         "button": "#2f74f0",  # a little deeper than the accent so white text keeps contrast
         "selection": (61, 134, 255, 52), "menu": "#1e1e22", "shadow": (0, 0, 0, 120),
+        "positive": "#3d86ff", "neutral": "#6e6e74", "negative": "#f59a3c",
     },
 }
 
 UI_FAMILIES = ["Inter", "Segoe UI Variable Text", "SF Pro Text", "Segoe UI", "Noto Sans"]
 DISPLAY_FAMILY = "Inter Display"  # Inter cut for larger sizes: tighter spacing, finer details
 
-# Sentiment wash over the window background: (rgb, peak alpha) per mood.
+# Sentiment wash over the window background: peak alpha per mood. Positive and negative take their color from
+# the theme's sentiment tokens; the neutral wash is a soft white.
 MOOD = {
-    "light": {"positive": ((46, 196, 108), 70), "neutral": ((255, 255, 255), 120), "negative": ((236, 72, 72), 66)},
-    "dark": {"positive": ((34, 170, 92), 60), "neutral": ((214, 222, 240), 22), "negative": ((214, 52, 60), 64)},
+    "light": {"positive": 96, "neutral": ((255, 255, 255), 120), "negative": 120},
+    "dark": {"positive": 96, "neutral": ((214, 222, 240), 22), "negative": 104},
 }
 
 _mode = "light"
@@ -243,18 +247,6 @@ QPushButton[flat="true"]:checked {{ background: {panel}; border-color: {edge}; c
 QPushButton[flat="true"]:disabled {{ color: {t['faint']}; }}
 QPushButton[small="true"] {{ padding: 3px 9px; border-radius: 8px; font-size: 9pt; }}
 
-/* A segmented switch (the header's range presets): one rounded track, the chosen segment raised on it */
-QFrame[segmented="true"] {{ background: {soft}; border: none; border-radius: 15px; }}
-QFrame[segmented="true"] QPushButton {{
-    background: transparent; border: 1px solid transparent; border-radius: 13px; padding: 4px 11px;
-    color: {t['muted']}; font-weight: 500;
-}}
-QFrame[segmented="true"] QPushButton:hover {{ color: {t['text']}; }}
-QFrame[segmented="true"] QPushButton:checked {{ background: {panel}; color: {t['text']}; border-color: {edge}; }}
-
-QProgressBar {{ background: {soft}; border: none; border-radius: 3px; max-height: 6px; min-height: 6px; text-align: center; color: transparent; }}
-QProgressBar::chunk {{ border-radius: 3px; background: {t['accent']}; }}
-
 /* Tabs: plain words, the chosen one an outlined pill */
 QTabWidget::pane {{ border: none; top: 0; }}
 QTabWidget::tab-bar {{ left: 0; }}
@@ -310,7 +302,7 @@ QMenu::item:selected {{ background: {soft}; }}
 QMenu::item:disabled {{ color: {t['faint']}; }}
 QMenu::separator {{ height: 1px; background: {edge}; margin: 5px 8px; }}
 QMenu::indicator {{ width: 14px; height: 14px; }}
-QStatusBar {{ background: transparent; color: {t['muted']}; }}
+QStatusBar {{ background: transparent; color: {t['text']}; }}
 QStatusBar::item {{ border: none; }}
 QMessageBox, QFileDialog {{ background: {t['menu']}; }}
 """
@@ -357,12 +349,14 @@ def _mix(a: QColor, b: QColor, f: float) -> QColor:
 
 
 def mood_color(score: float) -> tuple[QColor, float]:
-    """The wash for a mood score in -1..1: green, white or red (alpha carries its strength), and its weight 0..1."""
+    """The wash for a mood score in -1..1: the positive color, white or the negative color (alpha carries its
+    strength), and its weight 0..1."""
     m = MOOD[_mode]
     white, wa = m["neutral"]
-    far, fa = m["positive" if score >= 0 else "negative"]
+    key = "positive" if score >= 0 else "negative"
+    fa = m[key]
     f = abs(score)
-    c = _mix(QColor(*white), QColor(*far), f)
+    c = _mix(QColor(*white), QColor(tokens()[key]), f)
     c.setAlpha(round(wa + (fa - wa) * f))
     return c, f
 

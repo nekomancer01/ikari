@@ -145,6 +145,20 @@ def test_background_mood_follows_the_dataset_and_can_be_turned_off(make_window):
     assert make_window().mood_act.isChecked() is False
 
 
+def test_background_mood_uses_the_chart_colors_in_both_themes(make_window):
+    from PySide6.QtGui import QColor
+    from subsentiment.gui import charts, theme
+    make_window()
+    try:
+        for mode in ("light", "dark"):
+            theme._mode = mode
+            for score, key in ((1.0, "positive"), (-1.0, "negative")):
+                wash, weight = theme.mood_color(score)
+                assert weight == 1.0 and wash.rgb() == QColor(charts.palette()[key]).rgb()
+    finally:
+        theme._mode = "light"
+
+
 def test_finish_text_says_what_the_fetch_did():
     req = mw.collect.FetchRequest("python")
     r = mw.collect.FetchResult("Python", 40, 900, False, updated=12, already=3, comment_errors=2)
@@ -216,12 +230,12 @@ def test_rows_saved_by_a_running_fetch_are_dripped_into_the_tables(make_window):
     w.fetch_job.qthread = None
 
 
-def test_coverage_window_lists_days_and_downloads_through_the_fetch_job(make_window, monkeypatch):
+def test_coverage_page_lists_days_and_downloads_through_the_fetch_job(make_window, monkeypatch):
     from subsentiment.gui import coverage
 
     def count(self, after, before):  # no network or thread: the archive "has" 5 posts every day
         self._on_counts(self.subreddit, {d: 5 for d in range(int(after), int(before), 86400)})
-    monkeypatch.setattr(coverage.CoverageWindow, "_count", count)
+    monkeypatch.setattr(coverage.CoveragePage, "_count", count)
     w = make_window()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("custom"))
@@ -229,7 +243,8 @@ def test_coverage_window_lists_days_and_downloads_through_the_fetch_job(make_win
     w.fetch_form.date_to.setDate(QDate(2023, 11, 15))
     started = []
     monkeypatch.setattr(w, "_launch", lambda req, msg: started.append(req))
-    w._show_coverage()
+    w.show()
+    w.show_page("coverage")
     c = w.coverage
     c.refresh_saved()
     day = 1_699_920_000  # 14 Nov 2023 00:00 UTC
@@ -246,7 +261,6 @@ def test_coverage_window_lists_days_and_downloads_through_the_fetch_job(make_win
     QApplication.processEvents()
     assert c.post_table.rowCount() == 1  # its one post, with 0 comments counted, so nothing to fetch
     assert not c.post_table.cellWidget(0, 2).findChild(mw.QPushButton).isEnabled()
-    c.close()
 
 
 def test_archive_counts_arrive_on_the_gui_thread(make_window, monkeypatch):
@@ -266,7 +280,7 @@ def test_archive_counts_arrive_on_the_gui_thread(make_window, monkeypatch):
             return super().setdefault(*a)
     w = make_window()
     w.datasets.setCurrentRow(0)
-    c = coverage.CoverageWindow(w)
+    c = w.coverage
     c.totals = Totals()
     c.subreddit = "Python"
     c._count(1_699_920_000, 1_699_920_000 + 86400)
@@ -276,7 +290,6 @@ def test_archive_counts_arrive_on_the_gui_thread(make_window, monkeypatch):
         time.sleep(0.01)
     assert seen["thread"] is threading.main_thread()
     assert c.totals["python"] == {1_699_920_000: 5} and not c.count_job.busy
-    c.close()
 
 
 def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypatch):
@@ -284,7 +297,7 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
 
     def count(self, after, before):  # the archive reports 0 for a day that has barely started
         self._on_counts(self.subreddit, {d: 0 for d in range(int(after), int(before), 86400)})
-    monkeypatch.setattr(coverage.CoverageWindow, "_count", count)
+    monkeypatch.setattr(coverage.CoveragePage, "_count", count)
     w = make_window()
     today = coverage.today()
     s = w.store
@@ -294,7 +307,8 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
     started = []
     monkeypatch.setattr(w, "_launch", lambda req, msg: started.append((req, msg)))
-    w._show_coverage()
+    w.show()
+    w.show_page("coverage")
     c = w.coverage
     c.refresh_saved()
     row = c.days.index(today)
@@ -307,7 +321,6 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     req, msg = started[-1]
     assert req.everything and req.after == today and req.limit == coverage.MAX_DAY_POSTS
     assert "so far today" in msg
-    c.close()
 
 
 def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypatch):
@@ -316,7 +329,7 @@ def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypat
 
     def count(self, after, before):  # 3 days ago the count is below what's saved
         self._on_counts(self.subreddit, {d: (1 if d == older else 9) for d in range(int(after), int(before), 86400)})
-    monkeypatch.setattr(coverage.CoverageWindow, "_count", count)
+    monkeypatch.setattr(coverage.CoveragePage, "_count", count)
     w = make_window()
     for day in (yesterday, older):
         for i in range(3):
@@ -325,7 +338,8 @@ def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypat
     w.store.commit()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
-    w._show_coverage()
+    w.show()
+    w.show_page("coverage")
     c = w.coverage
     c.refresh_saved()
     # The older day's count (1) can't be right; yesterday's is whole and shown.
@@ -335,7 +349,6 @@ def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypat
     assert (cell.main.text(), cell.side.text()) == ("3 of 9", "33%")
     cell = c.day_table.cellWidget(c.days.index(older + 86400), 1)
     assert (cell.main.text(), cell.side.text()) == ("0 of 9", "0%")  # a settled day keeps its total
-    c.close()
 
 
 def test_one_row_is_counted_as_one_row(make_window):
@@ -391,7 +404,7 @@ def test_each_rail_button_opens_its_page_and_the_last_one_is_reopened(make_windo
     for page in ("timeline", "words", "posts", "comments", "overview", "timeline"):
         w.rail.buttons[page].click()
         assert w.page() == page and w.pages.currentWidget() is w.page_widgets[page]
-        assert w.scope.isVisibleTo(w) == (page in ("overview", "timeline"))  # what it counts shows there
+        assert w.scope.isVisibleTo(w) == (page in ("overview", "timeline", "words"))  # what it counts shows there
     assert w.timeline_page.body.points == w.overview.timeline.points != []  # the same days, on its own page
     w.close()
     assert make_window().page() == "timeline"
@@ -441,7 +454,7 @@ def test_the_drawer_floats_over_the_page_on_a_narrow_window(make_window):
     assert root.indexOf(w.drawer) >= 0
 
 
-def test_range_presets_keep_the_newest_saved_days(make_window, tmp_path):
+def test_the_timelines_range_buttons_keep_the_newest_saved_days_on_every_page(make_window, tmp_path):
     s = Store(tmp_path / "w.db")
     newest = 1_700_000_000.0
     for d in range(40):  # one post a day for 40 days, the newest on the saved post's day
@@ -451,18 +464,22 @@ def test_range_presets_keep_the_newest_saved_days(make_window, tmp_path):
     s.close()
     w = make_window()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
-    assert w.presets.current() == "all" and len(w.posts) == 41
-    w.presets.buttons["week"].click()
-    assert len(w.chosen_days) == 7 and len(w.posts) == 8  # the newest day has two posts
-    assert w.presets.current() == "week" and w.days_pick.currentText() != "All days"
-    w.presets.buttons["month"].click()
-    assert len(w.chosen_days) == 30 and w.presets.current() == "month"
-    w.presets.buttons["all"].click()
-    assert w.chosen_days is None and len(w.posts) == 41 and w.days_pick.currentText() == "All days"
-    w.presets.buttons["week"].click()
+    buttons = w.overview.timeline.presets
+    assert buttons["All"].isChecked() and len(w.posts) == 41
+    buttons["1w"].click()
+    w._apply_span()  # what the tables do once the span settles
+    assert len(w.posts) == 8 and w.overview.tiles["count"].value.text() == "8"  # the newest day has two posts
+    assert w._preset == "1w" and buttons["1w"].isChecked()
+    buttons["1m"].click()
+    w._apply_span()
+    assert len(w.posts) == 31 and w._preset == "1m"
+    buttons["All"].click()
+    w._apply_span()
+    assert w.span is None and len(w.posts) == 41
+    buttons["1w"].click()
     w.close()
-    again = make_window()  # the choice is kept with the subreddit, as the day picker's is
-    assert again.current == "Python" and len(again.posts) == 8 and again.presets.current() == "week"
+    again = make_window()  # the span is kept with the subreddit
+    assert again.current == "Python" and len(again.posts) == 8 and again.overview.timeline.presets["1w"].isChecked()
 
 
 @pytest.mark.parametrize("counts", [(65_432, 412_837, 98_765), (1_234_567, 7_654_321, 2_345_678)])
@@ -550,3 +567,50 @@ def test_import_database_adds_its_subreddits_to_the_list(make_window, tmp_path, 
     (tmp_path / "other.db").write_bytes(b"junk" * 1000)
     w.import_act.trigger()
     assert len(warnings) == 1 and w.datasets.count() == 3
+
+
+def test_download_coverage_is_a_page_in_the_rail(make_window, monkeypatch):
+    from subsentiment.gui import coverage
+    monkeypatch.setattr(coverage.CoveragePage, "_count", lambda self, after, before: None)  # no network
+    w = make_window()
+    w.show()
+    w.datasets.setCurrentRow(0)
+    w.rail.buttons["coverage"].click()
+    assert w.page() == "coverage" and w.pages.currentWidget() is w.coverage and w.coverage.isVisible()
+    w.show_page("overview")
+    w.coverage_act.trigger()  # View > Download coverage (Ctrl+D) opens the same page
+    assert w.page() == "coverage"
+    assert not [t for t in QApplication.topLevelWidgets() if t.isVisible() and t is not w]  # no separate window
+    assert w.settings.value("ui/page") == "coverage"  # and it's where the next start opens
+
+
+def test_short_titles_leave_room_for_the_comments_column(make_window):
+    """QA on a2d5074: at 1920x1200 150% with the Saved drawer open, the Posts table hid its Comments column
+    although the titles were short and left half the table empty. The title column kept 40% of the width
+    whatever its titles needed."""
+    from subsentiment.gui import theme
+    from subsentiment.gui.tables import POST_COLUMNS, TablePage
+    app = QApplication.instance() or QApplication([])
+    before = app.font()
+    make_window()
+    theme.load_fonts(app)  # Inter, as the app draws with: its widths decide what fits
+    theme.apply(app, "light")
+    try:
+        page = TablePage(POST_COLUMNS, stretch_col=2)
+        page.resize(795, 600)  # the table's width there, in logical pixels
+        page.show()
+        row = {"id": "p1", "sentiment": -0.957, "label": "negative", "title": "terrible bug #188", "selftext": "",
+               "score": 134, "num_comments": 12, "author": "someone", "created_utc": 1_700_000_000.0}
+        page.load([row])
+        QApplication.processEvents()
+        header = page.view.horizontalHeader()
+        keys = [key for _, key, _ in POST_COLUMNS]
+        assert not header.isSectionHidden(keys.index("num_comments"))
+        assert header.sectionSize(keys.index("title")) >= page.view.viewport().width() // 4
+        page.resize(600, 600)  # a long title on a narrow table still keeps a third of it before the counts
+        page.load([dict(row, title="A much longer title that needs a good part of the table to be read " * 2)])
+        QApplication.processEvents()
+        assert header.sectionSize(keys.index("title")) >= page.view.viewport().width() // 3 - 1
+        page.close()
+    finally:
+        app.setFont(before)

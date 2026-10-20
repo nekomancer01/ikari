@@ -21,17 +21,13 @@ from PySide6.QtWidgets import (
 from subsentiment.gui import motion, theme
 from subsentiment.gui.days import DAY, flat_button, short_date
 
-LIGHT = {"positive": "#0163ff", "neutral": "#b4b4b8", "negative": "#f28513", "line": "#0163ff"}
-DARK = {"positive": "#3d86ff", "neutral": "#6e6e74", "negative": "#f59a3c", "line": "#3d86ff"}
-
-
 def palette() -> dict:
-    """Series colors for the current theme, with text, grid and card surface from the theme."""
+    """Series colors, text, grid and card surface, all from the current theme."""
     t = theme.tokens()
     grid = QColor(*t["edge"][:3])
     grid.setAlpha(t["edge"][3])
-    return dict(DARK if theme.mode() == "dark" else LIGHT, surface=t["panel"], text=t["text"], muted=t["muted"],
-                grid=grid.name(QColor.NameFormat.HexArgb))
+    return {"positive": t["positive"], "neutral": t["neutral"], "negative": t["negative"], "line": t["positive"],
+            "surface": t["panel"], "text": t["text"], "muted": t["muted"], "grid": grid.name(QColor.NameFormat.HexArgb)}
 
 
 def _ui_font(point_size: float) -> QFont:
@@ -205,9 +201,9 @@ class TimelineChart(QWidget):
     that always shows every day, with a window over the part in view.
 
     Zoom by dragging across the plot, with the mouse wheel (Shift+wheel moves sideways), with the range buttons
-    or by dragging the navigator's window or its edges; double-click the plot for every day again. Zooming
-    only changes what the chart shows: the header's Days picker still decides which days are counted, and the
-    window calls `show_every_day` when other days are chosen there or another subreddit is shown.
+    or by dragging the navigator's window or its edges; double-click the plot for every day again. The span in
+    view is also the span every page counts: `view_changed` is sent whenever it, or the range button marked,
+    changes, and `show_span` shows the span another chart (or the last session) chose.
 
     Self-contained: the overview card holds it today, and it fills a page of any width just as well.
 
@@ -219,6 +215,7 @@ class TimelineChart(QWidget):
     dot (or its label) sends `note_requested` with the day; clicking a week or month's zooms in to its days."""
 
     note_requested = Signal(int)
+    view_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -229,6 +226,7 @@ class TimelineChart(QWidget):
         self._grouped: dict[tuple, tuple] = {}  # groups() by (lo, hi, width), for the points as they are now
         self.view: tuple[float, float] | None = None
         self.preset: str | None = "All"
+        self._sent = (None, "All")  # the (view, preset) view_changed last told of
         a, b = self.domain()
         self._screen = (a, b, TIMELINE_BOUNDS[0])  # the (lo, hi, y bound) drawn now, eased towards _to
         self._from = self._to = self._screen
@@ -284,9 +282,18 @@ class TimelineChart(QWidget):
         return [self.notes[d] for d in days[bisect.bisect_left(days, start):bisect.bisect_left(days, end)]]
 
     def show_every_day(self) -> None:
-        """Forget the zoom, for other data: another subreddit, or other days in the Days picker."""
         self.view, self.preset = None, "All"
         self._apply(False)
+
+    def show_span(self, view: tuple[float, float] | None, preset: str | None = None) -> None:
+        """Show a range button's span, else ``view`` (every day for None), at once."""
+        if preset in self.presets and preset != "All":
+            a, b = self.domain()
+            self.set_view(b - dict(PRESETS)[preset] * DAY, b, preset=preset)
+        elif view is not None:
+            self.set_view(*view)
+        else:
+            self.show_every_day()
 
     def domain(self) -> tuple[float, float]:
         """Every day's span, from the first one's start to the end of the last one."""
@@ -369,7 +376,11 @@ class TimelineChart(QWidget):
     def _apply(self, animate: bool, follow: bool = False) -> None:
         """Ease (or jump) to the view. With follow (new data), a zoom that is easing carries on, its start
         moved along with its target, so it neither restarts nor jumps."""
-        if self.view is not None:  # the days may have changed under it
+        if self.preset not in (None, "All"):  # a range button's span is always the latest days there are now
+            a, b = self.domain()
+            days = dict(PRESETS)[self.preset] * DAY
+            self.view = None if days >= b - a else (b - days, b)
+        elif self.view is not None:  # the days may have changed under it
             a, b = self.domain()
             span = min(self.view[1] - self.view[0], b - a)
             lo = min(max(self.view[0], a), b - span)
@@ -390,6 +401,9 @@ class TimelineChart(QWidget):
             self.update()
         if self._pointer is not None:  # the box follows new means and a new grouping under a still pointer
             self._hover_at(self._pointer, self._areas()[0])
+        if (self.view, self.preset) != self._sent:
+            self._sent = (self.view, self.preset)
+            self.view_changed.emit()
 
     def _zoom_step(self, f: float) -> None:
         self._screen = tuple(a + (b - a) * f for a, b in zip(self._from, self._to))
