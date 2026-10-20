@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QListWidget, QListWidgetItem,
 from subsentiment.analysis import Analysis
 from subsentiment.gui import motion
 from subsentiment.gui.charts import DistributionChart, TimelineChart
-from subsentiment.gui.widgets import QuietScrollBars, StatTile, VerticalScrollArea, label, panel
+from subsentiment.gui.widgets import ElidedLabel, QuietScrollBars, StatTile, VerticalScrollArea, label, panel
 
 
 class OverviewPage(VerticalScrollArea):
@@ -43,7 +43,15 @@ class OverviewPage(VerticalScrollArea):
         for chart, title, stretch in ((self.distribution, "Sentiment distribution", 2),
                                       (self.timeline, "Mean sentiment per day (UTC)", 3)):
             card, inner = panel("tile", margins=14, spacing=4)
-            inner.addWidget(label(title, "caption"))
+            head = QHBoxLayout()
+            # The timeline's caption gives way to its range buttons on a narrow window.
+            caption = ElidedLabel(title, "caption") if chart is self.timeline else label(title, "caption")
+            caption.setMinimumHeight(self.timeline.toolbar.sizeHint().height())  # both charts start level
+            head.addWidget(caption)
+            head.addStretch(1)
+            if chart is self.timeline:
+                head.addWidget(chart.toolbar)  # the range buttons, by the caption as on SteamDB
+            inner.addLayout(head)
             inner.addWidget(chart, 1)
             charts.addWidget(card, stretch)
         lay.addLayout(charts, 3)

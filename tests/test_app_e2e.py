@@ -996,7 +996,7 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
     assert o.tiles["count"].value.text() == f"{want:,}"
     assert sum(o.distribution._counts.values()) == want
     assert o.distribution._counts == {k: sum(r["label"] == k for r in rows) for k in ("negative", "neutral", "positive")}
-    assert sum(n for _, _, n in o.timeline._shown[0]) == want
+    assert sum(n for _, _, n in o.timeline.points) == want
     assert o.most_positive.item(0).text().startswith(f"{max(r['sentiment'] for r in rows):+.2f}")
     assert o.most_negative.item(0).text().startswith(f"{min(r['sentiment'] for r in rows):+.2f}")
     assert w.tabbar.tabText(1) == f"Posts  {want:,}" and w.subheading.text().startswith("Last fetched")  # counts: on the tab
@@ -1011,3 +1011,27 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
         assert int(re.match(r"[\d,]*", shown).group().replace(",", "") or 0) == saved.get(day, 0), (day, shown)
     w._stop_fetch()
     wait_idle(w)
+
+
+def test_a_zoomed_timeline_keeps_up_with_a_fetch(env):
+    """The timeline stays live while zoomed: "1w" picked mid-fetch still shows the latest week once every day
+    is in, and the navigator under it every day."""
+    w = env.window()
+    env.archive.posts += make_posts("Zoom", NOW, days=20, per_day=(5,), seed=6)
+    w.fetch_form.subreddit.setText("Zoom")
+    w.fetch_form.include_comments.setChecked(False)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    tl = w.overview.timeline
+    end = time.monotonic() + 20
+    while not tl.presets["1w"].isEnabled():
+        assert time.monotonic() < end and w.fetch_job.busy, len(tl.points)
+        pump(5)
+    QTest.mouseClick(tl.presets["1w"], Qt.MouseButton.LeftButton)
+    assert tl.preset == "1w"
+    wait_idle(w)
+    pump(400)  # the overview's last 250 ms refresh
+    saved = {int(r["created_utc"] // DAY * DAY) for r in env.store().posts("Zoom")}
+    assert [d for d, _, _ in tl.points] == sorted(saved)
+    a, b = tl.domain()
+    assert tl.view == (b - 7 * DAY, b) and tl.preset == "1w" and (a, b) == (min(saved), max(saved) + DAY)
