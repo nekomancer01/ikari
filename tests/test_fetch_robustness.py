@@ -163,7 +163,14 @@ def test_stop_keeps_the_posts_a_slow_slice_already_downloaded(archive, tmp_path)
     a = archive([post(f"p{n}", DAY0 + n * 72) for n in range(2400)])
     a.delays["/api/posts/search"] = 1.0
     stop = threading.Event()
-    threading.Timer(2.5, stop.set).start()
+
+    def stop_on_second_pages():
+        # The four slices running ask for their second page only once their first is in: Stop comes then,
+        # while those are still out. (A fixed 2.5 s timer came before any first page on a loaded runner.)
+        while len(a.paths()) < 8:
+            time.sleep(0.01)
+        stop.set()
+    threading.Thread(target=stop_on_second_pages, daemon=True).start()
     store = Store(tmp_path / "s.db")
     result = collect.run(arctic_shift.ArcticShiftClient(limiter=arctic_shift.RateLimiter(0)), store,
                          collect.FetchRequest("Sub", after=DAY0, before=DAY0 + 2 * DAY, limit=2400,
