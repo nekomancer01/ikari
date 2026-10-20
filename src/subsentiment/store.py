@@ -104,13 +104,13 @@ NOT_IMAGE = "c.post_id NOT IN (SELECT id FROM posts WHERE image = 1)"
 
 def scoring_at_least(rows, min_score: int | None) -> list:
     """The posts scoring at least ``min_score``, or the comments on them (a comment goes by its post's score,
-    so it shows with its post); every row when None. A score Arctic Shift hasn't filled in yet (None, for
-    about 36 hours) isn't held against a row. Always a new list."""
+    so it shows with its post); every row when None. With a filter on, a score Arctic Shift hasn't filled in
+    yet (None, for about 36 hours) doesn't pass: those rows come back once it has. Always a new list."""
     rows = list(rows)
     if min_score is None or not rows:
         return rows
     col = "post_score" if "post_score" in rows[0].keys() else "score"
-    return [r for r in rows if r[col] is None or r[col] >= min_score]
+    return [r for r in rows if r[col] is not None and r[col] >= min_score]
 
 
 def _unpack(blob: bytes) -> dict:
