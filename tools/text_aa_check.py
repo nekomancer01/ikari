@@ -53,7 +53,7 @@ def fringe(img, box) -> tuple[int, int]:
 
 def child(name: str, keep: bool, out: str | None) -> dict:
     sys.path.insert(0, str(ROOT / "src"))
-    from PySide6.QtCore import QDate, Qt, QTimer
+    from PySide6.QtCore import QBuffer, QDate, QIODevice, Qt, QTimer
     from PySide6.QtGui import QFont, QGuiApplication
     from PySide6.QtWidgets import QApplication, QDateEdit, QFormLayout, QFrame, QLabel
 
@@ -99,8 +99,12 @@ def child(name: str, keep: bool, out: str | None) -> dict:
             img = img.convertToFormat(img.Format.Format_RGB32)
             b = [min(v, lim - 1) for v, lim in zip(box, (img.width(), img.height()) * 2)]
             result[kind] = dict(zip(("coloured", "text"), fringe(img, b)))
+            crop = img.copy(b[0], b[1], b[2] - b[0], b[3] - b[1])
+            buf = QBuffer()
+            buf.open(QIODevice.OpenModeFlag.WriteOnly)
+            crop.save(buf, "PNG")
+            result[kind]["png"] = bytes(buf.data().toBase64()).decode()  # so a CI log carries the pixels
             if out:
-                crop = img.copy(b[0], b[1], b[2] - b[0], b[3] - b[1])
                 crop.scaled(crop.width() * 6, crop.height() * 6).save(str(Path(out) / f"{name}-{kind}.png"))
         app.quit()
 
@@ -143,6 +147,10 @@ def main() -> int:
         s, w = r["screen"], r["widget"]
         print(f"| {r['variant']} | {r['platform']} | {r['dpr']} | {s['coloured']}/{s['text']} | "
               f"{w['coloured']}/{w['text']} |")
+    for r in rows:
+        for kind in ("screen", "widget"):
+            if kind in r:
+                print(f"PNG {r['variant']}-{kind} {r[kind].pop('png')}")
     app = next((r for r in rows if r.get("variant") == "app" and "screen" in r), None)
     if app is None:
         print("the app variant didn't render")
