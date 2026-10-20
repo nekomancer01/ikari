@@ -583,6 +583,35 @@ def span_check(e):
     check("double-click back to every day")
 
 
+@step("words and score: the word cloud, and the score filter on every page")
+def words_and_score(e):
+    if "words" not in pages() or not hasattr(w.words_page.body, "placed"):
+        e["notes"].append("no word cloud on this main")
+    else:
+        t0 = time.perf_counter()
+        go("words")
+        pump(1.5)  # counted off the GUI thread
+        cloud = w.words_page.body
+        placed = cloud.placed()
+        e["notes"].append(f"word cloud: {len(cloud._words)} words counted, {len(placed)} drawn, top "
+                          f"{[p[1] for p in placed[:5]]}, shown in {time.perf_counter() - t0:.1f}s")
+        e["shots"].append(shot(w, "words"))
+    if not hasattr(w, "score_pick"):
+        return
+    from subsentiment.store import scoring_at_least
+
+    go("posts")
+    for text in ("Score 100+", "Any score"):
+        w.score_pick.setCurrentIndex(w.score_pick.findText(text))
+        pump(0.8)
+        want = len(scoring_at_least(w.store.posts(w.current), w.min_score))
+        shown = w.posts_tab.view.model().rowCount()
+        e["notes"].append(f"{text}: posts table {shown}, expected {want}{'' if shown == want else ' MISMATCH'}; "
+                          f"subtitle {w.subheading.text()!r}")
+        if text != "Any score":
+            e["shots"].append(shot(w, "score-100"))
+
+
 @step("look-around: every tab, scope, theme and View option")
 def look_around(e):
     for name in pages():
@@ -743,7 +772,8 @@ def coverage_open(e):
         if (w.datasets.item(i).data(Qt.ItemDataRole.UserRole) or "").lower() == ARGS.busy.lower():
             w.datasets.setCurrentRow(i)
     pump(0.5)
-    w.coverage_act.trigger()
+    open_drawer("")
+    go("coverage") if "coverage" in pages() else w.coverage_act.trigger()  # a rail page since #91
     pump(1)
     c = w.coverage
     e["shots"].append(shot(c, "coverage-open"))
@@ -779,7 +809,9 @@ def coverage_comments(e):
 
 @step("delete: File > Delete saved data for the busy subreddit")
 def delete(e):
-    if w.coverage is not None:
+    if hasattr(w, "rail") and "coverage" in pages():
+        go("overview")  # a page since #91, not a window to close
+    elif w.coverage is not None:
         w.coverage.close()
     t = time.perf_counter()
     w.delete_act.trigger()
@@ -790,7 +822,7 @@ def delete(e):
     e["shots"].append(shot(w, "after-delete"))
 
 
-for fn in (first_launch, small_fetch, busy_fetch, stop_midway, days_pick, span_check, look_around, motion_check, timeline, export, comments_all, coverage_open, coverage_day,
+for fn in (first_launch, small_fetch, busy_fetch, stop_midway, days_pick, span_check, words_and_score, look_around, motion_check, timeline, export, comments_all, coverage_open, coverage_day,
            coverage_comments, delete):
     fn()
 
