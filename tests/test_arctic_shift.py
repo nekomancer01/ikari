@@ -5,7 +5,7 @@ import pytest
 import requests
 
 from subsentiment.arctic_shift import (
-    BASE_URL, SETTLE_SECONDS, TOP_PAGES, ArcticShiftClient, QueryTimeout, RateLimiter, quotas, slices, slot_count,
+    BASE_URL, SETTLE_SECONDS, TOP_PAGES, ArcticShiftClient, QueryTimeout, RateLimiter, Stopped, quotas, slices, slot_count,
 )
 from subsentiment.reddit import FetchError, Post
 
@@ -227,8 +227,10 @@ def test_query_is_passed_through():
 def test_removed_posts_are_skipped_and_removed_bodies_blanked():
     items = [post(1, removed_by_category="moderator"), post(2, selftext="[removed]"),
              post(3, _meta={"retrieved_2nd_on": NOW, "removal_type": "moderator", "was_deleted_later": True})]
-    posts = archive(items).fetch_posts("python", after=NOW - DAY, before=NOW + 1)
+    c = archive(items)
+    posts = c.fetch_posts("python", after=NOW - DAY, before=NOW + 1)
     assert [p.id for p in posts] == ["p2"] and posts[0].selftext == ""
+    assert set(c.removed) == {"p1", "p3"}  # noted, so coverage can count them as checked
 
 
 def test_posts_by_id_are_fetched_in_batches_of_500():
@@ -443,10 +445,29 @@ def test_day_counts_read_each_bucket_format_and_fill_empty_days():
 
 def test_a_timing_out_count_is_split_and_a_day_that_still_times_out_is_left_out():
     slow = FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
-    # two days: the whole range times out three times, then day one works and day two keeps timing out
-    c = client([slow] * 3 + [ok([{"created_utc": D0, "count": 4}])] + [slow] * 3)
+    # two days: the whole range times out three times, then day one works and day two keeps timing out,
+    # including the second go it gets at the end; it's left out (unknown), never counted as 0
+    c = client([slow] * 3 + [ok([{"created_utc": D0, "count": 4}])] + [slow] * 6)
     assert c.day_counts("Python", D0, D0 + 2 * DAY) == {D0: 4}
-    assert [p["limit"] for _, p in c.session.calls] == [3, 3, 3, 2, 2, 2, 2]  # never shrunk like a page
+    assert [p["limit"] for _, p in c.session.calls] == [3, 3, 3] + [2] * 7  # never shrunk like a page
+    assert [p["after"] for _, p in c.session.calls[-6:]] == [D0 + DAY] * 6
+
+
+def test_a_day_whose_count_timed_out_gets_a_second_go():
+    slow = FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
+    c = client([slow] * 3 + [ok([{"created_utc": D0 - 7200, "count": 4}])])
+    assert c.day_counts("Python", D0, D0 + DAY) == {D0: 4}
+
+
+def test_day_buckets_keyed_two_hours_before_utc_midnight_count_for_that_utc_day():
+    # The archive keys a UTC day's bucket at 22:00Z the day before (its own midnight, UTC+2), and the
+    # hour before the clocks change, UTC+1: 23:00Z. Each still belongs to the UTC day that follows.
+    buckets = [{"created_utc": "2026-10-13T22:00:00.000Z", "count": 12},
+               {"created_utc": (D0 + DAY - 7200) * 1000, "count": 3},
+               {"created_utc": D0 + 3 * DAY - 3600, "count": 7},
+               {"created_utc": D0 + 4 * DAY - 7200, "count": 9}]  # the day after the range
+    counts = client([ok(buckets)]).day_counts("Python", D0, D0 + 4 * DAY)
+    assert counts == {D0: 12, D0 + DAY: 3, D0 + 2 * DAY: 0, D0 + 3 * DAY: 7}
 
 
 def test_all_comments_ask_for_the_whole_thread_and_say_whether_it_is_complete():
@@ -493,6 +514,44 @@ def test_a_page_shrunk_after_a_timeout_doesnt_end_the_slice_early():
     assert len(timeouts) == 1  # the smaller page that worked is kept, not retried at full size each time
 
 
+def busy_day(n, removed_every=5):
+    """A day holding n posts spread evenly, every ``removed_every``-th one removed on Reddit."""
+    step = DAY / n
+    return [at(int(T0 + 1 + k * step), k, **({"removed_by_category": "deleted"} if k % removed_every == 0 else {}))
+            for k in range(n)]
+
+
+def test_reading_a_whole_busy_day_goes_on_until_every_slice_runs_out():
+    # Sat 17 Oct on r/AskReddit: 4,288 posts, about a fifth removed, and the archive kept timing out on
+    # full pages. "Download all" stopped at 2,639 of them and still said the day was complete.
+    items = busy_day(4000)
+    usable = {d["id"] for d in items if "removed_by_category" not in d}
+    clock = FakeClock()
+    sample = ArcticShiftClient(session=BusyArchive(items, max_limit=25), limiter=RateLimiter(0.0, clock, clock.sleep))
+    short = sample.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000)
+    assert len(short) < len(usable) and not sample.exhausted  # a few rounds only: it can't say it got them all
+
+    c = ArcticShiftClient(session=BusyArchive(items, max_limit=25), limiter=RateLimiter(0.0, clock, clock.sleep))
+    posts = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True)
+    assert {p.id for p in posts} == usable and c.exhausted
+    assert len(c.removed) == len(items) - len(usable)
+
+
+def test_a_whole_day_read_to_the_limit_or_stopped_is_not_called_exhausted():
+    items = busy_day(400)
+    c = archive(items)
+    assert len(c.fetch_posts("python", after=T0, before=T0 + DAY, limit=100, exhaust=True)) == 100
+    assert not c.exhausted  # stopped at the limit with posts left
+    calls = []
+    stop = lambda: len(calls) > 3 or calls.append(1)  # noqa: E731
+    c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True, should_stop=stop)
+    assert not c.exhausted
+    c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True)
+    assert c.exhausted
+    c.fetch_posts("python", after=T0, before=T0 + DAY, limit=5, top=True)
+    assert not c.exhausted  # top mode picks, it never reads everything
+
+
 def test_a_post_right_on_a_slice_edge_is_found():
     items = [at(T0 + 6 * 3600, 1), at(T0 + 6 * 3600 + 5, 2)]  # the first sits exactly where slice two starts
     posts = archive(items).fetch_posts("python", after=T0, before=T0 + DAY, limit=4)
@@ -523,7 +582,7 @@ def test_slices_are_read_a_few_at_once_with_the_same_result():
     items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(24)]
     got = {}
     for workers in (1, 4):
-        session = SlowServer(items, delay=0.05)
+        session = SlowServer(items, delay=0.1)
         c = ArcticShiftClient(session=session, limiter=RateLimiter(0.0), workers=workers)
         start = time.perf_counter()
         seen_on = set()
@@ -533,19 +592,32 @@ def test_slices_are_read_a_few_at_once_with_the_same_result():
         assert seen_on == {threading.get_ident()}  # results are handed over on the calling thread
     assert got[1][0] == got[4][0]
     assert got[4][2] == 4 and got[1][2] == 1
-    assert got[4][1] < got[1][1] / 2.5  # 28 slices of 50 ms: about 1.4 s one at a time, 0.35 s four at once
+    assert got[4][1] < got[1][1] / 2.5  # 28 slices of 100 ms: about 2.8 s one at a time, 0.7 s four at once
 
 
 def test_requests_still_start_no_faster_than_the_limiter_allows():
     items = [at(T0 + d * DAY + 3600 * h, d * 100 + h) for d in range(7) for h in range(24)]
     starts = []
-    session = SlowServer(items, delay=0.05)
-    real_get = session.get
-    session.get = lambda *a, **k: (starts.append(time.perf_counter()), real_get(*a, **k))[1]
-    ArcticShiftClient(session=session, limiter=RateLimiter(0.02), workers=4).fetch_posts(
+    limiter = RateLimiter(0.02)
+    real_wait, grab = limiter.wait, threading.Lock()
+
+    def wait(should_stop=None):
+        # When the limiter let each request go, by its own clock. Timing anything after that also counts how
+        # late the OS ran each worker thread, which on a busy machine (the suite runs in parallel) bunches
+        # two together. The lock keeps another grant from moving _next before it's read.
+        with grab:
+            real_wait(should_stop)
+            starts.append(limiter._next - limiter.interval)
+
+    limiter.wait = wait
+    ArcticShiftClient(session=SlowServer(items, delay=0.05), limiter=limiter, workers=4).fetch_posts(
         "python", after=T0, before=T0 + 7 * DAY, limit=28)
+    assert len(starts) >= 28
     gaps = [b - a for a, b in zip(starts, starts[1:])]
-    assert min(gaps) >= 0.018
+    # The limiter's clock (time.monotonic) only ticks every ~16 ms on Windows before Python 3.13, so there a
+    # gap can read up to one tick short of the interval; nothing ever starts together.
+    tick = time.get_clock_info("monotonic").resolution
+    assert min(gaps) >= 0.018 - tick
 
 
 def test_an_error_in_one_slice_stops_the_fetch():
@@ -581,11 +653,11 @@ def test_stopping_top_mode_keeps_the_days_already_ranked():
 
 def test_concurrent_requests_stay_within_the_servers_remaining_budget():
     # A server allowing 3 requests per 0.3 s window, and 4 threads asking as fast as the limiter lets them.
-    lock, window, used, refused = threading.Lock(), [time.monotonic()], [0], []
+    lock, window, used, refused = threading.Lock(), [time.perf_counter()], [0], []
 
     def answer():
         with lock:
-            now = time.monotonic()
+            now = time.perf_counter()
             if now - window[0] >= 0.3:
                 window[0], used[0] = now, 0
             used[0] += 1
@@ -617,3 +689,45 @@ def test_a_request_that_never_got_an_answer_frees_its_slot():
     finished = threading.Event()
     threading.Thread(target=lambda: (limiter.wait(), finished.set()), daemon=True).start()
     assert finished.wait(0.5)
+
+
+def test_stop_cuts_short_the_retries_and_waits_of_requests_in_flight():
+    # Every page times out, so each request backs off 2 s, then 4 s, then the window is halved and so on.
+    class AlwaysSlow(ArchiveSession):
+        def get(self, url, params=None, timeout=None):
+            time.sleep(0.02)
+            return FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
+
+    flag = threading.Event()
+    c = ArcticShiftClient(session=AlwaysSlow([]), limiter=RateLimiter(0.0), should_stop=flag.is_set)
+    threading.Timer(0.3, flag.set).start()
+    start = time.perf_counter()
+    assert c.fetch_posts("python", after=T0, before=T0 + DAY, limit=40, should_stop=flag.is_set) == []
+    assert time.perf_counter() - start < 1.0
+
+
+def test_stop_keeps_what_finished_slices_found():
+    items = [at(T0 + 3600 * h, h) for h in range(24)]
+    session = SlowServer(items, delay=0.05)
+    flag = threading.Event()
+    c = ArcticShiftClient(session=session, limiter=RateLimiter(0.0), workers=1, should_stop=flag.is_set)
+    got = []
+
+    def on_posts(batch):
+        got.extend(batch)
+        flag.set()  # Stop right after the first slice is in
+
+    posts = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=24, should_stop=flag.is_set,
+                          on_posts=on_posts)
+    assert posts == got and 0 < len(posts) < 24
+
+
+def test_a_long_wait_ends_as_soon_as_stop_is_pressed():
+    limiter = RateLimiter(0.0)
+    limiter.hold(30)
+    flag = threading.Event()
+    threading.Timer(0.2, flag.set).start()
+    start = time.perf_counter()
+    with pytest.raises(Stopped):
+        limiter.wait(flag.is_set)
+    assert time.perf_counter() - start < 1.0

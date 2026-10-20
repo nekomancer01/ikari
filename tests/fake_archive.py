@@ -14,6 +14,7 @@ answers them, so a request ikari shouldn't send fails here too:
 - busy subreddits (``busy``) time out the way the archive does: keyword search answers
   "Query timed out" (HTTP 200), a page over a window holding more than BUSY_PAGE posts or a day aggregate
   over more than BUSY_AGG_DAYS days answers 422 "Timeout. Maybe slow down a bit".
+- a day aggregate's buckets hold UTC days but are keyed two hours early, at 22:00Z the day before.
 - scores are 1 and num_comments 0 until a post is 36 hours old; removed posts stay in the archive.
 
 It can also be told to answer some requests with errors first (``fail``), or to answer slowly
@@ -124,6 +125,7 @@ class FakeArchive:
         self.requests: list[tuple[str, dict]] = []
         self.faults: dict[str, list[tuple[int, dict]]] = {}  # path -> responses to give before real ones
         self.delay = 0.0  # seconds each request takes, so a test can stop a fetch midway
+        self.delays: dict[str, float] = {}  # the same for one endpoint only
         self._lock = threading.Lock()
         archive = self
 
@@ -171,8 +173,8 @@ class FakeArchive:
             if fault:
                 status, payload = fault.pop(0)
                 return status, payload, headers
-        if self.delay:
-            time.sleep(self.delay)
+        if self.delays.get(path, self.delay):
+            time.sleep(self.delays.get(path, self.delay))
         try:
             if headers.get("X-RateLimit-Remaining") == "-1":
                 raise Rejected(429, "Too many requests", {"X-RateLimit-Remaining": "0",
@@ -267,4 +269,6 @@ class FakeArchive:
         for p in self._matching(q):
             day = int(p["created_utc"] // DAY * DAY)
             counts[day] = counts.get(day, 0) + 1
-        return [{"created_utc": day * 1000, "count": n} for day, n in sorted(counts.items())]
+        # Keyed the way the archive keys them: at its own midnight, UTC+2, so 22:00Z the day before. The
+        # bucket still holds the UTC day.
+        return [{"created_utc": (day - 7200) * 1000, "count": n} for day, n in sorted(counts.items())]

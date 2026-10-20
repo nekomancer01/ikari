@@ -11,7 +11,8 @@ import math
 import time
 from datetime import datetime, timezone
 
-from PySide6.QtCore import QRectF, QSize, Qt, QThread, Slot
+import shiboken6
+from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QThread, Slot
 from PySide6.QtGui import QColor, QGuiApplication, QLinearGradient, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton,
@@ -27,12 +28,10 @@ from subsentiment.gui.worker import CountWorker
 
 DAY = 86400
 MAX_DAY_POSTS = 10000  # cap on one day's "Download all"
-UNKNOWN_DAY_POSTS = 2000  # what a day's "Download all" asks for when the archive couldn't count it
-SLACK = 25  # extra posts asked for beyond the count, in case it lags the archive
 
 NOTE = ("Totals come from Arctic Shift and include posts and comments later removed from Reddit, which ikari "
-        "skips, so some days and threads stop short of 100%. A check mark means everything the archive still "
-        "has is saved. Days are UTC. A day's Download all fetches its posts only; comments download only from the "
+        "can't save. A day's share counts the removed posts ikari has seen as checked, and a thread can stop short "
+        "of 100%. A check mark means everything the archive still has is saved. Days are UTC. A day's Download all fetches its posts only; comments download only from the "
         "buttons on the right.")
 
 
@@ -62,25 +61,31 @@ def today() -> int:
     return int(time.time() // DAY * DAY)
 
 
-COUNT_LAG_DAYS = 1  # days before today whose archive count is still filling in
-
-
 def no_total(day: int, saved: int, total: int | None, complete: bool) -> bool:
-    """True for a day whose archive count can't be shown: today (not over yet), the day before (the
-    archive's daily counts lag by more than a day: on 19 Oct at 18:00 UTC, 18 Oct read about 55% of a
-    normal day while 17 Oct was settled), or any day whose count is below what's already saved."""
-    if day >= today() - COUNT_LAG_DAYS * DAY:
+    """True for a day whose archive count can't be shown: today (not over yet), or any day whose count
+    is below what's already saved. Yesterday's count is already whole: on 20 Oct, r/AskReddit's 19 Oct
+    read 4,517, the same as the sum of its 24 hourly counts."""
+    if day >= today():
         return True
     return not complete and total is not None and total < saved
 
 
-def share_text(saved: int, total: int | None, complete: bool, noun: str) -> tuple[str, str, float | None, str]:
-    """(main text, side text, share 0..1 or None, tooltip) for one coverage cell."""
+def share_text(saved: int, total: int | None, complete: bool, noun: str,
+               removed: int = 0) -> tuple[str, str, float | None, str]:
+    """(main text, side text, share 0..1 or None, tooltip) for one coverage cell. ``removed`` is how many
+    of the archive's items ikari has seen were removed from Reddit: the archive's count includes them but
+    they can't be saved, so they count as checked."""
     if complete:
         tip = f"All {plural(saved, noun)} the archive still has are saved."
         if total is not None and total > saved:
             tip += f" Its count of {total:,} includes ones removed from Reddit."
         return f"{saved:,} saved", "✓ Complete", 1.0, tip
+    if removed and total:
+        checked = saved + removed
+        share = min(1.0, checked / total)
+        tip = (f"Arctic Shift counts {plural(total, noun)} here. ikari has checked {min(checked, total):,} of "
+               f"them: {saved:,} saved and {removed:,} removed from Reddit, which can't be saved.")
+        return f"{saved:,} saved", f"{100 * share:.0f}%", share, tip
     if total is None:
         return f"{saved:,} saved", "total unknown", None, "The archive hasn't counted these yet."
     if total == 0 and saved == 0:
@@ -145,7 +150,7 @@ class Cell(QWidget):
         self.bar.setSizePolicy(keep)
         lay.addWidget(self.bar)
         # An open day has no bar, so its side text goes on its own line there: side by side,
-        # "1,234 saved so far" and "Still counting" don't fit the column at 150%.
+        # "1,234 saved so far" and "No usable count" don't fit the column at 150%.
         self.note = label("", "muted")
         self.note.setVisible(False)
         lay.addWidget(self.note)
@@ -159,21 +164,23 @@ class Cell(QWidget):
         self.lay.setContentsMargins(*((8, 2, 12, 2) if open_day else (8, 7, 12, 9)))
         self.lay.setSpacing(0 if open_day else 5)
 
-    def set_open(self, saved: int, is_today: bool = True) -> None:
-        """A day without a usable total: just what's saved so far, no share or estimate."""
+    def set_open(self, saved: int, why: str = "today", total: int | None = None) -> None:
+        """A day without a usable total: just what's saved so far, no share or estimate. ``why`` is
+        "today" (not over yet) or "wrong" (a day whose count is below what's saved)."""
         self.main.setText(f"{saved:,} saved so far")
         self.side.setText("")
-        self.note.setText("Today" if is_today else "Still counting")
+        self.note.setText("Today" if why == "today" else "No usable count")
         self.bar.setVisible(False)  # an empty bar would read as 0%
         self.note.setVisible(True)
         self._pad(open_day=True)
-        self.setToolTip("Today isn't over, so there's no total yet. Download all fetches everything "
-                        "posted today so far." if is_today else
-                        "Arctic Shift's count for this day is still filling in, so there's no total yet. "
-                        "Download all fetches everything posted that day.")
+        self.setToolTip(
+            "Today isn't over, so there's no total yet. Download all fetches everything posted today so far."
+            if why == "today" else
+            f"Arctic Shift counted {total or 0:,} posts for this day, fewer than are already saved, so the "
+            "count can't be right. Download all fetches everything posted that day.")
 
-    def set(self, saved: int, total: int | None, complete: bool, noun: str) -> None:
-        main, side, share, tip = share_text(saved, total, complete, noun)
+    def set(self, saved: int, total: int | None, complete: bool, noun: str, removed: int = 0) -> None:
+        main, side, share, tip = share_text(saved, total, complete, noun, removed)
         self.bar.setVisible(True)
         self.note.setVisible(False)
         self._pad(open_day=False)
@@ -278,6 +285,8 @@ class CoverageWindow(QDialog):
         self._count_worker: CountWorker | None = None
         self._post_rows: list = []
         self._post_ids: list[str] = []
+        self._built: dict[int, tuple] = {}  # post rows with widgets, and what they last showed
+        self._comments_done: set[str] = set()
         self._day_rows: list[int] = []
 
         root = QVBoxLayout(self)
@@ -320,6 +329,9 @@ class CoverageWindow(QDialog):
         h.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         h.resizeSection(2, 136)
         self.post_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.post_table.verticalScrollBar().valueChanged.connect(self._fill_visible)
+        self._post_viewport = self.post_table.viewport()
+        self._post_viewport.installEventFilter(self)  # resized or shown: more rows may be on screen
         self.posts_title = section("Posts")
         self.all_comments = small_button("Download all comments")
         self.all_comments.clicked.connect(self._download_day_comments)
@@ -418,6 +430,7 @@ class CoverageWindow(QDialog):
     def _fill_days(self, totals: dict[int, int], rebuild: bool) -> None:
         store = self.window_.store
         saved = store.posts_per_day(self.subreddit, self.days[-1], self.days[0] + DAY)
+        removed = store.removed_per_day(self.subreddit, self.days[-1], self.days[0] + DAY)
         complete = store.complete_keys("posts", self.subreddit)
         t = self.day_table
         if rebuild or self._day_rows != self.days:
@@ -442,21 +455,23 @@ class CoverageWindow(QDialog):
             cell: Cell = t.cellWidget(row, 1)
             button: QPushButton = t.cellWidget(row, 2).findChild(QPushButton)
             if no_total(day, n, total, done):
-                cell.set_open(n, day >= current)
+                cell.set_open(n, "today" if day >= current else "wrong", total)
                 button.setText("Download all")
                 button.setEnabled(not self.busy)
                 button.setToolTip("Fetch everything posted today so far" if day >= current
                                   else f"Fetch every post from {day_text(day)}")
                 continue
-            cell.set(n, total, done, "post")
+            gone = removed.get(day, 0)
+            cell.set(n, total, done, "post", gone)
             if total is None and counting and not done:
                 cell.side.setText("counting…")
-            full = done or (total is not None and 0 < total <= n)
+            full = done or (total is not None and 0 < total <= n + gone)
             button.setText("Check again" if full else "Download all")
             button.setEnabled(not self.busy and not (total == 0 and not done and day < self.days[0]))
             button.setToolTip(
                 "Look for posts the archive has added since" if full else
-                f"Fetch every post from {day_text(day)}" + (f" ({total - n:,} more)" if total and total > n else ""))
+                f"Fetch every post from {day_text(day)}"
+                + (f" (up to {total - n - gone:,} more)" if total and total > n + gone else ""))
 
     def _selected_day(self) -> int | None:
         rows = self.day_table.selectionModel().selectedRows() if self.day_table.selectionModel() else []
@@ -477,8 +492,7 @@ class CoverageWindow(QDialog):
         if day is None or not self.subreddit:
             self.posts_title.setText("POSTS")
             t.setRowCount(0)
-            self._post_ids = []
-            self._post_rows = []
+            self._post_ids, self._post_rows, self._built = [], [], {}
             self.all_comments.setEnabled(False)
             self._empty("Pick a day to see its posts.")
             self.posts_empty.setVisible(True)
@@ -490,41 +504,76 @@ class CoverageWindow(QDialog):
         self.posts_title.setText(f"POSTS ON {day_text(day).upper()} · {len(rows):,}")
         ids = [r["id"] for r in rows]
         if ids != self._post_ids:
+            # A busy day has thousands of posts, and three widgets a row took seconds to build; rows get
+            # their widgets when they scroll into view (_fill_visible), so a new post costs the same as any.
+            keep = t.verticalScrollBar().value()
             t.setRowCount(0)
             t.setRowCount(len(rows))
-            for i, r in enumerate(rows):
-                title = ElidedLabel()
-                title.setContentsMargins(8, 0, 4, 0)
-                t.setCellWidget(i, 0, title)
-                t.setCellWidget(i, 1, Cell())
-                button = small_button("Download all")
-                button.clicked.connect(lambda _=False, pid=r["id"]: self._download_comments([pid]))
-                t.setCellWidget(i, 2, centred(button))
-            self._post_ids = ids
+            self._post_ids, self._built = ids, {}
+            t.verticalScrollBar().setValue(keep)
         self._post_rows = rows
+        self._comments_done = complete
         todo = []
-        for i, r in enumerate(rows):
-            done = r["id"] in complete
+        for r in rows:
             total = r["num_comments"]
-            t.cellWidget(i, 0).set_full(" ".join((r["title"] or "").split()))
-            cell: Cell = t.cellWidget(i, 1)
-            cell.set(r["saved_comments"], total, done, "comment")
-            if total is None and not done:
-                cell.side.setText("not counted yet")
-                cell.setToolTip("Arctic Shift counts a post's comments when it re-checks the post, usually "
-                                "about 36 hours after posting. Downloading still fetches what's there now.")
-            full = done or (bool(total) and r["saved_comments"] >= total)
-            if total != 0 and not full:
+            if total != 0 and not (r["id"] in complete or (bool(total) and r["saved_comments"] >= total)):
                 todo.append(r["id"])
-            button: QPushButton = t.cellWidget(i, 2).findChild(QPushButton)
-            button.setText("Check again" if full else "Download all")
-            button.setEnabled(not self.busy and (total != 0 or done))
+        self._fill_visible()
         self._todo_comments = todo
         self.all_comments.setText(f"Download all comments ({len(todo):,} posts)" if todo else "Download all comments")
         self.all_comments.setEnabled(not self.busy and bool(todo))
         self._empty("No posts from this day are saved yet. Use Download all on the left.")
         self.posts_empty.setVisible(not rows)
         t.setVisible(bool(rows))
+
+    def _fill_visible(self, *_) -> None:
+        """Build and fill the post rows on screen, plus a screenful either side for smooth scrolling."""
+        t = self.post_table
+        n = len(self._post_rows)
+        if not n:
+            return
+        height = max(t.viewport().height(), 1)
+        first = t.rowAt(0)
+        last = t.rowAt(height - 1)
+        first = 0 if first < 0 else first
+        last = n - 1 if last < 0 else last
+        span = last - first + 1
+        for i in range(max(0, first - span), min(n, last + span + 1)):
+            self._fill_post_row(i)
+
+    def _fill_post_row(self, i: int) -> None:
+        t, r = self.post_table, self._post_rows[i]
+        done = r["id"] in self._comments_done
+        state = (r["title"], r["saved_comments"], r["num_comments"], done, self.busy)
+        if self._built.get(i) == state:
+            return
+        if i not in self._built:
+            title = ElidedLabel()
+            title.setContentsMargins(8, 0, 4, 0)
+            t.setCellWidget(i, 0, title)
+            t.setCellWidget(i, 1, Cell())
+            button = small_button("Download all")
+            button.clicked.connect(lambda _=False, pid=r["id"]: self._download_comments([pid]))
+            t.setCellWidget(i, 2, centred(button))
+        self._built[i] = state
+        total = r["num_comments"]
+        t.cellWidget(i, 0).set_full(" ".join((r["title"] or "").split()))
+        cell: Cell = t.cellWidget(i, 1)
+        cell.set(r["saved_comments"], total, done, "comment")
+        if total is None and not done:
+            cell.side.setText("not counted yet")
+            cell.setToolTip("Arctic Shift counts a post's comments when it re-checks the post, usually "
+                            "about 36 hours after posting. Downloading still fetches what's there now.")
+        full = done or (bool(total) and r["saved_comments"] >= total)
+        button: QPushButton = t.cellWidget(i, 2).findChild(QPushButton)
+        button.setText("Check again" if full else "Download all")
+        button.setEnabled(not self.busy and (total != 0 or done))
+
+    def eventFilter(self, obj, event) -> bool:
+        if (obj is self._post_viewport and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)
+                and shiboken6.isValid(self.post_table)):  # not while the window is being torn down
+            self._fill_visible()
+        return super().eventFilter(obj, event)
 
     # -- archive counts -------------------------------------------------------
 
@@ -581,15 +630,11 @@ class CoverageWindow(QDialog):
     def _download_day(self, day: int) -> None:
         if not self.subreddit:
             return
-        total = self.totals.get(self.subreddit.lower(), {}).get(day)
-        have = self.window_.store.posts_per_day(self.subreddit, day, day + DAY).get(day, 0)
-        if no_total(day, have, total, False):  # no total to go by, so take everything there is
-            limit = MAX_DAY_POSTS
-        else:
-            limit = UNKNOWN_DAY_POSTS if total is None else max(total - have, 0) + SLACK
+        # Everything there is, not the archive's count less what's saved: the count can lag or be off, and
+        # the day is only marked complete when every part of it was read to its end.
         # Posts only: comments are fetched from the posts list, one post or one day at a time, when asked.
         req = collect.FetchRequest(subreddit=self.subreddit, after=day, before=day + DAY,
-                                   limit=min(limit, MAX_DAY_POSTS), include_comments=False, everything=True)
+                                   limit=MAX_DAY_POSTS, include_comments=False, everything=True)
         what = "so far today" if day >= today() else f"from {day_text(day)}"
         self.window_.start_request(req, f"Downloading every post {what} in r/{self.subreddit}…")
 

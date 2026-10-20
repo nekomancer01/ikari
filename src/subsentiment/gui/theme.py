@@ -18,6 +18,7 @@ numbers line up in columns.
 """
 from __future__ import annotations
 
+import os
 import random
 import sys
 import tempfile
@@ -91,6 +92,19 @@ def mode() -> str:
 
 def tokens() -> dict:
     return dict(THEMES[_mode], **OPAQUE[_mode]) if _reduce else THEMES[_mode]
+
+
+def qt_args(argv: list[str]) -> list[str]:
+    """Arguments for QApplication: on Windows, Qt's FreeType font engine instead of DirectWrite.
+
+    DirectWrite ignores QFont.NoSubpixelAntialias, so text kept ClearType's blue and orange fringes, which
+    look frayed at fractional scaling (tools/text_aa_check.py measures it). FreeType honours it. Left alone
+    when a platform is already chosen on the command line or in QT_QPA_PLATFORM."""
+    if sys.platform != "win32" or os.environ.get("QT_QPA_PLATFORM"):
+        return argv
+    if any(a == "-platform" or a.startswith("-platform=") for a in argv):
+        return argv
+    return [*argv, "-platform", "windows:fontengine=freetype"]
 
 
 def smooth_text(f: QFont) -> QFont:

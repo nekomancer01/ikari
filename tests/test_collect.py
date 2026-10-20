@@ -26,9 +26,11 @@ class FakeClient:
         return [self.by_id[i] for i in ids if i in self.by_id]
 
     def fetch_posts(self, subreddit, after, before, limit, query, top=False, skip=(), progress=None,
-                    should_stop=None, on_posts=None):
+                    should_stop=None, on_posts=None, exhaust=False):
         self.calls.append(("posts", top, set(skip)))
-        picked = [p for p in self.posts if top or p.id not in skip][:limit]
+        left = [p for p in self.posts if top or p.id not in skip]
+        picked = left[:limit]
+        self.exhausted = not top and len(picked) == len(left)
         for p in picked:  # the real client hands over each page as it is downloaded
             if on_posts:
                 on_posts([p])
@@ -179,6 +181,22 @@ def test_downloading_a_whole_day_marks_it_complete_only_when_the_archive_ran_out
     assert s2.complete_keys("posts", "python") == set()  # it may have had more than the 2 asked for
 
 
+def test_a_whole_day_that_stopped_short_of_the_limit_is_not_marked_complete(tmp_path):
+    # Sat 17 Oct: Download all saved 1,859 posts, well under its limit, but the archive had more it never
+    # read. Getting fewer than asked for doesn't mean the archive ran out; only the client can say that.
+    class ShortClient(FakeClient):
+        def fetch_posts(self, *a, **kw):
+            picked = super().fetch_posts(*a, **kw)[:2]
+            self.exhausted = False
+            return picked
+
+    s = store_with(tmp_path, [])
+    collect.run(ShortClient(posts=[mk(1), mk(2), mk(3)]), s,
+                collect.FetchRequest("python", after=T, before=T + 86400, limit=10000, everything=True,
+                                     include_comments=False))
+    assert s.complete_keys("posts", "python") == set()
+
+
 def test_each_post_and_comment_is_saved_and_announced_as_it_arrives(tmp_path):
     s = store_with(tmp_path, [])
     counts = []
@@ -249,3 +267,21 @@ def test_comments_fetched_at_once_still_give_up_after_repeated_failures(tmp_path
     assert collect.GIVE_UP_AFTER <= tried < collect.GIVE_UP_AFTER + c.workers  # only those already under way
     assert result.comment_errors == 20
     assert all(r["comments_ok"] == 0 for r in s.posts_between("python", None, None))
+
+
+def test_stop_doesnt_wait_for_a_comment_tree_still_downloading(tmp_path):
+    # One huge thread takes the archive ages to send; Stop shouldn't sit it out.
+    class HugeThread(SlowClient):
+        def fetch_comments(self, post, limit):
+            if post.id == "p0":
+                time.sleep(3)
+            return super().fetch_comments(post, limit)
+
+    s = store_with(tmp_path, [])
+    stop = threading.Event()
+    threading.Timer(0.3, stop.set).start()
+    start = time.perf_counter()
+    result = collect.run(HugeThread(posts=[mk(i) for i in range(12)]), s, collect.FetchRequest("python"),
+                         should_stop=stop.is_set)
+    assert time.perf_counter() - start < 1.5 and result.stopped
+    assert s.posts("python") and result.comment_errors == 0  # what finished is kept, nothing marked failed

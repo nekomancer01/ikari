@@ -223,18 +223,22 @@ class ShrinkingComboBox(QComboBox):
         return QSize(min(full.width(), 120), full.height())
 
 
-class StatusLabel(QLabel):
-    """Wrapped muted text that takes no room in the panel while it's empty."""
+class StatusLabel(ElidedLabel):
+    """The muted line under Fetch: one line that ends in "…" (the tooltip has it all), no room while empty.
+
+    It used to wrap, and a long "Added … Updated …" message took three lines, which pushed the sidebar
+    into scrolling and shifted its fields."""
 
     def __init__(self):
-        super().__init__()
-        self.setProperty("role", "muted")
-        self.setWordWrap(True)
+        super().__init__("", "muted")
         self.setVisible(False)
 
     def setText(self, text: str) -> None:
         super().setText(text)
         self.setVisible(bool(text))
+
+    def text(self) -> str:
+        return self.full_text()
 
 
 class QuietScrollBars(QObject):
@@ -316,6 +320,9 @@ class StatTile(QFrame):
 
 class TablePage(QWidget):
     """Filterable, sortable table on a solid panel; double-click opens the item on Reddit."""
+
+    SHRINKS = ("author", "post_title")  # free text that can end in "…" to leave room for the main text
+    OPTIONAL = ("author", "post_title", "num_comments")  # hidden in this order when there's still no room
 
     def __init__(self, columns, stretch_col: int):
         super().__init__()
@@ -403,12 +410,48 @@ class TablePage(QWidget):
         font = header_font(self.view.font())
         header.setFont(font)  # Qt elides header titles using the widget's font, not the stylesheet's
         metrics = QFontMetrics(font)
+        self._widths = {}  # column -> (width for its values, narrowest that still shows its title)
         for col in range(self.model.columnCount()):
-            if col == self.stretch_col:
-                continue
-            title = self.model.headerData(col, Qt.Orientation.Horizontal)
-            header.resizeSection(col, max(self.view.sizeHintForColumn(col),
-                                          metrics.horizontalAdvance(title) + 16 + 24 + 8))  # padding, arrow, slack
+            if col != self.stretch_col:
+                title = self.model.headerData(col, Qt.Orientation.Horizontal)
+                least = metrics.horizontalAdvance(title) + 16 + 24 + 8  # padding, sort arrow, slack
+                self._widths[col] = (max(self.view.sizeHintForColumn(col), least), least)
+        self._share_width()
+
+    def _share_width(self) -> None:
+        """Keep room for the text column (the title, the comment). A comment's post title and the author
+        used to take so much that the comment itself showed as "T…".
+
+        First the free-text columns (author, post title) give up width down to their titles and their
+        values end in "…"; if the text column still has under 40% of the width, the least needed columns
+        are hidden, author first."""
+        widths = getattr(self, "_widths", None)
+        if not widths:
+            return
+        keys = {col: self.model.columns[col][1] for col in widths}
+        room = self.view.viewport().width()
+        hidden = set()
+        for key in (None, *self.OPTIONAL):
+            if key is not None:
+                hidden |= {col for col, k in keys.items() if k == key}
+            shown = {col: wl for col, wl in widths.items() if col not in hidden}
+            fixed = sum(w for col, (w, _) in shown.items() if keys[col] not in self.SHRINKS)
+            loose = {col: wl for col, wl in shown.items() if keys[col] in self.SHRINKS}
+            spare = sum(w - least for w, least in loose.values())
+            over = fixed + sum(w for w, _ in loose.values()) - room * 0.6
+            give = min(1.0, over / spare) if over > 0 and spare > 0 else (0.0 if over <= 0 else 1.0)
+            used = fixed + sum(round(w - (w - least) * give) for w, least in loose.values())
+            if room - used >= room * 0.4 or key == self.OPTIONAL[-1]:
+                break
+        header = self.view.horizontalHeader()
+        for col, (w, least) in widths.items():
+            header.setSectionHidden(col, col in hidden)
+            header.resizeSection(col, round(w - (w - least) * give) if keys[col] in self.SHRINKS else w)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._share_width()
+
     def _update_count(self, *args) -> None:
         self.count.setText(f"{self.proxy.rowCount():,} rows")
 
@@ -428,6 +471,7 @@ class MainWindow(QMainWindow):
         self.updates = UpdateFlow(self, self.settings)
         self.thread: QThread | None = None
         self.worker: FetchWorker | None = None
+        self._stopping = False  # Stop was pressed on the running fetch
         self.current: str | None = None
         self.request: collect.FetchRequest | None = None
         self._live = QTimer(self)
@@ -442,6 +486,7 @@ class MainWindow(QMainWindow):
         self._since = 0.0  # rows saved since this moment belong to the running fetch
         # How far each table has read the running fetch's rows, so each save reads only what's new.
         self._read_to = {"posts": 0.0, "comments": 0.0}
+        self._follow = False  # show the subreddit being fetched, until the user picks another one
         self.posts: list = []
         self.comments: list = []
         self.coverage = None  # the Download coverage window, once opened
@@ -553,6 +598,10 @@ class MainWindow(QMainWindow):
         lay.setSpacing(10)
         scroll.setWidget(body)
         outer.addWidget(scroll)
+        # The scroll bar sits in the right margin when it shows, so the fields don't shift left.
+        bar = scroll.verticalScrollBar()
+        bar.rangeChanged.connect(
+            lambda _lo, hi: lay.setContentsMargins(19, 16, 19 - (bar.sizeHint().width() if hi > 0 else 0), 16))
 
         brand = QVBoxLayout()
         brand.setSpacing(2)
@@ -654,10 +703,11 @@ class MainWindow(QMainWindow):
         lay.addLayout(saved_head)
         self.datasets = QListWidget()
         self.datasets.setFrameShape(QFrame.Shape.NoFrame)
-        # Fills whatever height is left, down to two rows. Its default preferred height (about 190 px)
-        # counted in full and pushed the storage line below a 150% maximized window.
+        # Fills whatever height is left, down to one row. Its default preferred height (about 190 px)
+        # counted in full and pushed the storage line below a 150% maximized window, and at two rows a
+        # status line under Fetch did the same.
         self.datasets.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
-        self.datasets.setMinimumHeight(84)
+        self.datasets.setMinimumHeight(42)
         QuietScrollBars(self.datasets)
         self.datasets.currentItemChanged.connect(self._on_dataset_selected)
         lay.addWidget(self.datasets, 1)
@@ -926,6 +976,8 @@ class MainWindow(QMainWindow):
         self._since = time.time() - 1.0
         self._read_to = {"posts": self._since, "comments": self._since}
         self._flush_rows()
+        self._follow = True
+        self._open_fetched()  # if it's already saved, show it now; otherwise with its first rows
         self.thread = QThread(self)
         self.worker = FetchWorker(req, self.db_path)
         self.worker.moveToThread(self.thread)
@@ -938,19 +990,25 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.thread.quit)
         self.thread.finished.connect(self._on_thread_done)
         self._set_busy(True)
+        self._stopping = False
         self.progress_msg.setText(message)
         self.thread.start()
 
     def _stop_fetch(self) -> None:
         if self.worker:
             self.worker.stop()
-            self.progress_msg.setText("Stopping after the current request…")
+            self._stopping = True
+            self.progress_msg.setText("Stopping…")
+            if self.coverage is not None:
+                self.coverage.set_progress(0, 0, "Stopping…")
             self.stop_btn.setEnabled(False)
 
     def _on_progress(self, done: int, total: int, msg: str) -> None:
         if total:
             self.progress.setRange(0, total)
             self.progress.setValue(done)
+        if self._stopping:  # what's still finishing ("Waiting 4 s…") would read as Stop being ignored
+            msg = "Stopping…"
         self.progress_msg.setText(msg)
         if self.coverage is not None:
             self.coverage.set_progress(done, total, msg)
@@ -958,9 +1016,23 @@ class MainWindow(QMainWindow):
     def _on_saved(self) -> None:
         # A row was committed: queue it for the tables right away, and refresh the sidebar list and
         # overview charts at most about once a second so big fetches stay smooth.
+        if self._follow and not self._showing_fetch():
+            self._open_fetched()
         self._queue_new_rows()
         if not self._live.isActive():
             self._live.start()
+
+    def _open_fetched(self) -> None:
+        """Show the subreddit being fetched, if anything of it is saved yet."""
+        self._refresh_datasets(select=self.request.subreddit, reload=False)
+        item = self.datasets.currentItem()
+        name = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not name or name.lower() != self.request.subreddit.lower() or self._showing_fetch():
+            return
+        self._show_dataset(name)
+        for kind, rows in (("posts", self.posts), ("comments", self.comments)):
+            # What was just loaded needn't be read again; rows sharing the last instant are caught by id.
+            self._read_to[kind] = max([self._read_to[kind]] + [r["fetched_at"] for r in rows])
 
     def _showing_fetch(self) -> bool:
         return bool(self.request and self.current and self.current.lower() == self.request.subreddit.lower())
@@ -1011,16 +1083,11 @@ class MainWindow(QMainWindow):
     def _live_refresh(self) -> None:
         if self.thread is None or self.request is None:
             return
-        target = self.request.subreddit.lower()
         if self._showing_fetch():
             self._refresh_datasets(reload=False)
             self._render_overview()
-        elif self.current is None:  # the first rows of a new subreddit: open it
-            self._refresh_datasets(select=self.request.subreddit, reload=False)
-            item = self.datasets.currentItem()
-            name = item.data(Qt.ItemDataRole.UserRole) if item else None
-            if name and name.lower() == target:
-                self._show_dataset(name)
+        elif self._follow:
+            self._open_fetched()
         else:
             self._refresh_datasets(reload=False)
         if self.coverage is not None:
@@ -1086,6 +1153,8 @@ class MainWindow(QMainWindow):
 
     def _on_dataset_selected(self, item: QListWidgetItem | None) -> None:
         name = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        if self.thread is not None and self.request and name.lower() != self.request.subreddit.lower():
+            self._follow = False  # the user chose to look at something else while it runs
         self._show_dataset(name)
         if name:
             self.settings.setValue("ui/last_dataset", name)
@@ -1208,7 +1277,8 @@ class MainWindow(QMainWindow):
     def _show_about(self) -> None:
         QMessageBox.about(self, "About ikari", (
             f"<h3>ikari {__version__}</h3>"
-            "<p>Gather subreddit posts and comments and score their sentiment with VADER.</p>"
+            "<p>Gather subreddit posts and comments and score their sentiment with a model that runs "
+            "on this computer.</p>"
             "<p>Fonts: Manrope and Sora, both under the SIL Open Font License 1.1.</p>"))
 
     def paintEvent(self, event) -> None:
@@ -1218,9 +1288,22 @@ class MainWindow(QMainWindow):
         self._save_fetch_settings()
         if self.coverage is not None:
             self.coverage.close()
+        self.settings.sync()  # app.main may end the process without Qt's usual clean-up
         if self.worker:
-            self.worker.stop()
-            self.thread.quit()
-            self.thread.wait(3000)
+            # A fetch ending after this must not touch the closed store, so nothing it sends is handled.
+            thread, worker = self.thread, self.worker
+            worker.stop()
+            for sig in (worker.progress, worker.finished, worker.failed, worker.saved, thread.finished):
+                sig.disconnect()
+            thread.quit()
+            thread.wait(3000)
+        self._live.stop()  # both read the store
+        self._drip.stop()
         self.store.close()
         super().closeEvent(event)
+
+    def running_threads(self) -> list[QThread]:
+        """Fetch and count threads still running, such as one stuck on a slow request after the window
+        closed."""
+        threads = [self.thread, self.coverage and self.coverage._count_thread]
+        return [t for t in threads if t is not None and t.isRunning()]

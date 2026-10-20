@@ -16,9 +16,10 @@ What callers should know:
 """
 from __future__ import annotations
 
+import itertools
 import math
+import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from datetime import datetime, timezone
 from typing import Callable, Collection, Iterable
@@ -63,6 +64,14 @@ _GONE = ("[deleted]", "[removed]")
 WaitFn = Callable[[float, str], None]
 
 
+class Stopped(Exception):
+    """Stop was pressed: raised by ArcticShiftClient.get instead of sending (or retrying) a request, and
+    caught by the fetch loops, which return what they have."""
+
+
+STOP_POLL = 0.2  # seconds between Stop checks during a long wait
+
+
 class QueryTimeout(FetchError):
     """The archive gave up on a query as too slow, even with small pages. A narrower date window
     usually works."""
@@ -77,7 +86,7 @@ class RateLimiter:
     successful requests ease it back to the base interval.
     """
 
-    def __init__(self, interval: float = BASE_INTERVAL, clock: Callable[[], float] = time.monotonic,
+    def __init__(self, interval: float = BASE_INTERVAL, clock: Callable[[], float] = time.perf_counter,
                  sleep: Callable[[float], None] = time.sleep, wall: Callable[[], float] = time.time):
         self.base = self.interval = interval
         self._clock = clock
@@ -96,16 +105,20 @@ class RateLimiter:
         self._budget_known = False  # the server has sent X-RateLimit-Remaining at least once
         self._answered = False  # any answer has arrived yet
 
-    def wait(self) -> None:
-        """Block until a request may go out, and count it as in flight until ``observe`` or ``done``."""
+    def wait(self, should_stop: StopFn | None = None) -> None:
+        """Block until a request may go out, and count it as in flight until ``observe`` or ``done``.
+        Raises Stopped, sending nothing, if ``should_stop`` turns true meanwhile."""
+        announced = False
         with self._lock:
             while True:
+                if should_stop and should_stop():
+                    raise Stopped
                 now = self._clock()
                 if self._budget is not None and now >= self._budget_until:
                     self._budget = None  # the window reset; the next answer gives the new budget
                 unknown = not self._answered or (self._budget_known and self._budget is None)
                 if unknown and self._in_flight:
-                    self._lock.wait(1.0)
+                    self._lock.wait(STOP_POLL if should_stop else 1.0)
                     continue
                 if self._budget is not None and self._budget <= 0:
                     self.hold(self._budget_until - now, "Arctic Shift's request limit was reached")
@@ -114,8 +127,12 @@ class RateLimiter:
                 # sleep overshoots (Windows' timer is coarse); planning start times ahead doesn't.
                 delay = self._next - now
                 if delay > 0:
-                    if delay >= 3 and self.on_wait:
+                    if delay >= 3 and self.on_wait and not announced:
                         self.on_wait(delay, self._reason)
+                        announced = True
+                    if should_stop and delay > STOP_POLL:
+                        self._sleep(STOP_POLL)  # then look again: Stop may have been pressed
+                        continue
                     self._sleep(delay)
                 self._next = self._clock() + self.interval
                 self._in_flight += 1
@@ -233,13 +250,19 @@ def _light_rank(d: dict) -> tuple:
 
 class ArcticShiftClient:
     def __init__(self, session: requests.Session | None = None, limiter: RateLimiter | None = None,
-                 workers: int = WORKERS):
+                 workers: int = WORKERS, should_stop: StopFn | None = None):
         self.workers = workers
+        # Checked before every request and during waits, so Stop doesn't sit out retries and backoffs.
+        self.should_stop = should_stop
         self._local = threading.local()  # per-thread state of get(), as several threads share a client
         self.session = session or requests.Session()
         self.session.headers["User-Agent"] = USER_AGENT
         self.limiter = limiter or RateLimiter()
         self._page_cap = PAGE  # largest page the archive has answered without timing out in this fetch
+        # Posts the archive returned that were removed on Reddit, id -> created_utc: fetching skips them,
+        # but the archive's daily counts include them, so Download coverage counts them as checked.
+        self.removed: dict[str, float] = {}
+        self.exhausted = False  # whether the last fetch_posts read its whole range (see there)
 
     # -- HTTP ---------------------------------------------------------------
 
@@ -250,9 +273,10 @@ class ArcticShiftClient:
         params = dict(params)
         self._local.last_params = params  # what was finally sent, after any shrinking
         timeouts = 0
+        stop = None if getattr(self._local, "finishing", False) else self.should_stop
         for attempt in range(ATTEMPTS):
             backoff = min(5.0 * 2 ** attempt, MAX_WAIT)
-            self.limiter.wait()
+            self.limiter.wait(stop)
             try:
                 resp = self.session.get(BASE_URL + path, params=params, timeout=60)
             except (requests.ConnectionError, requests.Timeout):
@@ -316,6 +340,7 @@ class ArcticShiftClient:
         progress: ProgressFn | None = None,
         should_stop: StopFn | None = None,
         on_posts: Callable[[list[Post]], None] | None = None,
+        exhaust: bool = False,
     ) -> list[Post]:
         """Up to ``limit`` posts created in [after, before), spread evenly over the range, oldest first.
 
@@ -327,6 +352,11 @@ class ArcticShiftClient:
 
         ``on_posts`` is given each batch of posts as soon as it is downloaded (each slice's, outside top
         mode, where posts can only be ranked at the end), so a caller can show them while the rest comes.
+
+        Slices that run out leave others to make up the difference, a few rounds at most; with
+        ``exhaust`` (not in top mode), rounds go on until every slice has been read to its end or
+        ``limit`` is reached. Afterwards ``self.exhausted`` says whether every slice was read to its end,
+        so the range holds no posts beyond the ones returned and those in ``skip``.
         """
         subreddit = normalize_subreddit(subreddit)
         if error := subreddit_error(subreddit):
@@ -338,6 +368,7 @@ class ArcticShiftClient:
             base["query"] = query
         skip = set(skip)
         self._page_cap = PAGE
+        self.exhausted = False
 
         n = slot_count(after, before, limit, top)
         windows = slices(after, before, n)
@@ -379,8 +410,8 @@ class ArcticShiftClient:
                 progress(f"{what} posts from r/{subreddit}: part {done} of {len(windows)}, {got:,} so far")
 
         # Quiet slices (night hours, a slow week) leave the total short. Share what's missing among the
-        # slices that had more to give, a few rounds at most.
-        for _ in range(3):
+        # slices that had more to give, a few rounds at most (as many as it takes, with exhaust).
+        for _ in itertools.count() if exhaust and not top else range(3):
             short = limit - sum(map(len, picked))
             if top:
                 open_ = [i for i, extra in enumerate(spare) if extra]
@@ -414,6 +445,7 @@ class ArcticShiftClient:
                     on_posts(extra)
         posts = [p for group in picked for p in group]
         posts.sort(key=lambda p: p.created_utc)
+        self.exhausted = not top and not any(more)
         return posts
 
     def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int, int]:
@@ -439,7 +471,10 @@ class ArcticShiftClient:
             # A few spare for removed posts; a full page when saved posts may need skipping. Once the
             # archive has timed out on a big page, this fetch keeps to the smaller size that worked.
             size = min(self._page_cap, PAGE if skip else want - len(out) + 5)
-            page, end, sent = self._page(base, cursor, hi, size)
+            try:
+                page, end, sent = self._page(base, cursor, hi, size)
+            except Stopped:
+                return out, cursor, True
             if sent < size:
                 self._page_cap = sent
             size = sent  # a page shrunk after a timeout is full at this size, not at the size asked for
@@ -447,7 +482,9 @@ class ArcticShiftClient:
             fresh: list[Post] = []
             for d in new:
                 seen.add(d["id"])
-                if d["id"] not in skip and not _removed(d) and len(out) < want:
+                if _removed(d):
+                    self._note_removed(d)
+                elif d["id"] not in skip and len(out) < want:
                     out.append(_post(d))
                     fresh.append(out[-1])
                     cursor = max(cursor, int(_number(d.get("created_utc"), 0)) - 1)
@@ -470,7 +507,11 @@ class ArcticShiftClient:
         for start, end in slices(lo, hi, TOP_PAGES):
             if should_stop and should_stop():
                 break
-            for d in self._page(dict(base, fields=TOP_FIELDS), start, end, PAGE)[0]:
+            try:
+                page = self._page(dict(base, fields=TOP_FIELDS), start, end, PAGE)[0]
+            except Stopped:
+                break
+            for d in page:
                 if d.get("id"):
                     pool[d["id"]] = d
         return list(pool.values())
@@ -484,7 +525,11 @@ class ArcticShiftClient:
         checked here: a slice that was ranked is kept, rather than thrown away for want of one request."""
         head = ranked[:want + math.ceil(want * TOP_SPARE)]
         light = [d["id"] for d in head if isinstance(d, dict)]
-        full = {p.id: p for p in self.fetch_posts_by_ids(light)} if light else {}
+        self._local.finishing = True  # Stop can't cut this request short (see above)
+        try:
+            full = {p.id: p for p in self.fetch_posts_by_ids(light)} if light else {}
+        finally:
+            self._local.finishing = False
         usable = [d if isinstance(d, Post) else full[d["id"]] for d in head
                   if isinstance(d, Post) or d["id"] in full]
         return usable[:want], usable[want:] + ranked[len(head):]
@@ -496,41 +541,70 @@ class ArcticShiftClient:
         for i in range(0, len(ids), IDS_BATCH):
             if should_stop and should_stop():
                 break
-            out.extend(_post(d) for d in self.get("/api/posts/ids", {"ids": ",".join(ids[i:i + IDS_BATCH])})
-                       if d.get("id") and not _removed(d))
+            try:
+                page = self.get("/api/posts/ids", {"ids": ",".join(ids[i:i + IDS_BATCH])})
+            except Stopped:
+                break
+            for d in page:
+                if not d.get("id"):
+                    continue
+                if _removed(d):
+                    self._note_removed(d)
+                else:
+                    out.append(_post(d))
         return out
+
+    def _note_removed(self, d: dict) -> None:
+        created = _number(d.get("created_utc"), None)
+        if created is not None:
+            self.removed[d["id"]] = float(created)
 
     def day_counts(self, subreddit: str, after: float, before: float,
                    should_stop: StopFn | None = None) -> dict[int, int]:
         """Posts the archive holds for each UTC day in [after, before), as {day start: count}, from its
         aggregate endpoint. The counts include posts later removed on Reddit, which fetching skips. Days
-        the archive couldn't count (it times out on very busy subreddits) are left out."""
+        the archive couldn't count (it times out on very busy subreddits) are left out, not given 0.
+
+        The archive keys each day's bucket at its own midnight, two hours ahead of UTC (22:00Z the day
+        before, while Europe is on summer time), though the bucket holds the UTC day: on r/AskReddit the
+        bucket keyed 2026-10-16T22:00Z held 4,288 posts, exactly the 24 hourly buckets of UTC 17 Oct. So
+        a bucket counts for the UTC day whose midnight is nearest its key."""
         subreddit = normalize_subreddit(subreddit)
         if error := subreddit_error(subreddit):
             raise FetchError(error)
         first, end = int(after // DAY * DAY), int(math.ceil(before / DAY) * DAY)
         todo = [(lo, min(lo + COUNT_CHUNK_DAYS * DAY, end)) for lo in range(first, end, COUNT_CHUNK_DAYS * DAY)]
         out: dict[int, int] = {}
-        while todo:
+        failed: list[int] = []
+        retried = False
+        while todo or (failed and not retried):
             if should_stop and should_stop():
                 break
+            if not todo:  # one more go at the days that timed out, now the archive has had a breather
+                todo, failed, retried = [(d, d + DAY) for d in failed], [], True
             lo, hi = todo.pop(0)
             params = {"subreddit": subreddit, "aggregate": "created_utc", "frequency": "day",
                       "after": lo, "before": hi, "limit": (hi - lo) // DAY + 1}
             try:
                 buckets = self.get("/api/posts/search/aggregate", params, shrink=False)
+            except Stopped:
+                break
             except QueryTimeout:
-                if hi - lo > DAY:  # try the halves; a single day that times out stays unknown
+                if hi - lo > DAY:  # try the halves
                     mid = lo + (hi - lo) // DAY // 2 * DAY
                     todo[:0] = [(lo, mid), (mid, hi)]
+                else:
+                    failed.append(lo)
                 continue
             for day in range(lo, hi, DAY):
                 out[day] = 0  # a day with no bucket had no posts
             for b in buckets:
                 when, n = _bucket_time(b), _number((b or {}).get("count", (b or {}).get("doc_count")), None)
-                if when is not None and n is not None and lo <= when < hi:
-                    day = int(when // DAY * DAY)
-                    out[day] = out.get(day, 0) + int(n)
+                if when is None or n is None:
+                    continue
+                day = int((when + DAY // 2) // DAY * DAY)
+                if lo <= day < hi:
+                    out[day] += int(n)
         return out
 
     # -- comments ---------------------------------------------------------------
@@ -587,9 +661,13 @@ class ArcticShiftClient:
         return comments, items, _collapsed(tree)
 
 
-def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS):
+def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS, should_stop: StopFn | None = None):
     """Run fn(item) for each item, up to ``workers`` at once, and yield (item, result, error) as each
-    finishes, on the calling thread. Stopping early (closing the generator) cancels what hasn't started."""
+    finishes, on the calling thread. Stopping early (closing the generator) starts nothing more.
+
+    With ``should_stop``, once it turns true this returns without waiting for calls still running: their
+    results are dropped. For calls that can take long and are cheap to redo, like a big comment tree.
+    The worker threads are daemons, so one left on a slow request never holds up the app quitting."""
     items = list(items)
     if workers <= 1 or len(items) <= 1:
         for item in items:
@@ -598,14 +676,42 @@ def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS):
             except Exception as e:  # noqa: BLE001 - handed to the caller, like the threaded path
                 yield item, None, e
         return
-    pool = ThreadPoolExecutor(max_workers=min(workers, len(items)))
+    todo, done = queue.SimpleQueue(), queue.SimpleQueue()
+    for item in items:
+        todo.put(item)
+    closed = threading.Event()
+
+    def work():
+        while not closed.is_set():
+            try:
+                item = todo.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                done.put((item, fn(item), None))
+            except Exception as e:  # noqa: BLE001 - handed to the caller
+                done.put((item, None, e))
+
+    threads = [threading.Thread(target=work, daemon=True) for _ in range(min(workers, len(items)))]
+    for t in threads:
+        t.start()
     try:
-        futures = {pool.submit(fn, item): item for item in items}
-        for f in as_completed(futures):
-            error = f.exception()
-            yield futures[f], None if error else f.result(), error
+        for _ in items:
+            while True:
+                try:
+                    result = done.get(timeout=STOP_POLL if should_stop else None)
+                    break
+                except queue.Empty:
+                    if should_stop():
+                        return
+            yield result
+            if should_stop and should_stop():
+                return
     finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+        closed.set()  # nothing new starts
+        if not (should_stop and should_stop()):
+            for t in threads:
+                t.join()
 
 
 def _walk(items: list, depth: int = 0):

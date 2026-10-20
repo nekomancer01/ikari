@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS complete (
     kind TEXT NOT NULL, subreddit TEXT NOT NULL, key TEXT NOT NULL, fetched_at REAL,  -- subreddit lowercased
     PRIMARY KEY (kind, subreddit, key)
 );
+-- Posts the archive has that were removed on Reddit, which ikari skips. Its daily counts include them, so
+-- Download coverage counts the ones seen as checked.
+CREATE TABLE IF NOT EXISTS removed_posts (
+    id TEXT PRIMARY KEY, subreddit TEXT NOT NULL, created_utc REAL  -- subreddit lowercased
+);
 CREATE INDEX IF NOT EXISTS posts_sub ON posts(subreddit COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS comments_sub ON comments(subreddit COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS comments_post ON comments(post_id);
@@ -64,6 +69,12 @@ class Store:
         self.db.executescript(SCHEMA)
 
     def close(self) -> None:
+        # Copy what's committed into the main file now, so a process ended right after (see gui.app.end_now)
+        # leaves it there and not only in the WAL file.
+        try:
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:  # busy with a fetch's writes: the WAL file still holds them safely
+            pass
         self.db.close()
 
     def save_post(self, post: Post, sentiment: float, label: str) -> None:
@@ -98,6 +109,20 @@ class Store:
     def complete_keys(self, kind: str, subreddit: str) -> set[str]:
         return {r["key"] for r in self.db.execute(
             "SELECT key FROM complete WHERE kind = ? AND subreddit = ?", (kind, subreddit.lower()))}
+
+    def save_removed(self, subreddit: str, removed: dict[str, float]) -> None:
+        self.db.executemany("INSERT OR REPLACE INTO removed_posts VALUES (?, ?, ?)",
+                            [(pid, subreddit.lower(), created) for pid, created in removed.items()])
+
+    def removed_per_day(self, subreddit: str, after: float, before: float) -> dict[int, int]:
+        """Removed posts seen per UTC day in [after, before), as {day start: count}; ones also saved
+        (removed after ikari got them) are counted as saved instead."""
+        rows = self.db.execute(
+            "SELECT CAST(created_utc / 86400 AS INTEGER) * 86400 d, COUNT(*) n FROM removed_posts "
+            "WHERE subreddit = ? AND created_utc >= ? AND created_utc < ? "
+            "AND id NOT IN (SELECT id FROM posts) GROUP BY d",
+            (subreddit.lower(), after, before))
+        return {r["d"]: r["n"] for r in rows}
 
     def posts_per_day(self, subreddit: str, after: float, before: float) -> dict[int, int]:
         """Saved posts per UTC day in [after, before), as {day start: count}."""
@@ -171,6 +196,7 @@ class Store:
         self.db.execute("DELETE FROM comments WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
         self.db.execute("DELETE FROM comment_fetches WHERE post_id NOT IN (SELECT id FROM posts)")
         self.db.execute("DELETE FROM complete WHERE subreddit = ?", (subreddit.lower(),))
+        self.db.execute("DELETE FROM removed_posts WHERE subreddit = ?", (subreddit.lower(),))
         self.db.commit()
         self._compact()
 
@@ -179,6 +205,7 @@ class Store:
         self.db.execute("DELETE FROM comments")
         self.db.execute("DELETE FROM comment_fetches")
         self.db.execute("DELETE FROM complete")
+        self.db.execute("DELETE FROM removed_posts")
         self.db.commit()
         self._compact()
 
