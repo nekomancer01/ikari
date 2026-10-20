@@ -1,24 +1,25 @@
-"""Choosing which saved days the analysis counts: the header's day picker, what it filters, and what it remembers."""
+"""The span of saved days every page counts, chosen on the timeline (its range buttons, zoom, drag selection
+and navigator): what it filters, live, and what it remembers. It replaced the header's Days picker."""
 import csv
 import os
+import time
 from datetime import date
 
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, Qt  # noqa: E402
+from PySide6.QtCore import QPoint, QSettings, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox  # noqa: E402
 
-from subsentiment.gui import days  # noqa: E402
+from subsentiment.gui import days, motion  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.reddit import Comment, Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
 DAY = 86400
 D1, D2, D3 = (days.from_date(date(2026, 10, d)) for d in (5, 6, 9))  # 7 and 8 Oct have nothing saved
-SEP = days.from_date(date(2026, 9, 30))
 
 
 def settings_in(tmp_path, name="days-test"):
@@ -30,55 +31,10 @@ def settings_in(tmp_path, name="days-test"):
     return QSettings()
 
 
-def test_choice_text_names_the_days_briefly():
-    have = {SEP, D1, D2, D3}
-    assert days.choice_text(None, have) == "All days"
-    assert days.choice_text(set(have), have) == "All days"
-    assert days.choice_text(set(), have) == "No days"
-    assert days.choice_text({D2}, have) == "6 Oct"
-    assert days.choice_text({D1, D2}, have) == "5 – 6 Oct"
-    assert days.choice_text({SEP, D1 - DAY * 4}, {SEP, D1 - DAY * 4}) == "All days"
-    assert days.choice_text({SEP, D1 - 4 * DAY}, have | {D1 - 4 * DAY}) == "30 Sep – 1 Oct"
-    assert days.choice_text({D1, D3}, have) == "2 of 4 days"  # not a run: 7 and 8 Oct are left out
-
-
-def test_a_choice_is_remembered_per_subreddit_and_every_day_is_stored_as_none(tmp_path):
-    s = settings_in(tmp_path)
-    try:
-        have = {D1, D2, D3}
-        assert days.load_choice(s, "Python") is None
-        assert days.save_choice(s, "Python", {D1, D3}, have) == {D1, D3}
-        assert days.load_choice(s, "python") == {D1, D3}  # names are case-insensitive, like the store's
-        assert days.load_choice(s, "rust") is None
-        assert days.save_choice(s, "Python", set(), have) == set()
-        assert days.load_choice(s, "Python") == set()  # nothing chosen is a choice too
-        assert days.save_choice(s, "Python", {D1, D2, D3}, have) is None  # every day: days fetched later count
-        assert not s.contains(days.settings_key("Python"))
-    finally:
-        QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
-
-
-def test_keep_filters_rows_by_their_own_utc_day():
-    rows = [{"created_utc": D1 + 10}, {"created_utc": D2 + DAY - 1}, {"created_utc": D3}]
-    assert days.keep(rows, None) == rows
-    assert days.keep(rows, {D2, D3}) == rows[1:]
-    assert days.keep(rows, set()) == []
-
-
-def test_calendar_grid_starts_on_the_locales_first_weekday(monkeypatch):
-    QApplication.instance() or QApplication([])
-    monkeypatch.setattr(days, "first_weekday", lambda: 0)  # Monday
-    cal = days.DayCalendar()
-    cal.show_month(2026, 10)  # 1 Oct 2026 is a Thursday
-    slots = cal.days_shown()
-    assert slots[:3] == [None] * 3 and slots[3] == days.from_date(date(2026, 10, 1))
-    assert cal.rows() == 5
-    monkeypatch.setattr(days, "first_weekday", lambda: 6)  # Sunday
-    cal.show_month(2026, 2)  # 1 Feb 2026 is a Sunday and February has exactly four weeks
-    assert cal.days_shown()[0] == days.from_date(date(2026, 2, 1)) and cal.rows() == 4
-
-
-# -- in the main window -----------------------------------------------------------------------------
+@pytest.fixture
+def settings(tmp_path):
+    yield settings_in(tmp_path)
+    QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
 
 
 @pytest.fixture
@@ -100,150 +56,188 @@ def window(tmp_path, monkeypatch):
 
     def make():
         w = mw.MainWindow(str(db))
+        motion.set_enabled(False)  # each change lands at once
+        w.resize(1280, 721)
+        w.show()
         w._refresh_datasets(select="Python")
         windows.append(w)
+        QApplication.processEvents()
         return w
     yield make
     for w in windows:
         w.close()
+    motion.set_enabled(True)
     QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
 
 
-def click(w, day, modifier=Qt.KeyboardModifier.NoModifier):
-    cal = w.days_pick.picker.calendar
-    QTest.mouseClick(cal, Qt.MouseButton.LeftButton, modifier, cal.rect_of(day).center())
+def pump(ms: int) -> None:
+    end = time.monotonic() + ms / 1000
+    while time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.01)
 
 
-def test_every_view_counts_only_the_chosen_days(window, tmp_path, monkeypatch):
+def drag(tl, lo: float, hi: float) -> None:
+    """Drag across the plot from ``lo`` to ``hi``, as a user zooms in to some days."""
+    plot, _ = tl._areas()
+    a, b, _ = tl._screen
+    x0, x1 = (round(tl._x(t, a, b, plot)) for t in (lo, hi))
+    y = round(plot.center().y())
+    QTest.mousePress(tl, Qt.MouseButton.LeftButton, pos=QPoint(x0, y))
+    QTest.mouseMove(tl, QPoint((x0 + x1) // 2, y))
+    QTest.mouseMove(tl, QPoint(x1, y))
+    QTest.mouseRelease(tl, Qt.MouseButton.LeftButton, pos=QPoint(x1, y))
+
+
+def tiles(w) -> int:
+    return int(w.overview.tiles["count"].value.text())
+
+
+def test_there_is_no_days_picker_in_the_header(window):
     w = window()
-    assert w.days_pick.currentText() == "All days" and w.overview.tiles["count"].value.text() == "10"
-    assert w.days_pick.isEnabled()
-    w.days_pick.showPopup()
-    cal = w.days_pick.picker.calendar
-    assert (cal.year, cal.month) == (2026, 10) and set(cal.counts) == {D1, D2, D3}
-    click(w, D2)  # drop 6 Oct
-    click(w, D1 + 2 * DAY)  # 7 Oct has nothing saved: not choosable
-    w.days_pick.hidePopup()  # applies at once rather than after the settling delay
-    assert w.chosen_days == {D1, D3}
-    assert w.days_pick.currentText() == "2 of 3 days"
-    assert w.overview.tiles["count"].value.text() == "8" and len(w.posts) == 4 and len(w.comments) == 4
-    assert w.posts_tab.model.rowCount() == 4 and w.comments_tab.model.rowCount() == 4
-    assert w.subheading.full_text().endswith("· 4\xa0posts · 4\xa0comments")
-    assert w.subheading.full_text().startswith("Last fetched ")  # the counts are on the tabs, checked above
-    shown = []
-    monkeypatch.setattr(w.overview.timeline, "set_points", shown.append)
-    w._render_overview()
-    assert [d for d, _, _ in shown[-1]] == [D1, D3]  # the timeline too
+    assert not hasattr(w, "days_pick") and not hasattr(w, "presets")
+    assert w.overview.timeline.toolbar.isVisible()  # the timeline's own range buttons stay
+
+
+def test_every_view_counts_the_days_the_timeline_shows(window, tmp_path, monkeypatch):
+    w = window()
+    tl = w.overview.timeline
+    assert w.span is None and tiles(w) == 10 and len(w.posts) == 5
+    drag(tl, D1 + 0.1 * DAY, D2 + 0.9 * DAY)  # 5 and 6 Oct, held to the closest zoom: 5 to 8 Oct
+    assert tl.view is not None and tl.view[0] < D2 and D2 + DAY < tl.view[1] <= D3
+    # The tiles and distribution follow at once, before the tables do.
+    assert tiles(w) == 6 and sum(w.overview.distribution._counts.values()) == 6
+    assert w.overview.distribution._counts == {"negative": 2, "neutral": 0, "positive": 4}
+    assert w.overview.tiles["mean"].value.text() == "+0.167"
+    assert [d for d, _, _ in tl.points] == [D1, D2, D3]  # the timeline still has every day, to zoom back out
+    pump(400)  # past the tables' settling delay
+    assert len(w.posts) == 3 and len(w.comments) == 3
+    assert w.posts_tab.model.rowCount() == 3 and w.comments_tab.model.rowCount() == 3
+    assert w.subheading.full_text().endswith("· 5 – 7 Oct · 3\xa0posts · 3\xa0comments")
 
     out = tmp_path / "posts.csv"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(out), ""))
     w._export("posts")
-    assert sorted(r["id"] for r in csv.DictReader(open(out, encoding="utf-8-sig"))) == ["p0", "p1", "p3", "p4"]
-    assert "from 2 chosen days" in w.statusBar().currentMessage()
+    assert sorted(r["id"] for r in csv.DictReader(open(out, encoding="utf-8-sig"))) == ["p0", "p1", "p2"]
+    assert "from 5 Oct 2026 to " in w.statusBar().currentMessage()
 
-    w._refresh_datasets(select="rust")  # another subreddit has its own choice: every day
-    assert w.chosen_days is None and w.days_pick.currentText() == "All days" and len(w.posts) == 1
+    w._refresh_datasets(select="rust")  # another subreddit has its own span: every day
+    assert w.span is None and tl.view is None and len(w.posts) == 1 and tiles(w) == 1
     w._refresh_datasets(select="Python")
-    assert w.chosen_days == {D1, D3} and len(w.posts) == 4
+    assert w.span == tl.view and tl.view is not None and len(w.posts) == 3 and tiles(w) == 6
 
-
-def test_the_choice_survives_a_restart_and_all_days_resets_it(window):
-    w = window()
-    w.days_pick.showPopup()
-    w.days_pick.picker.none_btn.click()
-    click(w, D3)
-    w.days_pick.hidePopup()
-    assert w.days_pick.currentText() == "9 Oct" and w.overview.tiles["count"].value.text() == "4"
-    w.close()
-
-    again = window()
-    assert again.chosen_days == {D3} and again.days_pick.currentText() == "9 Oct" and len(again.posts) == 2
-    again.days_pick.showPopup()
-    again.days_pick.picker.all_btn.click()
-    again.days_pick.hidePopup()
-    assert again.chosen_days is None and len(again.posts) == 5
-    assert not again.settings.contains(days.settings_key("Python"))
-
-
-def test_shift_click_and_drag_choose_runs_of_days(window):
-    w = window()
-    w.days_pick.showPopup()
-    w.days_pick.picker.none_btn.click()
-    click(w, D1)
-    click(w, D3, modifier=Qt.KeyboardModifier.ShiftModifier)  # 5 to 9 Oct: the saved days among them
-    assert w.days_pick.picker.chosen() == {D1, D2, D3}
-    w.days_pick.picker.none_btn.click()
-    cal = w.days_pick.picker.calendar
-    QTest.mousePress(cal, Qt.MouseButton.LeftButton, pos=cal.rect_of(D1).center())
-    QTest.mouseMove(cal, cal.rect_of(D2).center())
-    QTest.mouseRelease(cal, Qt.MouseButton.LeftButton, pos=cal.rect_of(D2).center())
-    assert w.days_pick.picker.chosen() == {D1, D2}
-    # The keyboard works too: arrows move from the last day clicked, Space toggles.
-    cal.setFocus()
-    QTest.keyClick(cal, Qt.Key.Key_Right)
-    QTest.keyClick(cal, Qt.Key.Key_Space)
-    assert w.days_pick.picker.chosen() == {D1}
-    QTest.keyClick(cal, Qt.Key.Key_Right)
-    QTest.keyClick(cal, Qt.Key.Key_Space)  # 7 Oct has nothing saved
-    assert w.days_pick.picker.chosen() == {D1}
-    QTest.keyClick(cal, Qt.Key.Key_Up)
-    QTest.keyClick(cal, Qt.Key.Key_Space)  # a week back is 30 Sep, outside this month: stays on 1 Oct
-    QTest.keyClick(cal, Qt.Key.Key_Down)  # 8 Oct
-    QTest.keyClick(cal, Qt.Key.Key_Right)  # 9 Oct
-    QTest.keyClick(cal, Qt.Key.Key_Return)
-    assert w.days_pick.picker.chosen() == {D1, D3}
-    w.days_pick.hidePopup()
-    assert w.chosen_days == {D1, D3}
-
-
-def test_quick_choices_and_month_arrows(window):
-    w = window()
-    s = Store(w.db_path)
-    s.save_post(Post("old", "Python", "september", "", "a", 1, 0.9, 0, SEP + 60, "https://r/old", ""), 0.1, "neutral")
-    s.commit()
-    s.close()
-    w._refresh_datasets(select="Python")
-    w.days_pick.showPopup()
-    p = w.days_pick.picker
-    assert p.title.text() == "October 2026" and p.prev.isEnabled() and not p.next.isEnabled()
-    p.prev.click()
-    assert p.title.text() == "September 2026" and not p.prev.isEnabled()
-    p.month_btn.click()
-    assert p.chosen() == {SEP}
-    p.week_btn.click()
-    assert p.chosen() == {D1, D2, D3}  # the 7 days up to the latest saved one
-    assert "3 of 4 days" in p.summary.text()
-    w.days_pick.hidePopup()
-    assert w.days_pick.currentText() == "3 of 4 days"
+    QTest.mouseDClick(tl, Qt.MouseButton.LeftButton, pos=tl._areas()[0].center().toPoint())  # every day again
+    assert w.span is None and tiles(w) == 10
+    pump(400)
     assert len(w.posts) == 5
 
 
-def test_deleting_a_subreddit_forgets_its_days(window, monkeypatch):
+def test_the_timeline_page_and_the_overview_share_one_span(window):
+    w = window()
+    w.show_page("timeline")
+    QApplication.processEvents()
+    page = w.timeline_page.body
+    drag(page, D2 + 0.5 * DAY, D3)
+    assert page.view is not None and w.overview.timeline.view == page.view == w.span
+    assert tiles(w) < 10
+    page.zoom_preset("All")
+    assert w.overview.timeline.view is None and tiles(w) == 10
+    w.overview.timeline.set_view(D1, D1 + 3 * DAY)
+    w.show_page("timeline")
+    assert page.view == (D1, D1 + 3 * DAY)
+
+
+def test_the_span_survives_a_restart_and_every_day_forgets_it(window):
+    w = window()
+    w.overview.timeline.set_view(D2, D2 + 4 * DAY)  # 6 to 9 Oct
+    assert tiles(w) == 6
+    w.close()
+
+    again = window()
+    assert again.span == again.overview.timeline.view == (D2, D2 + 4 * DAY)
+    assert tiles(again) == 6 and len(again.posts) == 3
+    again.overview.timeline.zoom_preset("All")
+    assert again.span is None and not again.settings.contains(days.settings_keys("Python")[0])
+
+
+def test_a_range_button_is_remembered_by_name(settings):
+    s = settings
+    days.save_range(s, "Python", (D1, D3), "1w")
+    assert days.load_range(s, "python") == (None, "1w")  # names are case-insensitive, like the store's
+    days.save_range(s, "Python", (D1, D3), None)
+    assert days.load_range(s, "Python") == ((D1, D3), None)
+    assert days.load_range(s, "rust") == (None, None)
+    days.save_range(s, "Python", None, "All")
+    assert days.load_range(s, "Python") == (None, None) and not s.contains(days.settings_keys("Python")[0])
+
+
+def test_days_picked_in_earlier_versions_open_as_the_span_from_the_first_to_the_last(settings):
+    s = settings
+    key, old = days.settings_keys("Python")
+    s.setValue(old, "2026-10-05,2026-10-09")  # what the Days picker stored
+    assert days.load_range(s, "Python") == ((D1, D3 + DAY), None)
+    s.setValue(old, "")  # "No days" picked: every day now, as the timeline can't show none
+    assert days.load_range(s, "Python") == (None, None)
+    s.setValue(old, "2026-10-06")
+    days.save_range(s, "Python", (D1, D3), None)  # a new span replaces it
+    assert not s.contains(old) and days.load_range(s, "Python") == ((D1, D3), None)
+
+
+def test_an_old_days_choice_is_shown_on_the_timeline(window):
+    QSettings().setValue(days.settings_keys("Python")[1], "2026-10-05,2026-10-06")
+    w = window()
+    assert w.overview.timeline.view == (D1, D1 + 3 * DAY)  # 5 and 6 Oct, widened to the closest zoom
+    assert tiles(w) == 6
+
+
+def test_deleting_a_subreddit_forgets_its_span(window, monkeypatch):
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
     w = window()
-    w._on_days_chosen({D1})
-    assert w.settings.contains(days.settings_key("Python"))
+    w.overview.timeline.set_view(D1, D1 + 3 * DAY)
+    assert w.settings.contains(days.settings_keys("Python")[0])
     w._delete_dataset()
-    assert not w.settings.contains(days.settings_key("Python"))
+    assert not any(w.settings.contains(k) for k in days.settings_keys("Python"))
     w._refresh_datasets(select="rust")
-    w._on_days_chosen(set())
+    QSettings().setValue(days.settings_keys("rust")[1], "2026-10-06")
     w._delete_all()
-    assert not w.settings.childGroups() or days.SETTINGS_GROUP not in w.settings.childGroups()
-    assert not w.days_pick.isEnabled()  # nothing saved: nothing to pick
+    assert not {days.SETTINGS_GROUP, days.RANGE_GROUP} & set(w.settings.childGroups())
 
 
-def test_a_refresh_while_the_calendar_is_open_keeps_the_users_pick(window):
+def test_keep_filters_rows_by_the_days_they_were_created_on():
+    rows = [{"created_utc": None}, {"created_utc": D1 + 10}, {"created_utc": D2 + DAY - 1}, {"created_utc": D3}]
+    assert days.keep(rows, None) == rows and days.keep(rows, None) is not rows
+    assert days.keep(rows, days.whole((D1 + 0.2 * DAY, D2 + 0.7 * DAY))) == rows[1:3]
+    assert days.keep(rows, days.whole((D1 + 0.6 * DAY, D2 + 0.7 * DAY))) == rows[2:3]  # 5 Oct's point is out of view
+    assert days.keep(rows, days.whole((D2 + DAY, D3))) == []
+
+
+def test_the_span_is_named_briefly():
+    assert days.span_text((D2, D2 + DAY)) == "6 Oct"
+    assert days.span_text((D1, D3 + DAY)) == "5 – 9 Oct"
+    assert days.span_text((D1 - 7 * DAY, D1)) == "28 Sep – 4 Oct"
+    new_year = days.from_date(date(2026, 1, 1))
+    assert days.span_text((new_year - 2 * DAY, new_year + DAY)) == "30 Dec 2025 – 1 Jan 2026"
+
+
+def test_a_day_counts_when_its_point_is_in_view():
+    assert days.whole(None) is None
+    assert days.whole((D1, D1 + 3 * DAY)) == (D1, D1 + 3 * DAY)  # whole days, as the range buttons show them
+    assert days.whole((D1 + 0.4 * DAY, D1 + 3.6 * DAY)) == (D1, D1 + 4 * DAY)
+    assert days.whole((D1 + 0.6 * DAY, D1 + 3.4 * DAY)) == (D1 + DAY, D1 + 3 * DAY)
+
+
+def test_switching_the_scope_leaves_the_remembered_span_alone(window):
     w = window()
-    w.days_pick.showPopup()
-    click(w, D2)  # still settling when a running fetch's once-a-second refresh arrives
-    w._refresh_days()
-    assert w.days_pick.picker.chosen() == {D1, D3} and w.days_pick.currentText() == "2 of 3 days"
-    w.days_pick.hidePopup()
-    assert w.chosen_days == {D1, D3}
+    w.overview.timeline.set_view(D2, D2 + 3 * DAY)
+    key = days.settings_keys("Python")[0]
+    saved = w.settings.value(key)
+    w.scope.setCurrentText("Posts only")
+    w.scope.setCurrentText("Posts and comments")
+    assert w.settings.value(key) == saved
 
 
-def test_rows_without_a_date_are_left_out_of_a_narrower_choice():
-    assert days.keep([{"created_utc": None}, {"created_utc": D1}], {D1}) == [{"created_utc": D1}]
-    assert days.choice_text({days.from_date(date(2025, 12, 31)), days.from_date(date(2026, 1, 1))},
-                            {days.from_date(date(2025, 12, 31)), days.from_date(date(2026, 1, 1)), D1}) == \
-        "31 Dec 2025 – 1 Jan 2026"
+def test_rows_without_a_date_are_left_out_of_the_counts():
+    from subsentiment.analysis import Analysis
+    a = Analysis([{"created_utc": None, "sentiment": 0.5, "label": "positive"},
+                  {"created_utc": D1, "sentiment": -0.5, "label": "negative"}])
+    assert a.count == 1 and a.mean == -0.5
