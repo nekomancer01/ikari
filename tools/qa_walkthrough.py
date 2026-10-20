@@ -37,6 +37,7 @@ def parse() -> argparse.Namespace:
     ap.add_argument("--live", action="store_true", help="use the real Arctic Shift")
     ap.add_argument("--scale", type=float, default=1.0, help="device pixel ratio, e.g. 1.5 for Windows 150%%")
     ap.add_argument("--screen", default="1920x1200", help="physical screen size")
+    ap.add_argument("--real-screen", action="store_true", help="use the desktop instead of an offscreen screen")
     ap.add_argument("--theme", default="dark", choices=["dark", "light", "system"])
     ap.add_argument("--small", default="python", help="a quieter subreddit")
     ap.add_argument("--busy", default="AskReddit", help="a busy subreddit")
@@ -56,7 +57,7 @@ pw, ph = (int(v) for v in ARGS.screen.split("x"))
 cfg = Path(tempfile.mkdtemp()) / "screens.json"
 cfg.write_text(json.dumps({"screens": [{"name": "qa", "x": 0, "y": 0, "width": pw, "height": ph,
                                         "logicalDpi": 96, "logicalBaseDpi": 96, "dpr": 1}]}))
-if os.environ.get("QT_QPA_PLATFORM", "offscreen").startswith("offscreen"):
+if not ARGS.real_screen:
     os.environ["QT_QPA_PLATFORM"] = f"offscreen:configfile={cfg}"
 if ARGS.scale != 1:
     os.environ["QT_SCALE_FACTOR"] = str(ARGS.scale)

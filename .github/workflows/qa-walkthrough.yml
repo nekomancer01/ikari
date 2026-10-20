@@ -38,9 +38,9 @@ jobs:
           QT_DEBUG_PLUGINS: "0"
         run: |
           python -c "import PySide6.QtWidgets as w, sys; a = w.QApplication([]); s = a.primaryScreen(); print(a.platformName(), s.geometry(), s.devicePixelRatio(), s.logicalDotsPerInch())"
-          python -X faulthandler tools/qa_walkthrough.py --out qa/100 --timeout 120 --stop-after 15 --latency 0.6
+          python -X faulthandler tools/qa_walkthrough.py --real-screen --out qa/100 --timeout 120 --stop-after 15 --latency 0.6
           Write-Host "exit code at 100%: $LASTEXITCODE"
-          python -X faulthandler tools/qa_walkthrough.py --out qa/150 --scale 1.5 --timeout 240 --stop-after 15 --latency 0.6
+          python -X faulthandler tools/qa_walkthrough.py --real-screen --out qa/150 --scale 1.5 --timeout 240 --stop-after 15 --latency 0.6
           Write-Host "exit code at 150%: $LASTEXITCODE"
       - name: Build and capture ikari.exe at 150%
         shell: pwsh
