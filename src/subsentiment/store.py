@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 import csv
-import heapq
 import os
 import sqlite3
 import time
-from operator import itemgetter
 from pathlib import Path
 
 from subsentiment.reddit import Comment, Post
@@ -273,74 +271,3 @@ class Store:
         finally:
             part.unlink(missing_ok=True)
         return len(rows)
-
-
-class Tally:
-    """What the Overview shows for a set of post/comment rows: counts per label, the mean score, the mean
-    per UTC day and the strongest items. Rows a running fetch adds are counted in as they come, so the
-    Overview doesn't go through every saved row again each second."""
-
-    STRONGEST = 10
-
-    def __init__(self, rows=()):
-        self.counts = {"negative": 0, "neutral": 0, "positive": 0}
-        self.total = 0.0
-        self.days: dict[int, list] = {}  # day start (UTC) -> [sum of scores, count]
-        self.top: list = []  # most positive first
-        self.bottom: list = []  # most negative first
-        self.add(rows)
-
-    def add(self, rows) -> None:
-        rows = list(rows)
-        counts, days = self.counts, self.days
-        total = 0.0
-        for r in rows:
-            s = r["sentiment"]
-            counts[r["label"]] += 1
-            total += s
-            day = int(r["created_utc"] // 86400 * 86400)
-            bucket = days.get(day)
-            if bucket is None:
-                days[day] = [s, 1]
-            else:
-                bucket[0] += s
-                bucket[1] += 1
-        self.total += total
-        score = itemgetter("sentiment")
-        self.top = heapq.nlargest(self.STRONGEST, self.top + rows, key=score)
-        self.bottom = heapq.nsmallest(self.STRONGEST, self.bottom + rows, key=score)
-
-    @classmethod
-    def combined(cls, *tallies: "Tally") -> "Tally":
-        out = cls()
-        for t in tallies:
-            for k, n in t.counts.items():
-                out.counts[k] += n
-            out.total += t.total
-            for day, (total, n) in t.days.items():
-                bucket = out.days.setdefault(day, [0.0, 0])
-                bucket[0] += total
-                bucket[1] += n
-        score = itemgetter("sentiment")
-        out.top = heapq.nlargest(cls.STRONGEST, [r for t in tallies for r in t.top], key=score)
-        out.bottom = heapq.nsmallest(cls.STRONGEST, [r for t in tallies for r in t.bottom], key=score)
-        return out
-
-    def summary(self) -> dict:
-        """Counts per label and the mean score."""
-        n = sum(self.counts.values())
-        return {"count": n, "counts": dict(self.counts), "mean": self.total / n if n else 0.0}
-
-    def daily_means(self) -> list[tuple[int, float, int]]:
-        """[(day_start_utc, mean_sentiment, n)] sorted by day."""
-        return [(d, total / n, n) for d, (total, n) in sorted(self.days.items())]
-
-
-def summarize(rows) -> dict:
-    """Counts per label and mean compound score for a set of post/comment rows."""
-    return Tally(rows).summary()
-
-
-def daily_means(rows) -> list[tuple[int, float, int]]:
-    """[(day_start_utc, mean_sentiment, n)] sorted by day."""
-    return Tally(rows).daily_means()

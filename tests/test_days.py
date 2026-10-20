@@ -116,7 +116,7 @@ def click(w, day, modifier=Qt.KeyboardModifier.NoModifier):
 
 def test_every_view_counts_only_the_chosen_days(window, tmp_path, monkeypatch):
     w = window()
-    assert w.days_pick.currentText() == "All days" and w.tiles["count"].value.text() == "10"
+    assert w.days_pick.currentText() == "All days" and w.overview.tiles["count"].value.text() == "10"
     assert w.days_pick.isEnabled()
     w.days_pick.showPopup()
     cal = w.days_pick.picker.calendar
@@ -126,12 +126,12 @@ def test_every_view_counts_only_the_chosen_days(window, tmp_path, monkeypatch):
     w.days_pick.hidePopup()  # applies at once rather than after the settling delay
     assert w.chosen_days == {D1, D3}
     assert w.days_pick.currentText() == "2 of 3 days"
-    assert w.tiles["count"].value.text() == "8" and len(w.posts) == 4 and len(w.comments) == 4
+    assert w.overview.tiles["count"].value.text() == "8" and len(w.posts) == 4 and len(w.comments) == 4
     assert w.posts_tab.model.rowCount() == 4 and w.comments_tab.model.rowCount() == 4
     assert w.tabbar.tabText(1) == "Posts  4" and w.tabbar.tabText(2) == "Comments  4"
     assert w.subheading.full_text().startswith("4 posts and 4 comments on 2 chosen days")
     shown = []
-    monkeypatch.setattr(w.timeline, "set_points", shown.append)
+    monkeypatch.setattr(w.overview.timeline, "set_points", shown.append)
     w._render_overview()
     assert [d for d, _, _ in shown[-1]] == [D1, D3]  # the timeline too
 
@@ -153,7 +153,7 @@ def test_the_choice_survives_a_restart_and_all_days_resets_it(window):
     w.days_pick.picker.none_btn.click()
     click(w, D3)
     w.days_pick.hidePopup()
-    assert w.days_pick.currentText() == "9 Oct" and w.tiles["count"].value.text() == "4"
+    assert w.days_pick.currentText() == "9 Oct" and w.overview.tiles["count"].value.text() == "4"
     w.close()
 
     again = window()

@@ -16,7 +16,8 @@ from PySide6.QtWidgets import QApplication, QTableView  # noqa: E402
 
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui.models import POST_COLUMNS, RowsModel  # noqa: E402
-from subsentiment.store import Store, Tally, daily_means, summarize  # noqa: E402
+from subsentiment.analysis import Analysis  # noqa: E402
+from subsentiment.store import Store  # noqa: E402
 
 POSTS, COMMENTS = 300, 20_000
 LABELS = ("positive", "neutral", "negative")
@@ -153,20 +154,23 @@ def test_the_text_filter_ignores_case_and_line_breaks_and_applies_to_rows_a_fetc
 
 def test_the_overview_counts_rows_as_they_arrive():
     rng = random.Random(3)
-    rows = [{"id": str(i), "label": LABELS[i % 3], "sentiment": rng.uniform(-1, 1), "created_utc": i * 5000.0}
-            for i in range(500)]
-    t = Tally(rows[:200])
+    rows = [{"id": str(i), "label": LABELS[i % 3], "sentiment": round(rng.uniform(-1, 1), 1),  # with ties
+             "created_utc": i * 5000.0} for i in range(500)]
+    t = Analysis(rows[:200])
     t.add(rows[200:450])
     t.add(rows[450:])
-    whole = summarize(rows)
-    assert t.summary()["counts"] == whole["counts"] and abs(t.summary()["mean"] - whole["mean"]) < 1e-9
-    assert [(d, round(m, 9), n) for d, m, n in t.daily_means()] == \
-           [(d, round(m, 9), n) for d, m, n in daily_means(rows)]
-    ranked = sorted(rows, key=lambda r: r["sentiment"])
-    assert t.top == ranked[::-1][:10] and t.bottom == ranked[:10]
-    both = Tally.combined(Tally(rows[:100]), Tally(rows[100:]))
-    assert both.summary()["counts"] == t.summary()["counts"] and abs(both.summary()["mean"] - whole["mean"]) < 1e-9
-    assert both.top == t.top and both.bottom == t.bottom
+    whole = Analysis(rows)
+    assert t.counts == whole.counts and t.count == 500 and abs(t.mean - sum(r["sentiment"] for r in rows) / 500) < 1e-9
+    days = {}
+    for r in rows:
+        days.setdefault(int(r["created_utc"] // 86400 * 86400), []).append(r["sentiment"])
+    assert [(d, round(m, 9), n) for d, m, n in t.daily_means] == \
+           [(d, round(sum(v) / len(v), 9), len(v)) for d, v in sorted(days.items())]
+    ranked = sorted(rows, key=lambda r: r["sentiment"])  # what the overview listed before it counted as rows came
+    assert t.most_positive() == ranked[::-1][:10] and t.most_negative() == ranked[:10]
+    both = Analysis.combined(Analysis(rows[:100]), Analysis(rows[100:]))
+    assert both.counts == t.counts and abs(both.mean - t.mean) < 1e-9 and both.daily_means == whole.daily_means
+    assert both.most_positive() == t.most_positive() and both.most_negative() == t.most_negative()
 
 
 def test_the_end_of_a_fetch_reads_back_only_what_it_saved(window, monkeypatch):
