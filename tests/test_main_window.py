@@ -256,10 +256,9 @@ def test_archive_counts_arrive_on_the_gui_thread(make_window, monkeypatch):
     c.subreddit = "Python"
     c._count(1_699_920_000, 1_699_920_000 + 86400)
     c._count_thread.wait(5000)
-    end = time.monotonic() + 5
-    while c._count_thread is not None and time.monotonic() < end:  # its finished signal is queued
+    end = time.monotonic() + 5  # the results come back as queued signals, slower on a busy machine
+    while (c._count_thread is not None or "thread" not in seen) and time.monotonic() < end:
         QApplication.processEvents()
-        time.sleep(0.01)
     assert seen["thread"] is threading.main_thread()
     assert c.totals["python"] == {1_699_920_000: 5} and c._count_thread is None
     c.close()
