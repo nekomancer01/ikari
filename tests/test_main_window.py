@@ -11,6 +11,7 @@ from PySide6.QtCore import QDate, QSettings  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from subsentiment.gui import main_window as mw  # noqa: E402
+from subsentiment.gui.fetch_form import range_bounds  # noqa: E402
 from subsentiment.reddit import Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
@@ -44,41 +45,42 @@ def make_window(tmp_path, monkeypatch):
 
 def test_fetch_form_and_viewed_dataset_are_restored(make_window):
     w = make_window()
-    w.subreddit.setText("r/AskScience")
-    w.query.setText("black holes")
-    w.date_from.setDate(QDate(2026, 3, 1))  # editing a date switches to a custom range
-    w.date_to.setDate(QDate(2026, 3, 31))
-    w.include_comments.setChecked(False)
-    w.comments_per_post.setValue(20)
-    assert not w.refresh_scores.isChecked()  # off by default
-    w.refresh_scores.setChecked(True)
+    w.fetch_form.subreddit.setText("r/AskScience")
+    w.fetch_form.query.setText("black holes")
+    w.fetch_form.date_from.setDate(QDate(2026, 3, 1))  # editing a date switches to a custom range
+    w.fetch_form.date_to.setDate(QDate(2026, 3, 31))
+    w.fetch_form.include_comments.setChecked(False)
+    w.fetch_form.comments_per_post.setValue(20)
+    assert not w.fetch_form.refresh_scores.isChecked()  # off by default
+    w.fetch_form.refresh_scores.setChecked(True)
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     w.tabbar.setCurrentIndex(1)
     w.close()
 
     again = make_window()
-    assert again.subreddit.text() == "r/AskScience" and again.query.text() == "black holes"
-    assert again.range.currentData() == "custom"
-    assert (again.date_from.date(), again.date_to.date()) == (QDate(2026, 3, 1), QDate(2026, 3, 31))
-    assert (again.include_comments.isChecked(), again.comments_per_post.value()) == (False, 20)
-    assert not again.comments_per_post.isEnabled()
-    assert again.refresh_scores.isChecked()
+    assert again.fetch_form.subreddit.text() == "r/AskScience" and again.fetch_form.query.text() == "black holes"
+    assert again.fetch_form.range.currentData() == "custom"
+    form = again.fetch_form
+    assert (form.date_from.date(), form.date_to.date()) == (QDate(2026, 3, 1), QDate(2026, 3, 31))
+    assert (again.fetch_form.include_comments.isChecked(), again.fetch_form.comments_per_post.value()) == (False, 20)
+    assert not again.fetch_form.comments_per_post.isEnabled()
+    assert again.fetch_form.refresh_scores.isChecked()
     assert again.current == "Python" and again.tabbar.currentIndex() == 1
 
 
 def test_comments_are_fetched_by_default_and_presets_fill_the_dates(make_window):
     w = make_window()
-    assert w.include_comments.isChecked() and w.range.currentData() == "week"
+    assert w.fetch_form.include_comments.isChecked() and w.fetch_form.range.currentData() == "week"
     today = QDate.currentDate()
-    assert (w.date_from.date(), w.date_to.date()) == (today.addDays(-7), today)
-    w.range.setCurrentIndex(w.range.findData("month"))
-    assert w.date_from.date() == today.addDays(-30) and w.range.currentData() == "month"
+    assert (w.fetch_form.date_from.date(), w.fetch_form.date_to.date()) == (today.addDays(-7), today)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
+    assert w.fetch_form.date_from.date() == today.addDays(-30) and w.fetch_form.range.currentData() == "month"
 
 
 def test_range_bounds():
     now = datetime(2026, 10, 19, 12, 0)
-    assert mw.range_bounds("day", QDate(), QDate(), now) == ((now - timedelta(days=1)).timestamp(), None)
-    after, before = mw.range_bounds("custom", QDate(2026, 3, 31), QDate(2026, 3, 1), now)  # reversed is fine
+    assert range_bounds("day", QDate(), QDate(), now) == ((now - timedelta(days=1)).timestamp(), None)
+    after, before = range_bounds("custom", QDate(2026, 3, 31), QDate(2026, 3, 1), now)  # reversed is fine
     assert after == datetime(2026, 3, 1).timestamp() and before == datetime(2026, 4, 1).timestamp()
 
 
@@ -86,9 +88,9 @@ def test_fetch_builds_a_date_range_request(make_window, monkeypatch):
     sent = []
     monkeypatch.setattr(mw, "FetchWorker", lambda req, db: sent.append(req) or (_ for _ in ()).throw(RuntimeError))
     w = make_window()
-    w.subreddit.setText("python")
-    w.date_from.setDate(QDate(2026, 3, 1))
-    w.date_to.setDate(QDate(2026, 3, 2))
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.date_from.setDate(QDate(2026, 3, 1))
+    w.fetch_form.date_to.setDate(QDate(2026, 3, 2))
     with pytest.raises(RuntimeError):
         w._start_fetch()
     (req,) = sent
@@ -98,7 +100,7 @@ def test_fetch_builds_a_date_range_request(make_window, monkeypatch):
 
 def test_invalid_subreddit_is_explained_without_starting_a_fetch(make_window):
     w = make_window()
-    w.subreddit.setText("not a sub")
+    w.fetch_form.subreddit.setText("not a sub")
     w._start_fetch()
     assert not w.fetch_job.busy and "isn't a valid subreddit name" in w.progress_msg.text()
 
@@ -209,9 +211,9 @@ def test_coverage_window_lists_days_and_downloads_through_the_fetch_job(make_win
     monkeypatch.setattr(coverage.CoverageWindow, "_count", count)
     w = make_window()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
-    w.range.setCurrentIndex(w.range.findData("custom"))
-    w.date_from.setDate(QDate(2023, 11, 13))  # the saved post is from 14 Nov 2023 (UTC)
-    w.date_to.setDate(QDate(2023, 11, 15))
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("custom"))
+    w.fetch_form.date_from.setDate(QDate(2023, 11, 13))  # the saved post is from 14 Nov 2023 (UTC)
+    w.fetch_form.date_to.setDate(QDate(2023, 11, 15))
     started = []
     monkeypatch.setattr(w, "_launch", lambda req, msg: started.append(req))
     w._show_coverage()
@@ -276,7 +278,7 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     s.save_post(Post("t1", "Python", "fresh", "", "a", None, None, None, today + 60, "https://r", ""), 0.0, "neutral")
     s.commit()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
-    w.range.setCurrentIndex(w.range.findData("week"))
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
     started = []
     monkeypatch.setattr(w, "_launch", lambda req, msg: started.append((req, msg)))
     w._show_coverage()
@@ -309,7 +311,7 @@ def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypat
                               0, "neutral")
     w.store.commit()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
-    w.range.setCurrentIndex(w.range.findData("week"))
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
     w._show_coverage()
     c = w.coverage
     c.refresh_saved()
