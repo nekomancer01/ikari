@@ -1,0 +1,30 @@
+name: QA print
+
+# Prints a QA walkthrough run's report and a few screenshots (base64) into the log, for readers who can't
+# download artifacts.
+on:
+  push:
+    branches: ["claude/project-thread-7rn2xq"]
+    paths: [".github/workflows/qa-print.yml"]
+
+jobs:
+  print:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: qa-walkthrough-windows
+          run-id: "39350165620"
+          github-token: ${{ github.token }}
+          path: qa
+      - run: |
+          sudo apt-get install -y -qq imagemagick >/dev/null 2>&1 || true
+          find qa -type f | sort
+          for f in qa/*/walkthrough.md; do echo "=== $f"; cat "$f"; done
+          for f in qa/150/*.json; do echo "=== $f"; python3 -c "import json,sys;d=json.load(open('$f'));print(json.dumps({k:d[k] for k in ('info','local','stalls_ms','workarounds')}))"; done
+          for f in qa/exe/ikari-exe-150-screen.png qa/150/01-first-launch-maximized.png qa/150/01-first-launch-maximized-screen.png qa/150/13-tab-overview.png qa/150/19-coverage-open.png; do
+            [ -f "$f" ] || continue
+            echo "=== B64 $f"; base64 -w0 "$f"; echo; echo "=== END"
+          done
