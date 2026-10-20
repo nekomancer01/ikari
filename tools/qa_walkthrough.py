@@ -385,6 +385,80 @@ def stop_midway(e):
                       f"{end['db_posts']}/{end['db_comments']}, window {end['posts_rows']}/{end['comments_rows']}")
 
 
+@step("days: pick days in the header's Days picker on the first subreddit")
+def days_pick(e):
+    if not hasattr(w, "days_pick"):
+        e["notes"].append("no Days picker on this main")
+        return
+    from subsentiment.gui import days as dd
+    for i in range(w.datasets.count()):
+        if (w.datasets.item(i).data(Qt.ItemDataRole.UserRole) or "").lower() == ARGS.small.lower():
+            w.datasets.setCurrentRow(i)
+    pump(0.5)
+    all_posts, all_comments = len(w.posts), len(w.comments)
+    combo = w.days_pick
+    e["notes"].append(f"{w.heading.text()}: {all_posts}/{all_comments} with {combo.currentText()!r}, "
+                      f"{len(combo.counts)} saved days, picker enabled {combo.isEnabled()}")
+    click(combo)
+    pump(0.5)
+    picker = combo.picker
+    e["notes"].append(f"popup open {picker.isVisible()}")
+    e["shots"].append(shot(w, "days-open"))
+    if picker.isVisible():
+        picker.grab().save(str(OUT / "days-popup.png"))
+        e["shots"].append("days-popup.png")
+
+    def check(label):
+        pump(0.6)
+        chosen = w.chosen_days
+        want_p = len(dd.keep(w.store.posts(w.current), chosen))
+        want_c = len(dd.keep(w.store.comments(w.current), chosen))
+        shown = (w.posts_tab.view.model().rowCount(), w.comments_tab.view.model().rowCount())
+        tile = w.tiles["count"].value.text() if hasattr(w.tiles["count"], "value") else ""
+        ok = shown == (want_p, want_c)
+        e["notes"].append(f"{label}: combo {combo.currentText()!r}, tables {shown[0]}/{shown[1]}, expected "
+                          f"{want_p}/{want_c}{'' if ok else ' MISMATCH'}; items tile {tile}; tabs {w.tabbar.tabText(1)!r} "
+                          f"{w.tabbar.tabText(2)!r}; subtitle {w.subheading.text()!r}")
+
+    click(picker.none_btn)
+    check("None")
+    cal = picker.calendar
+    day = max(combo.counts) if combo.counts else None
+    rect = cal.rect_of(day) if day is not None else None
+    if rect is not None:
+        QTest.mouseClick(cal, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, rect.center())
+        check(f"one day ({dd.as_date(day)})")
+    e["shots"].append(shot(w, "days-one-day"))
+    click(picker.week_btn)
+    check("Last 7 days")
+    click(picker.all_btn)
+    check("All days")
+    picker.hide()
+    pump(0.3)
+    # A narrow choice survives switching away and back, and export follows it.
+    click(combo)
+    pump(0.3)
+    if rect is not None:
+        click(picker.none_btn)
+        QTest.mouseClick(cal, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, rect.center())
+    picker.hide()
+    pump(0.5)
+    path = TMP / "days-posts.csv"
+    QFileDialog.getSaveFileName = lambda *a, **k: (str(path), "")
+    w.export_posts.trigger()
+    pump(0.3)
+    import csv
+
+    rows = sum(1 for _ in csv.reader(path.open(encoding="utf-8-sig"))) - 1 if path.exists() else None
+    e["notes"].append(f"export with one day chosen: {rows} rows, table shows {w.posts_tab.view.model().rowCount()}")
+    e["shots"].append(shot(w, "days-chosen-closed"))
+    click(combo)
+    pump(0.3)
+    click(picker.all_btn)
+    picker.hide()
+    pump(0.5)
+
+
 @step("look-around: every tab, scope, theme and View option")
 def look_around(e):
     for i, name in enumerate(("overview", "posts", "comments")):
@@ -475,7 +549,7 @@ def delete(e):
     e["shots"].append(shot(w, "after-delete"))
 
 
-for fn in (first_launch, small_fetch, busy_fetch, stop_midway, look_around, export, coverage_open, coverage_day,
+for fn in (first_launch, small_fetch, busy_fetch, stop_midway, days_pick, look_around, export, coverage_open, coverage_day,
            coverage_comments, delete):
     fn()
 
