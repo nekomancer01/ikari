@@ -21,6 +21,7 @@ from subsentiment import arctic_shift  # noqa: E402
 from subsentiment.gui import coverage  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import worker  # noqa: E402
+from subsentiment.gui.rail import PAGES  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
 from fake_archive import DAY, FakeArchive, make_posts  # noqa: E402
@@ -103,7 +104,10 @@ def in_range(env, w, sub="Python") -> int:
 
 
 def fetch(w, sub="python", comments=True, rng="week", **extra):
-    """A fetch from the sidebar, which downloads every post in the range."""
+    """A fetch from the Fetch drawer, opened from the rail, which downloads every post in the range."""
+    if w._drawer_key() != "fetch":
+        QTest.mouseClick(w.rail.buttons["fetch"], Qt.MouseButton.LeftButton)
+    assert w._drawer_key() == "fetch"
     w.fetch_form.subreddit.setText(sub)
     w.fetch_form.include_comments.setChecked(comments)
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData(rng))
@@ -125,8 +129,8 @@ def test_starting_and_browsing_never_downloads_anything(env):
     for row in range(w.datasets.count()):  # switch between subreddits
         w.datasets.setCurrentRow(row)
         pump(50)
-    for i in range(3):  # every tab, and every Overview scope
-        w.tabbar.setCurrentIndex(i)
+    for page in PAGES:  # every page, and every Overview scope
+        w.show_page(page)
     for i in range(w.scope.count()):
         w.scope.setCurrentIndex(i)
     for size in (QSize(1280, 750), QSize(900, 600), QSize(1900, 1100)):
@@ -136,6 +140,30 @@ def test_starting_and_browsing_never_downloads_anything(env):
     pump(1200)  # longer than the redraw timer's 1 s
     assert env.archive.paths() == []
     assert not w.fetch_job.busy
+
+
+def test_the_fetch_drawer_closes_as_a_fetch_starts_and_the_header_follows_it(env):
+    w = env.window()
+    assert w._drawer_key() == "fetch" and w.fetch_form.subreddit.hasFocus()  # nothing saved: it starts open
+    QTest.mouseClick(w.rail.buttons["fetch"], Qt.MouseButton.LeftButton)  # the rail closes it again
+    assert w.drawer.isHidden() and not w.rail.buttons["fetch"].isChecked()
+    QTest.mouseClick(w.rail.buttons["fetch"], Qt.MouseButton.LeftButton)
+    env.archive.delay = 0.02
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(False)
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    assert w.fetch_job.busy and w.drawer.isHidden()
+    # Progress, what it's doing and Stop show under the header on every page, and the rail marks Fetch busy.
+    for page in PAGES:
+        QTest.mouseClick(w.rail.buttons[page], Qt.MouseButton.LeftButton)
+        assert w.page() == page and w.pages.currentWidget() is w.page_widgets[page]
+        assert w.progress.isVisible() and w.stop_btn.isVisible() and w.stop_btn.isEnabled()
+    assert w.rail.buttons["fetch"].busy
+    wait_idle(w)
+    assert not w.rail.buttons["fetch"].busy and not w.progress.isVisible() and not w.stop_btn.isVisible()
+    assert "Added" in w.progress_msg.text() and w.fetch_strip.isVisible()
+    QTest.mouseClick(w.fetch_strip.hide_btn, Qt.MouseButton.LeftButton)
+    assert not w.fetch_strip.isVisible()
 
 
 def test_a_fetch_without_comments_asks_for_no_comments(env):
@@ -234,7 +262,7 @@ def test_comments_come_with_a_fetch_when_asked(env):
     s = env.store()
     with_comments = {r["post_id"] for r in s.comments("python")}
     assert with_comments and with_comments <= {r["id"] for r in s.posts("python")}
-    assert w.tabbar.tabText(2).replace(" ", " ").split()[-1] != "0"
+    assert " 0 comments" not in w.subheading.text() and "comment" in w.subheading.text()
 
 
 def test_score_recheck_only_runs_when_ticked(env):
@@ -921,8 +949,8 @@ def test_choosing_days_never_downloads_and_a_fetch_only_adds_rows_from_chosen_da
     QTest.mouseClick(cal, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, cal.rect_of(day).center())
     pump(300)  # longer than the picker's settling delay
     w.days_pick.hidePopup()
-    for i in range(3):
-        w.tabbar.setCurrentIndex(i)
+    for page in PAGES:
+        w.show_page(page)
         pump(30)
     pump(1200)
     assert env.archive.paths() == []  # picking days only filters what's saved
@@ -997,7 +1025,7 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
     assert sum(o.distribution._counts.values()) == want
     assert o.distribution._counts == {k: sum(r["label"] == k for r in rows) for k in ("negative", "neutral", "positive")}
     assert sum(n for _, _, n in o.timeline._shown[0]) == want
-    assert w.tabbar.tabText(1) == f"Posts  {want:,}" and w.subheading.text().startswith("Last fetched")  # counts: on the tab
+    assert f"· {want:,}\xa0posts ·" in w.subheading.text() and w.subheading.text().startswith("Last fetched")
     assert sum(p for p, _ in w.days_pick.counts.values()) == want
     pump(800)  # what reads the store again does so once a second
     assert w.fetch_job.busy

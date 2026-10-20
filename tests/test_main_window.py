@@ -7,7 +7,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QDate, QSettings  # noqa: E402
+from PySide6.QtCore import QDate, QSettings, Qt  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from subsentiment.gui import main_window as mw  # noqa: E402
@@ -54,7 +55,7 @@ def test_fetch_form_and_viewed_dataset_are_restored(make_window):
     assert not w.fetch_form.refresh_scores.isChecked()  # off by default
     w.fetch_form.refresh_scores.setChecked(True)
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
-    w.tabbar.setCurrentIndex(1)
+    w.show_page("posts")
     w.close()
 
     again = make_window()
@@ -65,7 +66,7 @@ def test_fetch_form_and_viewed_dataset_are_restored(make_window):
     assert (again.fetch_form.include_comments.isChecked(), again.fetch_form.comments_per_post.value()) == (False, 20)
     assert not again.fetch_form.comments_per_post.isEnabled()
     assert again.fetch_form.refresh_scores.isChecked()
-    assert again.current == "Python" and again.tabbar.currentIndex() == 1
+    assert again.current == "Python" and again.page() == "posts"
 
 
 def test_comments_are_fetched_by_default_and_presets_fill_the_dates(make_window):
@@ -371,3 +372,73 @@ def test_bundled_fonts_are_weights_of_the_families_the_theme_asks_for():
         families = QFontDatabase.applicationFontFamilies(QFontDatabase.addApplicationFont(str(path)))
         wanted = theme.DISPLAY_FAMILY if path.name.startswith("InterDisplay") else theme.UI_FAMILIES[0]
         assert wanted in families, f"{path.name} registers as {families}, not as a weight of {wanted}"
+
+
+def test_each_rail_button_opens_its_page_and_the_last_one_is_reopened(make_window):
+    w = make_window()
+    for page in ("timeline", "words", "posts", "comments", "overview", "timeline"):
+        w.rail.buttons[page].click()
+        assert w.page() == page and w.pages.currentWidget() is w.page_widgets[page]
+        assert w.scope.isVisibleTo(w) == (page in ("overview", "timeline"))  # what it counts shows there
+    assert w.timeline_page.body._shown[0] == w.overview.timeline._shown[0] != []  # the same days, on its own page
+    w.close()
+    assert make_window().page() == "timeline"
+
+
+def test_the_old_tab_setting_opens_the_same_page(make_window):
+    QSettings().setValue("ui/tab", 2)  # Comments, from before the rail
+    assert make_window().page() == "comments"
+
+
+def test_saved_drawer_switches_subreddit_and_escape_closes_it(make_window):
+    w = make_window()
+    assert w.drawer.isHidden()  # data is saved: the page shows, no drawer
+    w.rail.buttons["saved"].click()
+    assert w._drawer_key() == "saved" and w.datasets.isVisibleTo(w)
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/rust"))
+    assert w.current == "rust" and w.heading.text() == "r/rust" and w._drawer_key() == "saved"
+    w.rail.buttons["fetch"].click()  # one drawer at a time
+    assert w._drawer_key() == "fetch" and not w.rail.buttons["saved"].isChecked()
+    QTest.keyClick(w.fetch_form.query, Qt.Key.Key_Escape)
+    assert w.drawer.isHidden() and not w.rail.buttons["fetch"].isChecked()
+
+
+def test_the_drawer_floats_over_the_page_on_a_narrow_window(make_window):
+    w = make_window()
+    w.show()
+    w.resize(1280, 720)
+    w.set_drawer("fetch")
+    QApplication.processEvents()
+    assert w.centralWidget().layout().indexOf(w.drawer) >= 0  # room for both: the page moves over
+    assert w.drawer.geometry().right() < w.content.geometry().left()
+    w.resize(900, 600)
+    QApplication.processEvents()
+    assert w.centralWidget().layout().indexOf(w.drawer) < 0 and w.drawer.width() == mw.DRAWER_WIDTH
+    assert w.content.width() >= w.content.minimumSizeHint().width() and w.width() <= 900
+    w.resize(1280, 720)
+    QApplication.processEvents()
+    assert w.centralWidget().layout().indexOf(w.drawer) >= 0
+
+
+def test_range_presets_keep_the_newest_saved_days(make_window, tmp_path):
+    s = Store(tmp_path / "w.db")
+    newest = 1_700_000_000.0
+    for d in range(40):  # one post a day for 40 days, the newest on the saved post's day
+        s.save_post(Post(f"d{d}", "Python", "ok", "", "a", 1, 0.9, 0, newest - d * 86400, "https://r", ""), 0.1,
+                    "neutral")
+    s.commit()
+    s.close()
+    w = make_window()
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
+    assert w.presets.current() == "all" and len(w.posts) == 41
+    w.presets.buttons["week"].click()
+    assert len(w.chosen_days) == 7 and len(w.posts) == 8  # the newest day has two posts
+    assert w.presets.current() == "week" and w.days_pick.currentText() != "All days"
+    w.presets.buttons["month"].click()
+    assert len(w.chosen_days) == 30 and w.presets.current() == "month"
+    w.presets.buttons["all"].click()
+    assert w.chosen_days is None and len(w.posts) == 41 and w.days_pick.currentText() == "All days"
+    w.presets.buttons["week"].click()
+    w.close()
+    again = make_window()  # the choice is kept with the subreddit, as the day picker's is
+    assert again.current == "Python" and len(again.posts) == 8 and again.presets.current() == "week"

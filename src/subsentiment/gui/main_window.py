@@ -7,7 +7,7 @@ from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThre
 from PySide6.QtGui import QAction, QActionGroup, QFontMetrics, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QTabBar,
+    QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
     QVBoxLayout, QWidget,
 )
 
@@ -16,7 +16,9 @@ from subsentiment.analysis import Analysis
 from subsentiment.gui import days, motion, native, theme
 from subsentiment.gui.coverage import CoverageWindow
 from subsentiment.gui.fetch_form import FetchForm
-from subsentiment.gui.overview import OverviewPage
+from subsentiment.gui.charts import TimelineChart
+from subsentiment.gui.overview import CardPage, OverviewPage, coming_soon
+from subsentiment.gui.rail import DRAWERS, PAGES, NavRail, Segmented
 from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
@@ -29,6 +31,48 @@ from subsentiment.store import Store
 
 
 SCOPES = ["Posts and comments", "Posts only", "Comments only"]
+# The header's range presets: key -> (label, newest saved days kept; None for every day).
+PRESETS = {"week": ("1W", 7), "month": ("1M", 30), "quarter": ("3M", 91), "all": ("All", None)}
+DRAWER_WIDTH = 318
+NO_DATA = "Open Fetch on the left, enter a subreddit and press Fetch and analyse."
+
+
+class FetchStrip(QWidget):
+    """Under the header: the running fetch's progress, what it's doing and Stop, then what it did, until
+    Hide. It takes no room while it has nothing to show."""
+
+    def __init__(self):
+        super().__init__()
+        self.progress = QProgressBar()
+        self.progress.setFixedWidth(160)
+        self.progress.setVisible(False)
+        self.message = StatusLabel()
+        self.stop_btn = mark(QPushButton("Stop"), "small", True)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setVisible(False)
+        self.hide_btn = mark(mark(QPushButton("Hide"), "flat", True), "small", True)
+        self.hide_btn.clicked.connect(lambda: self.message.setText(""))
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 6, 0, 0)
+        lay.setSpacing(10)
+        lay.addWidget(self.progress, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(self.message, 1)
+        lay.addWidget(self.stop_btn)
+        lay.addWidget(self.hide_btn)
+        for w in (self.progress, self.message):
+            w.installEventFilter(self)
+        self.setVisible(False)
+
+    def set_busy(self, busy: bool) -> None:
+        self.stop_btn.setEnabled(busy)
+        self.stop_btn.setVisible(busy)
+        self.hide_btn.setVisible(not busy)
+        self.progress.setVisible(busy)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() in (QEvent.Type.ShowToParent, QEvent.Type.HideToParent):
+            self.setVisible(not (self.progress.isHidden() and self.message.isHidden()))
+        return False
 
 
 def human_size(n: int) -> str:
@@ -132,15 +176,20 @@ class MainWindow(QMainWindow):
         # so a change applies on next launch.
         self._native_backdrop = native.prepare_window(self, self.settings.value("ui/backdrop", "gradient", str))
         self._shown = False
+        self._counted = Analysis()  # what the Overview and Timeline show
         self.mood = theme.MoodTint(self, self.settings.value("ui/mood_tint", True, bool))
         motion.set_enabled(not self.settings.value("ui/reduce_motion", False, bool))
 
         self._build_menu()
         backdrop = QWidget()  # transparent: the window paints the backdrop behind menus too
-        root = QHBoxLayout(backdrop)
+        root = self._root = QHBoxLayout(backdrop)
         root.setContentsMargins(12, 4, 12, 12)
         root.setSpacing(12)
-        root.addWidget(self._build_sidebar())
+        self.rail = NavRail()
+        self.rail.page_chosen.connect(self.show_page)
+        self.rail.drawer_toggled.connect(self.set_drawer)
+        root.addWidget(self.rail)
+        root.addWidget(self._build_drawers())
         root.addWidget(self._build_content(), 1)
         self.setCentralWidget(backdrop)
         # Permanent, so temporary messages (exports, restarts) don't wipe the access-mode note.
@@ -150,8 +199,12 @@ class MainWindow(QMainWindow):
         bar.hide()
         QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _: self._apply_theme())
         self._refresh_datasets(select=self.settings.value("ui/last_dataset", "", str))
-        self.tabbar.setCurrentIndex(self.settings.value("ui/tab", 0, int))
-        self.tabbar.currentChanged.connect(lambda i: self.settings.setValue("ui/tab", i))
+        # "ui/tab" held the index of the old Overview / Posts / Comments tabs.
+        old_tab = ("overview", "posts", "comments")[min(max(self.settings.value("ui/tab", 0, int), 0), 2)]
+        page = self.settings.value("ui/page", old_tab, str)
+        self.show_page(page if page in PAGES else "overview")
+        if not self.datasets.count():  # nothing saved yet: start where a fetch starts
+            self.set_drawer("fetch")
         if self.settings.value("updates/auto", True, bool):
             QTimer.singleShot(3000, lambda: self.updates.check(silent=True))
 
@@ -226,11 +279,65 @@ class MainWindow(QMainWindow):
         auto.toggled.connect(lambda on: self.settings.setValue("updates/auto", on))
         help_menu.addAction(auto)
 
-    def _build_sidebar(self) -> QWidget:
+    def _build_drawers(self) -> QWidget:
+        """The Fetch and Saved drawers, which open beside the rail. One shows at a time, in the same slot."""
+        self.drawer = QStackedWidget()
+        self.drawer.setMaximumWidth(DRAWER_WIDTH)
+        # Its width doesn't count towards the window's smallest size: where the page beside it would get less
+        # than it needs, the drawer floats over the page instead (_place_drawer).
+        self.drawer.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.drawer.hide()
+
+        fetch, lay = self._drawer_panel("Fetch", "Gather posts and read the mood")
+        self.fetch_form = FetchForm(self.settings, self)
+        self.fetch_form.submitted.connect(self._start_fetch)
+        self.fetch_form.range_moved.connect(self._range_moved)
+        lay.addLayout(self.fetch_form.layout)
+        self.fetch_form.align_labels()
+        self.fetch_btn = mark(QPushButton("Fetch and analyse"), "primary", True)
+        self.fetch_btn.setDefault(True)
+        self.fetch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.fetch_btn.clicked.connect(self._start_fetch)
+        lay.addWidget(self.fetch_btn)
+        lay.addStretch(1)
+        self.drawer.addWidget(fetch)
+
+        saved, lay = self._drawer_panel("Saved data", "Kept on this computer between sessions")
+        self.delete_btn = mark(mark(QPushButton("Delete…"), "flat", True), "small", True)
+        self.delete_btn.setToolTip("Delete the saved posts and comments for the selected subreddit")
+        self.delete_btn.clicked.connect(self._delete_dataset)
+        self.delete_all_btn = mark(mark(QPushButton("Delete all…"), "flat", True), "small", True)
+        self.delete_all_btn.setToolTip("Delete every saved subreddit")
+        self.delete_all_btn.clicked.connect(self._delete_all)
+        saved_head = QHBoxLayout()
+        saved_head.setSpacing(2)
+        saved_head.addWidget(section("Subreddits"), 1)
+        saved_head.addWidget(self.delete_btn)
+        saved_head.addWidget(self.delete_all_btn)
+        lay.addLayout(saved_head)
+        self.datasets = QListWidget()
+        self.datasets.setFrameShape(QFrame.Shape.NoFrame)
+        # Fills whatever height is left, down to one row; its default preferred height would count in full.
+        self.datasets.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        self.datasets.setMinimumHeight(42)
+        QuietScrollBars(self.datasets)
+        self.datasets.currentItemChanged.connect(self._on_dataset_selected)
+        lay.addWidget(self.datasets, 1)
+        self.coverage_btn = QPushButton("Download coverage…")
+        self.coverage_btn.setToolTip("How much of each day's posts, and each post's comments, is saved")
+        self.coverage_btn.clicked.connect(self._show_coverage)
+        lay.addWidget(self.coverage_btn)
+        self.storage_info = label("", "muted")
+        self.storage_info.setWordWrap(True)
+        self.storage_info.setToolTip("Saved on this computer, kept between sessions")
+        lay.addWidget(self.storage_info)
+        self.drawer.addWidget(saved)
+        return self.drawer
+
+    @staticmethod
+    def _drawer_panel(title: str, subtitle: str) -> tuple[QWidget, QVBoxLayout]:
+        """A drawer's panel: its title over a body that scrolls on a window too short for it."""
         side, outer = panel("true", margins=1, spacing=0)
-        side.setFixedWidth(318)
-        # On a short window (a 1080p screen at 150% leaves about 700 px) the sidebar scrolls rather than
-        # squashing its fields.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -245,129 +352,136 @@ class MainWindow(QMainWindow):
         bar = scroll.verticalScrollBar()
         bar.rangeChanged.connect(
             lambda _lo, hi: lay.setContentsMargins(19, 16, 19 - (bar.sizeHint().width() if hi > 0 else 0), 16))
-
         brand = QVBoxLayout()
         brand.setSpacing(2)
-        brand.addWidget(label("ikari", "title"))
-        brand.addWidget(label("Gather posts and read the mood", "subtitle"))
+        brand.addWidget(label(title, "title"))
+        brand.addWidget(label(subtitle, "subtitle"))
         lay.addLayout(brand)
-
-        self.fetch_form = FetchForm(self.settings, self)
-        self.fetch_form.submitted.connect(self._start_fetch)
-        self.fetch_form.range_moved.connect(self._range_moved)
-        lay.addWidget(section("Fetch"))
-        lay.addLayout(self.fetch_form.layout)
-        self.fetch_form.align_labels()
-
-        self.fetch_btn = mark(QPushButton("Fetch and analyse"), "primary", True)
-        self.fetch_btn.setDefault(True)
-        self.fetch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.fetch_btn.clicked.connect(self._start_fetch)
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self._stop_fetch)
-        buttons = QHBoxLayout()
-        buttons.setSpacing(8)
-        buttons.addWidget(self.fetch_btn, 1)
-        buttons.addWidget(self.stop_btn)
-        lay.addLayout(buttons)
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        self.progress_msg = StatusLabel()
-        lay.addWidget(self.progress)
-        lay.addWidget(self.progress_msg)
-
-        self.delete_btn = mark(mark(QPushButton("Delete…"), "flat", True), "small", True)
-        self.delete_btn.setToolTip("Delete the saved posts and comments for the selected subreddit")
-        self.delete_btn.clicked.connect(self._delete_dataset)
-        self.delete_all_btn = mark(mark(QPushButton("Delete all…"), "flat", True), "small", True)
-        self.delete_all_btn.setToolTip("Delete every saved subreddit")
-        self.delete_all_btn.clicked.connect(self._delete_all)
-        # The Delete buttons sit on the section's title row, so the panel fits a 150% maximized window.
-        saved_head = QHBoxLayout()
-        saved_head.setSpacing(2)
-        saved_head.addWidget(section("Saved data"), 1)
-        saved_head.addWidget(self.delete_btn)
-        saved_head.addWidget(self.delete_all_btn)
-        lay.addLayout(saved_head)
-        self.datasets = QListWidget()
-        self.datasets.setFrameShape(QFrame.Shape.NoFrame)
-        # Fills whatever height is left, down to one row. Its default preferred height (about 190 px)
-        # counted in full and pushed the storage line below a 150% maximized window, and at two rows a
-        # status line under Fetch did the same.
-        self.datasets.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
-        self.datasets.setMinimumHeight(42)
-        QuietScrollBars(self.datasets)
-        self.datasets.currentItemChanged.connect(self._on_dataset_selected)
-        lay.addWidget(self.datasets, 1)
-        self.storage_info = label("", "muted")
-        self.storage_info.setWordWrap(True)
-        self.storage_info.setToolTip("Saved on this computer, kept between sessions")
-        lay.addWidget(self.storage_info)
-        return side
+        lay.addSpacing(4)
+        return side, lay
 
     def _build_content(self) -> QWidget:
-        # One panel, as the sidebar is: the header on top, a rule under it, then the page.
+        # One panel: the header on top, a rule under it, then the page.
         content, lay = panel("true", margins=0, spacing=0)
 
         self.heading = ElidedLabel("No data yet", "heading")
-        self.subheading = ElidedLabel("Enter a subreddit on the left and press Fetch and analyse.", "subtitle")
-
-        self.tabbar = QTabBar()
-        self.tabbar.setDrawBase(False)
-        self.tabbar.setExpanding(False)
-        self.tabbar.setUsesScrollButtons(False)  # all three tabs always show
-        self.tabbar.setElideMode(Qt.TextElideMode.ElideRight)  # at the narrowest, long counts end in "…"
-        for t in ("Overview", "Posts", "Comments"):
-            self.tabbar.addTab(t)
-        # What the whole Overview (tiles, charts, mood tint) counts.
+        self.subheading = ElidedLabel(NO_DATA, "subtitle")
+        # What the Overview and Timeline count.
         self.scope = mark(ShrinkingComboBox(), "pill", True)
         self.scope.addItems(SCOPES)
-        self.scope.setToolTip("Count posts, comments or both on the Overview")
+        self.scope.setToolTip("Count posts, comments or both on the Overview and Timeline")
         saved = self.settings.value("ui/overview_scope", SCOPES[0], str)
         self.scope.setCurrentIndex(max(self.scope.findText(saved), 0))
         self.scope.currentTextChanged.connect(self._on_scope_changed)
-        # Which saved days every view counts (the Overview, both tables, CSV export). Picking never fetches.
+        # Which saved days every page counts (both tables and CSV export too). Picking never fetches.
         self.days_pick = mark(days.DaysCombo(), "pill", True)
         self.days_pick.chosen_changed.connect(self._on_days_chosen)
+        # Shortcuts to the saved days: the newest week, month or three months of them, or every day.
+        self.presets = Segmented({key: text for key, (text, _) in PRESETS.items()})
+        self.presets.setToolTip("Show only the newest saved days")
+        self.presets.chosen.connect(self._on_preset)
         self.heading.setMinimumWidth(QFontMetrics(theme.display_font(14, 600)).horizontalAdvance("r/subreddit"))
-        # The title, the Overview's scope picker, the day picker and the tabs share one centre line, and the
-        # subtitle runs the full width under them. It used to share a narrow column with the title and wrapped
-        # at 150%, cutting off "last fetched". The day picker sits by the tabs, which it filters too, so it
-        # stays put when the scope picker hides on the other tabs.
+
+        # The fetch running, or what the last one did, on every page: the drawer it started from closes.
+        self.fetch_strip = FetchStrip()
+        self.progress, self.progress_msg, self.stop_btn = (
+            self.fetch_strip.progress, self.fetch_strip.message, self.fetch_strip.stop_btn)
+        self.stop_btn.clicked.connect(self._stop_fetch)
+
         header = QGridLayout()
-        header.setContentsMargins(16, 12, 12, 12)
+        header.setContentsMargins(16, 12, 16, 12)
         header.setHorizontalSpacing(12)
         header.setVerticalSpacing(2)
         header.addWidget(self.heading, 0, 0, Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.scope, 0, 1, Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.days_pick, 0, 2, Qt.AlignmentFlag.AlignVCenter)
-        header.addWidget(self.tabbar, 0, 3, Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.presets, 0, 3, Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.subheading, 1, 0, 1, 4)
+        header.addWidget(self.fetch_strip, 2, 0, 1, 4)
         header.setColumnStretch(0, 1)
         lay.addLayout(header)
         lay.addWidget(mark(QFrame(), "role", "divider"))
 
         self.pages = QStackedWidget()
         self.content = content
-        self.tabbar.currentChanged.connect(lambda _: motion.crossfade(content))  # first: the old tab's look
-        self.tabbar.currentChanged.connect(self.pages.setCurrentIndex)
-        self.tabbar.currentChanged.connect(lambda i: self.scope.setVisible(i == 0))
         self.overview = OverviewPage()
-        self.pages.addWidget(self.overview)
+        self.timeline_page = CardPage("Mean sentiment per day (UTC)", TimelineChart())
+        self.words_page = CardPage("Words", coming_soon(
+            "The word cloud goes here: the words, phrases and authors that come up most."))
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
         self.comments_tab = TablePage(COMMENT_COLUMNS, stretch_col=2)
         # The post title would otherwise size to its text and squeeze the comment column.
         post_col = self.comments_tab.view.horizontalHeader()
         post_col.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
         post_col.resizeSection(4, 180)
-        self.pages.addWidget(self.posts_tab)
-        self.pages.addWidget(self.comments_tab)
+        self.page_widgets = {"overview": self.overview, "timeline": self.timeline_page, "words": self.words_page,
+                             "posts": self.posts_tab, "comments": self.comments_tab}
+        for key in PAGES:
+            self.pages.addWidget(self.page_widgets[key])
         body = QVBoxLayout()
         body.setContentsMargins(16, 16, 16, 16)
         body.addWidget(self.pages, 1)
         lay.addLayout(body, 1)
         return content
+
+    # -- pages and drawers ----------------------------------------------------
+
+    def page(self) -> str:
+        return self.rail.page()
+
+    def show_page(self, key: str) -> None:
+        if self.pages.currentWidget() is not self.page_widgets[key]:
+            motion.crossfade(self.content)  # first: the old page's look
+        self.rail.set_page(key)
+        self.pages.setCurrentWidget(self.page_widgets[key])
+        self.scope.setVisible(key in ("overview", "timeline"))
+        self.settings.setValue("ui/page", key)
+        if key == "timeline":  # kept up only while it shows
+            self.timeline_page.body.set_points(self._counted.daily_means)
+
+    def set_drawer(self, key: str) -> None:
+        """Open the Fetch or Saved drawer, or close the open one with ""."""
+        if key == self._drawer_key():
+            return
+        motion.crossfade(self.centralWidget())
+        self.rail.set_drawer(key)
+        if key:
+            self.drawer.setCurrentIndex(list(DRAWERS).index(key))
+        self.drawer.setVisible(bool(key))
+        self._place_drawer()
+        if key == "fetch":
+            self.fetch_form.subreddit.setFocus()
+
+    def _place_drawer(self) -> None:
+        """Beside the rail, pushing the page over, where the window is wide enough for both; floating over the
+        page's left edge where it isn't (a 1280x800 screen at 125%)."""
+        root, central = self._root, self.centralWidget()
+        m = root.contentsMargins()
+        left = m.left() + self.rail.sizeHint().width() + root.spacing()  # where the drawer starts, from the rail
+        room = central.width() - left - root.spacing() - m.right()
+        push = room >= DRAWER_WIDTH + self.content.minimumSizeHint().width()
+        placed = root.indexOf(self.drawer) >= 0
+        if push and not placed:
+            root.insertWidget(1, self.drawer)
+        elif not push and placed:
+            root.removeWidget(self.drawer)
+        if not push:
+            self.drawer.setGeometry(left, m.top(), DRAWER_WIDTH, central.height() - m.top() - m.bottom())
+            self.drawer.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if not self.drawer.isHidden():
+            self._place_drawer()
+
+    def _drawer_key(self) -> str:
+        return "" if self.drawer.isHidden() else list(DRAWERS)[self.drawer.currentIndex()]
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self._drawer_key():
+            self.set_drawer("")
+        else:
+            super().keyPressEvent(event)
 
     # -- theme ----------------------------------------------------------------
 
@@ -444,8 +558,8 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool) -> None:
         # Called after the fetch job starts (busy) or ends (idle); the update helpers read it.
         self.fetch_btn.setEnabled(not busy)
-        self.stop_btn.setEnabled(busy)
-        self.progress.setVisible(busy)
+        self.fetch_strip.set_busy(busy)
+        self.rail.buttons["fetch"].set_busy(busy)
         if busy:
             self.progress.setRange(0, 0)
             motion.fade_in(self.progress)
@@ -498,6 +612,8 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         self._stopping = False
         self.progress_msg.setText(message)
+        if self._drawer_key() == "fetch":  # the strip under the header follows it from here
+            self.set_drawer("")
 
     def _stop_fetch(self) -> None:
         if self.fetch_job.busy:
@@ -614,17 +730,16 @@ class MainWindow(QMainWindow):
         self._queued_ids.clear()
 
     def _update_dataset_labels(self) -> None:
-        self.tabbar.setTabText(1, f"Posts  {len(self.posts):,}")
-        self.tabbar.setTabText(2, f"Comments  {len(self.comments):,}")
         self.export_posts.setEnabled(bool(self.posts))
         self.export_comments.setEnabled(bool(self.comments))
         if not self.current:
             self.heading.setText("No data yet")
-            self.subheading.setText("Enter a subreddit on the left and press Fetch and analyse.")
+            self.subheading.setText(NO_DATA)
             return
         self.heading.setText(f"r/{self.current}")
-        # The tabs carry the counts and the day picker the chosen days, so this line only says how fresh it is.
-        self.subheading.setText(f"Last fetched {when_text(self._last_fetched)}")
+        # The day picker says which days; this line says how fresh they are and how much they hold.
+        self.subheading.setText(f"Last fetched {when_text(self._last_fetched)} · {plural(len(self.posts), 'post')}"
+                                f" · {plural(len(self.comments), 'comment')}")
 
     def _live_refresh(self) -> None:
         # What reads the store again (the saved-data list, Download coverage) once a second; the overview and
@@ -752,8 +867,10 @@ class MainWindow(QMainWindow):
         self._apply_days()
         self._update_delete_enabled()
         self.coverage_act.setEnabled(bool(self.current))
-        if switching and self.pages.currentIndex() == 0:
-            motion.fade_in_all(self.overview.cards)
+        self.coverage_btn.setEnabled(bool(self.current))
+        page = self.pages.currentWidget()
+        if switching and hasattr(page, "cards"):
+            motion.fade_in_all(page.cards)
         if self.coverage is not None:
             self.coverage.set_subreddit(self.current)
 
@@ -763,6 +880,7 @@ class MainWindow(QMainWindow):
         self._known = {}
         self._days_changed = False
         self.days_pick.set_days(self._day_counts, self.chosen_days)
+        self._mark_preset()
 
     def _apply_days(self) -> None:
         """Point every view at the saved rows from the chosen days."""
@@ -782,6 +900,7 @@ class MainWindow(QMainWindow):
         if chosen != self.chosen_days:
             motion.crossfade(self.content)
         self.chosen_days = chosen
+        self._mark_preset()
         if self.fetch_job.busy and self._showing_fetch():
             # A running fetch has added rows since the subreddit was loaded: read them all again.
             self._flush_rows()
@@ -790,6 +909,31 @@ class MainWindow(QMainWindow):
                              for k in ("posts", "comments")}
         else:
             self._apply_days()
+
+    def _preset_days(self, key: str) -> set[int] | None:
+        """The saved days a preset keeps: those within its span of the newest saved day."""
+        span = PRESETS[key][1]
+        if span is None or not self._day_counts:
+            return None
+        newest = max(self._day_counts)
+        return {d for d in self._day_counts if d > newest - span * 86400}
+
+    def _on_preset(self, key: str) -> None:
+        if not self.current:
+            self.presets.set_current("")
+            return
+        chosen = self._preset_days(key)
+        self.days_pick.set_days(self._day_counts, chosen)
+        self._on_days_chosen(chosen)
+        self.presets.set_current(key)  # kept even when it covers every saved day, as All would
+
+    def _mark_preset(self) -> None:
+        """Mark the preset the chosen days match, if any (the one already marked first, when two match)."""
+        def matches(key):
+            got = self._preset_days(key)
+            return (None if got is not None and set(self._day_counts) <= got else got) == self.chosen_days
+        keys = [self.presets.current(), "all", *PRESETS] if self.presets.current() else ["all", *PRESETS]
+        self.presets.set_current(next((k for k in keys if self.current and matches(k)), ""))
 
     def _on_scope_changed(self, text: str) -> None:
         self.settings.setValue("ui/overview_scope", text)
@@ -800,7 +944,10 @@ class MainWindow(QMainWindow):
         scope = self.scope.currentText()
         a = Analysis.combined(*[self._analysis[k] for k, skip in (("posts", "Comments only"), ("comments", "Posts only"))
                                 if scope != skip])
+        self._counted = a
         self.overview.show_analysis(a)
+        if self.timeline_page.isVisible():
+            self.timeline_page.body.set_points(a.daily_means)
         self.mood.set_counts(a.counts["positive"], a.counts["negative"], a.count)
 
     def _delete_dataset(self) -> None:

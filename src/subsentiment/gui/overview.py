@@ -1,11 +1,39 @@
-"""The Overview tab: four stat tiles, and the distribution and timeline charts."""
+"""The Overview page (four stat tiles, the timeline across the full width, the distribution under it) and
+the single-card pages beside it in the rail: Timeline and Words."""
 from __future__ import annotations
 
-from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from subsentiment.analysis import Analysis
 from subsentiment.gui.charts import DistributionChart, TimelineChart
 from subsentiment.gui.widgets import StatTile, VerticalScrollArea, label, panel
+
+
+def card(title: str, body: QWidget) -> QFrame:
+    """A titled card on a page."""
+    frame, inner = panel("tile", margins=14, spacing=4)
+    inner.addWidget(label(title, "caption"))
+    inner.addWidget(body, 1)
+    return frame
+
+
+class CardPage(QWidget):
+    """A page that is one titled card filling the content area, such as Timeline and Words."""
+
+    def __init__(self, title: str, body: QWidget):
+        super().__init__()
+        self.body = body
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(card(title, body), 1)
+        self.cards = [body.parentWidget()]
+
+
+def coming_soon(text: str) -> QLabel:
+    note = label(text, "muted")
+    note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    return note
 
 
 class OverviewPage(VerticalScrollArea):
@@ -33,20 +61,22 @@ class OverviewPage(VerticalScrollArea):
             tiles.addWidget(t, 1)
         lay.addLayout(tiles)
 
-        self.distribution = DistributionChart()
         self.timeline = TimelineChart()
-        charts = QHBoxLayout()
-        charts.setSpacing(14)
-        for chart, title, stretch in ((self.distribution, "Sentiment distribution", 2),
-                                      (self.timeline, "Mean sentiment per day (UTC)", 3)):
-            card, inner = panel("tile", margins=14, spacing=4)
-            inner.addWidget(label(title, "caption"))
-            inner.addWidget(chart, 1)
-            charts.addWidget(card, stretch)
-        lay.addLayout(charts, 3)
+        self.distribution = DistributionChart()
+        # Shorter than on a page of their own, so the whole Overview fits a 1920x1200 150% window unscrolled.
+        self.timeline.setMinimumHeight(150)
+        self.distribution.setMinimumHeight(120)
+        self.words = coming_soon("The word cloud goes here.")
+        lay.addWidget(card("Mean sentiment per day (UTC)", self.timeline), 5)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(14)
+        bottom.addWidget(card("Sentiment distribution", self.distribution), 2)
+        bottom.addWidget(card("Words", self.words), 3)
+        lay.addLayout(bottom, 4)
 
         # What fades in, one after another, when another subreddit is shown.
-        self.cards = [*self.tiles.values(), self.distribution.parentWidget(), self.timeline.parentWidget()]
+        self.cards = [*self.tiles.values(), self.timeline.parentWidget(), self.distribution.parentWidget(),
+                      self.words.parentWidget()]
         self.setWidget(page)
 
     def show_analysis(self, a: Analysis) -> None:

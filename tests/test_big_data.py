@@ -188,7 +188,7 @@ def test_the_end_of_a_fetch_reads_back_only_what_it_saved(window, monkeypatch):
     assert [posts.model.row_at(i)["score"] for i in range(POSTS) if posts.model.row_at(i)["id"] == "p5"] == [12345]
     assert comments.model.rowCount() == COMMENTS + 1 and len(window.comments) == COMMENTS + 1
     assert int(window.overview.tiles["count"].value.text().replace(",", "")) == before + 1
-    assert window.tabbar.tabText(2) == f"Comments  {COMMENTS + 1:,}"
+    assert window.subheading.text().endswith(f"· {COMMENTS + 1:,}\xa0comments")
 
 
 def test_switching_theme_recolours_without_reading_the_data_again(window, monkeypatch):

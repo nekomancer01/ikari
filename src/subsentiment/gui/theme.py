@@ -222,6 +222,15 @@ QPushButton[flat="true"] {{ background: transparent; border: 1px solid transpare
 QPushButton[flat="true"]:hover {{ background: {soft}; color: {t['text']}; }}
 QPushButton[small="true"] {{ padding: 3px 9px; border-radius: 8px; font-size: 9pt; }}
 
+/* A segmented switch (the header's range presets): one rounded track, the chosen segment raised on it */
+QFrame[segmented="true"] {{ background: {soft}; border: none; border-radius: 15px; }}
+QFrame[segmented="true"] QPushButton {{
+    background: transparent; border: 1px solid transparent; border-radius: 13px; padding: 4px 11px;
+    color: {t['muted']}; font-weight: 500;
+}}
+QFrame[segmented="true"] QPushButton:hover {{ color: {t['text']}; }}
+QFrame[segmented="true"] QPushButton:checked {{ background: {panel}; color: {t['text']}; border-color: {edge}; }}
+
 QProgressBar {{ background: {soft}; border: none; border-radius: 3px; max-height: 6px; min-height: 6px; text-align: center; color: transparent; }}
 QProgressBar::chunk {{ border-radius: 3px; background: {t['accent']}; }}
 

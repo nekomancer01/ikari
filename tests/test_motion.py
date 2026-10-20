@@ -122,12 +122,12 @@ def test_switching_subreddit_fades_and_counts_to_the_new_values(make_window):
     assert all(c.graphicsEffect() is None for c in w.overview.cards)  # painted plainly again once faded in
 
 
-def test_tabs_crossfade(make_window):
+def test_pages_crossfade(make_window):
     w = make_window()
-    w.tabbar.setCurrentIndex(0)
+    w.show_page("overview")
     pump(motion.VIEW_MS + 100)
-    w.tabbar.setCurrentIndex(1)
-    assert w.pages.currentIndex() == 1 and snapshots(w.content)
+    w.show_page("posts")
+    assert w.pages.currentWidget() is w.posts_tab and snapshots(w.content)
     pump(motion.VIEW_MS + 150)
     assert not snapshots(w.content)
 
@@ -152,7 +152,7 @@ def test_new_data_while_shown_counts_up(make_window):
 
 def test_a_snapshot_never_outlives_a_resize(make_window):
     w = make_window()
-    w.tabbar.setCurrentIndex(1)
+    w.show_page("posts")
     assert snapshots(w.content)
     w.resize(1100, 700)
     pump(50)
@@ -169,7 +169,7 @@ def test_reduce_motion_changes_everything_at_once(make_window):
     assert not snapshots(w.content)
     assert all(c.graphicsEffect() is None for c in w.overview.cards)
     assert drawn(w.overview.tiles["count"].value) == "30" and w.overview.distribution.shown_heights() == [25.0, 0.0, 5.0]
-    w.tabbar.setCurrentIndex(2)
+    w.show_page("comments")
     assert not snapshots(w.content)
     w.close()
 
@@ -201,7 +201,7 @@ def test_the_status_bar_fades_in_once_not_on_every_message(make_window):
 def test_behind_a_native_backdrop_the_new_look_fades_in_instead(make_window):
     w = make_window()
     w.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)  # what Mica or Acrylic sets up
-    w.tabbar.setCurrentIndex(1)
+    w.show_page("posts")
     assert not snapshots(w.content)  # no still of see-through glass laid over the glass
     assert isinstance(w.content.graphicsEffect(), QGraphicsOpacityEffect)
     pump(motion.VIEW_MS + 150)
