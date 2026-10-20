@@ -752,11 +752,11 @@ def test_each_answer_is_parsed_once():
 def test_an_ok_answer_that_isnt_json_is_retried_and_fails_only_if_it_keeps_coming():
     # A proxy's or CDN's error page with HTTP 200, or a body cut short: it used to fail the whole fetch on
     # the first one, while a 503 is waited out and retried.
-    session = FakeSession([FakeResponse(200, None)] * arctic_shift.ATTEMPTS)
+    session = FakeSession([FakeResponse(200, None)] * arctic_shift.GARBLED_TRIES)
     client = ArcticShiftClient(session=session, limiter=RateLimiter(interval=0, sleep=lambda s: None))
-    with pytest.raises(FetchError):
+    with pytest.raises(FetchError, match="couldn't be read"):
         client.get("/api/posts/search", {"subreddit": "Python"})
-    assert len(session.calls) == arctic_shift.ATTEMPTS
+    assert len(session.calls) == arctic_shift.GARBLED_TRIES
 
 
 @pytest.mark.parametrize("bad", [FakeResponse(200, None), FakeResponse(200, ["not", "an", "object"]),
@@ -765,3 +765,17 @@ def test_an_answer_that_cant_be_read_is_retried(bad):
     session = FakeSession([bad, FakeResponse(200, {"data": [{"id": "x"}, None, "junk"]})])
     client = ArcticShiftClient(session=session, limiter=RateLimiter(interval=0, sleep=lambda s: None))
     assert client.get("/api/posts/search", {"subreddit": "Python"}) == [{"id": "x"}]  # junk records skipped
+
+
+def test_a_slow_request_still_out_holds_back_the_next_while_the_budget_is_unknown():
+    # Only requests of a stopped job stop counting: a live slow one still keeps requests to one at a time.
+    limiter = RateLimiter(0.0)
+    limiter.wait()  # no answer has come yet, so the budget is unknown
+    sent = threading.Event()
+    threading.Thread(target=lambda: (limiter.wait(), sent.set()), daemon=True).start()
+    assert not sent.wait(0.5)
+    stopped = threading.Event()
+    other = RateLimiter(0.0)
+    other.wait(stopped.is_set)
+    stopped.set()  # its job was stopped: nobody waits for that answer any more
+    assert other.wait() is not None

@@ -91,11 +91,10 @@ def test_stop_doesnt_wait_for_a_slow_search(archive, tmp_path):
     assert time.monotonic() - start < 4  # 8 s before: it waited for every search in flight
 
 
-def test_requests_left_out_by_stop_dont_hold_up_the_next_job(archive, tmp_path, monkeypatch):
+def test_requests_left_out_by_stop_dont_hold_up_the_next_job(archive, tmp_path):
     # Stop leaves comment-tree requests running. They still counted as in flight, so once the server's
     # request window reset (the budget unknown again), the next fetch or count sent nothing until they
     # came back: up to a minute.
-    monkeypatch.setattr(arctic_shift, "STALE_IN_FLIGHT", 0.5)
     now = time.time()
     a = archive(make_posts("python", now, days=6))
     a.rate = (60, 1.0)
@@ -129,3 +128,19 @@ def test_top_mode_keeps_a_settled_score_it_downloaded_for_a_saved_post(archive, 
                                               include_comments=False))
     assert s.posts("Sub")[0]["score"] == 480  # None before: the settled copy was dropped
     assert result.updated == 1
+
+
+def test_more_posts_in_one_second_than_a_page_holds_never_marks_the_range_read_to_its_end(archive):
+    t = DAY0 + 5000
+    archive([post(f"p{k:03d}", t) for k in range(arctic_shift.PAGE + 20)] + [post("later", t + 60)])
+    c = arctic_shift.ArcticShiftClient(limiter=arctic_shift.RateLimiter(0), workers=1)
+    got = c.fetch_posts("Sub", DAY0, DAY0 + DAY, limit=1000, exhaust=True)
+    assert "later" in {p.id for p in got}  # it moves on rather than asking for that second forever
+    assert not c.exhausted  # some of that second's posts were never seen, so the day isn't complete
+
+
+def test_numeric_ids_and_infinite_numbers_are_read(archive):
+    archive([post(12345, DAY0 + 100, score=float("inf")), post("p2", DAY0 + 200, upvote_ratio=float("nan"))])
+    c = arctic_shift.ArcticShiftClient(limiter=arctic_shift.RateLimiter(0), workers=1)
+    got = {p.id: p for p in c.fetch_posts("Sub", DAY0, DAY0 + DAY, limit=10, skip={"12345"})}
+    assert set(got) == {"p2"} and got["p2"].upvote_ratio == 0.0  # the saved one is recognised and skipped

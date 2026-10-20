@@ -52,6 +52,7 @@ SLOT_PAGES = 10
 WORKERS = 4  # requests in flight at once. The limiter still spaces out when each one starts; this only
              # overlaps the second or two each spends waiting on the archive
 TIMEOUT_TRIES = 3  # query timeouts on one request before the caller is asked to narrow it
+GARBLED_TRIES = 3  # answers that aren't the archive's JSON before a request gives up
 MIN_WINDOW = 600  # seconds; a timing-out window is halved down to this
 TREE_LIMIT = 300  # comments asked for per thread; big trees are slow for the archive and trip its limits
 TREE_MAX = 25000  # the most comments the tree endpoint returns in one request
@@ -70,12 +71,22 @@ class Stopped(Exception):
 
 
 STOP_POLL = 0.2  # seconds between Stop checks during a long wait
-STALE_IN_FLIGHT = 5.0  # seconds after which a request still out no longer holds back the next one
 
 
 class QueryTimeout(FetchError):
     """The archive gave up on a query as too slow, even with small pages. A narrower date window
     usually works."""
+
+
+class _Flight:
+    """A request the limiter let out, until its answer comes."""
+
+    def __init__(self, should_stop: StopFn | None):
+        self.should_stop = should_stop
+
+    def abandoned(self) -> bool:
+        """The job that sent it was stopped, so nobody is waiting for its answer."""
+        return bool(self.should_stop and self.should_stop())
 
 
 class RateLimiter:
@@ -100,15 +111,16 @@ class RateLimiter:
         # the requests already sent. So the limiter counts what's in flight, keeps the remaining budget
         # minus those, and sends one request at a time whenever it doesn't know the budget (before the
         # first answer, and after a reset until the next answer says what the new window allows).
-        self._in_flight: list[float] = []  # when each request still out was sent, oldest first
+        # The requests still out, each as the Stop check of the job that sent it (or None).
+        self._in_flight: list[_Flight] = []
         self._budget: float | None = None  # requests left in the server's current window, if known
         self._budget_until = 0.0  # when that window resets
         self._budget_known = False  # the server has sent X-RateLimit-Remaining at least once
         self._answered = False  # any answer has arrived yet
 
-    def wait(self, should_stop: StopFn | None = None) -> None:
-        """Block until a request may go out, and count it as in flight until ``observe`` or ``done``.
-        Raises Stopped, sending nothing, if ``should_stop`` turns true meanwhile."""
+    def wait(self, should_stop: StopFn | None = None) -> _Flight:
+        """Block until a request may go out, and count it as in flight until ``observe`` or ``done``
+        (given what this returns). Raises Stopped, sending nothing, if ``should_stop`` turns true meanwhile."""
         announced = False
         with self._lock:
             while True:
@@ -118,9 +130,9 @@ class RateLimiter:
                 if self._budget is not None and now >= self._budget_until:
                     self._budget = None  # the window reset; the next answer gives the new budget
                 unknown = not self._answered or (self._budget_known and self._budget is None)
-                # Requests out longer than STALE_IN_FLIGHT don't hold the next one back: Stop leaves
-                # requests running unanswered (up to a minute), and waiting on them stalled the next job.
-                if unknown and self._in_flight and now - self._in_flight[-1] < STALE_IN_FLIGHT:
+                # Requests whose job was stopped don't hold the next one back: Stop leaves them running
+                # unanswered (up to a minute), and waiting on them stalled the next fetch or count.
+                if unknown and any(not f.abandoned() for f in self._in_flight):
                     self._lock.wait(STOP_POLL if should_stop else 1.0)
                     continue
                 if self._budget is not None and self._budget <= 0:
@@ -138,19 +150,22 @@ class RateLimiter:
                         continue
                     self._sleep(delay)
                 self._next = self._clock() + self.interval
-                self._in_flight.append(self._clock())
+                flight = _Flight(should_stop)
+                self._in_flight.append(flight)
                 if self._budget is not None:
                     self._budget -= 1
-                return
+                return flight
 
-    def done(self) -> None:
+    def done(self, flight: _Flight | None = None) -> None:
         """A request ``wait`` let out got no answer (a network error)."""
         with self._lock:
-            self._answer()
+            self._answer(flight)
             self._lock.notify_all()
 
-    def _answer(self) -> None:
-        if self._in_flight:
+    def _answer(self, flight: _Flight | None) -> None:
+        if flight in self._in_flight:
+            self._in_flight.remove(flight)
+        elif self._in_flight:
             self._in_flight.pop(0)
 
     def hold(self, seconds: float, reason: str = "Arctic Shift is busy") -> None:
@@ -174,10 +189,10 @@ class RateLimiter:
             return at - self._wall()
         return default
 
-    def observe(self, headers) -> None:
+    def observe(self, headers, flight: _Flight | None = None) -> None:
         """Note an answer's rate-limit headers, and pause until the reset when no requests are left."""
         with self._lock:
-            self._answer()
+            self._answer(flight)
             self._answered = True
             remaining = _number(headers.get("X-RateLimit-Remaining"), None)
             if remaining is not None:
@@ -205,8 +220,9 @@ def _meta(d: dict) -> dict:
 
 
 def _int(value) -> int:
-    """A count from the archive as an int; 0 for anything that isn't a number ("1.5" is 1)."""
-    return int(_number(value, 0) or 0) if _number(value, 0) == _number(value, 0) else 0
+    """A count from the archive as an int; 0 for anything that isn't a finite number ("1.5" is 1)."""
+    n = _number(value, 0)
+    return int(n) if math.isfinite(n) else 0
 
 
 def _settled(d: dict) -> bool:
@@ -227,18 +243,30 @@ def _post(d: dict) -> Post:
     selftext = _text(d.get("selftext"))
     permalink = _text(d.get("permalink")) or f"/r/{subreddit}/comments/{d['id']}/"
     return Post(
-        id=str(d["id"]),
+        id=d["id"],
         subreddit=subreddit,
         title=_text(d.get("title")),
         selftext="" if selftext in _GONE else selftext,
         author=_text(d.get("author")) or "[deleted]",
         score=_int(d.get("score")) if settled else None,
-        upvote_ratio=_number(d.get("upvote_ratio"), 0.0) if settled else None,
+        upvote_ratio=_ratio(d.get("upvote_ratio")) if settled else None,
         num_comments=_int(d.get("num_comments")) if settled else None,
         created_utc=_number(d.get("created_utc"), 0),
         permalink="https://www.reddit.com" + permalink,
         url=_text(d.get("url")),
     )
+
+
+def _ratio(value) -> float:
+    n = _number(value, 0.0)
+    return n if math.isfinite(n) else 0.0
+
+
+def _with_text_id(d: dict) -> dict:
+    """``d`` with its id as text, as ids are compared with saved ones (a numeric one never matched)."""
+    if d.get("id") is not None and not isinstance(d["id"], str):
+        d = dict(d, id=str(d["id"]))
+    return d
 
 
 def _text(value) -> str:
@@ -285,7 +313,9 @@ class ArcticShiftClient:
         # Posts the archive returned that were removed on Reddit, id -> created_utc: fetching skips them,
         # but the archive's daily counts include them, so Download coverage counts them as checked.
         self.removed: dict[str, float] = {}
+        self._removed_lock = threading.Lock()
         self.exhausted = False  # whether the last fetch_posts read its whole range (see there)
+        self._skipped_posts = False  # a slice moved past posts it couldn't page through (see _earliest)
 
     # -- HTTP ---------------------------------------------------------------
 
@@ -295,35 +325,39 @@ class ArcticShiftClient:
         whose ``limit`` isn't a page size), raising QueryTimeout if that doesn't help."""
         params = dict(params)
         self._local.last_params = params  # what was finally sent, after any shrinking
-        timeouts = 0
+        timeouts = garbled = 0
         stop = None if getattr(self._local, "finishing", False) else self.should_stop
         for attempt in range(ATTEMPTS):
             backoff = min(5.0 * 2 ** attempt, MAX_WAIT)
-            self.limiter.wait(stop)
+            flight = self.limiter.wait(stop)
             try:
                 resp = self.session.get(BASE_URL + path, params=params, timeout=60)
             except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError,
                     requests.exceptions.ContentDecodingError):  # no answer, or one cut off on the way
-                self.limiter.done()
+                self.limiter.done(flight)
                 if attempt == ATTEMPTS - 1:
                     raise
                 self.limiter.hold(backoff, "Couldn't reach Arctic Shift")
                 continue
             except BaseException:
-                self.limiter.done()
+                self.limiter.done(flight)
                 raise
-            self.limiter.observe(resp.headers)
+            self.limiter.observe(resp.headers, flight)
             payload = _json(resp)  # parsed once: a big comment tree takes a while to parse
             error = _error_text(payload)
             if resp.status_code == 200 and not error and isinstance(payload, dict):
                 self.limiter.ok()
                 data = payload.get("data")
                 # Anything that isn't an object is a malformed record; skipping it keeps the rest.
-                return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+                return [_with_text_id(d) for d in data if isinstance(d, dict)] if isinstance(data, list) else []
             if resp.status_code == 200 and not isinstance(payload, dict):
-                # Not the archive's JSON: a proxy's or CDN's error page, or a body cut short. Retried like
-                # a server error; it used to fail the whole fetch on the first one.
-                self.limiter.hold(backoff)
+                # Not the archive's JSON: a proxy's or CDN's error page, or a body cut short. It used to fail
+                # the whole fetch on the first one; a few are retried, then it's said what came back.
+                garbled += 1
+                if garbled >= GARBLED_TRIES:
+                    raise FetchError("Arctic Shift's answers couldn't be read (something between this computer "
+                                     "and the archive may be answering instead). Try again in a few minutes.")
+                self.limiter.hold(2.0 * garbled, "Arctic Shift's answer couldn't be read")
                 continue
             if _is_timeout(resp.status_code, error):
                 # The archive answers slow queries with "Query timed out" (HTTP 200) or "Timeout. Maybe
@@ -399,7 +433,7 @@ class ArcticShiftClient:
             base["query"] = query
         skip = set(skip)
         self._page_cap = PAGE
-        self.exhausted = False
+        self.exhausted = self._skipped_posts = False
 
         n = slot_count(after, before, limit, top)
         windows = slices(after, before, n)
@@ -479,7 +513,7 @@ class ArcticShiftClient:
                     on_posts(extra)
         posts = [p for group in picked for p in group]
         posts.sort(key=lambda p: p.created_utc)
-        self.exhausted = not top and not any(more)
+        self.exhausted = not top and not any(more) and not self._skipped_posts
         return posts
 
     def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int, int]:
@@ -537,8 +571,11 @@ class ArcticShiftClient:
                 if size < self._page_cap:
                     wide = True  # a bigger page reaches past that second
                     continue
-                cursor = int(max(_number(d.get("created_utc"), 0) for d in page))  # more than a page in
-                continue  # one second (never seen): move past it rather than ask for it forever
+                # More than a page in one second (never seen): move past it rather than ask forever, and
+                # don't call the range read to its end.
+                cursor = int(max(_number(d.get("created_utc"), 0) for d in page))
+                self._skipped_posts = True
+                continue
             # The next page starts a second before this one ended, so posts sharing that timestamp
             # aren't lost; `seen` drops the repeats.
             cursor = int(max(_number(d.get("created_utc"), 0) for d in page)) - 1
@@ -602,7 +639,14 @@ class ArcticShiftClient:
     def _note_removed(self, d: dict) -> None:
         created = _number(d.get("created_utc"), None)
         if created is not None:
-            self.removed[d["id"]] = float(created)
+            with self._removed_lock:  # slice threads Stop left running may still be adding
+                self.removed[d["id"]] = float(created)
+
+    def take_removed(self) -> dict[str, float]:
+        """The removed posts noted so far, which are then forgotten."""
+        with self._removed_lock:
+            taken, self.removed = self.removed, {}
+        return taken
 
     def day_counts(self, subreddit: str, after: float, before: float,
                    should_stop: StopFn | None = None) -> dict[int, int]:

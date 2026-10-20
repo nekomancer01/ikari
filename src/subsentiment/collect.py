@@ -93,10 +93,11 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
                                 skip=() if req.top else stored.keys(),
                                 progress=note, should_stop=should_stop, on_posts=save_streamed,
                                 exhaust=req.everything)
-    removed = getattr(client, "removed", None)
+    # Taken, not read and cleared: after Stop, slice threads still running may be adding to it.
+    take = getattr(client, "take_removed", None)
+    removed = take() if take else {}
     if removed:  # the archive's daily counts include these, so Download coverage counts them as checked
         store.save_removed(name, removed)
-        removed.clear()
     new = [p for p in picked if p.id not in stored]
     for p in new:
         if p.id not in streamed:
@@ -153,7 +154,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         if todo:
             progress(len(todo), len(todo), "Done")
     return FetchResult(subreddit, len(new), n_comments, should_stop(), updated=len(updated),
-                       already=len(picked) - len(new), comment_errors=errors)
+                       already=len(picked) - len(new) - len(settled), comment_errors=errors)
 
 
 def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, progress, should_stop,
