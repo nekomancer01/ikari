@@ -2,8 +2,10 @@
 
 Run from the repo root:  python tools/db_size.py <path to subsentiment.db>
                          python tools/db_size.py --build <new .db> [subreddit] [days] [posts]
+                         python tools/db_size.py --migrate <path to subsentiment.db>
 --build fetches from the real Arctic Shift archive into a new database (every comment on up to ``posts``
-posts a day, default 300), as the app's Fetch does. The database measured is copied first; it is never changed.
+posts a day, default 300), as the app's Fetch does. --migrate opens a copy with this branch's Store and checks
+every row reads back the same. The database measured is copied first; it is never changed.
 """
 from __future__ import annotations
 
@@ -144,8 +146,43 @@ def options(path: Path) -> None:
     shutil.rmtree(tmp)
 
 
+def migrate(path: Path) -> None:
+    from subsentiment.store import Store
+
+    def contents(p: Path) -> dict:
+        db = sqlite3.connect(p)
+        out = {t: sorted(db.execute(f"SELECT * FROM {t}"), key=repr)
+               for t in ("posts", "comment_fetches", "complete", "removed_posts")}
+        out["comments"] = sorted(db.execute(
+            "SELECT c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score, c.created_utc, c.depth, "
+            "COALESCE(c.permalink, p.permalink || c.id || '/'), c.sentiment, c.label, c.fetched_at "
+            "FROM comments c LEFT JOIN posts p ON p.id = c.post_id"), key=repr)
+        db.close()
+        return out
+
+    tmp = Path(tempfile.mkdtemp())
+    copy = tmp / "subsentiment.db"
+    db, target = sqlite3.connect(path), sqlite3.connect(copy)
+    db.backup(target)  # with whatever the WAL file holds
+    db.close()
+    target.close()
+    before, size = contents(copy), file_size(copy)
+    t = time.time()
+    store = Store(copy)
+    took = time.time() - t
+    version = store.db.execute("PRAGMA user_version").fetchone()[0]
+    check = store.db.execute("PRAGMA integrity_check").fetchone()[0]
+    store.close()
+    print(f"{size / MB:.1f} MB -> {file_size(copy) / MB:.1f} MB in {took:.1f} s; user_version {version}, "
+          f"integrity {check}, every row reads back the same: {contents(copy) == before}, "
+          f"files left: {sorted(p.name for p in tmp.iterdir())}")
+    shutil.rmtree(tmp)
+
+
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["--build"]:
+    if sys.argv[1:2] == ["--migrate"]:
+        migrate(Path(sys.argv[2]))
+    elif sys.argv[1:2] == ["--build"]:
         build(Path(sys.argv[2]), sys.argv[3] if len(sys.argv) > 3 else "AskReddit",
               int(sys.argv[4]) if len(sys.argv) > 4 else 2, int(sys.argv[5]) if len(sys.argv) > 5 else 300)
     else:
