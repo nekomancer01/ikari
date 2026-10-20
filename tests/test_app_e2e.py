@@ -3,12 +3,14 @@ talking to a fake Arctic Shift server on localhost. The rule checked throughout:
 unless the user asked for it, and each action requests only what it says."""
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +22,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QMessageBox  # noqa: E402
 
 from subsentiment import arctic_shift  # noqa: E402
 from subsentiment.gui import coverage  # noqa: E402
+from subsentiment.gui import tables  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import worker  # noqa: E402
 from subsentiment.gui.rail import PAGES  # noqa: E402
@@ -1079,6 +1082,30 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
         assert int(re.match(r"[\d,]*", shown).group().replace(",", "") or 0) == saved.get(day, 0), (day, shown)
     w._stop_fetch()
     wait_idle(w)
+
+
+def test_data_saved_by_an_older_ikari_opens_shrunk_and_still_links_each_comment(env, monkeypatch):
+    shutil.copy(Path(__file__).parent / "data" / "store-53829f7.db", env.db)
+    before = os.path.getsize(env.db)
+    opened = []
+    monkeypatch.setattr(tables.QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
+    w = env.window()
+    assert os.path.getsize(env.db) < before
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
+    w.show_page("comments")
+    page = w.comments_tab
+    assert page.model.rowCount() == 11
+    for i in range(page.model.rowCount()):
+        page.view.doubleClicked.emit(page.model.index(i, 0))
+    old = sqlite3.connect(Path(__file__).parent / "data" / "store-53829f7.db")
+    assert sorted(opened) == sorted(link for (link,) in old.execute("SELECT permalink FROM comments"))
+    old.close()
+    fetch(w, comments=True)  # new comments are saved into it the same way
+    s = env.store()
+    fetched = [r for r in s.comments("python") if r["post_id"].startswith("py")]
+    assert fetched and all(r["permalink"] for r in fetched)
+    stored = dict(s.db.execute("SELECT id, permalink FROM comments WHERE post_id LIKE 'py%'"))
+    assert set(stored.values()) == {None}  # each is its post's permalink and id, so none is stored
 
 
 def test_a_zoomed_timeline_keeps_up_with_a_fetch(env):
