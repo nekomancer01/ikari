@@ -144,7 +144,7 @@ def window_shots(name: str, keep: bool, out: str) -> None:
     theme.apply(app, "dark")
     window = main_window.MainWindow(db)
     motion.set_enabled(False)  # text of the finished state, not mid-fade
-    window.subreddit.setText(screenshot.SUBREDDIT)
+    window.fetch_form.subreddit.setText(screenshot.SUBREDDIT)
     window.show()
     scale = os.environ.get("QT_SCALE_FACTOR", "1")
     sizes = {"1.5": [("maximized", 1280, 721), ("restored", 1203, 691)], "1.25": [("maximized", 1093, 614)]}[scale]

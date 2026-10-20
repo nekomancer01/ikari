@@ -116,8 +116,8 @@ def main(argv: list[str] | None = None) -> int:
     window.resize(1440, 900)
     window.show()
     window._refresh_datasets(SUBREDDIT)
-    window.subreddit.setText(SUBREDDIT)
-    window.include_comments.setChecked(True)
+    window.fetch_form.subreddit.setText(SUBREDDIT)
+    window.fetch_form.include_comments.setChecked(True)
     window.tabbar.setFocus()  # no text cursor blinking in the subreddit box
     window.scope.setCurrentText("Posts only")  # comments are short and repeat; post titles don't
     for page in (window.posts_tab, window.comments_tab):  # newest first shows a mix of labels
