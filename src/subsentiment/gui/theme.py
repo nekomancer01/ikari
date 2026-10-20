@@ -94,7 +94,8 @@ def smooth_text(f: QFont) -> QFont:
 
 
 def display_font(point_size: float, weight: int = 600) -> QFont:
-    f = QFont(DISPLAY_FAMILY)
+    f = QFont(QGuiApplication.font())  # the app font's features (tabular figures), so it measures as it paints
+    f.setFamily(DISPLAY_FAMILY)
     f.setPointSizeF(point_size)
     f.setWeight(QFont.Weight(weight))
     return smooth_text(f)
