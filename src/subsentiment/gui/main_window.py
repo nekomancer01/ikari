@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from datetime import datetime
+from functools import partial
 
 from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QFontMetrics, QGuiApplication, QIcon, QKeySequence
@@ -17,7 +18,7 @@ from subsentiment.analysis import Analysis
 from subsentiment.gui import days, motion, native, theme
 from subsentiment.gui.coverage import CoverageWindow
 from subsentiment.gui.fetch_form import FetchForm
-from subsentiment.gui.charts import TimelineChart
+from subsentiment.gui.charts import NoteDialog, TimelineChart
 from subsentiment.gui.overview import CardPage, OverviewPage, coming_soon
 from subsentiment.gui.rail import DRAWERS, PAGES, NavRail, Segmented
 from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
@@ -416,6 +417,9 @@ class MainWindow(QMainWindow):
         self.overview = OverviewPage()
         timeline = TimelineChart()
         self.timeline_page = CardPage("Mean sentiment per day (UTC)", timeline, timeline.toolbar)
+        self.timelines = (self.overview.timeline, timeline)
+        for chart in self.timelines:
+            chart.note_requested.connect(self._edit_note)
         self.words_page = CardPage("Words", coming_soon(
             "The word cloud goes here: the words, phrases and authors that come up most."))
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
@@ -867,7 +871,7 @@ class MainWindow(QMainWindow):
         switching = (name or None) != self.current
         if switching:  # the old subreddit fades out over the new one, whose cards fade in one by one
             motion.crossfade(self.content)
-            for chart in (self.overview.timeline, self.timeline_page.body):
+            for chart in self.timelines:
                 chart.show_every_day()
         self.current = name or None
         self.chosen_days = days.load_choice(self.settings, name) if name else None
@@ -878,6 +882,7 @@ class MainWindow(QMainWindow):
                            "comments": self.store.comments(name) if name else []}
             self._refresh_days()
         self._apply_days()
+        self._show_notes()
         self._update_delete_enabled()
         self.coverage_act.setEnabled(bool(self.current))
         self.coverage_btn.setEnabled(bool(self.current))
@@ -912,7 +917,7 @@ class MainWindow(QMainWindow):
         chosen = days.save_choice(self.settings, self.current, chosen, self._day_counts)
         if chosen != self.chosen_days:
             motion.crossfade(self.content)
-            for chart in (self.overview.timeline, self.timeline_page.body):  # other days: from all of them
+            for chart in self.timelines:  # other days: from all of them
                 chart.show_every_day()
         self.chosen_days = chosen
         self._mark_preset()
@@ -965,13 +970,31 @@ class MainWindow(QMainWindow):
             self.timeline_page.body.set_points(a.daily_means)
         self.mood.set_counts(a.counts["positive"], a.counts["negative"], a.count)
 
+    def _show_notes(self) -> None:
+        notes = self.store.notes(self.current) if self.current else {}
+        for chart in self.timelines:
+            chart.set_notes(notes)
+
+    def _edit_note(self, day: int) -> None:
+        """Add, change or remove the note on a day the timeline's dot was clicked on."""
+        if not self.current:
+            return
+        dialog = NoteDialog(day, *self.store.notes(self.current).get(day, ("", "")), parent=self)
+        dialog.chosen.connect(partial(self._save_note, self.current, day))
+        dialog.open()
+
+    def _save_note(self, subreddit: str, day: int, tag: str, text: str) -> None:
+        self.store.save_note(subreddit, day, tag, text)
+        self._show_notes()
+
     def _delete_dataset(self) -> None:
         if not self.current or self.fetch_job.busy:
             return
         if QMessageBox.question(
                 self, "Delete saved data",
                 f"Delete the {len(self._saved['posts']):,} posts and {len(self._saved['comments']):,} comments saved for "
-                f"r/{self.current}? This can't be undone.") != QMessageBox.StandardButton.Yes:
+                f"r/{self.current}{', and its timeline notes' if self.store.notes(self.current) else ''}? "
+                "This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_subreddit(self.current)
         self.settings.remove(days.settings_key(self.current))
