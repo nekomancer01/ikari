@@ -653,7 +653,7 @@ def test_download_all_comments_on_new_posts_says_what_it_got_and_doesnt_offer_th
     # Posts under 36 hours old have no comment count yet. Download all comments fetched their threads,
     # but the rows still read "not counted yet" and the button still offered the same posts, every time.
     w = env.window()
-    fetch(w, comments=False, limit=100)
+    fetch(w, comments=False)
     cov = open_coverage(w)
     row = next(r for r, d in enumerate(cov.days)
                if any(p["num_comments"] is None for p in w.store.comment_coverage("python", d, d + DAY)))
@@ -681,7 +681,7 @@ def test_a_days_download_all_that_hits_a_window_the_archive_cant_answer_saves_th
     # day isn't called complete, and the line under the bar says what happened.
     monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.2)  # timeout back-offs, shortened further
     w = env.window()
-    fetch(w, comments=False, limit=3)
+    fetch(w, comments=False, rng="day")  # the day below isn't saved whole, so it can't be complete yet
     cov = open_coverage(w)
     row, day = next((r, d) for r, d in enumerate(cov.days) if cov.totals["python"].get(d) and d < coverage.today())
     in_day = sorted(p["created_utc"] for p in env.archive.posts
@@ -882,13 +882,13 @@ def test_choosing_days_never_downloads_and_a_fetch_only_adds_rows_from_chosen_da
 
 def test_a_second_fetch_into_a_shown_subreddit_ends_without_reading_it_all_back(env, monkeypatch):
     w = env.window()
-    fetch(w, limit=5)
+    fetch(w, rng="day")
     full_reads = []
     for name in ("posts", "comments"):
         real = getattr(Store, name)
         monkeypatch.setattr(Store, name, lambda self, *a, real=real, name=name: (
             full_reads.append(name) if self is w.store else None, real(self, *a))[1])
-    fetch(w, limit=100, refresh_scores=True)  # more posts and comments, and saved ones re-checked
+    fetch(w, refresh_scores=True)  # the week: more posts and comments, and saved ones re-checked
     assert full_reads == []  # it used to read every saved row again as the fetch ended
     store = env.store()
     for tab, saved in ((w.posts_tab, store.posts("python")), (w.comments_tab, store.comments("python"))):
