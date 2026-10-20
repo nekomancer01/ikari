@@ -238,7 +238,7 @@ QTabBar::tab:selected {{ color: {t['text']}; background: {panel}; border-color: 
 
 /* Tables and lists: a ruled table in an outlined box, its header row tinted */
 QTableView {{
-    background: {panel}; border: 1px solid {edge}; border-radius: 10px; gridline-color: transparent;
+    background: {panel}; border: 1px solid {edge}; border-radius: 10px; gridline-color: transparent; font-weight: 400;
     selection-background-color: {sel}; selection-color: {t['text']}; alternate-background-color: {panel};
 }}
 QListWidget {{
