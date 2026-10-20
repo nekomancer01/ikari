@@ -77,7 +77,7 @@ class RateLimiter:
     successful requests ease it back to the base interval.
     """
 
-    def __init__(self, interval: float = BASE_INTERVAL, clock: Callable[[], float] = time.monotonic,
+    def __init__(self, interval: float = BASE_INTERVAL, clock: Callable[[], float] = time.perf_counter,
                  sleep: Callable[[float], None] = time.sleep, wall: Callable[[], float] = time.time):
         self.base = self.interval = interval
         self._clock = clock

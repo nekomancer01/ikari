@@ -581,11 +581,11 @@ def test_stopping_top_mode_keeps_the_days_already_ranked():
 
 def test_concurrent_requests_stay_within_the_servers_remaining_budget():
     # A server allowing 3 requests per 0.3 s window, and 4 threads asking as fast as the limiter lets them.
-    lock, window, used, refused = threading.Lock(), [time.monotonic()], [0], []
+    lock, window, used, refused = threading.Lock(), [time.perf_counter()], [0], []
 
     def answer():
         with lock:
-            now = time.monotonic()
+            now = time.perf_counter()
             if now - window[0] >= 0.3:
                 window[0], used[0] = now, 0
             used[0] += 1
