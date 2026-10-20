@@ -29,7 +29,7 @@ from subsentiment.gui.rail import PAGES  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 from subsentiment import store as store_mod  # noqa: E402
 
-from fake_archive import DAY, FakeArchive, make_posts  # noqa: E402
+from fake_archive import DAY, SLOW_DOWN, FakeArchive, make_posts  # noqa: E402
 
 NOW = time.time()
 SEARCH, TREE, IDS, AGG = "/api/posts/search", "/api/comments/tree", "/api/posts/ids", "/api/posts/search/aggregate"
@@ -173,6 +173,33 @@ def test_the_fetch_drawer_closes_as_a_fetch_starts_and_the_header_follows_it(env
     assert "Added" in w.progress_msg.text() and w.fetch_strip.isVisible()
     QTest.mouseClick(w.fetch_strip.hide_btn, Qt.MouseButton.LeftButton)
     assert not w.fetch_strip.isVisible()
+
+
+def test_the_strip_says_what_the_fetch_is_doing_again_once_a_wait_for_arctic_shift_is_over(env, monkeypatch):
+    # The archive times a search out twice, so ikari waits 4 s (announced), then asks again and the answer
+    # takes a while. The strip used to say "Waiting 4 s" all that time, until a whole slice of the day was in.
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 5.0)
+    w = env.window()
+    env.archive.fail(SEARCH, *[SLOW_DOWN] * 8)
+    env.archive.delays[SEARCH] = 1.5
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(False)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("day"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    end = time.monotonic() + 30
+    while "Waiting 4 s" not in w.progress_msg.text():
+        assert w.fetch_job.busy and time.monotonic() < end, "no announced wait"
+        pump(5)
+    asked = len(env.archive.paths())
+    while len(env.archive.paths()) == asked:  # every search waits on the same pause: the next one ends it
+        assert time.monotonic() < end, "the wait never ended"
+        pump(5)
+    pump(300)  # the search asked again is still out (1.5 s)
+    assert w.progress_msg.text().startswith("Day "), w.progress_msg.text()
+    env.archive.delays.clear()
+    env.archive.faults.clear()
+    wait_idle(w)
+    assert "Added" in w.progress_msg.text()
 
 
 def test_a_fetch_without_comments_asks_for_no_comments(env):

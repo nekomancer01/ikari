@@ -57,10 +57,23 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         saved: Callable[[], None] = lambda: None) -> FetchResult:
     """Run one fetch. ``saved`` is called after each batch of rows is committed, so a UI can show
     them while the fetch goes on."""
+    shown, said = progress, [(0, 0, "")]
+
+    def progress(done: int, total: int, msg: str) -> None:  # remembered, to come back to after a wait
+        said[0] = (done, total, msg)
+        shown(done, total, msg)
+
+    def waiting(secs: float, why: str) -> None:
+        # Once the pause is over, what the fetch is doing comes back: the wait's line used to stay up until
+        # the next progress, a whole slice of a busy day later, so the fetch read as stuck waiting.
+        if secs:
+            shown(0, 0, f"{why}. Waiting {secs:.0f} s before the next request…")
+        elif said[0][2]:
+            shown(*said[0])
     note = lambda msg: progress(0, 0, msg)  # noqa: E731
     limiter = getattr(client, "limiter", None)
     if limiter is not None:
-        limiter.on_wait = lambda secs, why: note(f"{why}. Waiting {secs:.0f} s before the next request…")
+        limiter.on_wait = waiting
     if hasattr(client, "should_stop"):
         client.should_stop = should_stop  # so Stop also cuts short retries and waits inside a request
 
