@@ -183,13 +183,13 @@ def test_the_end_of_a_fetch_reads_back_only_what_it_saved(window, monkeypatch):
     writer.commit()
     writer.close()
     reads = count_calls(monkeypatch, Store, "comments") + count_calls(monkeypatch, Store, "posts")
-    before = int(window.tiles["count"].value.text().replace(",", ""))
+    before = int(window.overview.tiles["count"].value.text().replace(",", ""))
     window._merge_fetched()
     assert reads == []  # not all 20,300 rows again
     posts, comments = window.posts_tab, window.comments_tab
     assert [posts.model.row_at(i)["score"] for i in range(POSTS) if posts.model.row_at(i)["id"] == "p5"] == [12345]
     assert comments.model.rowCount() == COMMENTS + 1 and len(window.comments) == COMMENTS + 1
-    assert int(window.tiles["count"].value.text().replace(",", "")) == before + 1
+    assert int(window.overview.tiles["count"].value.text().replace(",", "")) == before + 1
     assert window.tabbar.tabText(2) == f"Comments  {COMMENTS + 1:,}"
 
 

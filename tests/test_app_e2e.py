@@ -854,4 +854,4 @@ def test_a_second_fetch_into_a_shown_subreddit_ends_without_reading_it_all_back(
         assert tab.model.rowCount() == len(saved) == len(tab.all_rows)
         shown = {tab.model.row_at(i)["id"]: tuple(tab.model.row_at(i)) for i in range(tab.model.rowCount())}
         assert shown == {r["id"]: tuple(r) for r in saved}  # new scores included
-    assert w.tiles["count"].value.text() == f"{len(store.posts('python')) + len(store.comments('python')):,}"
+    assert w.overview.tiles["count"].value.text() == f"{len(store.posts('python')) + len(store.comments('python')):,}"
