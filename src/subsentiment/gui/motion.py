@@ -16,8 +16,8 @@ from __future__ import annotations
 
 from typing import Callable
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QRect, QSize, Qt, QVariantAnimation
-from PySide6.QtGui import QPainter
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QVariantAnimation
+from PySide6.QtGui import QGuiApplication, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QGraphicsOpacityEffect, QLabel, QWidget
 
 from subsentiment.gui import native
@@ -67,7 +67,7 @@ class _Snapshot(QLabel):
     fade jumped sideways and back. So the grab starts a little up and left, at a whole device pixel, and is
     drawn back at that same pixel."""
 
-    def __init__(self, target: QWidget, ms: int):
+    def __init__(self, target: QWidget, ms: int, still_under: bool = False):
         super().__init__(target)
         self.setObjectName("motion-snapshot")
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -75,10 +75,14 @@ class _Snapshot(QLabel):
         # Grabbed from the window, so the backdrop behind see-through panels is in the picture too and the
         # fade is a true crossfade rather than two layers of glass.
         origin = target.mapTo(window, QPoint(0, 0))
-        dpr = window.devicePixelRatioF()
-        self._lead = QPoint(_to_whole_pixel(origin.x(), dpr), _to_whole_pixel(origin.y(), dpr))
-        self._still = window.grab(QRect(origin - self._lead, target.size() + QSize(self._lead.x(), self._lead.y())))
+        self._lead = lead(target)
+        self._still = _picture(window, QRect(origin - self._lead, target.size() + QSize(self._lead.x(), self._lead.y())))
         self.opacity = 1.0
+        # With still_under, the new look is grabbed once too and the fade blends the two pictures: an opaque
+        # still means nothing under it repaints on each frame (a whole window takes ~40 ms to paint at 150%),
+        # at the cost of what changes under it showing once the fade is done.
+        self._still_under = still_under
+        self._under = None
         self.setGeometry(target.rect())
         self.anim = _ease(QVariantAnimation(self, duration=ms, startValue=1.0, endValue=0.0))
         self.anim.valueChanged.connect(self._fade)
@@ -90,10 +94,19 @@ class _Snapshot(QLabel):
 
     def _fade(self, value: float) -> None:
         self.opacity = value
+        if self._still_under and self._under is None:
+            window, target = self.window(), self.parentWidget()
+            self.hide()
+            self._under = window.grab(QRect(target.mapTo(window, QPoint(0, 0)) - self._lead,
+                                            self._still.deviceIndependentSize().toSize()))
+            self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+            self.show()
         self.update()
 
     def paintEvent(self, event) -> None:
         p = QPainter(self)
+        if self._under is not None:
+            p.drawPixmap(-self._lead, self._under)
         p.setOpacity(self.opacity)
         p.drawPixmap(-self._lead, self._still)
 
@@ -105,14 +118,41 @@ class _Snapshot(QLabel):
         return False
 
 
+def _picture(window: QWidget, rect: QRect) -> QPixmap:
+    """The window's pixels in rect as they were last painted. Where the window's backing store is a plain image
+    (Windows, X11, offscreen) they are copied from it, which takes a few milliseconds; rendering the window again
+    (grab) takes about 40 at 150%. Elsewhere (Wayland swaps buffers, so the image may hold an older frame) and
+    whenever the image doesn't match the window, it's rendered."""
+    store = window.backingStore() if QGuiApplication.platformName() in ("windows", "xcb", "offscreen") else None
+    image = store.paintDevice() if store is not None else None
+    dpr = window.devicePixelRatioF()
+    r = QRectF(rect)
+    device = QRectF(r.topLeft() * dpr, r.size() * dpr).toAlignedRect()
+    if isinstance(image, QImage) and abs(image.width() - window.width() * dpr) < 1 and image.rect().contains(device):
+        picture = QPixmap.fromImage(image.copy(device))
+        picture.setDevicePixelRatio(dpr)
+        return picture
+    return window.grab(rect)
+
+
+def lead(widget: QWidget) -> QPoint:
+    """How far up and left of widget's corner the nearest point on a whole device pixel of its window is. A
+    picture of a widget painted from there and drawn back there lines up with what painting it directly gives;
+    one drawn at the corner itself is a pixel off at 150% wherever the corner falls between device pixels."""
+    origin, dpr = widget.mapTo(widget.window(), QPoint(0, 0)), widget.window().devicePixelRatioF()
+    return QPoint(_to_whole_pixel(origin.x(), dpr), _to_whole_pixel(origin.y(), dpr))
+
+
 def _to_whole_pixel(at: int, dpr: float) -> int:
     """How far back from logical coordinate ``at`` the nearest one on a whole device pixel is (0 at 100% and
     200%, 0 or 1 at 150%, up to 3 at 125%)."""
     return next((k for k in range(8) if abs((at - k) * dpr - round((at - k) * dpr)) < 1e-6), 0)
 
 
-def crossfade(target: QWidget, ms: int = VIEW_MS) -> None:
-    """Call just before changing what target shows: its current look fades out over the new one."""
+def crossfade(target: QWidget, ms: int = VIEW_MS, still_under: bool = False) -> None:
+    """Call just before changing what target shows: its current look fades out over the new one. With
+    ``still_under`` the new one is held as a picture during the fade too (see _Snapshot), for a change that
+    repaints all of a big area, like the theme."""
     if not enabled() or not target.isVisible() or target.width() <= 0 or target.height() <= 0:
         return
     parent = target.parentWidget()
@@ -131,7 +171,7 @@ def crossfade(target: QWidget, ms: int = VIEW_MS) -> None:
         # A fade already running: start from what's on screen now, not from the picture before it.
         old.hide()
         old.deleteLater()
-    _Snapshot(target, ms)
+    _Snapshot(target, ms, still_under)
 
 
 def fading(target: QWidget, early: bool = False) -> bool:
