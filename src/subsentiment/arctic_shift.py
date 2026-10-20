@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import itertools
 import math
+import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from datetime import datetime, timezone
 from typing import Callable, Collection, Iterable
@@ -64,6 +64,14 @@ _GONE = ("[deleted]", "[removed]")
 WaitFn = Callable[[float, str], None]
 
 
+class Stopped(Exception):
+    """Stop was pressed: raised by ArcticShiftClient.get instead of sending (or retrying) a request, and
+    caught by the fetch loops, which return what they have."""
+
+
+STOP_POLL = 0.2  # seconds between Stop checks during a long wait
+
+
 class QueryTimeout(FetchError):
     """The archive gave up on a query as too slow, even with small pages. A narrower date window
     usually works."""
@@ -97,16 +105,20 @@ class RateLimiter:
         self._budget_known = False  # the server has sent X-RateLimit-Remaining at least once
         self._answered = False  # any answer has arrived yet
 
-    def wait(self) -> None:
-        """Block until a request may go out, and count it as in flight until ``observe`` or ``done``."""
+    def wait(self, should_stop: StopFn | None = None) -> None:
+        """Block until a request may go out, and count it as in flight until ``observe`` or ``done``.
+        Raises Stopped, sending nothing, if ``should_stop`` turns true meanwhile."""
+        announced = False
         with self._lock:
             while True:
+                if should_stop and should_stop():
+                    raise Stopped
                 now = self._clock()
                 if self._budget is not None and now >= self._budget_until:
                     self._budget = None  # the window reset; the next answer gives the new budget
                 unknown = not self._answered or (self._budget_known and self._budget is None)
                 if unknown and self._in_flight:
-                    self._lock.wait(1.0)
+                    self._lock.wait(STOP_POLL if should_stop else 1.0)
                     continue
                 if self._budget is not None and self._budget <= 0:
                     self.hold(self._budget_until - now, "Arctic Shift's request limit was reached")
@@ -115,8 +127,12 @@ class RateLimiter:
                 # sleep overshoots (Windows' timer is coarse); planning start times ahead doesn't.
                 delay = self._next - now
                 if delay > 0:
-                    if delay >= 3 and self.on_wait:
+                    if delay >= 3 and self.on_wait and not announced:
                         self.on_wait(delay, self._reason)
+                        announced = True
+                    if should_stop and delay > STOP_POLL:
+                        self._sleep(STOP_POLL)  # then look again: Stop may have been pressed
+                        continue
                     self._sleep(delay)
                 self._next = self._clock() + self.interval
                 self._in_flight += 1
@@ -234,8 +250,10 @@ def _light_rank(d: dict) -> tuple:
 
 class ArcticShiftClient:
     def __init__(self, session: requests.Session | None = None, limiter: RateLimiter | None = None,
-                 workers: int = WORKERS):
+                 workers: int = WORKERS, should_stop: StopFn | None = None):
         self.workers = workers
+        # Checked before every request and during waits, so Stop doesn't sit out retries and backoffs.
+        self.should_stop = should_stop
         self._local = threading.local()  # per-thread state of get(), as several threads share a client
         self.session = session or requests.Session()
         self.session.headers["User-Agent"] = USER_AGENT
@@ -255,9 +273,10 @@ class ArcticShiftClient:
         params = dict(params)
         self._local.last_params = params  # what was finally sent, after any shrinking
         timeouts = 0
+        stop = None if getattr(self._local, "finishing", False) else self.should_stop
         for attempt in range(ATTEMPTS):
             backoff = min(5.0 * 2 ** attempt, MAX_WAIT)
-            self.limiter.wait()
+            self.limiter.wait(stop)
             try:
                 resp = self.session.get(BASE_URL + path, params=params, timeout=60)
             except (requests.ConnectionError, requests.Timeout):
@@ -452,7 +471,10 @@ class ArcticShiftClient:
             # A few spare for removed posts; a full page when saved posts may need skipping. Once the
             # archive has timed out on a big page, this fetch keeps to the smaller size that worked.
             size = min(self._page_cap, PAGE if skip else want - len(out) + 5)
-            page, end, sent = self._page(base, cursor, hi, size)
+            try:
+                page, end, sent = self._page(base, cursor, hi, size)
+            except Stopped:
+                return out, cursor, True
             if sent < size:
                 self._page_cap = sent
             size = sent  # a page shrunk after a timeout is full at this size, not at the size asked for
@@ -485,7 +507,11 @@ class ArcticShiftClient:
         for start, end in slices(lo, hi, TOP_PAGES):
             if should_stop and should_stop():
                 break
-            for d in self._page(dict(base, fields=TOP_FIELDS), start, end, PAGE)[0]:
+            try:
+                page = self._page(dict(base, fields=TOP_FIELDS), start, end, PAGE)[0]
+            except Stopped:
+                break
+            for d in page:
                 if d.get("id"):
                     pool[d["id"]] = d
         return list(pool.values())
@@ -499,7 +525,11 @@ class ArcticShiftClient:
         checked here: a slice that was ranked is kept, rather than thrown away for want of one request."""
         head = ranked[:want + math.ceil(want * TOP_SPARE)]
         light = [d["id"] for d in head if isinstance(d, dict)]
-        full = {p.id: p for p in self.fetch_posts_by_ids(light)} if light else {}
+        self._local.finishing = True  # Stop can't cut this request short (see above)
+        try:
+            full = {p.id: p for p in self.fetch_posts_by_ids(light)} if light else {}
+        finally:
+            self._local.finishing = False
         usable = [d if isinstance(d, Post) else full[d["id"]] for d in head
                   if isinstance(d, Post) or d["id"] in full]
         return usable[:want], usable[want:] + ranked[len(head):]
@@ -511,7 +541,11 @@ class ArcticShiftClient:
         for i in range(0, len(ids), IDS_BATCH):
             if should_stop and should_stop():
                 break
-            for d in self.get("/api/posts/ids", {"ids": ",".join(ids[i:i + IDS_BATCH])}):
+            try:
+                page = self.get("/api/posts/ids", {"ids": ",".join(ids[i:i + IDS_BATCH])})
+            except Stopped:
+                break
+            for d in page:
                 if not d.get("id"):
                     continue
                 if _removed(d):
@@ -553,6 +587,8 @@ class ArcticShiftClient:
                       "after": lo, "before": hi, "limit": (hi - lo) // DAY + 1}
             try:
                 buckets = self.get("/api/posts/search/aggregate", params, shrink=False)
+            except Stopped:
+                break
             except QueryTimeout:
                 if hi - lo > DAY:  # try the halves
                     mid = lo + (hi - lo) // DAY // 2 * DAY
@@ -625,9 +661,13 @@ class ArcticShiftClient:
         return comments, items, _collapsed(tree)
 
 
-def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS):
+def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS, should_stop: StopFn | None = None):
     """Run fn(item) for each item, up to ``workers`` at once, and yield (item, result, error) as each
-    finishes, on the calling thread. Stopping early (closing the generator) cancels what hasn't started."""
+    finishes, on the calling thread. Stopping early (closing the generator) starts nothing more.
+
+    With ``should_stop``, once it turns true this returns without waiting for calls still running: their
+    results are dropped. For calls that can take long and are cheap to redo, like a big comment tree.
+    The worker threads are daemons, so one left on a slow request never holds up the app quitting."""
     items = list(items)
     if workers <= 1 or len(items) <= 1:
         for item in items:
@@ -636,14 +676,42 @@ def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS):
             except Exception as e:  # noqa: BLE001 - handed to the caller, like the threaded path
                 yield item, None, e
         return
-    pool = ThreadPoolExecutor(max_workers=min(workers, len(items)))
+    todo, done = queue.SimpleQueue(), queue.SimpleQueue()
+    for item in items:
+        todo.put(item)
+    closed = threading.Event()
+
+    def work():
+        while not closed.is_set():
+            try:
+                item = todo.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                done.put((item, fn(item), None))
+            except Exception as e:  # noqa: BLE001 - handed to the caller
+                done.put((item, None, e))
+
+    threads = [threading.Thread(target=work, daemon=True) for _ in range(min(workers, len(items)))]
+    for t in threads:
+        t.start()
     try:
-        futures = {pool.submit(fn, item): item for item in items}
-        for f in as_completed(futures):
-            error = f.exception()
-            yield futures[f], None if error else f.result(), error
+        for _ in items:
+            while True:
+                try:
+                    result = done.get(timeout=STOP_POLL if should_stop else None)
+                    break
+                except queue.Empty:
+                    if should_stop():
+                        return
+            yield result
+            if should_stop and should_stop():
+                return
     finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+        closed.set()  # nothing new starts
+        if not (should_stop and should_stop()):
+            for t in threads:
+                t.join()
 
 
 def _walk(items: list, depth: int = 0):
