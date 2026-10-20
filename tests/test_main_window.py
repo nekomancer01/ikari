@@ -337,3 +337,20 @@ def test_posts_without_a_score_yet_sort_below_every_real_score(make_window):
     model.set_rows(rows)
     keys = [model.data(model.index(r, col), SORT_ROLE) for r in range(4)]
     assert sorted(range(4), key=lambda r: keys[r]) == [1, 0, 2, 3]  # pending first, then -5, -1, 0
+
+
+def test_an_export_that_cant_be_saved_says_so(make_window, monkeypatch, tmp_path):
+    # On Windows the usual cause is the CSV still being open in Excel. The error used to escape the slot:
+    # no message at all, and in the packaged app no console to show it either.
+    w = make_window()
+    target = tmp_path / "out.csv"
+    monkeypatch.setattr(mw.QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), ""))
+
+    def locked(*a, **k):
+        raise PermissionError(13, "Permission denied", str(target))
+    monkeypatch.setattr(w.store, "export_csv", locked)
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a[1:3]))
+    w._export("posts")
+    assert warned and warned[0][0] == "Export failed"
+    assert "close it and try again" in warned[0][1]

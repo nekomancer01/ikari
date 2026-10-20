@@ -16,7 +16,7 @@ LABELS = ("negative", "neutral", "positive")
 
 _URL = re.compile(r"https?://\S+")
 _MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
-_QUOTE = re.compile(r"^[ \t]*>.*$", re.MULTILINE)  # [ \t], not \s: \s ran across lines, quadratic on long posts
+_QUOTE = re.compile(r"^[ \t]*>.*$", re.MULTILINE)  # someone else's words ([ \t]: \s ran across lines, slow)
 _CODE = re.compile(r"```.*?```", re.DOTALL)
 
 # Obvious sarcasm: an explicit marker, an eye-roll emoji, or a stock positive frame
