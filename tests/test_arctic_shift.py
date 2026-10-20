@@ -5,7 +5,7 @@ import pytest
 import requests
 
 from subsentiment.arctic_shift import (
-    BASE_URL, SETTLE_SECONDS, ArcticShiftClient, QueryTimeout, RateLimiter, quotas, slices, slot_count,
+    BASE_URL, SETTLE_SECONDS, TOP_PAGES, ArcticShiftClient, QueryTimeout, RateLimiter, quotas, slices, slot_count,
 )
 from subsentiment.reddit import FetchError, Post
 
@@ -558,3 +558,22 @@ def test_an_error_in_one_slice_stops_the_fetch():
     with pytest.raises(FetchError, match="bad param"):
         archive([]).__class__(session=Broken(items), limiter=RateLimiter(0.0)).fetch_posts(
             "python", after=T0, before=T0 + 7 * DAY, limit=28)
+
+
+def test_top_posts_show_as_each_day_is_ranked():
+    items = [at(T0 + d * DAY + 600 * k, d * 100 + k, score=(k * 37) % 101) for d in range(7) for k in range(100)]
+    batches, lines = [], []
+    posts = archive(items).fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=14, top=True,
+                                       on_posts=batches.append, progress=lines.append)
+    assert len(batches) == 7 and sum(map(len, batches)) == 14 == len(posts)
+    assert all(p.title for b in batches for p in b)  # full posts, not light copies
+    assert lines[0].endswith(", 2 so far")  # the count goes up as days are ranked, not "0 so far" throughout
+
+
+def test_stopping_top_mode_keeps_the_days_already_ranked():
+    items = [at(T0 + d * DAY + 600 * k, d * 100 + k, score=(k * 37) % 101) for d in range(7) for k in range(100)]
+    c = archive(items)
+    c.workers = 1
+    stop = lambda: sum(1 for u, _ in c.session.calls if u.endswith("/api/posts/search")) >= 3 * TOP_PAGES  # noqa: E731
+    posts = c.fetch_posts("python", after=T0, before=T0 + 7 * DAY, limit=14, top=True, should_stop=stop)
+    assert len(posts) == 6 and all(p.title for p in posts)  # three days' picks, downloaded despite the Stop

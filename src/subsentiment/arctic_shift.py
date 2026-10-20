@@ -295,7 +295,7 @@ class ArcticShiftClient:
         n = slot_count(after, before, limit, top)
         windows = slices(after, before, n)
         picked: list[list[Post]] = [[] for _ in windows]
-        spare: list[list[Post]] = [[] for _ in windows]  # top mode: ranked candidates not picked yet
+        spare: list[list] = [[] for _ in windows]  # top mode: ranked candidates not picked yet, best first
         more = [True] * len(windows)  # the slice may hold posts we haven't read
         cursors = [lo for lo, _ in windows]
         what = "Ranking" if top else "Collecting"
@@ -306,7 +306,8 @@ class ArcticShiftClient:
             if should_stop and should_stop():
                 return None
             if top:
-                return sorted(self._top_pool(base, lo, hi, should_stop), key=_light_rank, reverse=True)
+                ranked = sorted(self._top_pool(base, lo, hi, should_stop), key=_light_rank, reverse=True)
+                return self._take_top(ranked, want)
             return self._earliest(base, lo, hi, want, skip, should_stop)
 
         # Slices are independent, so a few are read at once. Results are taken here, on the calling
@@ -320,12 +321,12 @@ class ArcticShiftClient:
             if result is None:
                 continue
             if top:
-                picked[i], spare[i] = result[:want], result[want:]
+                picked[i], spare[i] = result
                 more[i] = False
             else:
                 picked[i], cursors[i], more[i] = result
-                if on_posts and picked[i]:
-                    on_posts(picked[i])
+            if on_posts and picked[i]:
+                on_posts(picked[i])
             if progress:
                 got = sum(map(len, picked))
                 progress(f"{what} posts from r/{subreddit}: part {done} of {len(windows)}, {got:,} so far")
@@ -342,9 +343,14 @@ class ArcticShiftClient:
                 break
             shares = [(i, want) for i, want in zip(open_, quotas(short, len(open_))) if want > 0]
             if top:
-                for i, want in shares:
-                    picked[i] += spare[i][:want]
-                    spare[i] = spare[i][want:]
+                for (i, _), (extra, rest), error in in_parallel(
+                        lambda job: self._take_top(spare[job[0]], job[1]), shares, self.workers):
+                    if error:
+                        raise error
+                    picked[i] += extra
+                    spare[i] = rest
+                    if on_posts and extra:
+                        on_posts(extra)
                 continue
 
             def read_more(job):
@@ -359,12 +365,8 @@ class ArcticShiftClient:
                 picked[i] += extra
                 if on_posts and extra:
                     on_posts(extra)
-        if top:
-            picked = self._hydrate(picked, spare, should_stop)
         posts = [p for group in picked for p in group]
         posts.sort(key=lambda p: p.created_utc)
-        if top and on_posts and posts:
-            on_posts(posts)
         return posts
 
     def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int, int]:
@@ -426,13 +428,19 @@ class ArcticShiftClient:
                     pool[d["id"]] = d
         return list(pool.values())
 
-    def _hydrate(self, picked: list[list[dict]], spare: list[list[dict]], should_stop) -> list[list[Post]]:
-        """Full copies of each slice's picks, in one batch by id. Picks that turn out to be removed are
-        replaced by that slice's next-best spares."""
-        want = [len(group) for group in picked]
-        ranked = [group + extra[:math.ceil(len(group) * TOP_SPARE)] for group, extra in zip(picked, spare)]
-        full = {p.id: p for p in self.fetch_posts_by_ids([d["id"] for group in ranked for d in group], should_stop)}
-        return [[full[d["id"]] for d in group if d["id"] in full][:n] for group, n in zip(ranked, want)]
+    def _take_top(self, ranked: list, want: int) -> tuple[list[Post], list]:
+        """The best ``want`` of a slice's ranked candidates as full posts, and the rest, best first.
+
+        Candidates are light copies (or full posts left over from an earlier call), so the picks plus a
+        few spares are downloaded by id in one request; picks that turn out to be removed are replaced by
+        the next best. Done per slice, so a slice's posts show as soon as it is ranked. Stop isn't
+        checked here: a slice that was ranked is kept, rather than thrown away for want of one request."""
+        head = ranked[:want + math.ceil(want * TOP_SPARE)]
+        light = [d["id"] for d in head if isinstance(d, dict)]
+        full = {p.id: p for p in self.fetch_posts_by_ids(light)} if light else {}
+        usable = [d if isinstance(d, Post) else full[d["id"]] for d in head
+                  if isinstance(d, Post) or d["id"] in full]
+        return usable[:want], usable[want:] + ranked[len(head):]
 
     def fetch_posts_by_ids(self, ids: Iterable[str], should_stop: StopFn | None = None) -> list[Post]:
         """Current copies of the given posts, IDS_BATCH per request; removed ones are left out."""
