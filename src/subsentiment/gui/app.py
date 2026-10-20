@@ -23,7 +23,7 @@ def default_db_path() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     native.setup_app_identity()  # before the app and any window, so taskbar/dock/menu use our name and icon
-    app = QApplication(argv if argv is not None else sys.argv)
+    app = QApplication(theme.qt_args(list(argv if argv is not None else sys.argv)))
     app.setOrganizationName(STORAGE_ORG)
     app.setApplicationName(STORAGE_APP)  # drives storage paths only; the visible name is the display name
     app.setApplicationDisplayName("ikari")
