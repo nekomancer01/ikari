@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       all_platforms:
-        description: "Also build macOS and Linux (they aren't supported for now, so they are off by default)"
+        description: "Also build macOS (it isn't supported for now, so it is off by default)"
         type: boolean
         default: false
 
@@ -23,13 +23,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # Windows only for now. Run the workflow by hand with "all_platforms" ticked to build macOS
-      # and Linux too. To bring them back on main and releases, drop the `inputs` test
-      # so the long list is always used; the steps below still handle every OS.
+      # Windows and Linux on main and releases. Run the workflow by hand with "all_platforms" ticked to build
+      # macOS too. To bring it back on main and releases, drop the `inputs` test so the long list is always
+      # used; the steps below still handle every OS.
       # (The oldest supported Ubuntu is used so the AppImage runs on older glibc too.)
       matrix:
         include: >-
-          ${{ fromJSON(inputs.all_platforms && '[{"name": "Windows x64", "os": "windows-latest"}, {"name": "macOS Apple Silicon", "os": "macos-15"}, {"name": "macOS Intel", "os": "macos-15-intel"}, {"name": "Linux x86_64", "os": "ubuntu-22.04"}]' || '[{"name": "Windows x64", "os": "windows-latest"}]') }}
+          ${{ fromJSON(inputs.all_platforms && '[{"name": "Windows x64", "os": "windows-latest"}, {"name": "Linux x86_64", "os": "ubuntu-22.04"}, {"name": "macOS Apple Silicon", "os": "macos-15"}, {"name": "macOS Intel", "os": "macos-15-intel"}]' || '[{"name": "Windows x64", "os": "windows-latest"}, {"name": "Linux x86_64", "os": "ubuntu-22.04"}]') }}
     steps:
       - uses: actions/checkout@v5
 
