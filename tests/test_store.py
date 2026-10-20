@@ -181,3 +181,45 @@ def test_day_counts_and_exporting_chosen_days(tmp_path):
     assert [r["id"] for r in csv.DictReader(open(out, encoding="utf-8-sig"))] == ["p2"]  # starts with a BOM
     assert s.export_csv("python", "posts", out) == 2
     assert s.export_csv("python", "comments", out, days=set()) == 0
+
+
+def test_image_posts_are_hidden_from_every_read_and_counted_apart(tmp_path):
+    s = Store(tmp_path / "x.db")
+    s.save_post(make_post(1), 0.5, "positive")
+    img = make_post(2)
+    img.image = True
+    s.save_post(img, None, None)
+    s.save_comment(Comment("c1", "p1", "Python", "t3_p1", "b", "hi", 1, 1_700_000_100, 0, "u"), 0.1, "positive")
+    s.save_comment(Comment("c2", "p2", "Python", "t3_p2", "b", "pretty", 1, 1_700_000_100, 0, "u"), 0.1, "positive")
+    s.commit()
+    day = int(1_700_000_000 // 86400 * 86400)
+    assert [r["id"] for r in s.posts("python")] == ["p1"]
+    assert [r["id"] for r in s.posts_since("python", 0)] == ["p1"]
+    assert [r["id"] for r in s.comments("python")] == ["c1"]
+    assert [r["id"] for r in s.comments_since("python", 0)] == ["c1"]
+    assert s.datasets()[0]["posts"] == 1 and s.datasets()[0]["comments"] == 1
+    assert s.day_counts("python") == {day: (1, 1)}
+    assert s.posts_per_day("python", day, day + 86400) == {day: 1}
+    assert s.posts_per_day("python", day, day + 86400, images=True) == {day: 1}
+    assert [r["id"] for r in s.comment_coverage("python", day, day + 86400)] == ["p1"]
+    assert {r["id"]: r["image"] for r in s.posts_between("python")} == {"p1": 0, "p2": 1}  # collect needs both
+    assert s.export_csv("python", "posts", tmp_path / "p.csv") == 1
+    assert s.export_csv("python", "comments", tmp_path / "c.csv") == 1
+
+
+def test_posts_saved_before_images_were_filtered_are_hidden_on_open(tmp_path):
+    import sqlite3
+    db = sqlite3.connect(tmp_path / "old.db")
+    db.executescript("""CREATE TABLE posts (id TEXT PRIMARY KEY, subreddit TEXT NOT NULL, title TEXT, selftext TEXT,
+        author TEXT, score INTEGER, upvote_ratio REAL, num_comments INTEGER, created_utc REAL, permalink TEXT,
+        url TEXT, sentiment REAL, label TEXT, fetched_at REAL);
+        INSERT INTO posts VALUES ('a', 'Python', 'pic', '', 'x', 1, 1, 0, 1700000000, '', 'https://i.redd.it/a.jpeg', 0, 'neutral', 1);
+        INSERT INTO posts VALUES ('b', 'Python', 'pic with words', 'words', 'x', 1, 1, 0, 1700000000, '', 'https://i.redd.it/b.jpeg', 0, 'neutral', 1);
+        INSERT INTO posts VALUES ('c', 'Python', 'text', '', 'x', 1, 1, 0, 1700000000, '', '', 0, 'neutral', 1);""")
+    db.commit()
+    db.close()
+    s = Store(tmp_path / "old.db")
+    assert sorted(r["id"] for r in s.posts("python")) == ["b", "c"]
+    s.close()
+    s = Store(tmp_path / "old.db")  # reopened: migrated once, not again
+    assert sorted(r["id"] for r in s.posts("python")) == ["b", "c"]
