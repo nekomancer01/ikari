@@ -774,6 +774,16 @@ def test_a_long_wait_ends_as_soon_as_stop_is_pressed():
     assert time.perf_counter() - start < 1.0
 
 
+def test_stop_pressed_during_the_last_short_wait_sends_nothing():
+    # Waits under STOP_POLL weren't checked again for Stop, so a request went out after Stop was pressed
+    # (seen on Windows CI: test_stop_ends_a_fetch_and_frees_the_form found a search arrive after it).
+    flag = threading.Event()
+    limiter = RateLimiter(0.1, sleep=lambda s: flag.set())  # Stop is pressed while it sleeps
+    limiter.observe({}, limiter.wait())  # one request out and answered: the next waits 0.1 s
+    with pytest.raises(Stopped):
+        limiter.wait(flag.is_set)
+
+
 def test_each_answer_is_parsed_once():
     """A whole comment tree can be megabytes of JSON; reading it twice doubled the time spent on it."""
     class Counting(FakeResponse):

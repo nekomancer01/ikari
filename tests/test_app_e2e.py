@@ -349,7 +349,14 @@ def test_score_recheck_only_runs_when_ticked(env):
     assert env.window().fetch_form.refresh_scores.isChecked()  # remembered
 
 
-def test_stop_ends_a_fetch_and_frees_the_form(env):
+def test_stop_ends_a_fetch_and_frees_the_form(env, monkeypatch):
+    sent = []  # every request the limiter let out
+    let_out = worker.LIMITER.wait
+
+    def counted(*a, **k):
+        sent.append(let_out(*a, **k))
+        return sent[-1]
+    monkeypatch.setattr(worker.LIMITER, "wait", counted)
     w = env.window()
     env.archive.delay = 0.15
     w.fetch_form.subreddit.setText("python")
@@ -361,9 +368,14 @@ def test_stop_ends_a_fetch_and_frees_the_form(env):
     QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
     wait_idle(w)
     env.archive.delay = 0
+    # Requests let out before Stop can still be on their way: on a loaded runner one reached the archive
+    # after this point. Counted once every request sent has arrived.
+    end = time.monotonic() + 10
+    while len(env.archive.paths()) < len(sent) and time.monotonic() < end:
+        pump(20)
     n = len(env.archive.paths())
     pump(600)
-    assert len(env.archive.paths()) == n  # nothing carries on after Stop
+    assert len(env.archive.paths()) == n == len(sent)  # nothing carries on after Stop
     assert w.fetch_btn.isEnabled() and not w.stop_btn.isEnabled() and w.fetch_form.subreddit.isEnabled()
     assert "Stopped" in w.progress_msg.text() or "stopped" in w.progress_msg.text().lower()
 

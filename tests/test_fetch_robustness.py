@@ -159,18 +159,19 @@ def test_numeric_ids_and_infinite_numbers_are_read(archive):
 def test_stop_keeps_the_posts_a_slow_slice_already_downloaded(archive, tmp_path):
     # A busy day downloads slowly, a page at a time. Stop stopped waiting for the slices still running and
     # dropped everything they had, so a Download all stopped after minutes saved nothing.
-    # 8 slices of 300 posts, 3 pages each; Stop comes while the first four are on their third page
+    # 8 slices of 300 posts, 3 pages each; Stop comes once the first four have asked for their second page
     a = archive([post(f"p{n}", DAY0 + n * 72) for n in range(2400)])
     a.delays["/api/posts/search"] = 1.0
     stop = threading.Event()
 
-    def stop_on_second_pages():
-        # The four slices running ask for their second page only once their first is in: Stop comes then,
-        # while those are still out. (A fixed 2.5 s timer came before any first page on a loaded runner.)
-        while len(a.paths()) < 8:
+    def press_once_the_second_pages_are_asked_for():
+        # The first search (the whole range), each slice's first page, then their second: 9 requests. A fixed
+        # 2.5 s timer pressed Stop before any first page was back on a loaded Windows runner.
+        deadline = time.monotonic() + 30
+        while a.paths().count("/api/posts/search") < 9 and time.monotonic() < deadline:
             time.sleep(0.01)
         stop.set()
-    threading.Thread(target=stop_on_second_pages, daemon=True).start()
+    threading.Thread(target=press_once_the_second_pages_are_asked_for, daemon=True).start()
     store = Store(tmp_path / "s.db")
     result = collect.run(arctic_shift.ArcticShiftClient(limiter=arctic_shift.RateLimiter(0)), store,
                          collect.FetchRequest("Sub", after=DAY0, before=DAY0 + 2 * DAY, limit=2400,

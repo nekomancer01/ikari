@@ -151,6 +151,8 @@ class RateLimiter:
                         self._sleep(STOP_POLL)  # then look again: Stop may have been pressed
                         continue
                     self._sleep(delay)
+                    if should_stop and should_stop():  # pressed during that last short wait
+                        raise Stopped
                 self._next = self._clock() + self.interval
                 if announced and self.on_wait:
                     self.on_wait(0.0, "")  # over: the UI goes back to what the job is doing
