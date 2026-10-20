@@ -950,17 +950,20 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
     after a save, from the rows dripped into the tables by then, so while the fetch waited on a slow request
     the tables kept filling and the overview, day picker and coverage stood still behind them."""
     w = env.window()
-    # Each day's posts come at once, more than the tables show in a second; then a long wait on comments.
+    # The first day's posts come at once, more than the tables show in a second; then a long wait on that
+    # day's comments before the next day's posts (#69), so `want` is what is saved once that wait starts.
     env.archive.posts += make_posts("Burst", NOW, days=3, per_day=(80,), seed=4)
-    env.archive.delays[TREE] = 6.0
+    env.archive.delays[TREE] = 20  # long enough that no comment lands before the checks below, even on a busy runner
     w.fetch_form.subreddit.setText("Burst")
     w.fetch_form.include_comments.setChecked(True)
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
-    want = in_range(env, w, "Burst")
     end = time.monotonic() + 20
-    while w.posts_tab.model.rowCount() < want or w._drip.isActive():
+    store, want = env.store(), 0
+    while not want or w.posts_tab.model.rowCount() < want or w._drip.isActive():
         assert time.monotonic() < end and w.fetch_job.busy, w.posts_tab.model.rowCount()
+        if "comments on" in w.progress_msg.text():  # the first day's posts are all saved by now
+            want = want or len(store.posts("Burst"))
         if w.current and w.coverage is None:  # opened with the first rows, to watch the rest come in
             w._show_coverage()
         pump(5)

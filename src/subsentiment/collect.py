@@ -302,6 +302,8 @@ def _each_thread(posts: list[Post], get: Callable, save: Callable, what: str, st
 
     tried: set[str] = set()
     errors = 0
+    if posts:  # say what it's waiting on now, not only once the first thread is in
+        progress(0, len(posts), f"{what} 0/{len(posts)}")
     for p, got, error in in_parallel(fetch, posts, workers, should_stop):
         if got is None and error is None:
             continue
