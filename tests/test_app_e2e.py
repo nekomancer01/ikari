@@ -291,10 +291,13 @@ def test_closing_mid_fetch_leaves_the_fetch_alone(env, monkeypatch):
     errors = []
     monkeypatch.setattr(sys, "excepthook", lambda *e: errors.append(e))
     w = env.window()
-    env.archive.delay = 4  # a request still out when the window closes
+    # A request Stop waits for is still out when the window closes: in top mode, the download of a ranked
+    # day's picks. (A plain search no longer holds Stop up, so it can't keep a fetch running any more.)
+    env.archive.delays[IDS] = 4
     w.subreddit.setText("python")
+    w.pick.setCurrentIndex(w.pick.findData("top"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
-    pump(500)
+    pump(1500)
     w.close()
     assert w.running_threads(), "app.main ends the process instead of destroying this thread"
     end = time.monotonic() + 20

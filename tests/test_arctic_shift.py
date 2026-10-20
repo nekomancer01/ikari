@@ -7,6 +7,7 @@ import requests
 from subsentiment.arctic_shift import (
     BASE_URL, SETTLE_SECONDS, TOP_PAGES, ArcticShiftClient, QueryTimeout, RateLimiter, Stopped, quotas, slices, slot_count,
 )
+from subsentiment import arctic_shift
 from subsentiment.reddit import FetchError, Post
 
 NOW = 1_792_000_000
@@ -440,7 +441,7 @@ def test_day_counts_read_each_bucket_format_and_fill_empty_days():
     url, params = c.session.calls[0]
     assert url == BASE_URL + "/api/posts/search/aggregate"
     assert params == {"subreddit": "Python", "aggregate": "created_utc", "frequency": "day",
-                      "after": D0, "before": D0 + 4 * DAY, "limit": 5}
+                      "after": D0 - 1, "before": D0 + 4 * DAY, "limit": 5}  # `after` is exclusive
 
 
 def test_a_timing_out_count_is_split_and_a_day_that_still_times_out_is_left_out():
@@ -450,7 +451,7 @@ def test_a_timing_out_count_is_split_and_a_day_that_still_times_out_is_left_out(
     c = client([slow] * 3 + [ok([{"created_utc": D0, "count": 4}])] + [slow] * 6)
     assert c.day_counts("Python", D0, D0 + 2 * DAY) == {D0: 4}
     assert [p["limit"] for _, p in c.session.calls] == [3, 3, 3] + [2] * 7  # never shrunk like a page
-    assert [p["after"] for _, p in c.session.calls[-6:]] == [D0 + DAY] * 6
+    assert [p["after"] for _, p in c.session.calls[-6:]] == [D0 + DAY - 1] * 6
 
 
 def test_a_day_whose_count_timed_out_gets_a_second_go():
@@ -748,8 +749,19 @@ def test_each_answer_is_parsed_once():
     assert Counting.parsed == 1
 
 
-def test_an_ok_answer_that_isnt_json_still_fails():
-    session = FakeSession([FakeResponse(200, None)])
+def test_an_ok_answer_that_isnt_json_is_retried_and_fails_only_if_it_keeps_coming():
+    # A proxy's or CDN's error page with HTTP 200, or a body cut short: it used to fail the whole fetch on
+    # the first one, while a 503 is waited out and retried.
+    session = FakeSession([FakeResponse(200, None)] * arctic_shift.ATTEMPTS)
     client = ArcticShiftClient(session=session, limiter=RateLimiter(interval=0, sleep=lambda s: None))
-    with pytest.raises(ValueError):
+    with pytest.raises(FetchError):
         client.get("/api/posts/search", {"subreddit": "Python"})
+    assert len(session.calls) == arctic_shift.ATTEMPTS
+
+
+@pytest.mark.parametrize("bad", [FakeResponse(200, None), FakeResponse(200, ["not", "an", "object"]),
+                                 requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead")])
+def test_an_answer_that_cant_be_read_is_retried(bad):
+    session = FakeSession([bad, FakeResponse(200, {"data": [{"id": "x"}, None, "junk"]})])
+    client = ArcticShiftClient(session=session, limiter=RateLimiter(interval=0, sleep=lambda s: None))
+    assert client.get("/api/posts/search", {"subreddit": "Python"}) == [{"id": "x"}]  # junk records skipped

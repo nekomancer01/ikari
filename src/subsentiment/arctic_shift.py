@@ -70,6 +70,7 @@ class Stopped(Exception):
 
 
 STOP_POLL = 0.2  # seconds between Stop checks during a long wait
+STALE_IN_FLIGHT = 5.0  # seconds after which a request still out no longer holds back the next one
 
 
 class QueryTimeout(FetchError):
@@ -99,7 +100,7 @@ class RateLimiter:
         # the requests already sent. So the limiter counts what's in flight, keeps the remaining budget
         # minus those, and sends one request at a time whenever it doesn't know the budget (before the
         # first answer, and after a reset until the next answer says what the new window allows).
-        self._in_flight = 0
+        self._in_flight: list[float] = []  # when each request still out was sent, oldest first
         self._budget: float | None = None  # requests left in the server's current window, if known
         self._budget_until = 0.0  # when that window resets
         self._budget_known = False  # the server has sent X-RateLimit-Remaining at least once
@@ -117,7 +118,9 @@ class RateLimiter:
                 if self._budget is not None and now >= self._budget_until:
                     self._budget = None  # the window reset; the next answer gives the new budget
                 unknown = not self._answered or (self._budget_known and self._budget is None)
-                if unknown and self._in_flight:
+                # Requests out longer than STALE_IN_FLIGHT don't hold the next one back: Stop leaves
+                # requests running unanswered (up to a minute), and waiting on them stalled the next job.
+                if unknown and self._in_flight and now - self._in_flight[-1] < STALE_IN_FLIGHT:
                     self._lock.wait(STOP_POLL if should_stop else 1.0)
                     continue
                 if self._budget is not None and self._budget <= 0:
@@ -135,7 +138,7 @@ class RateLimiter:
                         continue
                     self._sleep(delay)
                 self._next = self._clock() + self.interval
-                self._in_flight += 1
+                self._in_flight.append(self._clock())
                 if self._budget is not None:
                     self._budget -= 1
                 return
@@ -143,8 +146,12 @@ class RateLimiter:
     def done(self) -> None:
         """A request ``wait`` let out got no answer (a network error)."""
         with self._lock:
-            self._in_flight = max(0, self._in_flight - 1)
+            self._answer()
             self._lock.notify_all()
+
+    def _answer(self) -> None:
+        if self._in_flight:
+            self._in_flight.pop(0)
 
     def hold(self, seconds: float, reason: str = "Arctic Shift is busy") -> None:
         """Send nothing for the next ``seconds`` (capped at MAX_WAIT)."""
@@ -170,13 +177,13 @@ class RateLimiter:
     def observe(self, headers) -> None:
         """Note an answer's rate-limit headers, and pause until the reset when no requests are left."""
         with self._lock:
-            self._in_flight = max(0, self._in_flight - 1)
+            self._answer()
             self._answered = True
             remaining = _number(headers.get("X-RateLimit-Remaining"), None)
             if remaining is not None:
                 reset = self.reset_after(headers, 10.0)
                 self._budget_known = True
-                self._budget = remaining - self._in_flight
+                self._budget = remaining - len(self._in_flight)
                 self._budget_until = self._clock() + max(reset, 0.0)
                 if remaining <= 0:
                     self.hold(reset, "Arctic Shift's request limit was reached")
@@ -192,35 +199,51 @@ def _number(value, default):
         return default
 
 
+def _meta(d: dict) -> dict:
+    meta = d.get("_meta")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _int(value) -> int:
+    """A count from the archive as an int; 0 for anything that isn't a number ("1.5" is 1)."""
+    return int(_number(value, 0) or 0) if _number(value, 0) == _number(value, 0) else 0
+
+
 def _settled(d: dict) -> bool:
     """True once the archive has re-fetched the item, so score and comment count are real."""
-    if (d.get("_meta") or {}).get("retrieved_2nd_on"):
+    if _meta(d).get("retrieved_2nd_on"):
         return True
     return _number(d.get("retrieved_on"), 0) - _number(d.get("created_utc"), 0) >= SETTLE_SECONDS
 
 
 def _removed(d: dict) -> bool:
-    meta = d.get("_meta") or {}
+    meta = _meta(d)
     return bool(d.get("removed_by_category") or meta.get("removal_type") or meta.get("was_deleted_later"))
 
 
 def _post(d: dict) -> Post:
     settled = _settled(d)
-    subreddit = d.get("subreddit") or ""
-    selftext = d.get("selftext") or ""
+    subreddit = _text(d.get("subreddit"))
+    selftext = _text(d.get("selftext"))
+    permalink = _text(d.get("permalink")) or f"/r/{subreddit}/comments/{d['id']}/"
     return Post(
-        id=d["id"],
+        id=str(d["id"]),
         subreddit=subreddit,
-        title=d.get("title") or "",
+        title=_text(d.get("title")),
         selftext="" if selftext in _GONE else selftext,
-        author=d.get("author") or "[deleted]",
-        score=int(d.get("score") or 0) if settled else None,
-        upvote_ratio=float(d.get("upvote_ratio") or 0.0) if settled else None,
-        num_comments=int(d.get("num_comments") or 0) if settled else None,
+        author=_text(d.get("author")) or "[deleted]",
+        score=_int(d.get("score")) if settled else None,
+        upvote_ratio=_number(d.get("upvote_ratio"), 0.0) if settled else None,
+        num_comments=_int(d.get("num_comments")) if settled else None,
         created_utc=_number(d.get("created_utc"), 0),
-        permalink="https://www.reddit.com" + (d.get("permalink") or f"/r/{subreddit}/comments/{d['id']}/"),
-        url=d.get("url") or "",
+        permalink="https://www.reddit.com" + permalink,
+        url=_text(d.get("url")),
     )
+
+
+def _text(value) -> str:
+    """A text field from the archive; "" for a missing one, or one that isn't text."""
+    return value if isinstance(value, str) else ""
 
 
 def slices(after: float, before: float, n: int) -> list[tuple[int, int]]:
@@ -279,7 +302,8 @@ class ArcticShiftClient:
             self.limiter.wait(stop)
             try:
                 resp = self.session.get(BASE_URL + path, params=params, timeout=60)
-            except (requests.ConnectionError, requests.Timeout):
+            except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.ContentDecodingError):  # no answer, or one cut off on the way
                 self.limiter.done()
                 if attempt == ATTEMPTS - 1:
                     raise
@@ -291,10 +315,16 @@ class ArcticShiftClient:
             self.limiter.observe(resp.headers)
             payload = _json(resp)  # parsed once: a big comment tree takes a while to parse
             error = _error_text(payload)
-            if resp.status_code == 200 and not error:
+            if resp.status_code == 200 and not error and isinstance(payload, dict):
                 self.limiter.ok()
-                data = (payload if payload is not None else resp.json()).get("data")  # not JSON: raises
-                return data if isinstance(data, list) else []
+                data = payload.get("data")
+                # Anything that isn't an object is a malformed record; skipping it keeps the rest.
+                return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+            if resp.status_code == 200 and not isinstance(payload, dict):
+                # Not the archive's JSON: a proxy's or CDN's error page, or a body cut short. Retried like
+                # a server error; it used to fail the whole fetch on the first one.
+                self.limiter.hold(backoff)
+                continue
             if _is_timeout(resp.status_code, error):
                 # The archive answers slow queries with "Query timed out" (HTTP 200) or "Timeout. Maybe
                 # slow down a bit" (HTTP 422). Wait, then try a smaller page.
@@ -392,8 +422,11 @@ class ArcticShiftClient:
         # Slices are independent, so a few are read at once. Results are taken here, on the calling
         # thread, so on_posts can save them to a database that belongs to it.
         done = 0
+        # Outside top mode, Stop returns at once rather than waiting out searches still in flight (up to a
+        # minute for a slow one); what they'd bring is dropped, as nothing of it was shown or saved yet.
+        # Top mode keeps a slice it has ranked (see _take_top), so it waits for that.
         for (i, want), result, error in in_parallel(read_slice, enumerate(quotas(limit, len(windows))),
-                                                   self.workers):
+                                                   self.workers, None if top else should_stop):
             if error:
                 raise error
             done += 1
@@ -437,7 +470,7 @@ class ArcticShiftClient:
                 have = skip | {p.id for p in picked[i]}
                 return self._earliest(base, cursors[i], windows[i][1], want, have, should_stop)
 
-            for (i, _), result, error in in_parallel(read_more, shares, self.workers):
+            for (i, _), result, error in in_parallel(read_more, shares, self.workers, should_stop):
                 if error:
                     raise error
                 extra, cursors[i], more[i] = result
@@ -468,10 +501,11 @@ class ArcticShiftClient:
         out: list[Post] = []
         seen: set[str] = set()
         cursor = lo - 1  # `after` is exclusive; this way a post right on the slice's start isn't lost
+        wide = bool(skip)
         for _ in range(SLOT_PAGES):
             # A few spare for removed posts; a full page when saved posts may need skipping. Once the
             # archive has timed out on a big page, this fetch keeps to the smaller size that worked.
-            size = min(self._page_cap, PAGE if skip else want - len(out) + 5)
+            size = min(self._page_cap, PAGE if wide else want - len(out) + 5)
             try:
                 page, end, sent = self._page(base, cursor, hi, size)
             except Stopped:
@@ -494,8 +528,17 @@ class ArcticShiftClient:
             if end < hi and (len(page) < size or not new):  # only part of the window was searched
                 cursor = end - 1
                 continue
-            if len(page) < size or not new:
+            if len(page) < size:
                 return out, cursor, False
+            if not new:
+                # A full page of posts already seen: they all share the second the page starts on (a
+                # burst of spam, usually removed), so asking again from there gets the same page. That
+                # used to end the slice as if it were read to its end, dropping the rest of it.
+                if size < self._page_cap:
+                    wide = True  # a bigger page reaches past that second
+                    continue
+                cursor = int(max(_number(d.get("created_utc"), 0) for d in page))  # more than a page in
+                continue  # one second (never seen): move past it rather than ask for it forever
             # The next page starts a second before this one ended, so posts sharing that timestamp
             # aren't lost; `seen` drops the repeats.
             cursor = int(max(_number(d.get("created_utc"), 0) for d in page)) - 1
@@ -509,7 +552,8 @@ class ArcticShiftClient:
             if should_stop and should_stop():
                 break
             try:
-                page = self._page(dict(base, fields=TOP_FIELDS), start, end, PAGE)[0]
+                # `after` is exclusive, so start - 1: a post made right on the slice's start is a candidate.
+                page = self._page(dict(base, fields=TOP_FIELDS), start - 1, end, PAGE)[0]
             except Stopped:
                 break
             for d in page:
@@ -585,7 +629,8 @@ class ArcticShiftClient:
                 todo, failed, retried = [(d, d + DAY) for d in failed], [], True
             lo, hi = todo.pop(0)
             params = {"subreddit": subreddit, "aggregate": "created_utc", "frequency": "day",
-                      "after": lo, "before": hi, "limit": (hi - lo) // DAY + 1}
+                      # `after` is exclusive (checked live): lo - 1 counts a post made at 00:00:00 too.
+                      "after": lo - 1, "before": hi, "limit": (hi - lo) // DAY + 1}
             try:
                 buckets = self.get("/api/posts/search/aggregate", params, shrink=False)
             except Stopped:
@@ -643,18 +688,18 @@ class ArcticShiftClient:
         items = 0
         for d in _walk(tree):
             items += 1
-            body = d.get("body") or ""
+            body = _text(d.get("body"))
             if not d.get("id") or body in _GONE or _removed(d):
                 continue
-            permalink = d.get("permalink") or f"/r/{post.subreddit}/comments/{post.id}/_/{d['id']}/"
+            permalink = _text(d.get("permalink")) or f"/r/{post.subreddit}/comments/{post.id}/_/{d['id']}/"
             comments.append(Comment(
-                id=d["id"],
+                id=str(d["id"]),
                 post_id=post.id,
                 subreddit=post.subreddit,
-                parent_id=d.get("parent_id") or "",
-                author=d.get("author") or "[deleted]",
+                parent_id=_text(d.get("parent_id")),
+                author=_text(d.get("author")) or "[deleted]",
                 body=body,
-                score=int(d.get("score") or 0) if _settled(d) else None,
+                score=_int(d.get("score")) if _settled(d) else None,
                 created_utc=_number(d.get("created_utc"), 0),
                 depth=int(d["depth"]) if isinstance(d.get("depth"), int) else 0,
                 permalink="https://www.reddit.com" + permalink,
@@ -721,8 +766,10 @@ def _walk(items: list, depth: int = 0):
     for item in items or ():
         if not isinstance(item, dict) or item.get("kind") != "t1":
             continue
-        d = dict(item.get("data") or {})
-        d.setdefault("depth", depth)
+        data = item.get("data")
+        d = dict(data) if isinstance(data, dict) else {}
+        if not isinstance(d.get("depth"), int):  # missing, or null in a malformed record
+            d["depth"] = depth
         yield d
         replies = d.get("replies")
         if isinstance(replies, dict):
