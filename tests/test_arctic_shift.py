@@ -559,7 +559,10 @@ def test_requests_still_start_no_faster_than_the_limiter_allows():
         "python", after=T0, before=T0 + 7 * DAY, limit=28)
     assert len(starts) >= 28
     gaps = [b - a for a, b in zip(starts, starts[1:])]
-    assert min(gaps) >= 0.018
+    # The limiter's clock (time.monotonic) only ticks every ~16 ms on Windows before Python 3.13, so there a
+    # gap can read up to one tick short of the interval; nothing ever starts together.
+    tick = time.get_clock_info("monotonic").resolution
+    assert min(gaps) >= 0.018 - tick
 
 
 def test_an_error_in_one_slice_stops_the_fetch():
