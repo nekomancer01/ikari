@@ -405,7 +405,7 @@ def test_each_rail_button_opens_its_page_and_the_last_one_is_reopened(make_windo
     for page in ("timeline", "words", "posts", "comments", "overview", "timeline"):
         w.rail.buttons[page].click()
         assert w.page() == page and w.pages.currentWidget() is w.page_widgets[page]
-        assert w.scope.isVisibleTo(w) == (page in ("overview", "timeline"))  # what it counts shows there
+        assert w.scope.isVisibleTo(w) == (page in ("overview", "timeline", "words"))  # what it counts shows there
     assert w.timeline_page.body.points == w.overview.timeline.points != []  # the same days, on its own page
     w.close()
     assert make_window().page() == "timeline"
@@ -568,3 +568,35 @@ def test_import_database_adds_its_subreddits_to_the_list(make_window, tmp_path, 
     (tmp_path / "other.db").write_bytes(b"junk" * 1000)
     w.import_act.trigger()
     assert len(warnings) == 1 and w.datasets.count() == 3
+
+
+def test_short_titles_leave_room_for_the_comments_column(make_window):
+    """QA on a2d5074: at 1920x1200 150% with the Saved drawer open, the Posts table hid its Comments column
+    although the titles were short and left half the table empty. The title column kept 40% of the width
+    whatever its titles needed."""
+    from subsentiment.gui import theme
+    from subsentiment.gui.tables import POST_COLUMNS, TablePage
+    app = QApplication.instance() or QApplication([])
+    before = app.font()
+    make_window()
+    theme.load_fonts(app)  # Inter, as the app draws with: its widths decide what fits
+    theme.apply(app, "light")
+    try:
+        page = TablePage(POST_COLUMNS, stretch_col=2)
+        page.resize(795, 600)  # the table's width there, in logical pixels
+        page.show()
+        row = {"id": "p1", "sentiment": -0.957, "label": "negative", "title": "terrible bug #188", "selftext": "",
+               "score": 134, "num_comments": 12, "author": "someone", "created_utc": 1_700_000_000.0}
+        page.load([row])
+        QApplication.processEvents()
+        header = page.view.horizontalHeader()
+        keys = [key for _, key, _ in POST_COLUMNS]
+        assert not header.isSectionHidden(keys.index("num_comments"))
+        assert header.sectionSize(keys.index("title")) >= page.view.viewport().width() // 4
+        page.resize(600, 600)  # a long title on a narrow table still keeps a third of it before the counts
+        page.load([dict(row, title="A much longer title that needs a good part of the table to be read " * 2)])
+        QApplication.processEvents()
+        assert header.sectionSize(keys.index("title")) >= page.view.viewport().width() // 3 - 1
+        page.close()
+    finally:
+        app.setFont(before)
