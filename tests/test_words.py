@@ -91,7 +91,7 @@ def window(tmp_path):
     day = 1_700_000_000.0
     for i, (title, label) in enumerate([("Harbour festival tonight", "positive"), ("Harbour parking awful", "negative"),
                                         ("Library reopened", "positive")]):
-        s.save_post(Post(f"p{i}", "town", title, "", "a", 1, 0.9, 0, day - i * 86400, "https://r", ""), 0, label)
+        s.save_post(Post(f"p{i}", "town", title, "", "a", 1, 0.9, 0, day - i * 20 * 86400, "https://r", ""), 0, label)
     s.save_comment(Comment("c1", "p0", "town", "t3_p0", "b", "the festival lights were lovely", 1, day + 60, 0,
                            "/r/town/comments/p0/c1/"), 0.6, "positive")
     s.commit()
@@ -102,7 +102,7 @@ def window(tmp_path):
     QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
 
 
-def test_the_words_page_shows_the_saved_words_and_follows_scope_and_days(window):
+def test_the_words_page_shows_the_saved_words_and_follows_scope_and_span(window):
     w = window
     w.show()
     w.show_page("words")
@@ -117,9 +117,8 @@ def test_the_words_page_shows_the_saved_words_and_follows_scope_and_days(window)
     w.scope.setCurrentText("Comments only")
     assert shown() == {"festival": 1, "lights": 1, "lovely": 1}
     w.scope.setCurrentText("Posts and comments")
-    w.presets.buttons["week"].click()
-    w.days_pick.set_days(w._day_counts, {int(1_700_000_000 // 86400 * 86400)})
-    w._on_days_chosen({int(1_700_000_000 // 86400 * 86400)})  # only the newest day
+    w.overview.timeline.presets["1w"].click()  # the newest week: the first post and its comment
+    w._apply_span()  # what the tables and the cloud do once the span settles
     assert shown() == {"harbour": 1, "festival": 2, "tonight": 1, "lights": 1, "lovely": 1}
 
 
