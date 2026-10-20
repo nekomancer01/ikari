@@ -6,6 +6,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -385,6 +386,26 @@ def test_closing_mid_fetch_leaves_the_fetch_alone(env, monkeypatch):
         pump(50)
     pump(200)
     assert errors == []  # the fetch ending didn't reach for the closed store
+
+
+def test_a_save_reported_just_before_closing_isnt_handled_after_it(env, monkeypatch):
+    # The fetch thread said "saved" a moment before the window closed. Its signal was still queued when
+    # closeEvent disconnected the signals and closed the store, and was delivered anyway: the window read
+    # the closed store ("Cannot operate on a closed database"; seen once on Windows CI).
+    errors = []
+    monkeypatch.setattr(sys, "excepthook", lambda *e: errors.append(e))
+    w = env.window()
+    env.archive.delay = 4  # the fetch is still running when the window closes
+    w.fetch_form.subreddit.setText("python")
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    pump(300)
+    worker_ = w.fetch_job.worker
+    emitter = threading.Thread(target=worker_.saved.emit)  # from another thread, so it's queued
+    emitter.start()
+    emitter.join()
+    w.close()
+    pump(200)
+    assert errors == []
 
 
 def test_closing_while_a_search_is_out_ends_the_fetch_at_once(env, monkeypatch):
