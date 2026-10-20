@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from subsentiment import __version__, collect
-from subsentiment.gui import days, native, theme
+from subsentiment.gui import days, motion, native, theme
 from subsentiment.gui.charts import DistributionChart, TimelineChart
 from subsentiment.gui.coverage import CoverageWindow
 from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, RowsModel
@@ -156,6 +156,7 @@ class TablePage(QWidget):
         self.filter.textChanged.connect(self.proxy.setFilterFixedString)
         self.label_filter = QComboBox()
         self.label_filter.addItems(["All labels", "Positive", "Neutral", "Negative"])
+        self.label_filter.currentTextChanged.connect(lambda _: motion.crossfade(self.view))
         self.label_filter.currentTextChanged.connect(self._apply_label_filter)
         self.count = label("", "muted")
 
@@ -319,6 +320,7 @@ class MainWindow(QMainWindow):
         self._native_backdrop = native.prepare_window(self, self.settings.value("ui/backdrop", "gradient", str))
         self._shown = False
         self.mood = theme.MoodTint(self, self.settings.value("ui/mood_tint", True, bool))
+        motion.set_enabled(not self.settings.value("ui/reduce_motion", False, bool))
 
         self._build_menu()
         backdrop = QWidget()  # transparent: the window paints the backdrop behind menus too
@@ -332,6 +334,7 @@ class MainWindow(QMainWindow):
         # The status bar only appears while it has something to say (an export, a deletion).
         bar = self.statusBar()
         bar.messageChanged.connect(lambda text: bar.setVisible(bool(text)))
+        bar.messageChanged.connect(lambda text: motion.fade_in(bar) if text else None)
         bar.hide()
         QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _: self._apply_theme())
         self._refresh_datasets(select=self.settings.value("ui/last_dataset", "", str))
@@ -371,6 +374,11 @@ class MainWindow(QMainWindow):
                                   checked=self.settings.value("ui/reduce_transparency", False, bool))
         self.reduce_act.toggled.connect(self._set_reduce)
         view.addAction(self.reduce_act)
+        self.motion_act = QAction("Reduce motion", self, checkable=True,
+                                  checked=self.settings.value("ui/reduce_motion", False, bool))
+        self.motion_act.setToolTip("Show new data and other views at once, without fading")
+        self.motion_act.toggled.connect(self._set_reduce_motion)
+        view.addAction(self.motion_act)
         self.mood_act = QAction("Tint background by sentiment", self, checkable=True, checked=self.mood.enabled)
         self.mood_act.toggled.connect(self._set_mood_tint)
         view.addAction(self.mood_act)
@@ -583,6 +591,8 @@ class MainWindow(QMainWindow):
         lay.addLayout(header)
 
         self.pages = QStackedWidget()
+        self.content = content
+        self.tabbar.currentChanged.connect(lambda _: motion.crossfade(content))  # first: the old tab's look
         self.tabbar.currentChanged.connect(self.pages.setCurrentIndex)
         self.tabbar.currentChanged.connect(lambda i: self.scope.setVisible(i == 0))
         self.pages.addWidget(self._build_overview())
@@ -645,6 +655,8 @@ class MainWindow(QMainWindow):
             inner.addWidget(lw)
             extremes.addWidget(card)
         lay.addLayout(extremes, 2)
+        self.cards = [*self.tiles.values(), *(self.distribution.parentWidget(), self.timeline.parentWidget()),
+                      *(lw.parentWidget() for lw in (self.most_positive, self.most_negative))]
         # On a short window (1366x768 or 1280x800 at 125%) the overview scrolls rather than holding the
         # window taller than the screen or squeezing the charts.
         scroll = VerticalScrollArea()
@@ -660,6 +672,10 @@ class MainWindow(QMainWindow):
     def _set_reduce(self, on: bool) -> None:
         self.settings.setValue("ui/reduce_transparency", on)
         self._apply_theme()
+
+    def _set_reduce_motion(self, on: bool) -> None:
+        self.settings.setValue("ui/reduce_motion", on)
+        motion.set_enabled(not on)
 
     def _set_mood_tint(self, on: bool) -> None:
         self.settings.setValue("ui/mood_tint", on)
@@ -688,6 +704,7 @@ class MainWindow(QMainWindow):
             self._style_native_frame()
 
     def _apply_theme(self) -> None:
+        motion.crossfade(self, motion.THEME_MS)
         requested = self.settings.value("ui/theme", "system", str)
         native.set_appearance(requested)
         theme.apply(QApplication.instance(), requested, self.settings.value("ui/reduce_transparency", False, bool))
@@ -768,6 +785,7 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(busy)
         if busy:
             self.progress.setRange(0, 0)
+            motion.fade_in(self.progress)
         for w in (self.subreddit, self.query, self.range, self.date_from, self.date_to, self.pick,
                   self.limit, self.include_comments, self.refresh_scores):
             w.setEnabled(not busy)
@@ -975,6 +993,8 @@ class MainWindow(QMainWindow):
         With reload=False only the list and storage line change, not the dataset on screen."""
         sets = self.store.datasets()
         names = [d["name"] for d in sets]
+        if names != [self.datasets.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.datasets.count())]:
+            motion.crossfade(self.datasets.viewport())
         self.datasets.blockSignals(True)
         self.datasets.clear()
         for d in sets:
@@ -1011,6 +1031,9 @@ class MainWindow(QMainWindow):
         # about to be reloaded from the store, which has them anyway.
         self._drip.stop()
         self._queued = {"posts": [], "comments": []}
+        switching = (name or None) != self.current
+        if switching:  # the old subreddit fades out over the new one, whose cards fade in one by one
+            motion.crossfade(self.content)
         self.current = name or None
         self._saved = {"posts": self.store.posts(name) if name else [],
                        "comments": self.store.comments(name) if name else []}
@@ -1019,6 +1042,8 @@ class MainWindow(QMainWindow):
         self._apply_days(animate)
         self._update_delete_enabled()
         self.coverage_act.setEnabled(bool(self.current))
+        if switching and self.pages.currentIndex() == 0:
+            motion.fade_in_all(self.cards)
         if self.coverage is not None:
             self.coverage.set_subreddit(self.current)
 
@@ -1039,6 +1064,7 @@ class MainWindow(QMainWindow):
     def _on_days_chosen(self, chosen: set[int] | None) -> None:
         if not self.current:
             return
+        motion.crossfade(self.content)
         self.chosen_days = days.save_choice(self.settings, self.current, chosen, self._day_counts)
         if self.fetch_job.busy and self._showing_fetch():
             # A running fetch has added rows since the subreddit was loaded: read them all again.
@@ -1051,6 +1077,7 @@ class MainWindow(QMainWindow):
 
     def _on_scope_changed(self, text: str) -> None:
         self.settings.setValue("ui/overview_scope", text)
+        motion.crossfade(self.pages)
         self._render_overview()
 
     def _render_overview(self) -> None:
@@ -1060,10 +1087,14 @@ class MainWindow(QMainWindow):
         s = summarize(rows)
         n = s["count"]
         pos, neg = (s["counts"]["positive"] / n, s["counts"]["negative"] / n) if n else (0.0, 0.0)
-        self.tiles["count"].set(f"{n:,}")
-        self.tiles["mean"].set(f"{s['mean']:+.3f}" if n else "–")
-        self.tiles["positive"].set(f"{100 * pos:.0f}%" if n else "–", pos)
-        self.tiles["negative"].set(f"{100 * neg:.0f}%" if n else "–", neg)
+        self.tiles["count"].set_number(n, lambda v: f"{round(v):,}")
+        if n:
+            self.tiles["mean"].set_number(s["mean"], lambda v: f"{v:+.3f}")
+            self.tiles["positive"].set_number(100 * pos, lambda v: f"{v:.0f}%", pos)
+            self.tiles["negative"].set_number(100 * neg, lambda v: f"{v:.0f}%", neg)
+        else:
+            for key in ("mean", "positive", "negative"):
+                self.tiles[key].set("–")
         self.mood.set_counts(s["counts"]["positive"], s["counts"]["negative"], n)
         self.distribution.set_counts(s["counts"])
         self.timeline.set_points(daily_means(rows))
@@ -1074,6 +1105,11 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _fill_extremes(widget: QListWidget, rows) -> None:
+        texts = [f"{r['sentiment']:+.2f}    {' '.join(((r['title'] if 'title' in r.keys() else r['body']) or '').split())[:140]}"
+                 for r in rows]
+        if texts == [widget.item(i).text() for i in range(widget.count())]:
+            return  # the same items: nothing to redo (a running fetch asks once a second)
+        motion.crossfade(widget.viewport())
         widget.clear()
         for r in rows:
             text = r["title"] if "title" in r.keys() else r["body"]
@@ -1140,7 +1176,10 @@ class MainWindow(QMainWindow):
             self.coverage = CoverageWindow(self)
         self.coverage.set_subreddit(self.current)
         self.coverage.set_busy(self.fetch_job.busy)
+        opening = not self.coverage.isVisible()
         self.coverage.show()
+        if opening:
+            motion.fade_window(self.coverage)
         self.coverage.raise_()
         self.coverage.activateWindow()
 

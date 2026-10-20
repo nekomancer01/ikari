@@ -88,3 +88,19 @@ def apply_backdrop(hwnd: int, kind: str) -> bool:
         return _set_attr(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, BACKDROPS[kind])
     except (AttributeError, OSError):
         return False
+
+
+SPI_GETCLIENTAREAANIMATION = 0x1042
+
+
+def animations_on() -> bool:
+    """Windows' "Animation effects" setting (Settings > Accessibility > Visual effects). True elsewhere."""
+    if not IS_WINDOWS:
+        return True
+    try:
+        on = ctypes.c_int(1)
+        if ctypes.windll.user32.SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, ctypes.byref(on), 0):
+            return bool(on.value)
+    except (AttributeError, OSError):
+        pass
+    return True
