@@ -103,7 +103,7 @@ def test_invalid_subreddit_is_explained_without_starting_a_fetch(make_window):
     w = make_window()
     w.subreddit.setText("not a sub")
     w._start_fetch()
-    assert w.thread is None and "isn't a valid subreddit name" in w.progress_msg.text()
+    assert not w.fetch_job.busy and "isn't a valid subreddit name" in w.progress_msg.text()
 
 
 def test_delete_one_then_all(make_window, monkeypatch):
@@ -188,7 +188,7 @@ def test_append_rows_shows_each_new_row_fading_in_and_skips_ones_already_shown()
 
 def test_rows_saved_by_a_running_fetch_are_dripped_into_the_tables(make_window):
     w = make_window()
-    w.thread = object()  # a fetch is "running"
+    w.fetch_job.qthread = object()  # a fetch is "running"
     w.request = mw.collect.FetchRequest("Python")
     w._since = 0.0
     w._show_dataset("Python")
@@ -198,7 +198,7 @@ def test_rows_saved_by_a_running_fetch_are_dripped_into_the_tables(make_window):
     w.posts_tab.add_rows([row(1), row(2)])
     assert len(w.posts) == before + 2 and w.posts_tab.model.rowCount() == before + 2
     assert w.posts_tab.add_rows([row(2)]) == 0
-    w.thread = None
+    w.fetch_job.qthread = None
 
 
 def test_coverage_window_lists_days_and_downloads_through_the_fetch_job(make_window, monkeypatch):
@@ -256,11 +256,11 @@ def test_archive_counts_arrive_on_the_gui_thread(make_window, monkeypatch):
     c.subreddit = "Python"
     c._count(1_699_920_000, 1_699_920_000 + 86400)
     end = time.monotonic() + 10  # the thread is wound down from the GUI thread, so keep handling events
-    while (c._count_thread is not None or "thread" not in seen) and time.monotonic() < end:
+    while (c.count_job.busy or "thread" not in seen) and time.monotonic() < end:
         QApplication.processEvents()
         time.sleep(0.01)
     assert seen["thread"] is threading.main_thread()
-    assert c.totals["python"] == {1_699_920_000: 5} and c._count_thread is None
+    assert c.totals["python"] == {1_699_920_000: 5} and not c.count_job.busy
     c.close()
 
 

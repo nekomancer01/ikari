@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import requests
-from PySide6.QtCore import QObject, Signal, Slot
+from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from subsentiment import collect
 from subsentiment.arctic_shift import ArcticShiftClient, RateLimiter
@@ -76,3 +76,46 @@ class CountWorker(QObject):
         except Exception as e:
             self.failed.emit(failure_text(e))
 
+
+class BackgroundJob(QObject):
+    """Runs one worker at a time on its own QThread: the fetch, or Download coverage's count.
+
+    Connect the worker's own signals, then ``start`` it. The worker's ``run`` slot does the work; its
+    ``finished`` or ``failed`` signal ends the thread, and once the thread has finished the job lets go of
+    both and emits ``ended``."""
+
+    ended = Signal()
+
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+        self.qthread: QThread | None = None
+        self.worker: QObject | None = None
+
+    @property
+    def busy(self) -> bool:
+        """A worker was started and its thread hasn't been tidied up yet."""
+        return self.qthread is not None
+
+    def running(self) -> bool:
+        return self.qthread is not None and self.qthread.isRunning()
+
+    def start(self, worker: QObject) -> None:
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._end)
+        self.qthread, self.worker = thread, worker
+        thread.start()
+
+    def stop(self) -> None:
+        """Ask the worker to stop; it ends (and ``ended`` fires) once what's under way returns."""
+        if self.worker is not None:
+            self.worker.stop()
+
+    def _end(self) -> None:
+        self.qthread.deleteLater()
+        self.worker.deleteLater()
+        self.qthread = self.worker = None
+        self.ended.emit()
