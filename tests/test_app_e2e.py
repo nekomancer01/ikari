@@ -262,7 +262,7 @@ def test_comments_come_with_a_fetch_when_asked(env):
     s = env.store()
     with_comments = {r["post_id"] for r in s.comments("python")}
     assert with_comments and with_comments <= {r["id"] for r in s.posts("python")}
-    assert " 0 comments" not in w.subheading.text() and "comment" in w.subheading.text()
+    assert " 0 comments" not in w.subheading.full_text() and "comment" in w.subheading.full_text()
 
 
 def test_score_recheck_only_runs_when_ticked(env):
@@ -1025,7 +1025,7 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
     assert sum(o.distribution._counts.values()) == want
     assert o.distribution._counts == {k: sum(r["label"] == k for r in rows) for k in ("negative", "neutral", "positive")}
     assert sum(n for _, _, n in o.timeline._shown[0]) == want
-    assert f"· {want:,}\xa0posts ·" in w.subheading.text() and w.subheading.text().startswith("Last fetched")
+    assert f"· {want:,}\xa0posts ·" in w.subheading.full_text() and w.subheading.text().startswith("Last fetched")
     assert sum(p for p, _ in w.days_pick.counts.values()) == want
     pump(800)  # what reads the store again does so once a second
     assert w.fetch_job.busy
