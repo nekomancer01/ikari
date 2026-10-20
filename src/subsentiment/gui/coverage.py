@@ -11,7 +11,8 @@ import math
 import time
 from datetime import datetime, timezone
 
-from PySide6.QtCore import QRectF, QSize, Qt, QThread, Slot
+import shiboken6
+from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QThread, Slot
 from PySide6.QtGui import QColor, QGuiApplication, QLinearGradient, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton,
@@ -287,6 +288,8 @@ class CoverageWindow(QDialog):
         self._count_worker: CountWorker | None = None
         self._post_rows: list = []
         self._post_ids: list[str] = []
+        self._built: dict[int, tuple] = {}  # post rows with widgets, and what they last showed
+        self._comments_done: set[str] = set()
         self._day_rows: list[int] = []
 
         root = QVBoxLayout(self)
@@ -329,6 +332,9 @@ class CoverageWindow(QDialog):
         h.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         h.resizeSection(2, 136)
         self.post_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.post_table.verticalScrollBar().valueChanged.connect(self._fill_visible)
+        self._post_viewport = self.post_table.viewport()
+        self._post_viewport.installEventFilter(self)  # resized or shown: more rows may be on screen
         self.posts_title = section("Posts")
         self.all_comments = small_button("Download all comments")
         self.all_comments.clicked.connect(self._download_day_comments)
@@ -489,8 +495,7 @@ class CoverageWindow(QDialog):
         if day is None or not self.subreddit:
             self.posts_title.setText("POSTS")
             t.setRowCount(0)
-            self._post_ids = []
-            self._post_rows = []
+            self._post_ids, self._post_rows, self._built = [], [], {}
             self.all_comments.setEnabled(False)
             self._empty("Pick a day to see its posts.")
             self.posts_empty.setVisible(True)
@@ -502,41 +507,76 @@ class CoverageWindow(QDialog):
         self.posts_title.setText(f"POSTS ON {day_text(day).upper()} · {len(rows):,}")
         ids = [r["id"] for r in rows]
         if ids != self._post_ids:
+            # A busy day has thousands of posts, and three widgets a row took seconds to build; rows get
+            # their widgets when they scroll into view (_fill_visible), so a new post costs the same as any.
+            keep = t.verticalScrollBar().value()
             t.setRowCount(0)
             t.setRowCount(len(rows))
-            for i, r in enumerate(rows):
-                title = ElidedLabel()
-                title.setContentsMargins(8, 0, 4, 0)
-                t.setCellWidget(i, 0, title)
-                t.setCellWidget(i, 1, Cell())
-                button = small_button("Download all")
-                button.clicked.connect(lambda _=False, pid=r["id"]: self._download_comments([pid]))
-                t.setCellWidget(i, 2, centred(button))
-            self._post_ids = ids
+            self._post_ids, self._built = ids, {}
+            t.verticalScrollBar().setValue(keep)
         self._post_rows = rows
+        self._comments_done = complete
         todo = []
-        for i, r in enumerate(rows):
-            done = r["id"] in complete
+        for r in rows:
             total = r["num_comments"]
-            t.cellWidget(i, 0).set_full(" ".join((r["title"] or "").split()))
-            cell: Cell = t.cellWidget(i, 1)
-            cell.set(r["saved_comments"], total, done, "comment")
-            if total is None and not done:
-                cell.side.setText("not counted yet")
-                cell.setToolTip("Arctic Shift counts a post's comments when it re-checks the post, usually "
-                                "about 36 hours after posting. Downloading still fetches what's there now.")
-            full = done or (bool(total) and r["saved_comments"] >= total)
-            if total != 0 and not full:
+            if total != 0 and not (r["id"] in complete or (bool(total) and r["saved_comments"] >= total)):
                 todo.append(r["id"])
-            button: QPushButton = t.cellWidget(i, 2).findChild(QPushButton)
-            button.setText("Check again" if full else "Download all")
-            button.setEnabled(not self.busy and (total != 0 or done))
+        self._fill_visible()
         self._todo_comments = todo
         self.all_comments.setText(f"Download all comments ({len(todo):,} posts)" if todo else "Download all comments")
         self.all_comments.setEnabled(not self.busy and bool(todo))
         self._empty("No posts from this day are saved yet. Use Download all on the left.")
         self.posts_empty.setVisible(not rows)
         t.setVisible(bool(rows))
+
+    def _fill_visible(self, *_) -> None:
+        """Build and fill the post rows on screen, plus a screenful either side for smooth scrolling."""
+        t = self.post_table
+        n = len(self._post_rows)
+        if not n:
+            return
+        height = max(t.viewport().height(), 1)
+        first = t.rowAt(0)
+        last = t.rowAt(height - 1)
+        first = 0 if first < 0 else first
+        last = n - 1 if last < 0 else last
+        span = last - first + 1
+        for i in range(max(0, first - span), min(n, last + span + 1)):
+            self._fill_post_row(i)
+
+    def _fill_post_row(self, i: int) -> None:
+        t, r = self.post_table, self._post_rows[i]
+        done = r["id"] in self._comments_done
+        state = (r["title"], r["saved_comments"], r["num_comments"], done, self.busy)
+        if self._built.get(i) == state:
+            return
+        if i not in self._built:
+            title = ElidedLabel()
+            title.setContentsMargins(8, 0, 4, 0)
+            t.setCellWidget(i, 0, title)
+            t.setCellWidget(i, 1, Cell())
+            button = small_button("Download all")
+            button.clicked.connect(lambda _=False, pid=r["id"]: self._download_comments([pid]))
+            t.setCellWidget(i, 2, centred(button))
+        self._built[i] = state
+        total = r["num_comments"]
+        t.cellWidget(i, 0).set_full(" ".join((r["title"] or "").split()))
+        cell: Cell = t.cellWidget(i, 1)
+        cell.set(r["saved_comments"], total, done, "comment")
+        if total is None and not done:
+            cell.side.setText("not counted yet")
+            cell.setToolTip("Arctic Shift counts a post's comments when it re-checks the post, usually "
+                            "about 36 hours after posting. Downloading still fetches what's there now.")
+        full = done or (bool(total) and r["saved_comments"] >= total)
+        button: QPushButton = t.cellWidget(i, 2).findChild(QPushButton)
+        button.setText("Check again" if full else "Download all")
+        button.setEnabled(not self.busy and (total != 0 or done))
+
+    def eventFilter(self, obj, event) -> bool:
+        if (obj is self._post_viewport and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)
+                and shiboken6.isValid(self.post_table)):  # not while the window is being torn down
+            self._fill_visible()
+        return super().eventFilter(obj, event)
 
     # -- archive counts -------------------------------------------------------
 
