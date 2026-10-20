@@ -544,12 +544,12 @@ def test_requests_still_start_no_faster_than_the_limiter_allows():
     limiter = RateLimiter(0.02)
     real_wait, grab = limiter.wait, threading.Lock()
 
-    def wait():
+    def wait(should_stop=None):
         # When the limiter let each request go, by its own clock. Timing anything after that also counts how
         # late the OS ran each worker thread, which on a busy machine (the suite runs in parallel) bunches
         # two together. The lock keeps another grant from moving _next before it's read.
         with grab:
-            real_wait()
+            real_wait(should_stop)
             starts.append(limiter._next - limiter.interval)
 
     limiter.wait = wait
