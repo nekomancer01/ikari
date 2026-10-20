@@ -2,10 +2,9 @@ name: Tests
 
 # The required check for pull requests ("Windows tests" in the "Protect main" ruleset): the whole test suite,
 # e2e, layout and packaging checks included, through the same command contributors run before pushing.
+# (On main the Build workflow runs the same suite before packaging.)
 on:
   pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
