@@ -68,7 +68,7 @@ def main() -> None:
         t0, spent[0], worst = time.time(), 0.0, 0.0
         start()
         stopped = False
-        while w.thread is not None:
+        while w.fetch_job.busy:
             if not stopped and time.time() - t0 > cap:
                 w._stop_fetch()
                 stopped = True
@@ -91,7 +91,7 @@ def main() -> None:
     w.coverage_act.trigger()
     cov = w.coverage
     t0 = time.time()
-    while (cov._count_thread is not None or not cov.days) and time.time() - t0 < 180:
+    while (cov.count_job.busy or not cov.days) and time.time() - t0 < 180:
         app.processEvents()
         time.sleep(0.01)
 
