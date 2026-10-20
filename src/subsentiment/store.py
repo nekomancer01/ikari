@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from subsentiment.reddit import Comment, Post
+from subsentiment.reddit import Comment, Post, is_image_post
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS posts (
@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS posts (
     created_utc REAL, permalink TEXT, url TEXT,
     sentiment REAL, label TEXT,
     fetched_at REAL
+    -- plus image: see Store.__init__, which adds it to databases saved before it existed
 );
 CREATE TABLE IF NOT EXISTS comments (
     id TEXT PRIMARY KEY,
@@ -62,6 +63,10 @@ COMMENT_COLUMNS = ("id", "post_id", "subreddit", "parent_id", "author", "body", 
                    "created_utc", "depth", "permalink", "sentiment", "label", "fetched_at")
 
 
+# Comments on image posts are hidden along with the posts (``c`` is the comments table).
+NOT_IMAGE = "c.post_id NOT IN (SELECT id FROM posts WHERE image = 1)"
+
+
 def _storable(value):
     """``value``, with any text SQLite can't store made safe. The archive's JSON can hold a lone half of an
     emoji ("\\ud83d", from a title cut short), which SQLite refuses, failing the whole fetch."""
@@ -91,6 +96,14 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")  # GUI reads while the fetch thread writes
         self.db.executescript(SCHEMA)
+        # Image posts are kept as rows (so Download coverage counts them as checked and a refetch doesn't
+        # download them again) but hidden from every read here and never given comments.
+        if "image" not in {r["name"] for r in self.db.execute("PRAGMA table_info(posts)")}:
+            self.db.execute("ALTER TABLE posts ADD COLUMN image INTEGER NOT NULL DEFAULT 0")
+            self.db.executemany("UPDATE posts SET image = 1 WHERE id = ?", [
+                (r["id"],) for r in self.db.execute("SELECT id, url, selftext FROM posts")
+                if is_image_post(r["url"], r["selftext"])])
+            self.db.commit()
 
     def close(self) -> None:
         # Copy what's committed into the main file now, so a process ended right after (see gui.app.end_now)
@@ -104,9 +117,10 @@ class Store:
     def save_post(self, post: Post, sentiment: float, label: str) -> None:
         values = (post.id, post.subreddit, post.title, post.selftext, post.author, post.score,
                   post.upvote_ratio, post.num_comments, post.created_utc, post.permalink, post.url,
-                  sentiment, label, time.time())
+                  sentiment, label, time.time(), int(post.image))
         values = tuple(map(_storable, values))
-        self.db.execute(f"INSERT OR REPLACE INTO posts VALUES ({','.join('?' * len(values))})", values)
+        self.db.execute(f"INSERT OR REPLACE INTO posts ({','.join(POST_COLUMNS)}, image) "
+                        f"VALUES ({','.join('?' * len(values))})", values)
 
     def save_comment(self, c: Comment, sentiment: float, label: str) -> None:
         values = (c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score,
@@ -121,10 +135,11 @@ class Store:
     def posts_between(self, subreddit: str, after: float | None = None,
                       before: float | None = None) -> list[sqlite3.Row]:
         """Stored posts created in [after, before), each with has_comments and, when ikari has asked for
-        its comments before, comments_ok and comments_settled."""
+        its comments before, comments_ok and comments_settled. Image posts are included (image = 1): the
+        caller needs them to skip, not to show."""
         return self.db.execute(
             "SELECT p.*, EXISTS(SELECT 1 FROM comments c WHERE c.post_id = p.id) AS has_comments, "
-            "f.ok AS comments_ok, f.settled AS comments_settled "
+            "f.ok AS comments_ok, f.settled AS comments_settled, p.image "
             "FROM posts p LEFT JOIN comment_fetches f ON f.post_id = p.id WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ?",
             (subreddit, after if after is not None else float("-inf"),
              before if before is not None else float("inf"))).fetchall()
@@ -154,12 +169,13 @@ class Store:
             (subreddit.lower(), after, before))
         return {r["d"]: r["n"] for r in rows}
 
-    def posts_per_day(self, subreddit: str, after: float, before: float) -> dict[int, int]:
-        """Saved posts per UTC day in [after, before), as {day start: count}."""
+    def posts_per_day(self, subreddit: str, after: float, before: float, images: bool = False) -> dict[int, int]:
+        """Saved posts per UTC day in [after, before), as {day start: count}; ``images`` counts the image
+        posts that were skipped instead (the archive's daily totals include them)."""
         rows = self.db.execute(
             "SELECT CAST(created_utc / 86400 AS INTEGER) * 86400 d, COUNT(*) n FROM posts "
-            "WHERE subreddit = ? COLLATE NOCASE AND created_utc >= ? AND created_utc < ? GROUP BY d",
-            (subreddit, after, before))
+            "WHERE subreddit = ? COLLATE NOCASE AND created_utc >= ? AND created_utc < ? AND image = ? GROUP BY d",
+            (subreddit, after, before, int(images)))
         return {r["d"]: r["n"] for r in rows}
 
     def comment_coverage(self, subreddit: str, after: float, before: float) -> list[sqlite3.Row]:
@@ -169,7 +185,7 @@ class Store:
             "SELECT p.id, p.subreddit, p.title, p.num_comments, p.score, p.created_utc, p.permalink, "
             "(SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS saved_comments "
             "FROM posts p WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? "
-            "ORDER BY p.created_utc DESC", (subreddit, after, before)).fetchall()
+            "AND p.image = 0 ORDER BY p.created_utc DESC", (subreddit, after, before)).fetchall()
 
     def posts_by_ids(self, ids) -> list[sqlite3.Row]:
         ids = list(ids)
@@ -192,16 +208,17 @@ class Store:
 
     def subreddits(self) -> list[str]:
         rows = self.db.execute(
-            "SELECT subreddit, MAX(fetched_at) f FROM posts GROUP BY subreddit COLLATE NOCASE ORDER BY f DESC")
+            "SELECT subreddit, MAX(fetched_at) f FROM posts WHERE image = 0 GROUP BY subreddit COLLATE NOCASE "
+            "ORDER BY f DESC")
         return [r["subreddit"] for r in rows]
 
     def datasets(self) -> list[dict]:
         """One entry per stored subreddit, most recently fetched first: name, posts, comments, last_fetched."""
         rows = self.db.execute(
-            "SELECT subreddit, COUNT(*) n, MAX(fetched_at) f FROM posts "
+            "SELECT subreddit, COUNT(*) n, MAX(fetched_at) f FROM posts WHERE image = 0 "
             "GROUP BY subreddit COLLATE NOCASE ORDER BY f DESC").fetchall()
         comments = {r["s"].lower(): r["n"] for r in self.db.execute(
-            "SELECT subreddit s, COUNT(*) n FROM comments GROUP BY subreddit COLLATE NOCASE")}
+            "SELECT c.subreddit s, COUNT(*) n FROM comments c WHERE " + NOT_IMAGE + " GROUP BY c.subreddit COLLATE NOCASE")}
         return [{"name": r["subreddit"], "posts": r["n"], "comments": comments.get(r["subreddit"].lower(), 0),
                  "last_fetched": r["f"]} for r in rows]
 
@@ -212,25 +229,26 @@ class Store:
 
     def posts(self, subreddit: str) -> list[sqlite3.Row]:
         return self.db.execute(
-            "SELECT * FROM posts WHERE subreddit = ? COLLATE NOCASE ORDER BY created_utc DESC",
+            "SELECT * FROM posts WHERE subreddit = ? COLLATE NOCASE AND image = 0 ORDER BY created_utc DESC",
             (subreddit,)).fetchall()
 
     def posts_since(self, subreddit: str, ts: float) -> list[sqlite3.Row]:
         """Posts saved at or after ``ts``, oldest first: what a running fetch has added."""
         return self.db.execute(
-            "SELECT * FROM posts WHERE subreddit = ? COLLATE NOCASE AND fetched_at >= ? ORDER BY fetched_at",
+            "SELECT * FROM posts WHERE subreddit = ? COLLATE NOCASE AND fetched_at >= ? AND image = 0 "
+            "ORDER BY fetched_at",
             (subreddit, ts)).fetchall()
 
     def comments_since(self, subreddit: str, ts: float) -> list[sqlite3.Row]:
         return self.db.execute(
             "SELECT c.*, p.title AS post_title FROM comments c LEFT JOIN posts p ON p.id = c.post_id "
-            "WHERE c.subreddit = ? COLLATE NOCASE AND c.fetched_at >= ? ORDER BY c.fetched_at",
+            "WHERE c.subreddit = ? COLLATE NOCASE AND c.fetched_at >= ? AND " + NOT_IMAGE + " ORDER BY c.fetched_at",
             (subreddit, ts)).fetchall()
 
     def comments(self, subreddit: str) -> list[sqlite3.Row]:
         return self.db.execute(
             "SELECT c.*, p.title AS post_title FROM comments c LEFT JOIN posts p ON p.id = c.post_id "
-            "WHERE c.subreddit = ? COLLATE NOCASE ORDER BY c.created_utc DESC",
+            "WHERE c.subreddit = ? COLLATE NOCASE AND " + NOT_IMAGE + " ORDER BY c.created_utc DESC",
             (subreddit,)).fetchall()
 
     def delete_subreddit(self, subreddit: str) -> None:
@@ -262,10 +280,12 @@ class Store:
     def day_counts(self, subreddit: str) -> dict[int, tuple[int, int]]:
         """Saved posts and comments per UTC day, by when each was created, as {day start: (posts, comments)}."""
         days: dict[int, list[int]] = {}
-        for i, table in enumerate(("posts", "comments")):
+        for i, (table, visible) in enumerate((("posts", "image = 0"),
+                                              ("comments", NOT_IMAGE.replace("c.", "")))):
             for r in self.db.execute(
                     f"SELECT CAST(created_utc / 86400 AS INTEGER) * 86400 d, COUNT(*) n FROM {table} "
-                    "WHERE subreddit = ? COLLATE NOCASE AND created_utc IS NOT NULL GROUP BY d", (subreddit,)):
+                    f"WHERE subreddit = ? COLLATE NOCASE AND created_utc IS NOT NULL AND {visible} GROUP BY d",
+                    (subreddit,)):
                 days.setdefault(r["d"], [0, 0])[i] = r["n"]
         return {d: (p, c) for d, (p, c) in days.items()}
 

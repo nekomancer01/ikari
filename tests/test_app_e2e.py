@@ -204,6 +204,36 @@ def test_removed_posts_are_not_saved(env):
     assert saved and not saved & removed
 
 
+def test_image_posts_are_skipped_hidden_and_count_as_checked(env):
+    # Some of the archive's posts are pictures: they aren't shown, scored, exported or given comments, but the
+    # archive's day counts include them, so coverage counts them as checked and a day can still read complete.
+    w = env.window()
+    after, before = w.fetch_form.bounds()
+    pics = [p for p in env.archive.posts if p["subreddit"] == "Python" and after <= p["created_utc"] < before
+            and not p.get("removed_by_category")][::3]
+    for p in pics:
+        p.update(url="https://i.redd.it/x.jpeg", selftext="", post_hint="image")
+    with_words = pics[0]
+    with_words["selftext"] = "my desk, details below"  # a picture with real text stays
+    ids = {p["id"] for p in pics[1:]}
+    fetch(w, comments=True)
+    s = env.store()
+    saved = {r["id"] for r in s.posts("python")}
+    assert saved and not saved & ids and with_words["id"] in saved
+    assert not [c for c in s.comments("python") if c["post_id"] in ids]
+    assert w.store.datasets()[0]["posts"] == len(saved)
+    csv_path = os.path.join(os.path.dirname(env.db), "p.csv")
+    s.export_csv("python", "posts", csv_path)
+    assert not any(i in open(csv_path, encoding="utf-8-sig").read() for i in ids)
+    cov = open_coverage(w)
+    skipped = w.store.posts_per_day("python", cov.days[-1], cov.days[0] + DAY, images=True)
+    assert sum(skipped.values()) == len(ids)
+    assert all(cov.day_table.cellWidget(r, 1).side.text() == "✓ Complete"
+               for r, d in enumerate(cov.days) if d >= w.fetch_form.bounds()[0] and d < coverage.today())
+    fetch(w, comments=False)  # a repeat fetch doesn't save them either
+    assert not {r["id"] for r in env.store().posts("python")} & ids
+
+
 def test_all_comments_fetches_each_whole_thread_and_is_remembered(env):
     w = env.window()
     w.fetch_form.comments_per_post.setValue(0)

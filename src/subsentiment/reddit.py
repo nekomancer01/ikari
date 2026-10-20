@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import Callable
 
@@ -29,6 +30,7 @@ class Post:
     created_utc: float
     permalink: str
     url: str
+    image: bool = False  # a picture or gallery with no text of its own: skipped, never shown or scored
 
     @property
     def text(self) -> str:
@@ -47,6 +49,25 @@ class Comment:
     created_utc: float
     depth: int
     permalink: str
+
+
+_IMAGE_HOSTS = ("i.redd.it", "preview.redd.it", "i.imgur.com", "imgur.com")
+_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+
+
+def is_image_post(url: str | None, selftext: str | None, post_hint: str = "", gallery=False) -> bool:
+    """Whether a post is just a picture: it links to an image (Reddit's own or imgur, a file ending in an
+    image extension) or a gallery, or the archive says so (``post_hint`` "image", ``gallery``), and has no
+    text of its own. A text post with a picture in it, or a link to an article, is not one. Saved posts
+    carry only url and selftext, so those two alone must be enough."""
+    if (selftext or "").strip():
+        return False
+    if post_hint == "image" or str(gallery).lower() == "true":  # the archive sometimes sends flags as text
+        return True
+    parts = urlsplit(url or "")
+    host, path = (parts.hostname or "").lower(), parts.path.lower()
+    return (host in _IMAGE_HOSTS or path.endswith(_IMAGE_EXTENSIONS)
+            or (host.endswith("reddit.com") and path.startswith("/gallery/")))
 
 
 _INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))  # come along with pasted text
