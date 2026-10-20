@@ -1,26 +1,22 @@
 from __future__ import annotations
 
-import heapq
 import time
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QDate, QItemSelectionModel, QSettings, QSize, Qt, QThread, QTimer, QUrl
-from PySide6.QtGui import (
-    QAction, QActionGroup, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence,
-)
+from PySide6.QtCore import QDate, QSettings, QSize, Qt, QThread, QTimer
+from PySide6.QtGui import QAction, QActionGroup, QFontMetrics, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog, QFormLayout,
-    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStackedWidget, QTableView, QTabBar,
-    QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
+    QHeaderView, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QScrollArea, QSizePolicy, QSpinBox, QStackedWidget, QTabBar, QVBoxLayout, QWidget,
 )
 
 from subsentiment import __version__, collect
 from subsentiment.analysis import Analysis
 from subsentiment.gui import days, native, theme
 from subsentiment.gui.coverage import CoverageWindow
-from subsentiment.gui.models import COMMENT_COLUMNS, PENDING, POST_COLUMNS, RowsModel
 from subsentiment.gui.overview import OverviewPage
+from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.widgets import (
@@ -60,14 +56,6 @@ def range_bounds(key: str, start: QDate, end: QDate, now: datetime | None = None
     first = datetime(lo.year(), lo.month(), lo.day())
     last = datetime(hi.year(), hi.month(), hi.day()) + timedelta(days=1)  # "to" includes that whole day
     return first.timestamp(), last.timestamp()
-
-
-def header_font(base: QFont) -> QFont:
-    """The table-header font the stylesheet draws with (8.5pt semibold)."""
-    font = QFont(base)
-    font.setPointSizeF(8.5)
-    font.setWeight(QFont.Weight.DemiBold)
-    return font
 
 
 def date_edit() -> QDateEdit:
@@ -138,228 +126,6 @@ def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
 
 def when_text(ts: float | None) -> str:
     return datetime.fromtimestamp(ts).strftime("%d %b %Y, %H:%M") if ts else "never"
-
-
-class TablePage(QWidget):
-    """Filterable, sortable table on a solid panel; double-click opens the item on Reddit."""
-
-    SHRINKS = ("author", "post_title")  # free text that can end in "…" to leave room for the main text
-    OPTIONAL = ("author", "post_title", "num_comments")  # hidden in this order when there's still no room
-    FIXED = ("sentiment", "created_utc")  # written in a fixed format: "+0.123", "2026-10-20 03:54"
-
-    def __init__(self, columns, stretch_col: int):
-        super().__init__()
-        self.model = RowsModel(columns)
-        self._all_rows: list = []
-        self._ids: set[str] = set()
-        self._text_key = columns[stretch_col][1]
-        self._haystacks: dict[str, str] = {}  # row id -> its text lowercased on one line, once filtered by
-
-        self.filter = QLineEdit()
-        self.filter.setPlaceholderText("Filter by text…")
-        self.filter.setClearButtonEnabled(True)
-        self.filter.textChanged.connect(lambda _: self._apply_filters())
-        self.label_filter = QComboBox()
-        self.label_filter.addItems(["All labels", "Positive", "Neutral", "Negative"])
-        self.label_filter.currentTextChanged.connect(lambda _: self._apply_filters())
-        self.count = label("", "muted")
-
-        self.view = QTableView()
-        self.view.setModel(self.model)
-        self.view.setSortingEnabled(True)
-        self.view.sortByColumn(0, Qt.SortOrder.AscendingOrder)
-        self.view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.view.setAlternatingRowColors(True)
-        self.view.setShowGrid(False)
-        self.view.setMouseTracking(True)
-        self.view.verticalHeader().hide()
-        self.view.verticalHeader().setDefaultSectionSize(34)
-        self.view.setWordWrap(False)
-        self.view.setFrameShape(QFrame.Shape.NoFrame)
-        self.stretch_col = stretch_col
-        header = self.view.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(stretch_col, QHeaderView.ResizeMode.Stretch)
-        header.setHighlightSections(False)
-        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.view.doubleClicked.connect(self._open)
-
-        card, inner = panel("solid", margins=14, spacing=10)
-        top = QHBoxLayout()
-        top.setSpacing(10)
-        top.addWidget(self.filter, 1)
-        top.addWidget(self.label_filter)
-        top.addWidget(self.count)
-        inner.addLayout(top)
-        inner.addWidget(self.view)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(card)
-        for sig in (self.model.rowsInserted, self.model.rowsRemoved, self.model.modelReset):
-            sig.connect(self._update_count)
-
-    @property
-    def all_rows(self) -> list:
-        """Every row loaded or added, whatever the filters show."""
-        return self._all_rows
-
-    def load(self, rows) -> None:
-        self._all_rows = rows
-        self._ids = {r["id"] for r in rows}
-        self._haystacks = {}
-        self._apply_filters()
-
-    def add_rows(self, rows) -> int:
-        """Add rows a running fetch has just saved; they fade in. Returns how many were new."""
-        new = [r for r in rows if r["id"] not in self._ids]
-        self._ids.update(r["id"] for r in new)
-        self._all_rows.extend(new)
-        shows = self._matcher()
-        self.model.append_rows([r for r in new if shows is None or shows(r)])
-        return len(new)
-
-    def update_rows(self, rows) -> int:
-        """Bring in rows a finished fetch saved: ones saved again (new scores) replace the rows shown, the
-        rest are added and fade in. Returns how many shown rows changed."""
-        where = {r["id"]: i for i, r in enumerate(self._all_rows)}
-        new, changed = [], []
-        for r in rows:
-            i = where.get(r["id"])
-            if i is None:
-                new.append(r)
-            elif self._all_rows[i] != r:  # most were dripped in as they were saved, and are unchanged
-                self._all_rows[i] = r
-                self._haystacks.pop(r["id"], None)
-                changed.append(r)
-        self._ids.update(r["id"] for r in new)
-        self._all_rows.extend(new)
-        shows = self._matcher()
-        if shows is None:
-            self.model.update_rows(changed + new)
-        else:  # a rescored row can change its label
-            self.model.set_rows(list(filter(shows, self._all_rows)), animate=True)
-        self._update_count()
-        return len(changed)
-
-    def _matcher(self):
-        """Whether a row passes the label and text filters, or None when nothing is filtered."""
-        label = self.label_filter.currentText().lower()
-        needle = " ".join(self.filter.text().lower().split())
-        if label == "all labels" and not needle:
-            return None
-        key, hays = self._text_key, self._haystacks
-
-        def shows(row) -> bool:
-            if label != "all labels" and row["label"] != label:
-                return False
-            if not needle:
-                return True
-            hay = hays.get(row["id"])
-            if hay is None:  # the text on one line, lowercased, kept for the next keystroke
-                hay = hays[row["id"]] = " ".join((row[key] or "").lower().split())
-            return needle in hay
-        return shows
-
-    def _apply_filters(self) -> None:
-        shows = self._matcher()
-        if not self.filter.text():
-            self._haystacks = {}  # a copy of every row's text; only needed while there is a filter
-        chosen = self.view.selectionModel().selectedRows()
-        selected = {self.model.row_at(i.row())["id"] for i in chosen}
-        current = self.view.currentIndex()
-        current_id = self.model.row_at(current.row())["id"] if current.isValid() else None
-        self.model.set_rows(self._all_rows if shows is None else list(filter(shows, self._all_rows)))
-        if current_id or 0 < len(selected) <= 1000:  # rows picked before still are, if the filters show them
-            for i, r in enumerate(self.model.rows):
-                if r["id"] == current_id:
-                    self.view.selectionModel().setCurrentIndex(
-                        self.model.index(i, current.column()), QItemSelectionModel.SelectionFlag.NoUpdate)
-                if r["id"] in selected:
-                    self.view.selectionModel().select(
-                        self.model.index(i, 0),
-                        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
-        if not self.filter.text():  # typing a filter keeps the columns as they are
-            self._fit_columns()
-        self._update_count()
-
-    def _fit_columns(self) -> None:
-        """Size each column to its values and its full header title, leaving the rest to the text column.
-
-        Qt's own sizing leaves out room for the sort arrow, so a sorted column's title got cut short."""
-        self.view.ensurePolished()  # the stylesheet's font and padding, before the window first shows
-        header = self.view.horizontalHeader()
-        font = header_font(self.view.font())
-        header.setFont(font)  # Qt elides header titles using the widget's font, not the stylesheet's
-        metrics = QFontMetrics(font)
-        self._widths = {}  # column -> (width for its values, narrowest that still shows its title)
-        for col in range(self.model.columnCount()):
-            if col != self.stretch_col:
-                title = self.model.headerData(col, Qt.Orientation.Horizontal)
-                least = metrics.horizontalAdvance(title) + 16 + 24 + 8  # padding, sort arrow, slack
-                self._widths[col] = (max(self._values_width(col), least), least)
-        self._share_width()
-
-    def _values_width(self, col: int) -> int:
-        """How wide the column's widest value draws. Qt's sizeHintForColumn measured up to 1,000 rows
-        through Python calls per column; this measures one cell for the padding (and the label's swatch)
-        and the text of the column's longest distinct values."""
-        rows = self.model.rows
-        if not rows:
-            return 0
-        _, key, fmt = self.model.columns[col]
-        if key in self.FIXED:  # every value is written the same length: sample both ends of the sort order,
-            values = {r[key] for r in rows[:150] + rows[-150:]}  # so both signs and many digits are measured
-        else:
-            values = {r[key] for r in rows}
-            if len(values) > 300:  # numbers, names, titles: the widest are among the longest written ones
-                values = heapq.nlargest(300, values, key=lambda v: len(str(v)) if v is not None else 1)
-        texts = [fmt(v) if v is not None else ("–" if key in PENDING else "") for v in values]
-        metrics = QFontMetrics(self.view.font())
-        cell = self.view.sizeHintForIndex(self.model.index(0, col)).width()
-        padding = cell - metrics.horizontalAdvance(self.model.data(self.model.index(0, col)) or "")
-        return padding + max(metrics.horizontalAdvance(t) for t in texts)
-
-    def _share_width(self) -> None:
-        """Keep room for the text column (the title, the comment). A comment's post title and the author
-        used to take so much that the comment itself showed as "T…".
-
-        First the free-text columns (author, post title) give up width down to their titles and their
-        values end in "…"; if the text column still has under 40% of the width, the least needed columns
-        are hidden, author first."""
-        widths = getattr(self, "_widths", None)
-        if not widths:
-            return
-        keys = {col: self.model.columns[col][1] for col in widths}
-        room = self.view.viewport().width()
-        hidden = set()
-        for key in (None, *self.OPTIONAL):
-            if key is not None:
-                hidden |= {col for col, k in keys.items() if k == key}
-            shown = {col: wl for col, wl in widths.items() if col not in hidden}
-            fixed = sum(w for col, (w, _) in shown.items() if keys[col] not in self.SHRINKS)
-            loose = {col: wl for col, wl in shown.items() if keys[col] in self.SHRINKS}
-            spare = sum(w - least for w, least in loose.values())
-            over = fixed + sum(w for w, _ in loose.values()) - room * 0.6
-            give = min(1.0, over / spare) if over > 0 and spare > 0 else (0.0 if over <= 0 else 1.0)
-            used = fixed + sum(round(w - (w - least) * give) for w, least in loose.values())
-            if room - used >= room * 0.4 or key == self.OPTIONAL[-1]:
-                break
-        header = self.view.horizontalHeader()
-        for col, (w, least) in widths.items():
-            header.setSectionHidden(col, col in hidden)
-            header.resizeSection(col, round(w - (w - least) * give) if keys[col] in self.SHRINKS else w)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._share_width()
-
-    def _update_count(self, *args) -> None:
-        self.count.setText(plural(self.model.rowCount(), "row"))
-
-    def _open(self, index) -> None:
-        row = self.model.row_at(index.row())
-        QDesktopServices.openUrl(QUrl(row["permalink"]))
 
 
 class MainWindow(QMainWindow):
