@@ -549,6 +549,54 @@ def motion_check(e):
     e["notes"].append(f"setting saved as {QSettings().value('ui/reduce_motion')!r} after unchecking")
 
 
+@step("timeline: range buttons, wheel zoom, drag and double-click on the Overview's timeline")
+def timeline(e):
+    from PySide6.QtCore import QPoint, QPointF
+    from PySide6.QtGui import QWheelEvent
+
+    t = w.overview.timeline
+    w.tabbar.setCurrentIndex(0)
+    pump(0.5)
+    if not hasattr(t, "presets"):
+        e["notes"].append("no zoomable timeline on this main")
+        return
+
+    def span(label):
+        lo, hi = t.view or t.domain()
+        e["notes"].append(f"{label}: {(hi - lo) / 86400:.1f} days in view, {len(t.visible())} points, "
+                          f"checked {[k for k, b in t.presets.items() if b.isChecked()]}")
+
+    span("start")
+    click(t.presets["1w"])
+    pump(0.8)
+    span("1w button")
+    e["shots"].append(shot(w, "timeline-1w"))
+    click(t.presets["All"])
+    pump(0.8)
+    span("All button")
+    plot = t._areas()[0]
+    mid = plot.center()
+    for _ in range(3):
+        ev = QWheelEvent(QPointF(mid), QPointF(t.mapToGlobal(mid.toPoint())), QPoint(0, 0), QPoint(0, 120),
+                         Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+        QApplication.sendEvent(t, ev)
+        pump(0.15)
+    pump(0.6)
+    span("3 wheel notches up")
+    e["shots"].append(shot(w, "timeline-wheel"))
+    a, b = QPoint(int(plot.left() + plot.width() * 0.2), int(mid.y())), QPoint(int(plot.left() + plot.width() * 0.5), int(mid.y()))
+    QTest.mousePress(t, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, a)
+    for k in range(1, 11):
+        QTest.mouseMove(t, a + (b - a) * (k / 10))
+        pump(0.02)
+    QTest.mouseRelease(t, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, b)
+    pump(0.8)
+    span("drag across a third of the plot")
+    QTest.mouseDClick(t, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, mid.toPoint())
+    pump(0.8)
+    span("double-click")
+
+
 @step("export: File > Export posts and comments as CSV")
 def export(e):
     for kind, act, view in (("posts", w.export_posts, w.posts_tab), ("comments", w.export_comments, w.comments_tab)):
@@ -637,7 +685,7 @@ def delete(e):
     e["shots"].append(shot(w, "after-delete"))
 
 
-for fn in (first_launch, small_fetch, busy_fetch, stop_midway, days_pick, look_around, motion_check, export, comments_all, coverage_open, coverage_day,
+for fn in (first_launch, small_fetch, busy_fetch, stop_midway, days_pick, look_around, motion_check, timeline, export, comments_all, coverage_open, coverage_day,
            coverage_comments, delete):
     fn()
 
