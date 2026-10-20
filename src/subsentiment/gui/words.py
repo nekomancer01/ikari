@@ -38,23 +38,26 @@ class WordTally(QObject):
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
-        self.counts = {k: WordCounts(k) for k in KINDS}
+        self._seen = {k: {} for k in KINDS}  # {id: (text, words)}: each row's text is split into words once
+        self.counts = {k: WordCounts(k, (), self._seen[k]) for k in KINDS}
         self.ready = True
         self._pending: dict[str, list] = {k: [] for k in KINDS}  # rows added while a recount runs
-        self._seen = {k: {} for k in KINDS}  # {id: (text, words)}: each row's text is split into words once
         self._slices = Slices(self)
         self._version = 0  # counts every change to the counts, for top()
         self._top, self._top_for = [], None
 
-    def count(self, posts: list, comments: list) -> None:
+    def count(self, posts: list, comments: list, fresh: bool = False) -> None:
         """Count these rows' words instead. Rows the counts have already are kept, so moving the span a few days
-        only counts the days it gained and takes off the ones it left."""
+        only counts the days it gained and takes off the ones it left; ``fresh`` (rows that may have been saved
+        again with a new label or text) counts them all again, still without splitting a known text again."""
         self._slices.stop()
         self._pending = {k: [] for k in KINDS}  # rows added for an earlier count's rows don't carry over
         rows = {"posts": list(posts), "comments": list(comments)}
         if sum(map(len, self._seen.values())) > self.SEEN_MAX:
             self._seen = {k: {} for k in KINDS}
-        if self.ready:
+            for k in KINDS:
+                self.counts[k].seen = self._seen[k]
+        if self.ready and not fresh:
             ids = {k: {r["id"] for r in rows[k]} for k in KINDS}
             gone = {k: self.counts[k].ids() - ids[k] for k in KINDS}
             new = {k: [r for r in rows[k] if r["id"] not in self.counts[k].ids()] for k in KINDS}

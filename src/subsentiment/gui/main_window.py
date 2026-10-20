@@ -781,6 +781,7 @@ class MainWindow(QMainWindow):
         self.coverage.refresh_saved()
 
     def _on_finished(self, result: collect.FetchResult) -> None:
+        self._loaded.clear()  # what it saved (scores too) is read again, not shown from memory
         self.progress_msg.setText(finish_text(result, self.request))
         self._live.stop()
         self._flush_rows()
@@ -796,6 +797,8 @@ class MainWindow(QMainWindow):
         """Bring what the finished fetch saved into the dataset on screen: rows it saved again (new scores)
         and any not dripped in yet. Reading back only these, not every saved row, keeps a big subreddit
         from freezing the window for seconds as the fetch ends."""
+        if self._span_slices.running():  # the tables are mid-way to a new span: finish it with the rows as they are
+            self._apply_span()
         dropped: set[str] = set()
         for kind, read, tab in (("posts", self.store.posts_since, self.posts_tab),
                                 ("comments", self.store.comments_since, self.comments_tab)):
@@ -822,6 +825,7 @@ class MainWindow(QMainWindow):
         self._render_overview()
 
     def _on_failed(self, message: str) -> None:
+        self._loaded.clear()
         self._live.stop()
         self._flush_rows()
         # Show anything stored before the error, unless the user went to look at another subreddit.
@@ -985,7 +989,8 @@ class MainWindow(QMainWindow):
             pass
 
     def _span_steps(self, reload: bool = False):
-        """_apply_span's work, yielding between the steps that take a while."""
+        """_apply_span's work, yielding between the steps that take a while. Each table takes its rows from
+        _saved in its own step, so rows a running fetch adds in between are in them."""
         whole = days.whole(self.span)
         if whole == self._table_days and not reload:
             return
@@ -994,14 +999,13 @@ class MainWindow(QMainWindow):
         self._drip.stop()
         self._queued = {"posts": [], "comments": []}
         self.posts = days.keep(self._saved["posts"], whole)
-        self.comments = days.keep(self._saved["comments"], whole)
-        self._update_dataset_labels()
-        yield
         self.posts_tab.load(self.posts)
         yield
+        self.comments = days.keep(self._saved["comments"], whole)
         self.comments_tab.load(self.comments)
+        self._update_dataset_labels()
         yield
-        self.word_tally.count(self.posts, self.comments)
+        self.word_tally.count(self.posts, self.comments, fresh=reload)
 
     @property
     def min_score(self) -> int | None:
@@ -1093,6 +1097,7 @@ class MainWindow(QMainWindow):
                 "This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_subreddit(self.current)
+        self._loaded.clear()
         for key in days.settings_keys(self.current):
             self.settings.remove(key)
         self.statusBar().showMessage(f"Deleted the saved data for r/{self.current}.", 8000)
@@ -1108,6 +1113,7 @@ class MainWindow(QMainWindow):
                 "This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_all()
+        self._loaded.clear()
         self.settings.remove("ui/last_dataset")
         self.settings.remove(days.SETTINGS_GROUP)
         self.settings.remove(days.RANGE_GROUP)

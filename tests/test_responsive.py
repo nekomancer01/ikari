@@ -167,3 +167,11 @@ def test_moving_the_span_counts_only_the_rows_it_gained_and_lost():
     assert tally.ready  # at once
     fresh = WordCounts("comments", rows[500:2500])
     assert tally.top(["comments"], 50) == WordCounts.top(fresh, n=50)
+
+
+def test_rows_saved_again_with_a_new_label_are_counted_again_when_the_span_reloads():
+    QApplication.instance() or QApplication([])
+    tally = WordTally()
+    tally.count([{"id": "a", "title": "happy banana", "selftext": "", "label": "positive"}], [])
+    tally.count([{"id": "a", "title": "sad banana", "selftext": "", "label": "negative"}], [], fresh=True)
+    assert tally.top(["posts"]) == [("banana", 1, -1.0), ("sad", 1, -1.0)]
