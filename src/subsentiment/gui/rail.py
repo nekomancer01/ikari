@@ -1,4 +1,4 @@
-"""The navigation rail down the window's left edge, and the segmented switch the header's range presets use.
+"""The navigation rail down the window's left edge.
 
 The rail has one button per page (Overview, Timeline, Words, Posts, Comments, Coverage) and two that open a drawer
 beside it instead of a page: Fetch at the top and Saved at the bottom. Icons are drawn here, in the theme's
@@ -8,9 +8,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import (
-    QAbstractButton, QButtonGroup, QFrame, QHBoxLayout, QPushButton, QSizePolicy, QSpacerItem, QVBoxLayout,
-)
+from PySide6.QtWidgets import QAbstractButton, QButtonGroup, QFrame, QSizePolicy, QSpacerItem, QVBoxLayout
 
 from subsentiment.gui import theme
 from subsentiment.gui.theme import mark
@@ -177,34 +175,3 @@ class NavRail(QFrame):
         """Mark which drawer is open ("" for none), without sending anything."""
         for k in DRAWERS:
             self.buttons[k].setChecked(k == key)
-
-
-class Segmented(QFrame):
-    """A row of mutually exclusive choices drawn as one control (the header's 1W / 1M / 3M / All). Clicking
-    one sends ``chosen`` with its key; ``set_current`` marks one without sending, or none with ""."""
-
-    chosen = Signal(str)
-
-    def __init__(self, choices: dict[str, str]):
-        super().__init__()
-        mark(self, "segmented", True)
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(2, 2, 2, 2)
-        lay.setSpacing(0)
-        self.group = QButtonGroup(self)
-        self.group.setExclusive(False)  # so that none can be marked, when the chosen days match no preset
-        self.buttons: dict[str, QPushButton] = {}
-        for key, text in choices.items():
-            b = self.buttons[key] = QPushButton(text)
-            b.setCheckable(True)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.clicked.connect(lambda _=False, k=key: (self.set_current(k), self.chosen.emit(k)))
-            self.group.addButton(b)
-            lay.addWidget(b)
-
-    def set_current(self, key: str) -> None:
-        for k, b in self.buttons.items():
-            b.setChecked(k == key)
-
-    def current(self) -> str:
-        return next((k for k, b in self.buttons.items() if b.isChecked()), "")

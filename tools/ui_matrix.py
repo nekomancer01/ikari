@@ -237,7 +237,7 @@ def alignment(window) -> list[str]:
         _same(problems, "saved drawer right edges", {"list": _rect(window.datasets, side).right(),
                                                     "delete all": _rect(window.delete_all_btn, side).right()})
 
-    # The content column: heading, subtitle and the page below share a left edge; the presets end at its right.
+    # The content column: heading, subtitle and the page below share a left edge; the scope ends at its right.
     page = window.pages.currentWidget()
     if page is window.overview:
         tiles = list(window.overview.tiles.values())
@@ -263,18 +263,19 @@ def alignment(window) -> list[str]:
         _same(problems, "content left edges", {"heading": _rect(window.heading, window).left(),
                                                 "subtitle": _rect(window.subheading, window).left(),
                                                 "page": _rect(page, window).left()})
-    presets_right = _rect(window.presets, window).right()
-    slack = TOL
-    bar = page.verticalScrollBar() if hasattr(page, "verticalScrollBar") else None
-    if bar is not None and bar.isVisible():
-        slack += bar.width()  # a scrolling overview gives its scroll bar the last few pixels
-    if window.presets.isVisible() and abs(presets_right - content_right) > slack:
-        problems.append(f"out of line, the presets end at {presets_right} but the content ends at {content_right}")
-    # Header controls share a vertical centre with each other.
-    mids = {name: _rect(w, window).center().y() for name, w in
-            (("presets", window.presets), ("days", window.days_pick), ("scope", window.scope)) if w.isVisible()}
-    if mids and max(mids.values()) - min(mids.values()) > 2:
-        problems.append(f"out of line, header control centres {mids}")
+    # The header's last control (the Overview and Timeline's scope) ends where the content does, and sits
+    # level with the heading.
+    if window.scope.isVisible():
+        scope_right = _rect(window.scope, window).right()
+        slack = TOL
+        bar = page.verticalScrollBar() if hasattr(page, "verticalScrollBar") else None
+        if bar is not None and bar.isVisible():
+            slack += bar.width()  # a scrolling overview gives its scroll bar the last few pixels
+        if abs(scope_right - content_right) > slack:
+            problems.append(f"out of line, the scope ends at {scope_right} but the content ends at {content_right}")
+        mids = {"scope": _rect(window.scope, window).center().y(), "heading": _rect(window.heading, window).center().y()}
+        if max(mids.values()) - min(mids.values()) > 2:
+            problems.append(f"out of line, header centres {mids}")
     # The rail's buttons share a centre line and fit inside it.
     rail = window.rail
     _same(problems, "rail button centres", {k: _rect(b, rail).center().x() for k, b in rail.buttons.items()})

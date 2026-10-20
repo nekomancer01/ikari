@@ -16,12 +16,12 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, QSize, Qt  # noqa: E402
+from PySide6.QtCore import QPoint, QSettings, QSize, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox  # noqa: E402
 
 from subsentiment import arctic_shift  # noqa: E402
-from subsentiment.gui import coverage  # noqa: E402
+from subsentiment.gui import coverage, days  # noqa: E402
 from subsentiment.gui import tables  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import worker  # noqa: E402
@@ -982,46 +982,54 @@ def test_coverage_left_and_opened_again_mid_count_counts_without_an_error(env):
     assert cov.count_error == "" and all(d in cov.totals["python"] for d in cov.days)
 
 
-def test_choosing_days_never_downloads_and_a_fetch_only_adds_rows_from_chosen_days(env):
+def test_choosing_a_span_on_the_timeline_never_downloads_and_a_fetch_only_adds_rows_from_it(env):
+    """Ame: the Overview's sentiment follows the stretch of time picked on the chart, and the Days picker that
+    used to choose it is gone. Dragging across the timeline counts only those days on every page."""
     w = env.window()
     fetch(w, comments=False)  # the past week, so the month's fetch below adds more
     saved = w.store.day_counts("python")
-    day = max(d for d, (posts, _) in saved.items() if posts)
+    first = min(saved)
     env.archive.clear()
 
-    w.days_pick.showPopup()  # open the picker, keep only one day, close it
-    pump(50)
-    w.days_pick.picker.none_btn.click()
-    cal = w.days_pick.picker.calendar
-    QTest.mouseClick(cal, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, cal.rect_of(day).center())
-    pump(300)  # longer than the picker's settling delay
-    w.days_pick.hidePopup()
+    tl = w.overview.timeline
+    plot, _ = tl._areas()
+    lo, hi, _ = tl._screen
+    x0, x1 = (round(tl._x(t, lo, hi, plot)) for t in (first + 0.2 * DAY, first + 1.8 * DAY))
+    y = round(plot.center().y())
+    QTest.mousePress(tl, Qt.MouseButton.LeftButton, pos=QPoint(x0, y))
+    QTest.mouseMove(tl, QPoint(x1, y))
+    QTest.mouseRelease(tl, Qt.MouseButton.LeftButton, pos=QPoint(x1, y))
+    first_day, end = days.whole(w.span)
+    chosen = {d for d in saved if first_day <= d < end}
+    want = sum(saved[d][0] for d in chosen)
+    assert first in chosen and len(chosen) < len(saved)
+    assert w.overview.tiles["count"].value.text() == f"{want:,}"  # at once, before the tables follow
     for page in PAGES:  # Download coverage lists the Fetch range, not the chosen days, and asks for counts
         if page != "coverage":
             w.show_page(page)
             pump(30)
     pump(1200)
-    assert env.archive.paths() == []  # picking days only filters what's saved
-    assert w.chosen_days == {day} and len(w.posts) == saved[day][0]
+    assert env.archive.paths() == []  # choosing days only filters what's saved
+    assert len(w.posts) == w.posts_tab.model.rowCount() == want
+    assert sum(w.overview.distribution._counts.values()) == want
 
     env.archive.delay = 0.05
     w.fetch_form.subreddit.setText("python")
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
-    seen = 0
-    while w.fetch_job.busy:  # rows from other days are saved but not shown while the fetch runs
+    while w.fetch_job.busy:  # rows from other days are saved, and on the timeline, but not in the tables
         QApplication.processEvents()
         rows = [w.posts_tab.model.row_at(i) for i in range(w.posts_tab.model.rowCount())]
-        assert all(int(r["created_utc"] // DAY * DAY) == day for r in rows)
-        seen = max(seen, len(rows))
+        assert all(first_day <= r["created_utc"] < end for r in rows)
         time.sleep(0.01)
-    pump(50)
+    pump(400)
     env.archive.delay = 0
-    on_day = [r for r in env.store().posts("python") if int(r["created_utc"] // DAY * DAY) == day]
-    assert w.posts_tab.model.rowCount() == len(on_day) == len(w.posts)
-    assert len(w.days_pick.counts) > len(saved) or sum(p for p, _ in w.days_pick.counts.values()) > \
-        sum(p for p, _ in saved.values())  # the picker knows about what the fetch added
-    assert w.days_pick.currentText() != "All days"
+    every = env.store().posts("python")
+    assert days.whole(w.span) == (first_day, end)  # earlier days were added, not later ones: the span stays
+    in_span = [r for r in every if first_day <= r["created_utc"] < end]
+    assert w.posts_tab.model.rowCount() == len(in_span) == len(w.posts)
+    assert sum(n for _, _, n in tl.points) == len(every) > len(in_span)  # the timeline has every day
+    assert w.overview.tiles["count"].value.text() == f"{len(in_span):,}"
 
 
 def test_a_second_fetch_into_a_shown_subreddit_ends_without_reading_it_all_back(env, monkeypatch):
@@ -1074,7 +1082,7 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
     assert o.distribution._counts == {k: sum(r["label"] == k for r in rows) for k in ("negative", "neutral", "positive")}
     assert sum(n for _, _, n in o.timeline.points) == want
     assert f"· {want:,}\xa0posts ·" in w.subheading.full_text() and w.subheading.text().startswith("Last fetched")
-    assert sum(p for p, _ in w.days_pick.counts.values()) == want
+    assert w._analysis["posts"].count == want
     pump(800)  # what reads the store again does so once a second
     assert w.fetch_job.busy
     assert w.storage_info.text().startswith(f"{want}\xa0posts")
@@ -1133,3 +1141,7 @@ def test_a_zoomed_timeline_keeps_up_with_a_fetch(env):
     assert [d for d, _, _ in tl.points] == sorted(saved)
     a, b = tl.domain()
     assert tl.view == (b - 7 * DAY, b) and tl.preset == "1w" and (a, b) == (min(saved), max(saved) + DAY)
+    week = [r for r in env.store().posts("Zoom") if r["created_utc"] >= b - 7 * DAY]
+    assert w.overview.tiles["count"].value.text() == f"{len(week):,}"  # the tiles count the week in view
+    pump(400)  # the tables' settling delay
+    assert len(w.posts) == w.posts_tab.model.rowCount() == len(week)

@@ -20,7 +20,7 @@ from subsentiment.gui.coverage import CoveragePage
 from subsentiment.gui.fetch_form import FetchForm
 from subsentiment.gui.charts import NoteDialog, TimelineChart
 from subsentiment.gui.overview import CardPage, OverviewPage, coming_soon
-from subsentiment.gui.rail import DRAWERS, PAGES, NavRail, Segmented
+from subsentiment.gui.rail import DRAWERS, PAGES, NavRail
 from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
@@ -33,8 +33,6 @@ from subsentiment.store import Store
 
 
 SCOPES = ["Posts and comments", "Posts only", "Comments only"]
-# The header's range presets: key -> (label, newest saved days kept; None for every day).
-PRESETS = {"week": ("1W", 7), "month": ("1M", 30), "quarter": ("3M", 91), "all": ("All", None)}
 DRAWER_WIDTH = 318
 NO_DATA = "Open Fetch on the left, enter a subreddit and press Fetch and analyse."
 
@@ -151,27 +149,37 @@ class MainWindow(QMainWindow):
         self._drip = QTimer(self)  # releases fetched rows into the tables a few at a time, so each is seen
         self._drip.setInterval(40)
         self._drip.timeout.connect(self._release_rows)
-        # The overview and day picker follow the rows the drip releases, a few times a second: often enough to
-        # read as live, rarely enough that each change has time to ease in.
+        # The overview follows the rows a running fetch saves, a few times a second: often enough to read as
+        # live, rarely enough that each change has time to ease in.
         self._shown_live = QTimer(self)
         self._shown_live.setSingleShot(True)
         self._shown_live.setInterval(250)
-        self._shown_live.timeout.connect(self._show_released)
+        self._shown_live.timeout.connect(self._render_overview)
+        # The tables follow the timeline's span once it settles, not at every step of a drag or a zoom.
+        self._span_settled = QTimer(self)
+        self._span_settled.setSingleShot(True)
+        self._span_settled.setInterval(300)
+        self._span_settled.timeout.connect(self._apply_span)
         self._queued: dict[str, list] = {"posts": [], "comments": []}
         self._queued_ids: set[str] = set()
         self._since = 0.0  # rows saved since this moment belong to the running fetch
         # How far each table has read the running fetch's rows, so each save reads only what's new.
         self._read_to = {"posts": 0.0, "comments": 0.0}
         self._follow = False  # show the subreddit being fetched, until the user picks another one
-        self.posts: list = []  # what the analysis counts: the saved rows from the chosen days
+        self.posts: list = []  # what the tables show and export writes: the saved rows from the days in the span
         self.comments: list = []
-        self._analysis = {"posts": Analysis(), "comments": Analysis()}  # what the overview counts, kept up as rows arrive
+        # Every saved row of the subreddit shown, kept up as a running fetch saves more; the overview counts the
+        # days of it in the span.
+        self._analysis = {"posts": Analysis(), "comments": Analysis()}
         self._last_fetched: float | None = None  # newest fetched_at among self.posts
         self._saved: dict[str, list] = {"posts": [], "comments": []}  # every saved row of the subreddit shown
-        self._day_counts: dict[int, tuple[int, int]] = {}
-        self.chosen_days: set[int] | None = None  # None: every day
-        self._known: dict[str, set[str]] = {}  # ids already in _day_counts, once a running fetch is counted in
-        self._days_changed = False  # _day_counts has days the day picker hasn't been given yet
+        # The span of days every page counts, as the timeline shows it: [lo, hi) in epoch seconds, None for
+        # every day; and the timeline's range button it came from, if any.
+        self.span: tuple[float, float] | None = None
+        self._preset: str | None = "All"
+        self._table_days: tuple[int, int] | None = None  # the whole days the tables were filtered to
+        self._following = False  # the timelines are being given new days
+        self._known: dict[str, set[str]] = {}  # ids already in _saved and _analysis, once a running fetch is counted in
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
         # A native material (Mica/Acrylic/vibrancy) needs a translucent window from the start,
         # so a change applies on next launch.
@@ -378,13 +386,6 @@ class MainWindow(QMainWindow):
         saved = self.settings.value("ui/overview_scope", SCOPES[0], str)
         self.scope.setCurrentIndex(max(self.scope.findText(saved), 0))
         self.scope.currentTextChanged.connect(self._on_scope_changed)
-        # Which saved days every page counts (both tables and CSV export too). Picking never fetches.
-        self.days_pick = mark(days.DaysCombo(), "pill", True)
-        self.days_pick.chosen_changed.connect(self._on_days_chosen)
-        # Shortcuts to the saved days: the newest week, month or three months of them, or every day.
-        self.presets = Segmented({key: text for key, (text, _) in PRESETS.items()})
-        self.presets.setToolTip("Show only the newest saved days")
-        self.presets.chosen.connect(self._on_preset)
         self.heading.setMinimumWidth(QFontMetrics(theme.display_font(14, 600)).horizontalAdvance("r/subreddit"))
 
         # The fetch running, or what the last one did, on every page: the drawer it started from closes.
@@ -399,13 +400,9 @@ class MainWindow(QMainWindow):
         header.setVerticalSpacing(2)
         header.addWidget(self.heading, 0, 0, Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.scope, 0, 1, Qt.AlignmentFlag.AlignVCenter)
-        header.addWidget(self.days_pick, 0, 2, Qt.AlignmentFlag.AlignVCenter)
-        header.addWidget(self.presets, 0, 3, Qt.AlignmentFlag.AlignVCenter)
-        header.addWidget(self.subheading, 1, 0, 1, 4)
-        header.addWidget(self.fetch_strip, 2, 0, 1, 4)
+        header.addWidget(self.subheading, 1, 0, 1, 2)
+        header.addWidget(self.fetch_strip, 2, 0, 1, 2)
         header.setColumnStretch(0, 1)
-        # Download coverage hides the day controls, which don't apply to it: the header keeps its height.
-        header.setRowMinimumHeight(0, max(w.sizeHint().height() for w in (self.scope, self.days_pick, self.presets)))
         lay.addLayout(header)
         lay.addWidget(mark(QFrame(), "role", "divider"))
 
@@ -417,6 +414,7 @@ class MainWindow(QMainWindow):
         self.timelines = (self.overview.timeline, timeline)
         for chart in self.timelines:
             chart.note_requested.connect(self._edit_note)
+            chart.view_changed.connect(partial(self._on_view_changed, chart))
         self.words_page = CardPage("Words", coming_soon(
             "The word cloud goes here: the words, phrases and authors that come up most."))
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
@@ -447,12 +445,9 @@ class MainWindow(QMainWindow):
         self.rail.set_page(key)
         self.pages.setCurrentWidget(self.page_widgets[key])
         self.scope.setVisible(key in ("overview", "timeline"))
-        # Coverage lists the days in Fetch's range, saved or not, so the saved-day controls don't apply there.
-        for control in (self.days_pick, self.presets):
-            control.setVisible(key != "coverage")
         self.settings.setValue("ui/page", key)
         if key == "timeline":  # kept up only while it shows
-            self.timeline_page.body.set_points(self._counted.daily_means)
+            self._show_span(self.timeline_page.body)
 
     def set_drawer(self, key: str) -> None:
         """Open the Fetch or Saved drawer, or close the open one with ""."""
@@ -676,32 +671,28 @@ class MainWindow(QMainWindow):
             rows = read(name, self._read_to[kind])
             if rows:  # rows saved in the same instant as the last one read come back too; the ids catch them
                 self._read_to[kind] = rows[-1]["fetched_at"]
-                self._count_days(kind, rows)
-            for r in days.keep(rows, self.chosen_days):
+                self._count_new(kind, rows)
+            for r in days.keep(rows, self._table_days):
                 if r["id"] not in self._queued_ids:
                     self._queued_ids.add(r["id"])
                     self._queued[kind].append(r)
         if any(self._queued.values()) and not self._drip.isActive():  # start() would restart it, and
             self._drip.start()  # comments saved every few ms would then hold every row back
-        if self._days_changed and not self._shown_live.isActive():  # rows on days not chosen still count there
-            self._shown_live.start()
 
-    def _count_days(self, kind: str, rows) -> None:
-        """Count rows the running fetch saved into the day picker's days, so the picker needn't count every
-        saved row again each second (70 ms for 100,000 comments). Rows saved before, saved again with new
-        scores, aren't counted twice."""
+    def _count_new(self, kind: str, rows) -> None:
+        """Count rows the running fetch saved into the overview, whatever their day: the timeline shows every
+        day, and the span can be moved onto them later. Rows saved before, saved again with new scores,
+        aren't counted twice (the finished fetch brings their new scores in)."""
         known = self._known.get(kind)
         if known is None:
             known = self._known[kind] = {r["id"] for r in self._saved[kind]}
-        slot = 0 if kind == "posts" else 1
-        for r in rows:
-            if r["id"] not in known and r["created_utc"] is not None:
-                known.add(r["id"])
-                day = days.day_of(r["created_utc"])
-                counts = list(self._day_counts.get(day, (0, 0)))
-                counts[slot] += 1
-                self._day_counts[day] = tuple(counts)
-                self._days_changed = True
+        new = [r for r in rows if r["id"] not in known and r["created_utc"] is not None]
+        if new:
+            known.update(r["id"] for r in new)
+            self._saved[kind].extend(new)
+            self._analysis[kind].add(new)
+            if not self._shown_live.isActive():
+                self._shown_live.start()
 
     def _release_rows(self) -> None:
         """Show the next few queued rows; a long backlog is released faster so it never lags far behind."""
@@ -710,23 +701,14 @@ class MainWindow(QMainWindow):
             batch, self._queued[kind] = queue[:max(1, len(queue) // 25)], queue[max(1, len(queue) // 25):]
             if batch:
                 self._add_rows(kind, tab, batch)
-                if not self._shown_live.isActive():
-                    self._shown_live.start()
         if not any(self._queued.values()):
             self._drip.stop()
         self._update_dataset_labels()
-
-    def _show_released(self) -> None:
-        if self._days_changed:
-            self._days_changed = False
-            self.days_pick.set_days(self._day_counts, self.chosen_days)
-        self._render_overview()
 
     def _add_rows(self, kind: str, tab: TablePage, rows) -> None:
         before = len(tab.all_rows)
         tab.add_rows(rows)
         new = tab.all_rows[before:]
-        self._analysis[kind].add(new)
         if kind == "posts" and new:
             self._last_fetched = max([self._last_fetched or 0.0] + [r["fetched_at"] for r in new])
 
@@ -746,13 +728,15 @@ class MainWindow(QMainWindow):
             self.subheading.setText(NO_DATA)
             return
         self.heading.setText(f"r/{self.current}")
-        # The day picker says which days; this line says how fresh they are and how much they hold.
-        self.subheading.setText(f"Last fetched {when_text(self._last_fetched)} · {plural(len(self.posts), 'post')}"
-                                f" · {plural(len(self.comments), 'comment')}")
+        # How fresh the data is, which days of it the timeline's span counts (on every page, the tables too),
+        # and how much they hold.
+        span = "" if self._table_days is None else f" · {days.span_text(self._table_days)}"
+        self.subheading.setText(f"Last fetched {when_text(self._last_fetched)}{span} · "
+                                f"{plural(len(self.posts), 'post')} · {plural(len(self.comments), 'comment')}")
 
     def _live_refresh(self) -> None:
-        # What reads the store again (the saved-data list, Download coverage) once a second; the overview and
-        # day picker follow the drip instead (_show_released).
+        # What reads the store again (the saved-data list, Download coverage) once a second; the overview
+        # follows the rows as they're counted instead (_count_new).
         if not self.fetch_job.busy or self.request is None:
             return
         if self._showing_fetch():
@@ -789,13 +773,10 @@ class MainWindow(QMainWindow):
                     saved[where[r["id"]]] = r
                 else:
                     saved.append(r)
-            before = len(tab.all_rows)
-            if tab.update_rows(days.keep(rows, self.chosen_days)):
-                self._analysis[kind] = Analysis(tab.all_rows)  # a rescored row changes the totals
-            else:
-                self._analysis[kind].add(tab.all_rows[before:])
+            self._analysis[kind] = Analysis(saved)  # a rescored row changes the totals
+            tab.update_rows(days.keep(rows, self._table_days))
+        self._known = {}
         self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
-        self._refresh_days()
         self._update_dataset_labels()
         self._render_overview()
 
@@ -860,97 +841,89 @@ class MainWindow(QMainWindow):
         switching = (name or None) != self.current
         if switching:  # the old subreddit fades out over the new one
             motion.crossfade(self.content)
-            for chart in self.timelines:
-                chart.show_every_day()
         self.current = name or None
-        self.chosen_days = days.load_choice(self.settings, name) if name else None
-        # One snapshot, so a row a running fetch saves meanwhile isn't in the day counts without being in the
-        # rows too: it comes in with the fetch's next rows and would be counted twice.
         with self.store.snapshot():
             self._saved = {"posts": self.store.posts(name) if name else [],
                            "comments": self.store.comments(name) if name else []}
-            self._refresh_days()
-        self._apply_days()
+        self._known = {}
+        self._analysis = {k: Analysis(rows) for k, rows in self._saved.items()}
+        self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
+        # The span remembered for it, shown on the timelines once they have its days.
+        self.span, self._preset = days.load_range(self.settings, name)
+        self._render_overview(restore=True)
+        self._apply_span(reload=True)
         self._show_notes()
         self._update_delete_enabled()
         self.coverage.set_subreddit(self.current)
 
-    def _refresh_days(self) -> None:
-        """Re-read which days have saved data, for the day picker."""
-        self._day_counts = self.store.day_counts(self.current) if self.current else {}
-        self._known = {}
-        self._days_changed = False
-        self.days_pick.set_days(self._day_counts, self.chosen_days)
-        self._mark_preset()
+    def _on_view_changed(self, chart: TimelineChart) -> None:
+        """A timeline was zoomed, dragged or set to a range button: every page now counts its span."""
+        for other in self._kept_up():
+            if other is not chart:
+                self._show_span(other, chart)
+        if (chart.view, chart.preset) == (self.span, self._preset):
+            return
+        self.span, self._preset = chart.view, chart.preset
+        if self.current and not self._following:  # a fetch or the scope moved it, not the user
+            days.save_range(self.settings, self.current, self.span, self._preset)
+        self._render_span()
+        self._span_settled.start()
 
-    def _apply_days(self) -> None:
-        """Point every view at the saved rows from the chosen days."""
-        self.posts = days.keep(self._saved["posts"], self.chosen_days)
-        self.comments = days.keep(self._saved["comments"], self.chosen_days)
+    def _show_span(self, chart: TimelineChart, like: TimelineChart | None = None) -> None:
+        """Show the counted days on ``chart`` and the span ``like`` shows, else the span every page counts,
+        without telling the window of it again."""
+        chart.blockSignals(True)
+        chart.set_points(self._counted.daily_means)
+        chart.show_span(*((like.view, like.preset) if like else (self.span, self._preset)))
+        chart.blockSignals(False)
+
+    def _apply_span(self, reload: bool = False) -> None:
+        """Point the tables (and so export) at the saved rows from the days in the span, if those changed."""
+        self._span_settled.stop()
+        whole = days.whole(self.span)
+        if whole == self._table_days and not reload:
+            return
+        self._table_days = whole
+        # Rows still queued are in _saved already, so the tables have them once reloaded.
+        self._drip.stop()
+        self._queued = {"posts": [], "comments": []}
+        self.posts = days.keep(self._saved["posts"], whole)
+        self.comments = days.keep(self._saved["comments"], whole)
         self.posts_tab.load(self.posts)
         self.comments_tab.load(self.comments)
-        self._analysis = {"posts": Analysis(self.posts), "comments": Analysis(self.comments)}
-        self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
         self._update_dataset_labels()
-        self._render_overview()
-
-    def _on_days_chosen(self, chosen: set[int] | None) -> None:
-        if not self.current:
-            return
-        chosen = days.save_choice(self.settings, self.current, chosen, self._day_counts)
-        if chosen != self.chosen_days:
-            motion.crossfade(self.content)
-            for chart in self.timelines:  # other days: from all of them
-                chart.show_every_day()
-        self.chosen_days = chosen
-        self._mark_preset()
-        if self.fetch_job.busy and self._showing_fetch():
-            # A running fetch has added rows since the subreddit was loaded: read them all again.
-            self._flush_rows()
-            self._show_dataset(self.current)
-            self._read_to = {k: max([self._since] + [r["fetched_at"] for r in self._saved[k]])
-                             for k in ("posts", "comments")}
-        else:
-            self._apply_days()
-
-    def _preset_days(self, key: str) -> set[int] | None:
-        """The saved days a preset keeps: those within its span of the newest saved day."""
-        span = PRESETS[key][1]
-        if span is None or not self._day_counts:
-            return None
-        newest = max(self._day_counts)
-        return {d for d in self._day_counts if d > newest - span * 86400}
-
-    def _on_preset(self, key: str) -> None:
-        if not self.current:
-            self.presets.set_current("")
-            return
-        chosen = self._preset_days(key)
-        self.days_pick.set_days(self._day_counts, chosen)
-        self._on_days_chosen(chosen)
-        self.presets.set_current(key)  # kept even when it covers every saved day, as All would
-
-    def _mark_preset(self) -> None:
-        """Mark the preset the chosen days match, if any (the one already marked first, when two match)."""
-        def matches(key):
-            got = self._preset_days(key)
-            return (None if got is not None and set(self._day_counts) <= got else got) == self.chosen_days
-        keys = [self.presets.current(), "all", *PRESETS] if self.presets.current() else ["all", *PRESETS]
-        self.presets.set_current(next((k for k in keys if self.current and matches(k)), ""))
 
     def _on_scope_changed(self, text: str) -> None:
         self.settings.setValue("ui/overview_scope", text)
         motion.crossfade(self.pages)
         self._render_overview()
 
-    def _render_overview(self) -> None:
+    def _render_overview(self, restore: bool = False) -> None:
+        """Show every saved day on the timelines, and the span's days on the tiles and distribution. With
+        restore, the timelines show the span the window holds (another subreddit's, as remembered)."""
         scope = self.scope.currentText()
-        a = Analysis.combined(*[self._analysis[k] for k, skip in (("posts", "Comments only"), ("comments", "Posts only"))
-                                if scope != skip])
-        self._counted = a
+        self._counted = Analysis.combined(
+            *[self._analysis[k] for k, skip in (("posts", "Comments only"), ("comments", "Posts only")) if scope != skip])
+        for chart in self._kept_up():
+            if restore:
+                self._show_span(chart)
+            else:  # a fetch adding days can move a span that ends on the latest day: _on_view_changed follows it
+                self._following = True
+                try:
+                    chart.set_points(self._counted.daily_means)
+                finally:
+                    self._following = False
+        if restore:
+            self.span, self._preset = self.overview.timeline.view, self.overview.timeline.preset
+        self._render_span()
+
+    def _kept_up(self) -> list[TimelineChart]:
+        """The Overview's timeline, and the Timeline page's while it shows."""
+        return [c for c in self.timelines if c is self.overview.timeline or c.isVisible()]
+
+    def _render_span(self) -> None:
+        a = self._counted.between(days.whole(self.span))
         self.overview.show_analysis(a)
-        if self.timeline_page.isVisible():
-            self.timeline_page.body.set_points(a.daily_means)
         self.mood.set_counts(a.counts["positive"], a.counts["negative"], a.count)
 
     def _show_notes(self) -> None:
@@ -980,7 +953,8 @@ class MainWindow(QMainWindow):
                 "This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_subreddit(self.current)
-        self.settings.remove(days.settings_key(self.current))
+        for key in days.settings_keys(self.current):
+            self.settings.remove(key)
         self.statusBar().showMessage(f"Deleted the saved data for r/{self.current}.", 8000)
         self.current = None
         self._refresh_datasets()
@@ -996,6 +970,7 @@ class MainWindow(QMainWindow):
         self.store.delete_all()
         self.settings.remove("ui/last_dataset")
         self.settings.remove(days.SETTINGS_GROUP)
+        self.settings.remove(days.RANGE_GROUP)
         self.statusBar().showMessage("Deleted all saved data.", 8000)
         self.current = None
         self._refresh_datasets()
@@ -1003,17 +978,20 @@ class MainWindow(QMainWindow):
     def _export(self, kind: str) -> None:
         if not self.current:
             return
+        self._apply_span()  # the span in view now, not as it was before the last zoom settled
         path, _ = QFileDialog.getSaveFileName(self, f"Export {kind}", f"{self.current}_{kind}.csv", "CSV files (*.csv)")
         if path:
             try:
-                n = self.store.export_csv(self.current, kind, path, days=self.chosen_days)
+                chosen = None if self._table_days is None else {
+                    d for d in range(*self._table_days, days.DAY)}
+                n = self.store.export_csv(self.current, kind, path, days=chosen)
             except OSError as e:  # on Windows, usually the file is still open in Excel
                 QMessageBox.warning(self, "Export failed",
                                     f"Couldn't save {path}.\n\n{e.strerror or e}\n\n"
                                     "If the file is open in another program, close it and try again.")
                 return
-            n_days = len(self.chosen_days & set(self._day_counts)) if self.chosen_days is not None else 0
-            on = "" if self.chosen_days is None else f" from {plural(n_days, 'chosen day')}"
+            on = "" if chosen is None else (f" from {days.short_date(self._table_days[0], True)} to "
+                                            f"{days.short_date(self._table_days[1] - days.DAY, True)}")
             self.statusBar().showMessage(f"Exported {n:,} {kind}{on} to {path}", 8000)
 
     def _import_database(self) -> None:
@@ -1061,6 +1039,7 @@ class MainWindow(QMainWindow):
         self._live.stop()  # both read the store
         self._drip.stop()
         self._shown_live.stop()
+        self._span_settled.stop()
         self.store.close()
         super().closeEvent(event)
 

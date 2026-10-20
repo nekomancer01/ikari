@@ -199,7 +199,7 @@ def test_switching_theme_recolours_without_reading_the_data_again(window, monkey
     assert reads == [] and window.comments_tab.model.rowCount() == COMMENTS
 
 
-def test_a_running_fetch_counts_its_rows_into_the_day_picker_without_recounting_every_day(window, monkeypatch):
+def test_a_running_fetch_counts_its_rows_into_the_overview_without_reading_every_row_again(window, monkeypatch):
     window.fetch_job.qthread = object()  # a fetch is "running" on the subreddit shown
     window.request = mw.collect.FetchRequest("Big")
     window._since = time.time() - 1
@@ -210,13 +210,17 @@ def test_a_running_fetch_counts_its_rows_into_the_day_picker_without_recounting_
     writer.db.execute("INSERT INTO comments SELECT 'fresh', post_id, subreddit, parent_id, author, 'hi', 1, ?, depth, "
                       "permalink, 0.1, 'neutral', ? FROM comments WHERE id = 'c1'", (new_day + 60, time.time()))
     writer.commit()
-    recounts = count_calls(monkeypatch, Store, "day_counts")
+    recounts = [count_calls(monkeypatch, Store, name) for name in ("posts", "comments", "day_counts")]
+    before = window._counted.count
     try:
         window._queue_new_rows()
         window._live_refresh()
-        assert recounts == []
-        assert window._day_counts == window.store.day_counts("Big")
-        assert window._day_counts[new_day] == (0, 1)
+        window._render_overview()
+        assert recounts == [[], [], []]
+        assert window._counted.count == before + 1  # the comment, not the post saved again
+        whole = Analysis.combined(Analysis(window.store.posts("Big")), Analysis(window.store.comments("Big")))
+        assert window._counted.daily_means == whole.daily_means
+        assert (new_day, 0.1, 1) in window.overview.timeline.points
     finally:
         window.fetch_job.qthread = None
         writer.close()
