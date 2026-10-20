@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import heapq
 import time
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import (
-    QDate, QEvent, QObject, QRectF, QSettings, QSize, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl,
+    QDate, QEvent, QObject, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl,
 )
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence,
@@ -20,12 +21,12 @@ from PySide6.QtWidgets import (
 from subsentiment import __version__, collect
 from subsentiment.gui import native, theme
 from subsentiment.gui.charts import DistributionChart, TimelineChart, palette
-from subsentiment.gui.models import COMMENT_COLUMNS, POST_COLUMNS, SORT_ROLE, RowsModel
+from subsentiment.gui.models import COMMENT_COLUMNS, PENDING, POST_COLUMNS, RowsModel
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.worker import FetchWorker
 from subsentiment.reddit import normalize_subreddit, subreddit_error
-from subsentiment.store import Store, daily_means, summarize
+from subsentiment.store import Store, Tally
 
 
 # Date ranges the fetch form offers: key -> (label, days back from now). "custom" uses the From/To dates.
@@ -323,28 +324,27 @@ class TablePage(QWidget):
 
     SHRINKS = ("author", "post_title")  # free text that can end in "…" to leave room for the main text
     OPTIONAL = ("author", "post_title", "num_comments")  # hidden in this order when there's still no room
+    FIXED = ("sentiment", "created_utc")  # written in a fixed format: "+0.123", "2026-10-20 03:54"
 
     def __init__(self, columns, stretch_col: int):
         super().__init__()
         self.model = RowsModel(columns)
         self._all_rows: list = []
-        self.proxy = QSortFilterProxyModel()
-        self.proxy.setSourceModel(self.model)
-        self.proxy.setSortRole(SORT_ROLE)
-        self.proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.proxy.setFilterKeyColumn(stretch_col)
+        self._ids: set[str] = set()
+        self._text_key = columns[stretch_col][1]
+        self._haystacks: dict[str, str] = {}  # row id -> its text lowercased on one line, once filtered by
 
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("Filter by text…")
         self.filter.setClearButtonEnabled(True)
-        self.filter.textChanged.connect(self.proxy.setFilterFixedString)
+        self.filter.textChanged.connect(lambda _: self._apply_filters())
         self.label_filter = QComboBox()
         self.label_filter.addItems(["All labels", "Positive", "Neutral", "Negative"])
-        self.label_filter.currentTextChanged.connect(self._apply_label_filter)
+        self.label_filter.currentTextChanged.connect(lambda _: self._apply_filters())
         self.count = label("", "muted")
 
         self.view = QTableView()
-        self.view.setModel(self.proxy)
+        self.view.setModel(self.model)
         self.view.setSortingEnabled(True)
         self.view.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -375,30 +375,75 @@ class TablePage(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(card)
-        for sig in (self.proxy.rowsInserted, self.proxy.rowsRemoved, self.proxy.modelReset, self.proxy.layoutChanged):
+        for sig in (self.model.rowsInserted, self.model.rowsRemoved, self.model.modelReset):
             sig.connect(self._update_count)
 
-    def load(self, rows, animate: bool = False) -> None:
+    @property
+    def all_rows(self) -> list:
+        """Every row loaded or added, whatever the filters show."""
+        return self._all_rows
+
+    def load(self, rows) -> None:
         self._all_rows = rows
-        self._apply_label_filter(self.label_filter.currentText(), animate)
+        self._ids = {r["id"] for r in rows}
+        self._haystacks = {}
+        self._apply_filters()
 
     def add_rows(self, rows) -> int:
-        """Append rows a running fetch has just saved; they fade in. Returns how many were new."""
-        have = {r["id"] for r in self._all_rows}
-        new = [r for r in rows if r["id"] not in have]
-        label = self.label_filter.currentText()
+        """Add rows a running fetch has just saved; they fade in. Returns how many were new."""
+        new = [r for r in rows if r["id"] not in self._ids]
+        self._ids.update(r["id"] for r in new)
         self._all_rows.extend(new)
-        shown = new if label == "All labels" else [r for r in new if r["label"] == label.lower()]
-        self.model.append_rows(shown)
-        self._update_count()
+        shows = self._matcher()
+        self.model.append_rows([r for r in new if shows is None or shows(r)])
         return len(new)
 
-    def _apply_label_filter(self, text: str, animate: bool = False) -> None:
-        rows = self._all_rows
-        if text != "All labels":
-            rows = [r for r in rows if r["label"] == text.lower()]
-        self.model.set_rows(rows, animate)
-        if not animate:
+    def update_rows(self, rows) -> int:
+        """Bring in rows a finished fetch saved: ones saved again (new scores) replace the rows shown, the
+        rest are added and fade in. Returns how many shown rows changed."""
+        where = {r["id"]: i for i, r in enumerate(self._all_rows)}
+        new, changed = [], []
+        for r in rows:
+            i = where.get(r["id"])
+            if i is None:
+                new.append(r)
+            elif self._all_rows[i] != r:  # most were dripped in as they were saved, and are unchanged
+                self._all_rows[i] = r
+                self._haystacks.pop(r["id"], None)
+                changed.append(r)
+        self._ids.update(r["id"] for r in new)
+        self._all_rows.extend(new)
+        shows = self._matcher()
+        if shows is None:
+            self.model.update_rows(changed + new)
+        else:  # a rescored row can change its label
+            self.model.set_rows(list(filter(shows, self._all_rows)), animate=True)
+        self._update_count()
+        return len(changed)
+
+    def _matcher(self):
+        """Whether a row passes the label and text filters, or None when nothing is filtered."""
+        label = self.label_filter.currentText().lower()
+        needle = " ".join(self.filter.text().lower().split())
+        if label == "all labels" and not needle:
+            return None
+        key, hays = self._text_key, self._haystacks
+
+        def shows(row) -> bool:
+            if label != "all labels" and row["label"] != label:
+                return False
+            if not needle:
+                return True
+            hay = hays.get(row["id"])
+            if hay is None:  # the text on one line, lowercased, kept for the next keystroke
+                hay = hays[row["id"]] = " ".join((row[key] or "").lower().split())
+            return needle in hay
+        return shows
+
+    def _apply_filters(self) -> None:
+        shows = self._matcher()
+        self.model.set_rows(self._all_rows if shows is None else list(filter(shows, self._all_rows)))
+        if not self.filter.text():  # typing a filter keeps the columns as they are
             self._fit_columns()
         self._update_count()
 
@@ -415,8 +460,28 @@ class TablePage(QWidget):
             if col != self.stretch_col:
                 title = self.model.headerData(col, Qt.Orientation.Horizontal)
                 least = metrics.horizontalAdvance(title) + 16 + 24 + 8  # padding, sort arrow, slack
-                self._widths[col] = (max(self.view.sizeHintForColumn(col), least), least)
+                self._widths[col] = (max(self._values_width(col), least), least)
         self._share_width()
+
+    def _values_width(self, col: int) -> int:
+        """How wide the column's widest value draws. Qt's sizeHintForColumn measured up to 1,000 rows
+        through Python calls per column; this measures one cell for the padding (and the label's swatch)
+        and only the longest of the column's distinct values."""
+        rows = self.model.rows
+        if not rows:
+            return 0
+        _, key, fmt = self.model.columns[col]
+        if key in self.FIXED:  # every value is written the same length; a sample has the widest digits
+            values = {r[key] for r in rows[:200]}
+        else:
+            values = {r[key] for r in rows}
+            if len(values) > 40:  # numbers, names, titles: the longest written ones are the widest
+                values = heapq.nlargest(40, values, key=lambda v: len(str(v)) if v is not None else 1)
+        texts = [fmt(v) if v is not None else ("–" if key in PENDING else "") for v in values]
+        metrics = QFontMetrics(self.view.font())
+        cell = self.view.sizeHintForIndex(self.model.index(0, col)).width()
+        padding = cell - metrics.horizontalAdvance(self.model.data(self.model.index(0, col)) or "")
+        return padding + max(metrics.horizontalAdvance(t) for t in texts)
 
     def _share_width(self) -> None:
         """Keep room for the text column (the title, the comment). A comment's post title and the author
@@ -453,10 +518,10 @@ class TablePage(QWidget):
         self._share_width()
 
     def _update_count(self, *args) -> None:
-        self.count.setText(f"{self.proxy.rowCount():,} rows")
+        self.count.setText(f"{self.model.rowCount():,} rows")
 
     def _open(self, index) -> None:
-        row = self.model.row_at(self.proxy.mapToSource(index).row())
+        row = self.model.row_at(index.row())
         QDesktopServices.openUrl(QUrl(row["permalink"]))
 
 
@@ -489,6 +554,8 @@ class MainWindow(QMainWindow):
         self._follow = False  # show the subreddit being fetched, until the user picks another one
         self.posts: list = []
         self.comments: list = []
+        self._tally = {"posts": Tally(), "comments": Tally()}  # what the Overview counts, kept up as rows arrive
+        self._last_fetched: float | None = None  # newest fetched_at among self.posts
         self.coverage = None  # the Download coverage window, once opened
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
         # A native material (Mica/Acrylic/vibrancy) needs a translucent window from the start,
@@ -865,7 +932,9 @@ class MainWindow(QMainWindow):
         theme.apply(QApplication.instance(), requested, self.settings.value("ui/reduce_transparency", False, bool))
         self.update()
         self._style_native_frame()
-        self._show_dataset(self.current or "")  # re-pick chart and swatch colors
+        for tab in (self.posts_tab, self.comments_tab):  # re-pick swatch and chart colours
+            tab.model.restyle()
+        self._render_overview()
 
     # -- control state --------------------------------------------------------
 
@@ -1058,16 +1127,24 @@ class MainWindow(QMainWindow):
             queue = self._queued[kind]
             batch, self._queued[kind] = queue[:max(1, len(queue) // 25)], queue[max(1, len(queue) // 25):]
             if batch:
-                tab.add_rows(batch)
+                self._add_rows(kind, tab, batch)
         if not any(self._queued.values()):
             self._drip.stop()
         self._update_dataset_labels()
+
+    def _add_rows(self, kind: str, tab: TablePage, rows) -> None:
+        before = len(tab.all_rows)
+        tab.add_rows(rows)
+        new = tab.all_rows[before:]
+        self._tally[kind].add(new)
+        if kind == "posts" and new:
+            self._last_fetched = max([self._last_fetched or 0.0] + [r["fetched_at"] for r in new])
 
     def _flush_rows(self) -> None:
         self._drip.stop()
         for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
             if self._queued[kind]:
-                tab.add_rows(self._queued[kind])
+                self._add_rows(kind, tab, self._queued[kind])
             self._queued[kind] = []
         self._queued_ids.clear()
 
@@ -1076,9 +1153,8 @@ class MainWindow(QMainWindow):
         self.tabbar.setTabText(2, f"Comments  {len(self.comments):,}")
         self.export_posts.setEnabled(bool(self.posts))
         self.export_comments.setEnabled(bool(self.comments))
-        fetched = max((r["fetched_at"] for r in self.posts), default=None)
         self.subheading.setText(f"{plural(len(self.posts), 'post')} and {plural(len(self.comments), 'comment')} · "
-                                f"last fetched {when_text(fetched)}")
+                                f"last fetched {when_text(self._last_fetched)}")
 
     def _live_refresh(self) -> None:
         if self.thread is None or self.request is None:
@@ -1101,9 +1177,24 @@ class MainWindow(QMainWindow):
         self._flush_rows()
         if self.current and self.current.lower() == result.subreddit.lower():
             self._refresh_datasets(reload=False)
-            self._show_dataset(self.current, animate=True)  # keeps the tables where they are
+            self._merge_fetched()  # keeps the tables where they are
         elif result.posts or result.updated or result.comments:
             self._refresh_datasets(select=result.subreddit)
+
+    def _merge_fetched(self) -> None:
+        """Bring what the finished fetch saved into the dataset on screen: rows it saved again (new scores)
+        and any not dripped in yet. Reading back only these, not every saved row, keeps a big subreddit
+        from freezing the window for seconds as the fetch ends."""
+        for kind, read, tab in (("posts", self.store.posts_since, self.posts_tab),
+                                ("comments", self.store.comments_since, self.comments_tab)):
+            before = len(tab.all_rows)
+            if tab.update_rows(read(self.current, self._since)):
+                self._tally[kind] = Tally(tab.all_rows)  # a rescored row changes the totals
+            else:
+                self._tally[kind].add(tab.all_rows[before:])
+        self._last_fetched = max((r["fetched_at"] for r in self.posts), default=None)
+        self._update_dataset_labels()
+        self._render_overview()
 
     def _on_failed(self, message: str) -> None:
         self._live.stop()
@@ -1159,8 +1250,8 @@ class MainWindow(QMainWindow):
         if name:
             self.settings.setValue("ui/last_dataset", name)
 
-    def _show_dataset(self, name: str, animate: bool = False) -> None:
-        """Show a saved subreddit. With animate (a fetch adding to it), new rows fade in."""
+    def _show_dataset(self, name: str) -> None:
+        """Show a saved subreddit."""
         # Rows still queued from a running fetch belong to whatever was shown before; the tables are
         # about to be reloaded from the store, which has them anyway.
         self._drip.stop()
@@ -1168,18 +1259,19 @@ class MainWindow(QMainWindow):
         self.current = name or None
         self.posts = self.store.posts(name) if name else []
         self.comments = self.store.comments(name) if name else []
-        self.posts_tab.load(self.posts, animate)
-        self.comments_tab.load(self.comments, animate)
+        self.posts_tab.load(self.posts)
+        self.comments_tab.load(self.comments)
+        self._tally = {"posts": Tally(self.posts), "comments": Tally(self.comments)}
         self.export_posts.setEnabled(bool(self.posts))
         self.export_comments.setEnabled(bool(self.comments))
         self._update_delete_enabled()
         self.tabbar.setTabText(1, f"Posts  {len(self.posts):,}")
         self.tabbar.setTabText(2, f"Comments  {len(self.comments):,}")
+        self._last_fetched = max((r["fetched_at"] for r in self.posts), default=None)
         if self.current:
             self.heading.setText(f"r/{self.current}")
-            fetched = max((r["fetched_at"] for r in self.posts), default=None)
             self.subheading.setText(f"{plural(len(self.posts), 'post')} and {plural(len(self.comments), 'comment')} · "
-                                    f"last fetched {when_text(fetched)}")
+                                    f"last fetched {when_text(self._last_fetched)}")
         else:
             self.heading.setText("No data yet")
             self.subheading.setText("Enter a subreddit on the left and press Fetch and analyse.")
@@ -1194,9 +1286,9 @@ class MainWindow(QMainWindow):
 
     def _render_overview(self) -> None:
         scope = self.scope.currentText()
-        rows = (list(self.posts) if scope != "Comments only" else []) + \
-               (list(self.comments) if scope != "Posts only" else [])
-        s = summarize(rows)
+        tally = Tally.combined(*[self._tally[k] for k, skip in (("posts", "Comments only"), ("comments", "Posts only"))
+                                 if scope != skip])
+        s = tally.summary()
         n = s["count"]
         pos, neg = (s["counts"]["positive"] / n, s["counts"]["negative"] / n) if n else (0.0, 0.0)
         self.tiles["count"].set(f"{n:,}")
@@ -1205,11 +1297,9 @@ class MainWindow(QMainWindow):
         self.tiles["negative"].set(f"{100 * neg:.0f}%" if n else "–", neg)
         self.mood.set_counts(s["counts"]["positive"], s["counts"]["negative"], n)
         self.distribution.set_counts(s["counts"])
-        self.timeline.set_points(daily_means(rows))
-
-        ranked = sorted(rows, key=lambda r: r["sentiment"])
-        self._fill_extremes(self.most_positive, list(reversed(ranked[-10:])))
-        self._fill_extremes(self.most_negative, ranked[:10])
+        self.timeline.set_points(tally.daily_means())
+        self._fill_extremes(self.most_positive, tally.top)
+        self._fill_extremes(self.most_negative, tally.bottom)
 
     @staticmethod
     def _fill_extremes(widget: QListWidget, rows) -> None:
