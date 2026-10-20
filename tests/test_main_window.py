@@ -117,6 +117,18 @@ def test_delete_one_then_all(make_window, monkeypatch):
     assert "Nothing saved yet" in w.storage_info.text()
 
 
+def test_the_window_says_which_database_it_has_open(make_window, tmp_path, monkeypatch):
+    # Started under another home (sudo, a Flatpak IDE) the app opens a different, empty database, and nothing
+    # on screen said where the one it had open was.
+    opened = []
+    monkeypatch.setattr(mw.QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()))
+    w = make_window()
+    assert str(tmp_path / "w.db") in w.storage_info.toolTip()
+    assert w.data_folder_act.statusTip() == str(tmp_path / "w.db")
+    w.data_folder_act.trigger()
+    assert [os.path.normpath(p) for p in opened] == [str(tmp_path)]
+
+
 def test_background_mood_follows_the_dataset_and_can_be_turned_off(make_window):
     from subsentiment.gui import theme
     assert theme.mood_score(3, 1, 4) == 1.0 and theme.mood_score(1, 3, 10) == -0.4 and theme.mood_score(0, 0, 0) == 0

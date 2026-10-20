@@ -3,8 +3,8 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
-from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThread, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QFontMetrics, QGuiApplication, QIcon, QKeySequence
+from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThread, QTimer, QUrl
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QFontMetrics, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QTabBar,
@@ -168,6 +168,11 @@ class MainWindow(QMainWindow):
         self.delete_all_act = QAction("Delete all saved data…", self, triggered=self._delete_all)
         file_menu.addAction(self.delete_act)
         file_menu.addAction(self.delete_all_act)
+        # Says which database is open: one started under another home (sudo, a Flatpak IDE) is a different file.
+        self.data_folder_act = QAction("Open data folder", self, statusTip=str(self.store.path),
+                                       triggered=lambda: QDesktopServices.openUrl(
+                                           QUrl.fromLocalFile(str(self.store.path.parent))))
+        file_menu.addAction(self.data_folder_act)
         file_menu.addSeparator()
         # On macOS Qt moves the Quit and About roles into the application menu.
         file_menu.addAction(QAction("Quit", self, shortcut=QKeySequence.StandardKey.Quit,
@@ -302,7 +307,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.datasets, 1)
         self.storage_info = label("", "muted")
         self.storage_info.setWordWrap(True)
-        self.storage_info.setToolTip("Saved on this computer, kept between sessions")
+        self.storage_info.setToolTip(f"Saved on this computer, kept between sessions, in {self.store.path}")
         lay.addWidget(self.storage_info)
         return side
 
