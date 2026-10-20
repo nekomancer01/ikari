@@ -191,6 +191,7 @@ def step(name: str):
         def run(*a, **k):
             entry = {"step": name, "notes": [], "shots": []}
             log.append(entry)
+            doing[0] = name.split(":")[0]
             before = snapshot_counters()
             t = time.perf_counter()
             try:
@@ -379,6 +380,8 @@ if not ARGS.live:
             p["num_comments"] *= 40
 
 beat = {"last": time.perf_counter()}
+doing = [""]  # what the walkthrough is doing now, so a freeze can be pinned on it
+stall_where: list = []
 
 
 def tick():
@@ -386,6 +389,7 @@ def tick():
     gap = (now - beat["last"]) * 1000
     if gap > 200:
         stalls.append(gap)
+        stall_where.append((round(gap), doing[0]))
     beat["last"] = now
 
 
@@ -617,24 +621,30 @@ def words_and_score(e):
 @step("look-around: every tab, scope, theme and View option")
 def look_around(e):
     for name in pages():
+        doing[0] = f"page {name}"
         go(name)
         e["shots"].append(shot(w, f"page-{name}"))
     go("overview")
     for name in ("fetch", "saved") if hasattr(w, "rail") else ():
+        doing[0] = f"drawer {name}"
         open_drawer(name)
         e["shots"].append(shot(w, f"drawer-{name}"))
     open_drawer("")
     for i in range(w.scope.count()):
         w.scope.setCurrentIndex(i)
         pump(0.2)
+    doing[0] = "theme light"
     w._set_theme("light")
     e["shots"].append(shot(w, "overview-light"))
+    doing[0] = "reduce transparency"
     w.reduce_act.setChecked(True)
     e["shots"].append(shot(w, "reduce-transparency"))
     w.reduce_act.setChecked(False)
     w.mood_act.setChecked(False)
     w.mood_act.setChecked(True)
+    doing[0] = "theme dark"
     w._set_theme("dark")
+    doing[0] = "restore"
     w.showNormal()
     pump(0.5)
     e["shots"].append(shot(w, "restored-dark"))
@@ -829,7 +839,8 @@ for fn in (first_launch, small_fetch, busy_fetch, stop_midway, days_pick, span_c
     fn()
 
 summary = {"workarounds": WORKAROUNDS, "info": info, "steps": log, "dialogs": dialogs, "http": {**http, "status": dict(http["status"])},
-           "local": local, "stalls_ms": sorted((round(s) for s in stalls), reverse=True)[:20]}
+           "local": local, "stalls_ms": sorted((round(s) for s in stalls), reverse=True)[:20],
+           "worst_stalls_where": sorted(stall_where, reverse=True)[:12]}
 if archive is not None:
     summary["archive_violations"] = archive.violations()[:20]
 (OUT / "walkthrough.json").write_text(json.dumps(summary, indent=1, default=str))
