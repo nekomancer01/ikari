@@ -217,3 +217,26 @@ def test_a_running_fetch_counts_its_rows_into_the_day_picker_without_recounting_
     finally:
         window.thread = None
         writer.close()
+
+
+def test_typing_a_filter_keeps_the_selected_row_selected(window):
+    tab = window.comments_tab
+    pick = next(i for i in range(tab.model.rowCount()) if tab.model.row_at(i)["body"].startswith("Great work"))
+    picked = tab.model.row_at(pick)["id"]
+    tab.view.selectRow(pick)
+    tab.filter.setText("great")
+    assert [tab.model.row_at(i.row())["id"] for i in tab.view.selectionModel().selectedRows()] == [picked]
+    assert tab.model.row_at(tab.view.currentIndex().row())["id"] == picked
+    tab.filter.setText("awful")  # it doesn't match: nothing is selected
+    assert tab.view.selectionModel().selectedRows() == []
+
+
+def test_rows_without_a_date_sort_with_the_dated_ones():
+    m = RowsModel(POST_COLUMNS)
+    row = lambda i, t: {"id": f"p{i}", "sentiment": 0.0, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
+                        "score": None, "num_comments": None, "author": None, "created_utc": t}
+    m.set_rows([row(1, 50.0), row(2, None), row(3, 10.0)])
+    m.sort(6, Qt.SortOrder.AscendingOrder)  # Posted
+    assert [m.row_at(i)["id"] for i in range(3)] == ["p2", "p3", "p1"]
+    m.sort(5, Qt.SortOrder.AscendingOrder)  # Author, all unknown
+    assert m.append_rows([row(4, None)]) == 1 and m.rowCount() == 4

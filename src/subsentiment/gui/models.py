@@ -79,15 +79,17 @@ class RowsModel(QAbstractTableModel):
 
     def _key_of(self, column: int) -> Callable:
         key = self.columns[column][1]
-        missing = -1 if key in NUMERIC else ""  # keeps unknown numbers sortable alongside real ones
+        missing = -1 if key in NUMERIC or key == "created_utc" else ""  # sorts alongside the real values
         return lambda row: missing if (v := row[key]) is None else v
 
-    def _sorted(self, rows: list) -> list:
-        """``rows`` in the current sort order; also sets self._keys to match."""
+    def _sorted(self, rows: list, keys: list | None = None) -> list:
+        """``rows`` in the current sort order; also sets self._keys to match. ``keys`` are the rows' sort
+        keys when the caller has them: rows that are already mostly in order then sort in about one pass."""
         if self._sort is None:
             self._keys = []
             return list(rows)
-        keys = list(map(self._key_of(self._sort[0]), rows))
+        if keys is None:
+            keys = list(map(self._key_of(self._sort[0]), rows))
         order = sorted(range(len(rows)), key=keys.__getitem__, reverse=self._sort[1])
         self._keys = [keys[i] for i in order]
         return [rows[i] for i in order]
@@ -99,11 +101,12 @@ class RowsModel(QAbstractTableModel):
             self._sort = wanted
             self._resort()
 
-    def _resort(self) -> None:
+    def _resort(self, keys_kept: bool = False) -> None:
+        """Put the rows back in sort order; with ``keys_kept``, self._keys still holds each row's key."""
         self.layoutAboutToBeChanged.emit()
         old = self.persistentIndexList()
         ids = [self.rows[i.row()]["id"] for i in old]
-        self.rows = self._sorted(self.rows)
+        self.rows = self._sorted(self.rows, self._keys if keys_kept else None)
         where = {r["id"]: i for i, r in enumerate(self.rows)} if old else {}
         self.changePersistentIndexList(old, [self.index(where[rid], i.column()) for rid, i in zip(ids, old)])
         self.layoutChanged.emit()
@@ -136,6 +139,7 @@ class RowsModel(QAbstractTableModel):
         """Rows saved again (with new scores) replace the ones shown; rows not shown yet are added and fade
         in. The view keeps its place."""
         where = {r["id"]: i for i, r in enumerate(self.rows)} if rows else {}
+        key_of = self._key_of(self._sort[0]) if self._sort is not None else None
         added, changed = [], False
         for r in rows:
             i = where.get(r["id"])
@@ -143,12 +147,12 @@ class RowsModel(QAbstractTableModel):
                 added.append(r)
             elif self.rows[i] != r:
                 self.rows[i] = r
+                if key_of is not None:
+                    self._keys[i] = key_of(r)
                 changed = True
         if changed:
-            if self._sort is not None:  # an updated score can move a row
-                self._resort()
             self.dataChanged.emit(self.index(0, 0), self.index(len(self.rows) - 1, len(self.columns) - 1))
-        self._insert(added)
+        self._insert(added, resort=changed)  # an updated score can move a row
 
     def append_rows(self, rows: list) -> int:
         """Add rows not shown yet, each fading in from now; returns how many were new."""
@@ -158,19 +162,24 @@ class RowsModel(QAbstractTableModel):
         self._insert(added)
         return len(added)
 
-    def _insert(self, added: list) -> None:
-        """Put each new row where the current sort order puts it (at the end when unsorted); they fade in."""
+    def _insert(self, added: list, resort: bool = False) -> None:
+        """Put each new row where the current sort order puts it (at the end when unsorted); they fade in.
+        With ``resort``, rows already shown have new keys, so the whole table is put back in order."""
         if not added:
+            if resort and self._sort is not None:
+                self._resort(keys_kept=True)
             return
         self._ids.update(r["id"] for r in added)
         now = self._clock()
-        if self._sort is None or len(added) > 200:  # a big batch: one insert at the end, then one re-sort
+        if self._sort is None or resort or len(added) > 1000:  # one insert at the end, then one re-sort
             start = len(self.rows)
             self.beginInsertRows(QModelIndex(), start, start + len(added) - 1)
             self.rows.extend(added)
+            if self._sort is not None:
+                self._keys.extend(map(self._key_of(self._sort[0]), added))
             self.endInsertRows()
             if self._sort is not None:
-                self._resort()
+                self._resort(keys_kept=True)
         else:
             descending, key_of = self._sort[1], self._key_of(self._sort[0])
             for r in added:

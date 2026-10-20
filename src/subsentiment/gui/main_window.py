@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import (
-    QDate, QEvent, QObject, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl,
+    QDate, QEvent, QItemSelectionModel, QObject, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl,
 )
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence,
@@ -442,7 +442,22 @@ class TablePage(QWidget):
 
     def _apply_filters(self) -> None:
         shows = self._matcher()
+        if not self.filter.text():
+            self._haystacks = {}  # a copy of every row's text; only needed while there is a filter
+        chosen = self.view.selectionModel().selectedRows()
+        selected = {self.model.row_at(i.row())["id"] for i in chosen}
+        current = self.view.currentIndex()
+        current_id = self.model.row_at(current.row())["id"] if current.isValid() else None
         self.model.set_rows(self._all_rows if shows is None else list(filter(shows, self._all_rows)))
+        if current_id or 0 < len(selected) <= 1000:  # rows picked before still are, if the filters show them
+            for i, r in enumerate(self.model.rows):
+                if r["id"] == current_id:
+                    self.view.selectionModel().setCurrentIndex(
+                        self.model.index(i, current.column()), QItemSelectionModel.SelectionFlag.NoUpdate)
+                if r["id"] in selected:
+                    self.view.selectionModel().select(
+                        self.model.index(i, 0),
+                        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
         if not self.filter.text():  # typing a filter keeps the columns as they are
             self._fit_columns()
         self._update_count()
@@ -466,17 +481,17 @@ class TablePage(QWidget):
     def _values_width(self, col: int) -> int:
         """How wide the column's widest value draws. Qt's sizeHintForColumn measured up to 1,000 rows
         through Python calls per column; this measures one cell for the padding (and the label's swatch)
-        and only the longest of the column's distinct values."""
+        and the text of the column's longest distinct values."""
         rows = self.model.rows
         if not rows:
             return 0
         _, key, fmt = self.model.columns[col]
-        if key in self.FIXED:  # every value is written the same length; a sample has the widest digits
-            values = {r[key] for r in rows[:200]}
+        if key in self.FIXED:  # every value is written the same length: sample both ends of the sort order,
+            values = {r[key] for r in rows[:150] + rows[-150:]}  # so both signs and many digits are measured
         else:
             values = {r[key] for r in rows}
-            if len(values) > 40:  # numbers, names, titles: the longest written ones are the widest
-                values = heapq.nlargest(40, values, key=lambda v: len(str(v)) if v is not None else 1)
+            if len(values) > 300:  # numbers, names, titles: the widest are among the longest written ones
+                values = heapq.nlargest(300, values, key=lambda v: len(str(v)) if v is not None else 1)
         texts = [fmt(v) if v is not None else ("–" if key in PENDING else "") for v in values]
         metrics = QFontMetrics(self.view.font())
         cell = self.view.sizeHintForIndex(self.model.index(0, col)).width()

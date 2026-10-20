@@ -669,3 +669,21 @@ def test_choosing_days_never_downloads_and_a_fetch_only_adds_rows_from_chosen_da
     assert len(w.days_pick.counts) > len(saved) or sum(p for p, _ in w.days_pick.counts.values()) > \
         sum(p for p, _ in saved.values())  # the picker knows about what the fetch added
     assert w.days_pick.currentText() != "All days"
+
+
+def test_a_second_fetch_into_a_shown_subreddit_ends_without_reading_it_all_back(env, monkeypatch):
+    w = env.window()
+    fetch(w, limit=5)
+    full_reads = []
+    for name in ("posts", "comments"):
+        real = getattr(Store, name)
+        monkeypatch.setattr(Store, name, lambda self, *a, real=real, name=name: (
+            full_reads.append(name) if self is w.store else None, real(self, *a))[1])
+    fetch(w, limit=100, refresh_scores=True)  # more posts and comments, and saved ones re-checked
+    assert full_reads == []  # it used to read every saved row again as the fetch ended
+    store = env.store()
+    for tab, saved in ((w.posts_tab, store.posts("python")), (w.comments_tab, store.comments("python"))):
+        assert tab.model.rowCount() == len(saved) == len(tab.all_rows)
+        shown = {tab.model.row_at(i)["id"]: tuple(tab.model.row_at(i)) for i in range(tab.model.rowCount())}
+        assert shown == {r["id"]: tuple(r) for r in saved}  # new scores included
+    assert w.tiles["count"].value.text() == f"{len(store.posts('python')) + len(store.comments('python')):,}"
