@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
-from PySide6.QtCore import QSettings, QSize, Qt, QThread, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QFontMetrics, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QListWidget, QListWidgetItem,
@@ -885,6 +885,8 @@ class MainWindow(QMainWindow):
                 sig.disconnect()
             thread.quit()
             thread.wait(3000)
+            # Signals it sent just before are already queued, and disconnecting doesn't take them back.
+            QCoreApplication.removePostedEvents(self, QEvent.Type.MetaCall)
         self._live.stop()  # both read the store
         self._drip.stop()
         self._shown_live.stop()
