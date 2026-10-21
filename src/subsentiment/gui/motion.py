@@ -8,15 +8,18 @@ motion off (View > Reduce motion, or Windows' Animation effects turned off) each
   fades out over the new contents.
 - `fade_in(widget)`: a widget that has just appeared fades in.
 - `Tween`: eases a number from its old value to a new one, for counts and bar heights.
+- `throb(widget)`: where a waiting widget's throbber is, for a widget that paints one while it waits.
 
 Fading a still picture, rather than the live widgets, means charts and tables aren't repainted on every frame
 and no widget moves, so layouts stay exactly as they are.
 """
 from __future__ import annotations
 
+import time
 from typing import Callable
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QVariantAnimation
+import shiboken6
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation
 from PySide6.QtGui import QGuiApplication, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QGraphicsOpacityEffect, QLabel, QWidget
 
@@ -26,6 +29,7 @@ VIEW_MS = 220   # a page, tab or filter changing
 THEME_MS = 320  # light to dark and back
 DATA_MS = 420   # numbers and bars easing to new values
 APPEAR_MS = 200  # a status line or window appearing
+THROB_MS = 1400  # one sweep of a throbber
 
 _wanted = True  # the View > Reduce motion setting, inverted
 _os_allows: bool | None = None
@@ -253,3 +257,47 @@ class Tween(QObject):
     def _step(self, v) -> None:
         self.value = float(v)
         self._apply(self.value)
+
+
+# -- throbber -----------------------------------------------------------------------------------------------
+
+class _Throbbers(QObject):
+    """One clock for every throbber on screen, so twenty of them cost one timer and stay in step. A widget
+    asks for the phase as it paints and is repainted on the next tick; one that stops painting a throbber (it
+    got its number, or was hidden or scrolled away) simply stops asking, and with none left the clock stops."""
+
+    def __init__(self):
+        super().__init__()
+        self._painted: list[QWidget] = []
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+
+    def phase(self, widget: QWidget) -> float | None:
+        if not enabled():
+            return None
+        if widget not in self._painted:
+            self._painted.append(widget)
+        if not self._timer.isActive():
+            self._timer.start()
+        return time.monotonic() * 1000 % THROB_MS / THROB_MS
+
+    def _tick(self) -> None:
+        painted, self._painted = self._painted, []
+        for w in painted:
+            if shiboken6.isValid(w):  # a table row rebuilt since deletes its widgets
+                w.update()
+        if not painted:
+            self._timer.stop()
+
+
+_throbbers: _Throbbers | None = None
+
+
+def throb(widget: QWidget) -> float | None:
+    """For a widget painting a throbber: how far through its sweep it is (0 to 1), and widget is repainted
+    on the next frame. None with motion off, for a still "waiting" look instead."""
+    global _throbbers
+    if _throbbers is None:
+        _throbbers = _Throbbers()
+    return _throbbers.phase(widget)
