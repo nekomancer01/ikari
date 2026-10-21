@@ -117,6 +117,10 @@ def test_a_narrow_cloud_shrinks_its_longest_most_used_words_rather_than_leaving_
     assert {word for _, word, *_ in placed} == {"festival", "harbour", "grinding", "tonight", "parking", "awful",
                                                  "library"}
     assert all(cloud.rect().toRectF().contains(b) for b, *_ in placed)
+    # Sized for the width, so the most used aren't each shrunk by a different amount: words used as often are
+    # the same size, and the more used never smaller.
+    sizes = {word: px for _, word, _, _, px in placed}
+    assert sizes["festival"] == sizes["harbour"] == sizes["grinding"] > sizes["tonight"] == sizes["library"]
 
 
 def test_a_little_less_room_keeps_the_words_where_they_are_and_a_lot_lays_them_out_afresh():

@@ -286,7 +286,10 @@ class WordCloud(QWidget):
             self._sprites.clear()
         w, h = self.width(), self.height()
         most, least = self._words[0][1], self._words[-1][1]
-        biggest = min(self.MAX_PX, max(self.MIN_PX + 4, h / 6))
+        # Narrow (the Words page beside its meanings card) caps it too, so a word of up to nine letters fits across
+        # at the biggest size: words used as often stay the same size, and only longer ones are shrunk below.
+        across = QFontMetricsF(self._font(self.MAX_PX)).horizontalAdvance("abcdefghi") / self.MAX_PX + 0.35
+        biggest = min(self.MAX_PX, max(self.MIN_PX + 4, min(h / 6, w / across)))
         cx, cy = w / 2, h / 2
         if self._spiral_for != (w, h):
             # Stretched to the widget's shape, so the cloud fills it; out to where it has left the widget wherever
