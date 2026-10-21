@@ -5,7 +5,8 @@ from __future__ import annotations
 import multiprocessing
 import os
 import time
-from concurrent.futures import CancelledError, Future, ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Callable, Iterator
 
 import requests
@@ -73,48 +74,72 @@ class Slices(QObject):
 class ScorePool(QObject):
     """Scores texts by a subreddit's words in other processes, one per spare core: long scoring then neither
     holds up the window (a thread would, by the interpreter lock) nor waits for room between its frames. The
-    processes start at the first ``submit`` and end at ``close``. ``scored`` brings (tag, [(score, label,
-    label without the words)]) back on the GUI thread, or ``failed`` the tag of texts they couldn't score."""
+    processes start at the first ``submit`` and end a minute after ``rest`` (so setting words one after another
+    doesn't start them each time), or at ``close``. ``scored`` brings (tag, [(score, label, label without the
+    words)]) back on the GUI thread, or ``failed`` the tag of texts they couldn't score. Once processes can't
+    run here, every later submit fails at once rather than starting more."""
 
     scored = Signal(object, object)
     failed = Signal(object)
-    _done = Signal(object, object)  # from the pool's own thread: tag, future
+    _done = Signal(object, object, object)  # from the pool's own thread: the pool, tag, future
 
     WORKERS = max(1, min(8, (os.cpu_count() or 2) - 1))
+    IDLE_MS = 60_000
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self._pool: ProcessPoolExecutor | None = None
+        self.broken = False
+        self._idle = QTimer(self)
+        self._idle.setSingleShot(True)
+        self._idle.setInterval(self.IDLE_MS)
+        self._idle.timeout.connect(self.close)
         self._done.connect(self._settle)
 
     def submit(self, tag, weights: dict[str, float], words: frozenset[str], texts: list[str]) -> None:
+        self._idle.stop()
         try:
+            if self.broken:
+                raise BrokenProcessPool("worker processes can't run here")
             if self._pool is None:
                 self._pool = ProcessPoolExecutor(self.WORKERS, mp_context=multiprocessing.get_context("spawn"))
-            future = self._pool.submit(Lexicon.compare, weights, words, texts)
-        except Exception:  # no processes here (a broken pool, or none allowed): the caller scores them itself
+            pool = self._pool
+            future = pool.submit(Lexicon.compare, weights, words, texts)
+        except Exception:  # none allowed, or they died: the caller scores them itself
+            self.broken = True
             self.close()
             QTimer.singleShot(0, lambda: self.failed.emit(tag))
             return
-        future.add_done_callback(lambda f: self._send(tag, f))
+        future.add_done_callback(lambda f: self._send(pool, tag, f))
+
+    def rest(self) -> None:
+        if self._pool is not None:
+            self._idle.start()
 
     def close(self) -> None:
-        """End the processes, dropping what they haven't started on."""
-        if self._pool is not None:
-            self._pool.shutdown(wait=False, cancel_futures=True)
-            self._pool = None
+        """End the processes now, and what they're on with them (it's for work dropped, or the app is closing)."""
+        pool, self._pool = self._pool, None
+        self._idle.stop()
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+            for process in list((pool._processes or {}).values()):
+                process.terminate()
 
-    def _send(self, tag, future: Future) -> None:
+    def _send(self, pool, tag, future: Future) -> None:
         try:
-            self._done.emit(tag, future)
+            self._done.emit(pool, tag, future)
         except RuntimeError:  # the window has closed
             pass
 
-    def _settle(self, tag, future: Future) -> None:
+    def _settle(self, pool, tag, future: Future) -> None:
         try:
             results = future.result()
-        except (Exception, CancelledError):  # cancelled too: one failing ends the others, which are then scored apart
-            self.close()
+        except BrokenProcessPool:  # its processes died: ended by close, or they can't run here
+            if pool is self._pool:
+                self.broken = True
+                self.close()
+            self.failed.emit(tag)
+        except Exception:  # cancelled by close, or this chunk alone failed
             self.failed.emit(tag)
         else:
             self.scored.emit(tag, results)

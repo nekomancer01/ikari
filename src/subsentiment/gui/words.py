@@ -532,7 +532,7 @@ class Rescore(QObject):
     follow as it goes. A change while one runs starts it again with every word it was doing."""
 
     rescored = Signal(str, str, object)  # subreddit (lowercased), "posts" or "comments", the rows with new scores
-    progress = Signal(str, int, int)  # subreddit, work done, of
+    progress = Signal(str, int, int)  # subreddit, thousandths done, 1000
     finished = Signal(str)  # subreddit: every item using the words is scored again and saved
     # Just before finished: subreddit, the words, how many items use them, how many labels the words changed
     # each way ({(label without them, label with them): items}), and how many others' scores were only out of
@@ -567,6 +567,7 @@ class Rescore(QObject):
         self._retry: list[list] = []  # chunks they couldn't score, scored here once the search is done
         self._lexicon: tuple[dict, frozenset] = ({}, frozenset())  # the run's weights, and the words it's for
         self._counts = [0, 0, 0, 0]  # the run's items to search, searched, found and scored
+        self._shown = 0  # how far it's got, in thousandths, as last sent
         self._sent_at = self._committed_at = 0.0
 
     def start(self, subreddit: str, words, rows: dict | None = None) -> None:
@@ -632,7 +633,7 @@ class Rescore(QObject):
         """Find the items using ``words``, yielding after each, and send them to be scored a chunk at a time."""
         self._lexicon = (self.store.lexicon(sub).weights, frozenset(words))
         uses = Lexicon(dict.fromkeys(words, 0.0)).uses
-        self._counts = [sum(map(len, rows.values())), 0, 0, 0]
+        self._counts, self._shown = [sum(map(len, rows.values())), 0, 0, 0], 0
         self._sent_at = self._committed_at = time.perf_counter()
         chunk, sent = [], False
         for kind in KINDS:
@@ -643,16 +644,18 @@ class Rescore(QObject):
                     self._counts[2] += 1
                     chunk.append((kind, r, text))
                     if len(chunk) == self.CHUNK:
-                        self._out += 1
-                        self.pool.submit((self._run, sub, chunk), *self._lexicon, [t for *_, t in chunk])
+                        self._submit(sub, chunk)
                         chunk, sent = [], True
                 self._tick(sub)
                 yield
         if sent and chunk:
-            self._out += 1
-            self.pool.submit((self._run, sub, chunk), *self._lexicon, [t for *_, t in chunk])
+            self._submit(sub, chunk)
         elif chunk:
             yield from self._score_here(sub, [chunk])
+
+    def _submit(self, sub: str, chunk: list) -> None:
+        self._out += 1
+        self.pool.submit((self._run, sub, chunk), *self._lexicon, [t for *_, t in chunk])
 
     def _score_here(self, sub: str, chunks: list[list]):
         for chunk in chunks:
@@ -712,8 +715,10 @@ class Rescore(QObject):
         if now - self._sent_at > self.BATCH:
             self._save(sub)
             total, searched, found, scored = self._counts
-            likely = found * total // max(searched, 1)  # found by the end, at this rate
-            self.progress.emit(sub, searched + self.SCORE_COST * scored, total + self.SCORE_COST * likely)
+            likely = found * total / max(searched, 1)  # found by the end, at this rate
+            done = (searched + self.SCORE_COST * scored) / max(total + self.SCORE_COST * likely, 1)
+            self._shown = max(self._shown, round(1000 * done))  # an estimate that grew doesn't take it back
+            self.progress.emit(sub, self._shown, 1000)
             self._sent_at = self._committed_at = time.perf_counter()
         elif now - self._committed_at > self.COMMIT:
             self.store.commit()
@@ -731,7 +736,7 @@ class Rescore(QObject):
         self._save(sub)
         self._doing = None
         if not self._todo:
-            self.pool.close()  # its processes aren't kept waiting for the next word set
+            self.pool.rest()
         using, changed, stale = self._tally.pop(sub, (set(), {}, set()))
         self.scored.emit(sub, words, len(using), Counter(changed.values()), len(stale - changed.keys()))
         self.finished.emit(sub)

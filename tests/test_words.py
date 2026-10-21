@@ -388,10 +388,12 @@ def test_the_result_counts_only_what_the_setting_changes_and_old_scores_apart(tm
         QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
 
 
-@pytest.mark.parametrize("processes", [True, False], ids=["in other processes", "where they can't run"])
-def test_a_big_rescore_is_scored_a_chunk_at_a_time_in_other_processes(tmp_path, monkeypatch, processes):
+@pytest.mark.parametrize("processes, again", [(True, False), (False, False), (True, True)],
+                         ids=["in other processes", "where they can't run", "set again while it runs"])
+def test_a_big_rescore_is_scored_a_chunk_at_a_time_in_other_processes(tmp_path, monkeypatch, processes, again):
     """Ame's r/classicwow had 31,497 items using "dungeon", which took minutes to score on the window's own
-    thread. Chunks go to worker processes instead; where those can't start, every item is still scored here."""
+    thread. Chunks go to worker processes instead; where those can't start, every item is still scored here.
+    A word set while a rescore runs starts it again, with new processes: what the old ones were on is dropped."""
     from subsentiment.gui import worker, words
 
     app = QApplication.instance() or QApplication([])
@@ -424,18 +426,33 @@ def test_a_big_rescore_is_scored_a_chunk_at_a_time_in_other_processes(tmp_path, 
         meanings.pick("grinding")
         meanings.rows["grinding"].set(-1.0)  # as if dragged there: no wait for a slider moved with the keys
         meanings._save(meanings.rows["grinding"])
+        if again:
+            until_out = time.monotonic() + 30
+            while not w.rescore._out:  # some chunks are with the processes
+                assert time.monotonic() < until_out
+                app.processEvents()
+            first = w.rescore.pool._pool
+            meanings.pick("library")
+            meanings.rows["library"].set(0.0)
+            meanings._save(meanings.rows["library"])
+            assert first._shutdown_thread and w.rescore.pool._pool is not first
         end = time.monotonic() + 60
         while w.rescore.running():
             assert time.monotonic() < end
             app.processEvents()
             time.sleep(0.01)
-        set_to = sentiment.Lexicon({"grinding": -1.0})
+        assert w.rescore.pool.broken == (not processes)
+        set_to = sentiment.Lexicon({"grinding": -1.0, **({"library": 0.0} if again else {})})
         assert {r["id"]: r["label"] for r in w.store.posts("town")} == {
             f"p{i}": set_to.score(t)[1] for i, t in enumerate(texts)}
-        assert sorted(pooled) == ([3, 4, 4] if processes else [])  # back in any order
-        assert w.rescore.pool._pool is None  # its processes end once it's done
-        changes = sum(1 for t in texts[:11] if set_to.score(t)[1] != sentiment.score(t)[1])
-        assert meanings.rows["grinding"].result.full_text() == f"✓ {changes} of 11 saved items changed label"
+        if not again:
+            assert sorted(pooled) == ([3, 4, 4] if processes else [])  # back in any order
+        assert (w.rescore.pool._pool is not None) == processes  # kept for a word set next
+        assert w.rescore.pool._idle.isActive() == processes  # until a minute after
+        w.rescore.pool._idle.timeout.emit()
+        assert w.rescore.pool._pool is None
+        changes = sum(1 for t in texts[:11 + again] if set_to.score(t)[1] != sentiment.score(t)[1])
+        assert meanings.rows["grinding"].result.full_text() == f"\u2713 {changes} of {11 + again} saved items changed label"
     finally:
         w.close()
         QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
