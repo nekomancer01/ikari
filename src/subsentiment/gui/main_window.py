@@ -1342,6 +1342,7 @@ class MainWindow(QMainWindow):
         if self.load_job.busy:  # what it read is let go; its thread is waited for, as it uses the file
             self.load_job.worker.finished.disconnect()
             self.load_job.worker.failed.disconnect()
+            self.load_job.worker.stop()
             self.load_job.qthread.quit()
             self.load_job.qthread.wait(3000)
         self.rescore.stop()

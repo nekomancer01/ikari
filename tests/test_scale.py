@@ -2,12 +2,14 @@
 and memory are counted, not timed, so these hold on a slow runner too; tools/perf.py --db measures the frame times
 on a real database."""
 import os
+import time
 import tracemalloc
 from collections import Counter
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QItemSelectionModel, QSettings, Qt  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from subsentiment.analysis import WordCounts  # noqa: E402
@@ -16,6 +18,7 @@ from subsentiment.gui import tables  # noqa: E402
 from subsentiment.gui.tables import COMMENT_COLUMNS as TABLE_COMMENTS, TablePage  # noqa: E402
 from subsentiment.gui.words import WordTally  # noqa: E402
 from subsentiment.gui.worker import LoadWorker  # noqa: E402
+from subsentiment import store as store_module  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
 from test_big_data import COMMENTS, POSTS, count_calls, fill  # noqa: E402
@@ -205,3 +208,22 @@ def test_a_big_table_loading_between_frames_takes_rows_a_fetch_adds_meanwhile():
         pass
     assert tab.model.rowCount() == 60_001 and "late" in {r["id"] for r in tab.model.rows}
     assert len(tab.all_rows) == 60_001
+
+
+def test_closing_the_window_while_a_big_subreddit_is_read_stops_the_read(tmp_path, monkeypatch):
+    """Qt aborted the process on exit when the window closed with the read's thread still going (half a minute
+    for Ame's 650,000 comments)."""
+    settings(tmp_path)
+    db = str(tmp_path / "big.db")
+    fill(db)
+    QSettings().setValue("ui/last_dataset", "Big")
+    real = store_module.words_in
+    monkeypatch.setattr(store_module, "words_in", lambda text: (time.sleep(0.001), real(text))[1])  # ~20 s to read
+    monkeypatch.setattr(mw.MainWindow, "wait_for_data", False)
+    w = mw.MainWindow(db)
+    w.show()
+    until(lambda: w.load_job.running())
+    QTest.qWait(200)
+    started = time.monotonic()
+    w.close()
+    assert not w.load_job.running() and time.monotonic() - started < 2

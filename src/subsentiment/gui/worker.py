@@ -3,6 +3,7 @@ the network, and long Python work on the GUI thread a slice at a time (`Slices`)
 from __future__ import annotations
 
 import gc
+import sqlite3
 import time
 from contextlib import contextmanager
 from typing import Callable, Iterator
@@ -131,16 +132,25 @@ class LoadWorker(QObject):
         super().__init__()
         self.args = (db_path, subreddit, min_scores)
         self.tag = tag
+        self.store: Store | None = None
+        self._stop = False
 
     def stop(self) -> None:
-        pass  # one read; the window ignores what it sends once closed
+        """Cut the read short (the window is closing): reading a big subreddit takes half a minute, and Qt aborted
+        the process when the window went with its thread still running."""
+        self._stop = True
+        store = self.store
+        if store is not None:
+            store.db.interrupt()  # (from any thread) the query being read fails at its next row
 
     @Slot()
     def run(self) -> None:
         db_path, subreddit, (min_post, min_comment) = self.args
         store = None
         try:
-            store = Store(db_path)
+            store = self.store = Store(db_path)
+            if self._stop:
+                raise sqlite3.OperationalError("interrupted")
             with store.snapshot(), lasting():
                 rows = {k: SavedRows(scoring_at_least(store.rows(k, subreddit, words=True), least))
                         for k, least in (("posts", min_post), ("comments", min_comment))}
@@ -150,6 +160,7 @@ class LoadWorker(QObject):
             self.failed.emit(failure_text(e))
         finally:
             if store is not None:
+                self.store = None
                 store.close()
 
 
