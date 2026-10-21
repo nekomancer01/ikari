@@ -171,6 +171,7 @@ QToolTip {{ background: {t['menu']}; color: {t['text']}; border: 1px solid {edge
 /* Panels: "true" is a page-level panel (the sidebar, the main area), "tile" and "solid" the cards on one */
 QFrame[glass="true"] {{ background: {panel}; border: 1px solid {edge}; border-radius: 16px; }}
 QFrame[glass="tile"], QFrame[glass="solid"] {{ background: {panel}; border: 1px solid {edge}; border-radius: 10px; }}
+QFrame[choice="true"] {{ background: {soft}; border: none; border-radius: 13px; }}
 QFrame[role="divider"] {{ background: {edge}; border: none; min-height: 1px; max-height: 1px; }}
 QLabel {{ background: transparent; border: none; }}
 QLabel[role="title"] {{ font-family: {display}; font-size: 13pt; font-weight: 600; letter-spacing: -0.2px; }}

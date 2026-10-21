@@ -316,7 +316,7 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     assert (cell.main.text(), cell.note.text()) == ("1 saved so far", "Today")
     assert "of" not in cell.main.text() and "%" not in cell.note.text()
     button = c.day_table.cellWidget(row, 2).findChild(mw.QPushButton)
-    assert button.text() == "Download all" and button.isEnabled()
+    assert button.text() == coverage.DOWNLOAD and button.isEnabled()
     button.click()
     req, msg = started[-1]
     assert req.everything and req.after == today and req.limit == coverage.MAX_DAY_POSTS
