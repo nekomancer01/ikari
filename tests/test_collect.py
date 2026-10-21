@@ -27,7 +27,7 @@ class FakeClient:
         return [self.by_id[i] for i in ids if i in self.by_id]
 
     def fetch_posts(self, subreddit, after, before, limit, query, top=False, skip=(), progress=None,
-                    should_stop=None, on_posts=None, exhaust=False):
+                    should_stop=None, on_posts=None, exhaust=False, read=()):
         self.calls.append(("posts", top, set(skip)))
         left = [p for p in self.posts if top or p.id not in skip]
         picked = left[:limit]
@@ -309,7 +309,7 @@ class DayClient(FakeClient):
         self.stop_after = stop_after
 
     def fetch_posts(self, subreddit, after, before, limit, query, top=False, skip=(), progress=None,
-                    should_stop=None, on_posts=None, exhaust=False):
+                    should_stop=None, on_posts=None, exhaust=False, read=()):
         self.windows.append((after, before, limit, exhaust))
         self.calls.append(("posts", after))
         if progress:
