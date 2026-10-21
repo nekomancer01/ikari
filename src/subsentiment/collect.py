@@ -29,6 +29,11 @@ class FetchRequest:
     query: str = ""
     include_comments: bool = True
     comments_per_post: int = 50  # 0: every comment on each post, as Download coverage's Download all comments
+    comment_pick: str = "top"  # which comments a cap keeps: "top" (highest-scored) or "random" (fixed per post)
+    # With a cap, keep asking for a saved post's thread until it has that many comments saved or is whole, as
+    # Download coverage's ticked days do; a later run with a bigger cap tops threads up. Without it, a capped
+    # fetch asks about each post once. comments_per_post 0 always keeps asking until the thread is whole.
+    fill_threads: bool = False
     top: bool = False  # highest-scored posts of each part of the range, instead of an even sample
     refresh_scores: bool = False  # also re-check saved posts whose scores hadn't settled
     # Every post in [after, before), with limit as a cap; when every part of the range was read to its
@@ -143,10 +148,13 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     # 3. Comments: for new posts, for saved ones whose scores just settled (their comment scores have
     #    too), and for saved posts whose comments were never fetched or failed last time. A post whose
     #    comments came back fine, even if there were none, isn't asked about again. Asked for all comments,
-    #    every saved post in the range is, until its whole thread is saved (as Download all comments does).
+    #    every saved post in the range is, until its whole thread is saved (as Download all comments does);
+    #    with fill_threads and a cap, until it has that many saved.
     n_comments = errors = 0
-    everything = not req.comments_per_post
-    saved_whole = store.complete_keys("comments", name) if everything and req.include_comments else set()
+    cap = req.comments_per_post
+    fill = req.fill_threads or not cap
+    saved_whole = store.complete_keys("comments", name) if fill and req.include_comments else set()
+    saved_count = store.comment_counts(name, req.after, req.before) if fill and cap and req.include_comments else {}
     gave_up = False  # the archive kept failing comment requests; the rest are left for the next fetch
 
     def comments(picked: list[Post], updated: list[Post], in_part: Callable[[str], bool], report) -> None:
@@ -161,14 +169,14 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
             _stored_post(r) for pid, r in stored.items()
             if in_part(pid) and not r["image"] and pid not in refreshed and (
                 _comments_missing(r) or (pid in repicked and _never_asked(r))
-                or (everything and pid not in saved_whole))]
+                or (fill and pid not in saved_whole and not (cap and saved_count.get(pid, 0) >= cap)))]
         todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up
         if gave_up:
             tried: set[str] = set()
         else:
             def save(p: Post, got) -> None:
                 nonlocal n_comments
-                comments, complete = got if everything else (got, False)
+                comments, complete = got if fill else (got, False)
                 had = store.comment_ids(p.id)  # a thread asked for again: count only what's new
                 for c in comments:
                     store.save_comment(c, *score(c.body))
@@ -180,10 +188,10 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
                 if comments:
                     saved()
 
-            get = (client.fetch_all_comments if everything
-                   else lambda p: client.fetch_comments(p, req.comments_per_post))
+            get = (lambda p: client.fetch_all_comments(p, cap, req.comment_pick)) if fill else (
+                lambda p: client.fetch_comments(p, cap, req.comment_pick))
             failed, tried, gave_up = _each_thread(
-                todo, get, save, "All comments for post" if everything else "Comments for post",
+                todo, get, save, "Comments for post" if cap else "All comments for post",
                 store, getattr(client, "tree_workers", getattr(client, "workers", 1)), report, should_stop)
             errors += failed
         if gave_up:
@@ -275,6 +283,9 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
             store.save_post(p, *score(p.text))
         store.commit()
         posts = [fresh.get(p.id, p) for p in posts]
+    cap = req.comments_per_post if req.fill_threads else 0  # Download coverage's cap; 0: every comment
+    if cap:  # a thread with its cap saved already is done for this cap
+        posts = [p for p in posts if len(store.comment_ids(p.id)) < cap]
     if len(posts) > 1:
         # A day's Download all comments offers posts whose comments weren't counted yet; once re-checked, the ones
         # with none, or with every one saved already, cost no request. They're done, so they aren't offered again.
@@ -303,7 +314,8 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
         store.commit()
         saved()
 
-    errors, tried, gave_up = _each_thread(posts, client.fetch_all_comments, save, "All comments for post",
+    errors, tried, gave_up = _each_thread(posts, lambda p: client.fetch_all_comments(p, cap, req.comment_pick), save,
+                                          "Comments for post" if cap else "All comments for post",
                                           store, getattr(client, "tree_workers", getattr(client, "workers", 1)),
                                           progress, should_stop)
     if gave_up:

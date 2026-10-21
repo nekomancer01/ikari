@@ -18,13 +18,14 @@ import shiboken6
 from PySide6.QtCore import QEvent, QSize, Qt, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QBoxLayout, QCheckBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton,
-    QTableWidget, QVBoxLayout, QWidget,
+    QSizePolicy, QTableWidget, QVBoxLayout, QWidget,
 )
 
 from subsentiment import collect
+from subsentiment.arctic_shift import TREE_MAX
 from subsentiment.gui import theme
 from subsentiment.gui.widgets import (
-    Choice, ElidedLabel, ShareBar, VerticalScrollArea, label, panel, plural, section,
+    Choice, CommentCap, ElidedLabel, ShareBar, VerticalScrollArea, label, panel, plural, section,
 )
 from subsentiment.gui.worker import BackgroundJob, CountWorker, StoreWorker
 
@@ -355,9 +356,20 @@ class CoveragePage(VerticalScrollArea):
         root.addLayout(header)
 
         # What the ticked days download, and the one button that does it.
-        bar, bar_lay = panel("solid", margins=8, spacing=10)
-        bar_lay.setDirection(QBoxLayout.Direction.LeftToRight)
-        bar_lay.setContentsMargins(14, 7, 7, 7)
+        bar, rows = panel("solid", margins=8, spacing=8)
+        rows.setContentsMargins(14, 7, 7, 7)
+        # One line: what, the comment cap, then the estimate and the button. A narrower window puts the estimate and
+        # button on a second line, and a narrower one still the cap on its own line between them.
+        self.bar_lines, self.bar_first = (QBoxLayout(QBoxLayout.Direction.LeftToRight) for _ in range(2))
+        bar_lay, bar_cap, bar_end = QHBoxLayout(), QHBoxLayout(), QHBoxLayout()
+        for lay in (self.bar_lines, self.bar_first, bar_lay, bar_cap, bar_end):
+            lay.setSpacing(10)
+        rows.addLayout(self.bar_lines)
+        self.bar_lines.addLayout(self.bar_first)
+        self.bar_lines.addLayout(bar_end, 1)
+        self.bar_first.addLayout(bar_lay)
+        self.bar_first.addLayout(bar_cap)
+        self.bar_first.addStretch(1)  # the cap follows the choice, not the line's far end
         bar_lay.addWidget(QLabel("Download"))
         self.what = Choice(list(WHAT.items()), settings.value("coverage/what", "both", str))
         self.what.buttons["posts"].setToolTip("Every post from the ticked days")
@@ -366,11 +378,28 @@ class CoveragePage(VerticalScrollArea):
         self.what.buttons["both"].setToolTip("Every post from the ticked days, then every comment on them")
         self.what.changed.connect(lambda key: (settings.setValue("coverage/what", key), self._show_ticked()))
         bar_lay.addWidget(self.what)
+        # How many comments each thread keeps, and which: every comment download on this page follows it. A thread
+        # with that many saved isn't asked about again; a bigger cap later tops it up.
+        self.comment_cap = CommentCap(settings, "coverage", 0, TREE_MAX, self)
+        self.comment_cap.count.setSingleStep(50)
+        self.comment_cap.count.setSuffix(" per thread")
+        self.comment_cap.count.setSpecialValueText("All comments")
+        # Just wide enough for its widest text and the arrows, leaving the bar's room to the estimate.
+        count = self.comment_cap.count
+        count.setFixedWidth(count.fontMetrics().horizontalAdvance("25000 per thread") + 48)
+        self.comment_cap.pick.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        for signal in (self.comment_cap.count.valueChanged, self.comment_cap.pick.currentIndexChanged):
+            signal.connect(self.comment_cap.save)
+            signal.connect(self._show_ticked)
+        bar_cap.addWidget(self.comment_cap.count)
+        bar_cap.addWidget(self.comment_cap.pick)
+        for lay in (bar_lay, bar_cap):
+            lay.addStretch(1)  # on a line of its own, each part stays at the left
         self.estimate = ElidedLabel("", "muted")
-        bar_lay.addWidget(self.estimate, 1)
+        bar_end.addWidget(self.estimate, 1)
         self.download_ticked = theme.mark(small_button("Download selected"), "primary", True)
         self.download_ticked.clicked.connect(self._download_ticked)
-        bar_lay.addWidget(self.download_ticked)
+        bar_end.addWidget(self.download_ticked)
         root.addWidget(bar)
 
         self.day_table = table(["Day", "Posts", "", "Comment threads", ""])
@@ -753,6 +782,7 @@ class CoveragePage(VerticalScrollArea):
         self.tick_all.setText("Select none" if every else "Select all")
         self.tick_all.setEnabled(bool(shown))
         what = self.what.value()
+        self.comment_cap.set_enabled(what != "posts")
         self.download_ticked.setText(f"Download {plural(n, 'day')}" if n else "Download selected")
         idle = not self.busy and not self.delete_job.busy
         # Comments need no count; posts wait for theirs, as a day's Download all does.
@@ -923,6 +953,14 @@ class CoveragePage(VerticalScrollArea):
         direction = QBoxLayout.Direction.LeftToRight if wide else QBoxLayout.Direction.TopToBottom
         if self.body.direction() != direction:
             self.body.setDirection(direction)
+        # The bar on as few lines as fit, the estimate keeping room to say something.
+        what, cap = (self.bar_first.itemAt(k).layout().minimumSize().width() for k in (0, 1))
+        end = self.bar_lines.itemAt(1).layout().minimumSize().width()
+        room = self.viewport().width() - 21  # the bar's side margins
+        across, down = QBoxLayout.Direction.LeftToRight, QBoxLayout.Direction.TopToBottom
+        for lay, one in ((self.bar_lines, what + cap + end + 20 + 160 <= room), (self.bar_first, what + cap + 10 <= room)):
+            if lay.direction() != (across if one else down):
+                lay.setDirection(across if one else down)
         super().resizeEvent(event)
 
     def eventFilter(self, obj, event) -> bool:
@@ -1018,7 +1056,8 @@ class CoveragePage(VerticalScrollArea):
         if not self.subreddit:
             return
         store = self.window_.store
-        self._download_comments(store.open_threads(self.subreddit, [day])
+        cap = self.comment_cap.count.value()
+        self._download_comments(store.open_threads(self.subreddit, [day], cap=cap)
                                 or store.open_threads(self.subreddit, [day], every=True))
 
     def _download_ticked(self) -> None:
@@ -1029,15 +1068,17 @@ class CoveragePage(VerticalScrollArea):
     def _start(self, sub: str, what: str, days: tuple[int, ...]) -> bool:
         """Download ``what`` from these days of r/sub, newest first; False if there's nothing to start."""
         if what == "comments":
-            ids = self.window_.store.open_threads(sub, days)
+            ids = self.window_.store.open_threads(sub, days, cap=self.comment_cap.count.value())
             if not ids:
                 return False
-            req = collect.FetchRequest(subreddit=sub, comment_posts=tuple(ids))
+            req = collect.FetchRequest(subreddit=sub, comment_posts=tuple(ids), fill_threads=True,
+                                       **self.comment_cap.request())
             message = f"Downloading the comments on {plural(len(ids), 'post')} from {plural(len(days), 'day')}…"
         else:
             comments = what == "both"
             req = collect.FetchRequest(subreddit=sub, after=days[-1], before=days[0] + DAY, limit=None,
-                                       include_comments=comments, comments_per_post=0, days=days)
+                                       include_comments=comments, fill_threads=True, days=days,
+                                       **self.comment_cap.request())
             message = (f"Downloading every {'post and comment' if comments else 'post'} from "
                        f"{plural(len(days), 'day')} in r/{sub}…")
         # The ticks stay until it ends: unticked once it has read them all, kept (and offered to resume) if it's stopped.
@@ -1094,8 +1135,11 @@ class CoveragePage(VerticalScrollArea):
     def _download_comments(self, ids: list[str]) -> None:
         if not self.subreddit or not ids:
             return
-        req = collect.FetchRequest(subreddit=self.subreddit, comment_posts=tuple(ids))
-        self.window_.start_request(req, f"Downloading every comment on {plural(len(ids), 'post')}…")
+        req = collect.FetchRequest(subreddit=self.subreddit, comment_posts=tuple(ids), fill_threads=True,
+                                   **self.comment_cap.request())
+        cap = self.comment_cap.count.value()
+        what = f"up to {plural(cap, 'comment')}" if cap else "every comment"
+        self.window_.start_request(req, f"Downloading {what} on {plural(len(ids), 'post')}…")
 
     def _download_day_comments(self) -> None:
         self._download_comments(list(getattr(self, "_todo_comments", [])))
