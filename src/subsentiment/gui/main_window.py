@@ -450,6 +450,7 @@ class MainWindow(QMainWindow):
             chart.view_changed.connect(partial(self._on_view_changed, chart))
         self.words_page = CardPage("Words used most", WordCloud())
         self.word_tally = WordTally(self)
+        self._words_for = None  # the subreddit whose words the clouds show
         self.word_tally.changed.connect(self._render_words)
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
         self.comments_tab = TablePage(COMMENT_COLUMNS, stretch_col=2)
@@ -1091,14 +1092,17 @@ class MainWindow(QMainWindow):
 
     def _render_words(self) -> None:
         """The word clouds of the span's items the scope counts: 50 words in the Overview's card, 150 on the
-        page. They follow the span once it settles, as the tables do."""
+        page. They follow the span once it settles, as the tables do, and ease from the words shown to the new
+        ones. While a big recount runs the tally still has the counts from before it, so the subreddit's words
+        stay up, faded, to ease from once it's done; another subreddit's aren't shown meanwhile."""
         scope = self.scope.currentText()
         kinds = [k for k, skip in zip(KINDS, ("Comments only", "Posts only")) if scope != skip]
         busy = not self.word_tally.ready
-        words = [] if busy else self.word_tally.top(kinds, 150)
+        words = [] if busy and self._words_for != self.current else self.word_tally.top(kinds, 150)
+        if not busy:
+            self._words_for = self.current
         self.overview.words.set_words(words[:50], busy)
-        if self.words_page.isVisible():
-            self.words_page.body.set_words(words, busy)
+        self.words_page.body.set_words(words, busy)  # placed only once it shows
 
     def _show_notes(self) -> None:
         notes = self.store.notes(self.current) if self.current else {}
