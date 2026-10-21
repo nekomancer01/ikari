@@ -221,8 +221,10 @@ def test_a_fetch_downloads_every_post_in_the_range_a_day_at_a_time(env):
     w.fetch_form.subreddit.setText("python")
     w.fetch_form.include_comments.setChecked(False)
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
-    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     bars, lines = set(), set()
+    shown = w.progress_msg.setText  # every line the strip is given: a short day's can go before a look sees it
+    w.progress_msg.setText = lambda text: (lines.add(text), shown(text))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     while w.fetch_job.busy:
         bars.add((w.progress.value(), w.progress.maximum()))
         lines.add(w.progress_msg.text())
@@ -1160,7 +1162,9 @@ def test_the_word_cloud_keeps_its_words_in_place_while_a_fetch_adds_to_them(env)
     while w.fetch_job.busy:
         pump(120)
         shown.append({word: box.center() for box, word, *_ in cloud.placed()})
-    moves = []  # how far the words shown both times moved between two looks: the median, for each pair
+    # How far the words shown both times moved between two looks: the median, for each pair. That includes the
+    # look before the fetch's strip appears under the header, making the page a little shorter.
+    moves = []
     for a, b in zip(shown, shown[1:]):
         if a and a != b and set(a) & set(b):
             d = sorted((a[k] - b[k]).manhattanLength() for k in set(a) & set(b))

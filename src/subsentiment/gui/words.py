@@ -153,8 +153,9 @@ class WordCloud(QWidget):
     MOVE_MS = 650  # a change easing in
     GROW_FROM = 0.4  # of its size, where a word pops in from and fades out to
     BUSY_DIM = 0.45  # how far the cloud fades while new counts are worked out
-    PULL = 0.12  # of the way to the middle, a step a word takes each update where that's free
+    PULL = 0.06  # of the way to the middle, a step a word takes each update where that's free
     FAR = 0.3  # of the widget's shorter side: a word moved further fades out and in rather than sliding
+    RESHAPE = 0.15  # a change of width or height up to this share keeps the words where they are
 
     word_clicked = Signal(str)
 
@@ -213,23 +214,26 @@ class WordCloud(QWidget):
     def _layout(self) -> None:
         """Start placing the words if they or the size changed; they go down a few each frame, the biggest
         first, so a new layout never holds up the window. Words changed while one is placed are placed next."""
-        key = (self.width(), self.height(), self._version)
-        if self._placing is None and self._placed_for != key:
-            self._placing_for, self._next, self._next_drawn = (key, self._painted), [], (None, None)
+        key, before = (self.width(), self.height(), self._version), self._placed_for
+        if self._placing is None and before != key:
+            # A small change of size (a strip appearing above, a window edge dragged) keeps the words where they
+            # are, moved with it; a big one lays the cloud out afresh to fill its new shape.
+            near = before is not None and all(abs(a - b) <= self.RESHAPE * b for a, b in zip(key[:2], before[:2]))
+            self._placing_for, self._next, self._next_drawn = (key, self._painted, near), [], (None, None)
             self._placing = self._place()
             self._slices.start(self._placing, self._placed_all)
 
     def _placed_all(self) -> None:
-        """Ease every word to where it was just placed: from where it is on screen when the cloud was showing
-        at this size, straight there otherwise (a resize, a page just opened, or motion off)."""
-        (key, painted), before = self._placing_for, self._placed_for
+        """Ease every word to where it was just placed, from where it is on screen; straight there after a big
+        resize or with motion off, and popping in on a page just opened."""
+        key, painted, near = self._placing_for
         self._placing, self._placed_for, self._placed = None, key, self._next
         self._drawn, self._drawn_for = self._next_drawn
         # Placed for a cloud that wasn't on screen (a page just opened): the words pop in instead.
         fresh = not (painted and self._painted)
         if fresh:
             self._shown = {}
-        ease = motion.enabled() and self.isVisible() and (fresh or before is not None and before[:2] == key[:2])
+        ease = motion.enabled() and self.isVisible() and (fresh or near)
         shown, far = {}, self.FAR * min(key[0], key[1])
         for box, word, n, lean, px in self._placed:
             w = self._shown.get(word)
@@ -289,9 +293,10 @@ class WordCloud(QWidget):
                 spiral.append((1.6 * a * math.cos(a) * aspect, 1.6 * a * math.sin(a)))
                 a += max(0.12, 3 / max(1.6 * a, 1))
             self._spiral, self._spiral_for = spiral, (w, h)
-        # Where the words shown are; at a new size the cloud is laid out afresh to fill it.
-        same = self._placed_for is not None and self._placed_for[:2] == (w, h)
-        was = {word: s.box.center().toTuple() for word, s in self._shown.items() if s.shown and same}
+        # Where the words shown are, moved with the widget if its size changed a little (see _layout).
+        ow, oh = self._placed_for[:2] if self._placed_for else (w, h)
+        was = {word: (s.box.center().x() * w / max(ow, 1), s.box.center().y() * h / max(oh, 1))
+               for word, s in self._shown.items() if s.shown and self._placing_for[2]}
         rows = [0] * (int(h) // _CELL + 2)  # the cells taken, a row of them per int
 
         def free(x, y, bw, bh):
