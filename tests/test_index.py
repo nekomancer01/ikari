@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from subsentiment.analysis import Analysis, WordCounts
-from subsentiment.index import STEPS, RowIndex
+from subsentiment.index import STEPS, RowIndex, top_words
 from subsentiment.reddit import Comment, Post
 from subsentiment.store import PACKED, DayPack, Store, scoring_at_least
 
@@ -109,17 +109,28 @@ def test_rows_a_fetch_saves_and_rescores_are_counted_in(saved):
     since = clock.time()
     clock.sleep(0.01)
     rng = random.Random(9)
-    _fill(s, rng, posts=4, per=3, day0=DAY0 + 11, prefix="fresh")  # new rows on old days: the index re-sorts
+    _fill(s, rng, posts=4, per=3, day0=DAY0 + 11, prefix="fresh")  # new rows on old days
     s.save_comment(Comment("c3_0", "p3", "Deltarune", "t3_p3", "v0", "edited text", 77, DAY0 + 3 * 86400 + 113, 0,
                            "https://www.reddit.com/r/Deltarune/comments/p3/x/c3_0/"), -0.2, "negative")
     s.commit()
+    kept = index.ids.copy()
     index.add(s.rows("comments", "deltarune", since=since))
+    assert list(index.ids[:before]) == list(kept)  # every row keeps its position; the new ones go at the end
+    assert index.ordered == before  # and aren't in time order
+    days = (DAY0, DAY0 + 86400)
     s.rescore("comments", [("c9_3", 0.7, "positive")])
     s.commit()
     index.rescore([("c9_3", 0.7, "positive")])
     assert len(index) == before + 12
     rows = s.rows("comments", "deltarune", words=True)
+    in_day = {r["id"] for r in rows if days[0] <= r["created_utc"] < days[1]}
+    assert {i.decode() for i in index.ids[index.mask(days)]} == in_day
+    unordered = index.ids.copy()
+    order = index.reorder()
+    assert list(index.ids) == list(unordered[order])  # each new position's old one, to remap
     _same_rows(index, rows)
+    assert {i.decode() for i in index.ids[index.mask(days)]} == in_day
+    assert index.reorder().tolist() == list(range(len(index)))  # in order already
     assert Analysis(rows).counts == index.analysis().counts
     assert index.top_words(n=20) == WordCounts.top(WordCounts("comments", rows), n=20)
     index.close()
@@ -204,4 +215,88 @@ def test_rows_read_after_their_day_was_packed_still_have_their_text(saved):
     expected = s.rows("comments", "deltarune")
     assert [tuple(r)[:-1] for r in index.rows(range(len(index)))] == [tuple(r)[:-1] for r in expected]
     assert {r.id: r.body for r in index.rows(index.where(["c6_1"]))} == {"c6_1": "saved again during a fetch"}
+    index.close()
+
+
+@pytest.mark.parametrize("kind", ["posts", "comments"])
+def test_a_text_column_reads_as_the_rows_have_it_a_few_rows_at_a_time(saved, kind):
+    path, s = saved
+    rows = s.rows(kind, "deltarune")
+    index = RowIndex(path, kind, "deltarune")
+    names = list(PACKED[kind]) + (["post_title"] if kind == "comments" else [])
+    for name in names:
+        whole = [r[name] for r in rows]
+        assert index.column(name) == whole, name
+        assert [v for k in range(0, len(index), 7) for v in index.column(name, k, k + 7)] == whole, name
+    with pytest.raises(ValueError):
+        index.column("score")
+    index.close()
+
+
+def test_a_word_cloud_of_posts_and_comments_together_each_with_its_own_score_filter(saved):
+    path, s = saved
+    s.save_comment(Comment("newc0_9", "newp0", "Deltarune", "t3_newp0", "v", "zebra quokka", 7, clock.time() - 60, 0, None),
+                   0.5, "positive")  # words in no pack yet, so only one index has numbered them
+    s.commit()
+    posts, comments = RowIndex(path, "posts", "deltarune"), RowIndex(path, "comments", "deltarune")
+    for min_post, min_comment in ((None, None), (10, 1), (None, 50)):
+        expected = WordCounts.top(WordCounts("posts", scoring_at_least(s.rows("posts", "deltarune", words=True), min_post)),
+                                  WordCounts("comments", scoring_at_least(s.rows("comments", "deltarune", words=True), min_comment)),
+                                  n=60)
+        assert top_words([(posts, min_post), (comments, min_comment)], n=60) == expected
+    assert dict((w, n) for w, n, _ in top_words([(posts, None), (comments, None)], n=10_000))["zebra"] == 1
+    posts.close()
+    comments.close()
+
+
+@pytest.mark.parametrize("kind", ["posts", "comments"])
+def test_big_days_are_read_from_their_frames(tmp_path, kind):
+    path = tmp_path / "x.db"
+    s = Store(path)
+    _fill(s, random.Random(8), posts=600, per=1, days=2)  # 300 posts and comments a day: more than a frame
+    s.pack_settled()
+    assert all(d.startswith(DayPack.MAGIC) for (d,) in s.db.execute("SELECT data FROM packs WHERE kind = ?", (kind,)))
+    s.save_comment(Comment("c3_1", "p3", "Deltarune", "t3_p3", "v1", "saved again", 3, DAY0 + 86400 + 3 * 37 + 30, 0,
+                           None), 0.1, "positive")  # one in a pack whose row is newer
+    s.commit()
+    rows = s.rows(kind, "deltarune")
+    index = RowIndex(path, kind, "deltarune")
+    _same_rows(index, rows)
+    for name in list(PACKED[kind]) + (["post_title"] if kind == "comments" else []):
+        assert index.column(name, 5, 700) == [r[name] for r in rows[5:700]], name
+    assert index.top_words(n=30) == WordCounts.top(WordCounts(kind, s.rows(kind, "deltarune", words=True)), n=30)
+    index.close()
+    s.close()
+
+
+def test_a_thread_can_count_words_and_read_a_column_while_the_window_adds_and_draws_rows(saved):
+    import threading
+    path, s = saved
+    index = RowIndex(path, "comments", "deltarune")
+    errors, stop = [], threading.Event()
+
+    def worker():
+        try:
+            while not stop.is_set():
+                index.top_words(n=20)
+                index.column("body", 0, 100)
+                index.column("post_title", 0, 50)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+    thread = threading.Thread(target=worker)
+    thread.start()
+    rng = random.Random(11)
+    for k in range(20):
+        since = clock.time()
+        clock.sleep(0.002)
+        _fill(s, rng, posts=1, per=3, day0=DAY0 + 20 + k, prefix=f"t{k}")
+        index.add(s.rows("comments", "deltarune", since=since))
+        index.rows(range(0, len(index), 3))
+    stop.set()
+    thread.join()
+    assert not errors
+    index.reorder()
+    rows = s.rows("comments", "deltarune", words=True)
+    _same_rows(index, rows)
+    assert index.top_words(n=20) == WordCounts.top(WordCounts("comments", rows), n=20)
     index.close()
