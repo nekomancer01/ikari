@@ -148,6 +148,11 @@ class MainWindow(QMainWindow):
         self._upgrade_stop = threading.Event()
         self.upgrading = threading.Thread(target=Store.upgrade, args=(db_path, self._upgrade_stop), daemon=True)
         self.upgrading.start()
+        # What's read while it runs leaves its words uncounted (rows.Saved): read again once it's done.
+        self._upgraded = QTimer(self)
+        self._upgraded.setInterval(500)
+        self._upgraded.timeout.connect(self._after_upgrade)
+        self._upgraded.start()
         self.settings = QSettings()
         self.updates = UpdateFlow(self, self.settings)
         self.fetch_job = BackgroundJob(self)
@@ -946,7 +951,8 @@ class MainWindow(QMainWindow):
             return
         self._wanted = None
         if loaded is None:
-            loaded = (stats, {k: Saved(self.db_path, k, name) for k in KINDS} if name else
+            words = not self.upgrading.is_alive()
+            loaded = (stats, {k: Saved(self.db_path, k, name, words) for k in KINDS} if name else
                       {k: RowList() for k in KINDS})
         self._open(name, loaded)
 
@@ -1007,7 +1013,7 @@ class MainWindow(QMainWindow):
         if self._wanted is None or self.load_job.busy:
             return
         key = self._wanted
-        worker = LoadWorker(self.db_path, key, (key, self._stats.get(key)))
+        worker = LoadWorker(self.db_path, key, (key, self._stats.get(key)), words=not self.upgrading.is_alive())
         worker.read.connect(self._on_loaded)
         worker.failed.connect(self._on_load_failed)
         self.load_job.start(worker)
@@ -1017,6 +1023,17 @@ class MainWindow(QMainWindow):
         if self._wanted == key:
             self._wanted = None
             self._open(self._name_of(key), (stats, saved))
+
+    def _after_upgrade(self) -> None:
+        """Once the upgrade is done, read again what was read without its words while it ran."""
+        if self.upgrading.is_alive():
+            return
+        self._upgraded.stop()
+        for key in [k for k, (_, saved) in self._loaded.items() if not all(getattr(s, "words", True) for s in saved.values())]:
+            del self._loaded[key]
+        wordless = not all(getattr(s, "words", True) for s in self._saved.values())
+        if wordless and self.current and not (self.fetch_job.busy and self._showing_fetch()):
+            self._show_dataset(self.current)
 
     def _on_load_failed(self, message: str) -> None:
         if self._wanted is not None:  # read it here instead, where an error shows as it always has
@@ -1330,12 +1347,15 @@ class MainWindow(QMainWindow):
         self._span_slices.stop()
         self.word_tally.hold()
         self._wanted = None
+        self._upgraded.stop()
         if self.load_job.busy:  # what it read is let go; its thread is waited for, as it uses the file
             for sig in (self.load_job.worker.read, self.load_job.worker.finished, self.load_job.worker.failed):
                 sig.disconnect()
             self.load_job.worker.stop()
             self.load_job.qthread.quit()
-            self.load_job.qthread.wait(3000)
+            # A subreddit's index is a few seconds' reading at most (3 s for 650,000 comments while the upgrade
+            # runs), and Qt aborts the process if the thread is still going when the window goes.
+            self.load_job.qthread.wait()
         self.rescore.stop()
         deleting = self.coverage.delete_job
         if deleting.busy:  # one transaction: let it end, rather than cut it short, but show nothing of it
