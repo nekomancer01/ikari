@@ -244,6 +244,10 @@ class RowsModel(QAbstractTableModel):
                 yield
         return at[np.array(order, np.int64)], [keys[i] for i in order]
 
+    def sorting(self) -> bool:
+        """A big table's new order is being worked out away from the frames."""
+        return self._slices.running()
+
     def sort(self, column: int, order=Qt.SortOrder.AscendingOrder) -> None:
         """Called by the view when a header is clicked. Selected rows stay selected."""
         wanted = (column, order == Qt.SortOrder.DescendingOrder)
@@ -705,6 +709,14 @@ class TablePage(QWidget):
             sig.connect(self._update_count)
         self._fit_unread = False  # columns sized before the rows they're sized to were read
         self.model.read.connect(self._on_read)
+
+    def busy(self) -> str | None:
+        """What a big table is working out away from the frames, for the window's throbber; None for nothing."""
+        if self.model.sorting():
+            return "Sorting the table\u2026"
+        if self._slices.running() or self._typing.isActive():
+            return "Filtering the table\u2026"
+        return None
 
     @property
     def all_rows(self) -> Rows:

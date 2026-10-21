@@ -29,7 +29,7 @@ from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.widgets import (
-    ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatusLabel, fit_to_screen, label, panel, plural, section,
+    ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatusLabel, Throbber, fit_to_screen, label, panel, plural, section,
 )
 from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices, finish
 from subsentiment.reddit import normalize_subreddit, subreddit_error
@@ -229,6 +229,8 @@ class MainWindow(QMainWindow):
         bar.messageChanged.connect(self._status_changed)
         bar.hide()
         QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _: self._apply_theme())
+        # Anything the window waits on for over a second sweeps along the rule under the header.
+        self.throbber = Throbber(self.rule, self.waiting, beside=self.subheading)
         self._refresh_datasets(select=self.settings.value("ui/last_dataset", "", str))
         # "ui/tab" held the index of the old Overview / Posts / Comments tabs.
         old_tab = ("overview", "posts", "comments")[min(max(self.settings.value("ui/tab", 0, int), 0), 2)]
@@ -443,7 +445,8 @@ class MainWindow(QMainWindow):
         header.addWidget(self.fetch_strip, 2, 0, 1, 2)
         header.setColumnStretch(0, 1)
         lay.addLayout(header)
-        lay.addWidget(mark(QFrame(), "role", "divider"))
+        self.rule = mark(QFrame(), "role", "divider")
+        lay.addWidget(self.rule)
 
         self.pages = QStackedWidget()
         self.content = content
@@ -627,6 +630,28 @@ class MainWindow(QMainWindow):
         self.fetch_form.set_busy(busy)
         self._update_delete_enabled()  # don't delete rows the fetch thread is writing
         self.coverage.set_busy(busy)
+
+    def waiting(self) -> str | None:
+        """What the window is waiting on, for the throbber: "" where the header already says (a subreddit being
+        opened or filtered), None for nothing. While a fetch runs for the subreddit shown, the tables and words
+        following it are its progress bar's to tell."""
+        if self._wanted is not None:
+            return ""
+        table = self.posts_tab.busy() or self.comments_tab.busy()
+        if table:
+            return table
+        if self.rescore.running():
+            return "Scoring saved items\u2026"
+        if self.coverage.delete_job.busy:
+            return "Deleting days\u2026"
+        if not (self.fetch_job.busy and self._showing_fetch()):
+            if self._span_slices.running():
+                return "Filling the tables\u2026"
+            if self.word_tally.busy():
+                return "Counting words\u2026"
+        if self.upgrading.is_alive():
+            return "Shrinking saved data\u2026"
+        return None
 
     def set_deleting(self, on: bool) -> None:
         """Download coverage is deleting days on a thread: nothing else writes until it's done."""

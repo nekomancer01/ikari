@@ -79,6 +79,10 @@ class WordTally(QObject):
         return (a is not None and b is not None and a[0] is b[0] and a[1:3] == b[1:3]
                 and (not versions or a[3] == b[3]))
 
+    def busy(self) -> bool:
+        """Words asked for are being counted."""
+        return not self.ready or self._slices.running()
+
     def hold(self) -> None:
         """Not ready until the next count: the rows to count are on their way."""
         self._slices.stop()
