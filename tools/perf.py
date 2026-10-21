@@ -283,6 +283,18 @@ def main(argv: list[str] | None = None) -> int:
         for name in ("linux_gaming", "Deltarune"):  # as a click in the Saved list does it
             row = next(i for i in range(w.datasets.count()) if w.datasets.item(i).data(Qt.ItemDataRole.UserRole) == name)
             report(f"{page}: switch to {name}", [lambda r=row: w.datasets.setCurrentRow(r)])
+    for page in ("overview", "words"):
+        # A fetch saving comments, a request's 100 at a time: the word clouds follow every 250 ms (the overview's
+        # refresh) for two seconds.
+        w.show_page(page)
+        half = len(w.comments) // 2
+        w.word_tally.count(w.posts, w.comments[:half])
+        beat.run([], 3000)
+        rest = w.comments[half:]
+        batch = 100
+        report(f"{page}: words during a fetch",
+               [(lambda b=rest[i // 15 * batch:(i // 15 + 1) * batch]: (w.word_tally.add("comments", b), w._render_words()))
+                if i % 15 == 0 else (lambda: None) for i in range(120)])
     for page in ("overview", "words", "comments"):
         w.show_page(page)
         beat.run([], 800)
