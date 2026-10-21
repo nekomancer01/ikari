@@ -55,6 +55,12 @@ TIMEOUT_TRIES = 3  # query timeouts on one request before the caller is asked to
 GARBLED_TRIES = 3  # answers that aren't the archive's JSON before a request gives up
 MIN_WINDOW = 600  # seconds; a timing-out window is halved down to this
 MAX_SKIPS = 2  # windows that still time out at MIN_WINDOW skipped in a row before the fetch gives up
+# A comment thread is one cheap lookup by post id; the archive answers it in 1-2.5 s and has never timed one out or
+# limited it (live, 21 Oct: 173 threads on r/AskReddit and r/Deltarune, 4 in flight and 0.4 s apart, no 422 or 429).
+# Spacing and in-flight count were what held "Download all comments" to about two posts a second, so threads go
+# out twice as often and twice as many at once. A 429 still doubles the spacing for everything.
+TREE_SHARE = 0.5
+TREE_WORKERS = 8
 TREE_LIMIT = 300  # comments asked for per thread; big trees are slow for the archive and trip its limits
 TREE_MAX = 25000  # the most comments the tree endpoint returns in one request
 UNKNOWN_THREAD = 1000  # what fetch_all_comments asks for when a post's comment count isn't known yet
@@ -121,9 +127,10 @@ class RateLimiter:
         self._budget_known = False  # the server has sent X-RateLimit-Remaining at least once
         self._answered = False  # any answer has arrived yet
 
-    def wait(self, should_stop: StopFn | None = None) -> _Flight:
+    def wait(self, should_stop: StopFn | None = None, share: float = 1.0) -> _Flight:
         """Block until a request may go out, and count it as in flight until ``observe`` or ``done``
-        (given what this returns). Raises Stopped, sending nothing, if ``should_stop`` turns true meanwhile."""
+        (given what this returns). Raises Stopped, sending nothing, if ``should_stop`` turns true meanwhile.
+        ``share`` is how much of the spacing the request takes up: less for a light one (see TREE_SHARE)."""
         announced = False
         with self._lock:
             while True:
@@ -154,7 +161,7 @@ class RateLimiter:
                     self._sleep(delay)
                     if should_stop and should_stop():  # pressed during that last short wait
                         raise Stopped
-                self._next = self._clock() + self.interval
+                self._next = self._clock() + self.interval * share
                 if announced and self.on_wait:
                     self.on_wait(0.0, "")  # over: the UI goes back to what the job is doing
                 flight = _Flight(should_stop)
@@ -323,6 +330,7 @@ class ArcticShiftClient:
     def __init__(self, session: requests.Session | None = None, limiter: RateLimiter | None = None,
                  workers: int = WORKERS, should_stop: StopFn | None = None):
         self.workers = workers
+        self.tree_workers = max(workers, TREE_WORKERS)  # comment threads fetched at once (see TREE_SHARE)
         # Checked before every request and during waits, so Stop doesn't sit out retries and backoffs.
         self.should_stop = should_stop
         self._local = threading.local()  # per-thread state of get(), as several threads share a client
@@ -344,17 +352,18 @@ class ArcticShiftClient:
 
     # -- HTTP ---------------------------------------------------------------
 
-    def get(self, path: str, params: dict, shrink: bool = True) -> list:
+    def get(self, path: str, params: dict, shrink: bool = True, share: float = 1.0) -> list:
         """One API call with retries: waits on 429, backs off on 5xx and network errors, and on a
         query timeout backs off and asks for smaller pages (unless ``shrink`` is False, for requests
-        whose ``limit`` isn't a page size), raising QueryTimeout if that doesn't help."""
+        whose ``limit`` isn't a page size), raising QueryTimeout if that doesn't help. ``share`` is
+        RateLimiter.wait's."""
         params = dict(params)
         self._local.last_params = params  # what was finally sent, after any shrinking
         timeouts = garbled = 0
         stop = None if getattr(self._local, "finishing", False) else self.should_stop
         for attempt in range(ATTEMPTS):
             backoff = min(5.0 * 2 ** attempt, MAX_WAIT)
-            flight = self.limiter.wait(stop)
+            flight = self.limiter.wait(stop, share)
             try:
                 resp = self.session.get(BASE_URL + path, params=params, timeout=60)
             except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError,
@@ -827,7 +836,7 @@ class ArcticShiftClient:
     def _thread(self, post: Post, size: int) -> tuple[list[Comment], int, bool]:
         """The usable comments of a post's tree (parents first), how many items came back, and whether
         any replies were left collapsed."""
-        tree = self.get("/api/comments/tree", {"link_id": post.id, "limit": size})
+        tree = self.get("/api/comments/tree", {"link_id": post.id, "limit": size}, share=TREE_SHARE)
         comments: list[Comment] = []
         items = 0
         for d in _walk(tree):

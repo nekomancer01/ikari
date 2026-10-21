@@ -642,13 +642,13 @@ def test_requests_still_start_no_faster_than_the_limiter_allows():
     limiter = RateLimiter(0.02)
     real_wait, grab = limiter.wait, threading.Lock()
 
-    def wait(should_stop=None):
+    def wait(should_stop=None, share=1.0):
         # When the limiter let each request go, by its own clock. Timing anything after that also counts how
         # late the OS ran each worker thread, which on a busy machine (the suite runs in parallel) bunches
         # two together. The lock keeps another grant from moving _next before it's read.
         with grab:
-            real_wait(should_stop)
-            starts.append(limiter._next - limiter.interval)
+            real_wait(should_stop, share)
+            starts.append(limiter._next - limiter.interval * share)
 
     limiter.wait = wait
     ArcticShiftClient(session=SlowServer(items, delay=0.05), limiter=limiter, workers=4).fetch_posts(
@@ -897,3 +897,13 @@ def test_a_narrowed_window_full_of_one_seconds_posts_isnt_called_read_to_its_end
     c._page = page
     c.fetch_posts("python", after=T0, before=T0 + 3600, limit=100, exhaust=True)
     assert not c.exhausted and c.reached == []
+
+
+def test_comment_threads_go_out_at_half_the_spacing_of_searches():
+    c = client([ok([]) for _ in range(5)])
+    for _ in range(3):
+        c.get("/api/comments/tree", {"link_id": "p1", "limit": 100}, share=arctic_shift.TREE_SHARE)
+    c.get("/api/posts/search", {"limit": 100})
+    c.get("/api/posts/search", {"limit": 100})
+    assert c.clock.sleeps == [0.5, 0.5, 0.5, 1.0]  # the first goes at once; a search after a thread waits its share
+    assert ArcticShiftClient().tree_workers == arctic_shift.TREE_WORKERS > arctic_shift.WORKERS

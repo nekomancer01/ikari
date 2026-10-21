@@ -133,6 +133,32 @@ class LoadWorker(QObject):
                 store.close()
 
 
+class StoreWorker(QObject):
+    """Makes one change to the saved data with a connection of its own, such as deleting days and giving their
+    space back: sqlite lets go of the interpreter while it works, so the window paints meanwhile."""
+    finished = Signal(object)  # what the Store method returned
+    failed = Signal(str)
+
+    def __init__(self, db_path: str, method: str, *args):
+        super().__init__()
+        self.db_path, self.method, self.args = db_path, method, args
+
+    def stop(self) -> None:
+        pass  # one transaction; it ends by itself
+
+    @Slot()
+    def run(self) -> None:
+        store = None
+        try:
+            store = Store(self.db_path)
+            self.finished.emit(getattr(store, self.method)(*self.args))
+        except Exception as e:
+            self.failed.emit(failure_text(e))
+        finally:
+            if store is not None:
+                store.close()
+
+
 class CountWorker(QObject):
     """Asks the archive how many posts each day in a range has (ArcticShiftClient.day_counts)."""
     finished = Signal(str, object)  # subreddit, {day start: count}
@@ -157,8 +183,8 @@ class CountWorker(QObject):
 
 
 class BackgroundJob(QObject):
-    """Runs one worker at a time on its own QThread: the fetch, Download coverage's count, or reading a saved
-    subreddit.
+    """Runs one worker at a time on its own QThread: the fetch, Download coverage's count or deletion, or reading
+    a saved subreddit.
 
     Connect the worker's own signals, then ``start`` it. The worker's ``run`` slot does the work; its
     ``finished`` or ``failed`` signal ends the thread, and once the thread has finished the job lets go of

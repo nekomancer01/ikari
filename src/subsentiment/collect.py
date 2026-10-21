@@ -184,7 +184,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
                    else lambda p: client.fetch_comments(p, req.comments_per_post))
             failed, tried, gave_up = _each_thread(
                 todo, get, save, "All comments for post" if everything else "Comments for post",
-                store, getattr(client, "workers", 1), report, should_stop)
+                store, getattr(client, "tree_workers", getattr(client, "workers", 1)), report, should_stop)
             errors += failed
         if gave_up:
             rest = [p for p in todo if p.id not in tried]  # not tried this time: retried on the next fetch
@@ -291,7 +291,8 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
         saved()
 
     errors, tried, gave_up = _each_thread(posts, client.fetch_all_comments, save, "All comments for post",
-                                          store, getattr(client, "workers", 1), progress, should_stop)
+                                          store, getattr(client, "tree_workers", getattr(client, "workers", 1)),
+                                          progress, should_stop)
     if gave_up:
         errors += len([p for p in posts if p.id not in tried])  # not tried: retried next time
     if posts:

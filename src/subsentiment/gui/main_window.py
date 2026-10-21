@@ -626,8 +626,18 @@ class MainWindow(QMainWindow):
         self._update_delete_enabled()  # don't delete rows the fetch thread is writing
         self.coverage.set_busy(busy)
 
+    def set_deleting(self, on: bool) -> None:
+        """Download coverage is deleting days on a thread: nothing else writes until it's done."""
+        self.fetch_btn.setEnabled(not on and not self.fetch_job.busy)
+        self._update_delete_enabled()
+        self.coverage.set_busy(on or self.fetch_job.busy)
+
+    def writing(self) -> bool:
+        """A fetch or a deletion is changing the saved data."""
+        return self.fetch_job.busy or self.coverage.delete_job.busy
+
     def _update_delete_enabled(self) -> None:
-        idle = not self.fetch_job.busy
+        idle = not self.writing()
         self.delete_btn.setEnabled(idle and bool(self.current))
         self.delete_act.setEnabled(idle and bool(self.current))
         self.delete_all_btn.setEnabled(idle and self.datasets.count() > 0)
@@ -637,7 +647,7 @@ class MainWindow(QMainWindow):
     # -- fetching -------------------------------------------------------------
 
     def _start_fetch(self) -> None:
-        if self.fetch_job.busy:
+        if self.writing():
             return
         field = self.fetch_form.subreddit
         name = normalize_subreddit(field.text())
@@ -650,7 +660,7 @@ class MainWindow(QMainWindow):
 
     def start_request(self, req: collect.FetchRequest, message: str) -> bool:
         """Run a fetch the coverage panel asked for; False if one is already running."""
-        if self.fetch_job.busy:
+        if self.writing():
             return False
         self._launch(req, message)
         return True
@@ -1188,8 +1198,25 @@ class MainWindow(QMainWindow):
                 if rows[kind]:
                     tab.update_rows(days.keep(rows[kind].values(), self._table_days))
 
+    def days_deleted(self, subreddit: str, days: int, posts: int, comments: int) -> None:
+        """Download coverage deleted some days of ``subreddit``: if it's still shown, show it again from the store
+        on every page. If nothing of it is left it stays shown, empty, so its days can be downloaded again from
+        here. Another subreddit picked meanwhile stays shown."""
+        for key in [k for k in self._loaded if k[0] == subreddit.lower()]:
+            del self._loaded[key]
+        shown = (self.current or "").lower() == subreddit.lower()
+        self._refresh_datasets(select=subreddit if shown else None, reload=False)
+        if shown:
+            if subreddit.lower() not in self._stats:
+                self.datasets.blockSignals(True)
+                self.datasets.setCurrentRow(-1)  # it has no row any more
+                self.datasets.blockSignals(False)
+            self._show_dataset(self.current)
+        self.statusBar().showMessage(f"Deleted {plural(posts, 'post')} and {plural(comments, 'comment')} saved from "
+                                     f"{plural(days, 'day')} of r/{subreddit}.", 8000)
+
     def _delete_dataset(self) -> None:
-        if not self.current or self.fetch_job.busy:
+        if not self.current or self.writing():
             return
         if QMessageBox.question(
                 self, "Delete saved data",
@@ -1206,7 +1233,7 @@ class MainWindow(QMainWindow):
         self._refresh_datasets()
 
     def _delete_all(self) -> None:
-        if self.fetch_job.busy or not self.datasets.count():
+        if self.writing() or not self.datasets.count():
             return
         if QMessageBox.question(
                 self, "Delete all saved data",
@@ -1245,7 +1272,7 @@ class MainWindow(QMainWindow):
 
     def _import_database(self) -> None:
         """Merge another ikari database (one saved under another account or computer) into this one."""
-        if self.fetch_job.busy:
+        if self.writing():
             return
         path, _ = QFileDialog.getOpenFileName(self, "Import database", str(self.store.path.parent),
                                               "ikari databases (*.db);;All files (*)")
@@ -1298,6 +1325,13 @@ class MainWindow(QMainWindow):
             self.load_job.qthread.quit()
             self.load_job.qthread.wait(3000)
         self.rescore.stop()
+        deleting = self.coverage.delete_job
+        if deleting.busy:  # one transaction: let it end, rather than cut it short, but show nothing of it
+            deleting.worker.finished.disconnect()
+            deleting.worker.failed.disconnect()
+            deleting.ended.disconnect()
+            deleting.qthread.quit()
+            deleting.qthread.wait(10000)
         self._upgrade_stop.set()  # it stops after the day it's packing
         self.upgrading.join()
         self.store.close()
@@ -1306,5 +1340,6 @@ class MainWindow(QMainWindow):
     def running_threads(self) -> list[QThread]:
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
-        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.load_job, self.rescore.job)
+        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job, self.load_job,
+                                    self.rescore.job)
                 if j.running()]
