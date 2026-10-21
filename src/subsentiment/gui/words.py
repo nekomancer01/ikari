@@ -61,6 +61,10 @@ class WordTally(QObject):
         self._version = 0  # counts every change to the counts, for top()
         self._top, self._top_for = [], None
 
+    def busy(self) -> bool:
+        """A recount, or a moved span's change, is being worked out between frames."""
+        return not self.ready or self._slices.running()
+
     def learn(self, known: dict[str, dict]) -> None:
         """The words of rows split elsewhere ({kind: {id: words}}), for rows read without theirs."""
         self.known = {k: known.get(k) or {} for k in KINDS}

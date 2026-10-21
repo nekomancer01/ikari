@@ -5,9 +5,10 @@ Nothing here knows about ikari's data; the windows put these together.
 from __future__ import annotations
 
 import math
+import time
 from typing import Callable
 
-from PySide6.QtCore import QDate, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QDate, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath
 from PySide6.QtWidgets import (
     QAbstractScrollArea, QCalendarWidget, QComboBox, QDateEdit, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
@@ -295,6 +296,90 @@ class ShareBar(QWidget):
         else:
             p.setBrush(QColor(t["accent"]))
         p.drawRoundedRect(fill, 3, 3)
+
+
+class Throbber(ShareBar):
+    """A ShareBar's sweep laid over ``line`` (a divider), taking no room, once the window has been waiting on
+    something for DELAY seconds: ``waiting()`` names what (a caption shown at the line's right end, in
+    ``beside``'s row when its text leaves room), "" for a wait to show without one, or None for none. It's asked
+    a few times a second, so a wait needn't say when it starts or ends, and one over within the delay shows
+    nothing at all."""
+
+    DELAY = 1.0  # seconds a wait goes on before it shows
+    POLL_MS = 100
+
+    def __init__(self, line: QWidget, waiting: Callable[[], str | None], beside: ElidedLabel | None = None,
+                 inset: int = 16):
+        super().__init__()
+        host = line.parentWidget()
+        self.setParent(host)
+        self.line, self.beside, self.inset, self._waiting = line, beside, inset, waiting
+        self.setFixedHeight(3)
+        self.set(None, waiting=True)
+        self.caption = label("", "caption")
+        self.caption.setParent(host)
+        self._since: float | None = None  # when the wait under way began
+        for w in (self, self.caption):
+            w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            w.hide()
+        line.installEventFilter(self)
+        self._poll = QTimer(self)  # runs while the line is on screen
+        self._poll.setInterval(self.POLL_MS)
+        self._poll.timeout.connect(self.check)
+
+    def check(self) -> None:
+        what = self._waiting()
+        if what is None:
+            self._since = None
+            self.hide()
+            self.caption.hide()
+            return
+        now = time.monotonic()
+        if self._since is None:
+            self._since = now
+        if now - self._since < self.DELAY:
+            return
+        self.caption.setText(what)
+        appearing = self.isHidden()
+        self._place()
+        if appearing:
+            self.show()
+            motion.fade_in(self)
+        self.raise_()  # over a crossfade's picture of the page, too
+        if self.caption.isVisible():
+            self.caption.raise_()
+
+    def eventFilter(self, obj, event) -> bool:
+        kind = event.type()
+        if kind in (QEvent.Type.Move, QEvent.Type.Resize) and self.isVisible():
+            self._place()
+        elif kind == QEvent.Type.Show:
+            self._poll.start()
+        elif kind == QEvent.Type.Hide:
+            self._poll.stop()
+            self._since = None
+            self.hide()
+            self.caption.hide()
+        return False
+
+    def _place(self) -> None:
+        g = self.line.geometry()
+        self.setGeometry(g.x() + self.inset, g.center().y() - 1, max(g.width() - 2 * self.inset, 0), 3)
+        size = self.caption.sizeHint()
+        x = g.right() - self.inset - size.width()
+        if self.beside is not None:  # in its row, past its text
+            row = self.beside.geometry()
+            y = row.center().y() - size.height() // 2
+            room = x - row.x() - self.beside.fontMetrics().horizontalAdvance(self.beside.full_text()) >= 24
+        else:  # just above the line
+            y, room = g.y() - size.height() - 2, True
+        self.caption.setGeometry(x, y, size.width(), size.height())
+        fits = bool(self.caption.text()) and room and x > g.x()
+        if fits and self.caption.isHidden():
+            self.caption.show()
+            motion.fade_in(self.caption)
+        elif not fits:
+            self.caption.hide()
 
 
 class CountingLabel(QLabel):

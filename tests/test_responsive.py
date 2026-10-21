@@ -206,3 +206,76 @@ def test_a_theme_switch_during_a_page_fade_doesnt_hold_that_fade_still(window, m
     assert motion.fading(w.content)
     w._set_theme("dark")  # the theme's picture already has the page fade's frame; that fade stops
     assert not motion.fading(w.content)
+
+
+def test_a_wait_shows_the_throbber_only_once_it_has_gone_on_for_a_second(monkeypatch):
+    from PySide6.QtWidgets import QFrame, QVBoxLayout, QWidget
+    from subsentiment.gui import widgets
+    QApplication.instance() or QApplication([])
+    now = [100.0]
+    monkeypatch.setattr(widgets.time, "monotonic", lambda: now[0])
+    host = QWidget()
+    host.resize(900, 120)
+    lay = QVBoxLayout(host)
+    beside = widgets.ElidedLabel("12 posts and 40 comments", "subtitle")
+    rule = theme.mark(QFrame(), "role", "divider")
+    lay.addWidget(beside)
+    lay.addWidget(rule)
+    waiting = [None]
+    throbber = widgets.Throbber(rule, lambda: waiting[0], beside=beside)
+    host.show()
+    QApplication.processEvents()
+    waiting[0] = "Counting words…"
+    throbber.check()
+    now[0] += 0.5
+    throbber.check()
+    assert throbber.isHidden()  # half a second in: nothing shown, so a quick action doesn't flicker
+    waiting[0] = None
+    throbber.check()
+    waiting[0] = "Counting words…"
+    now[0] += 0.7
+    throbber.check()
+    assert throbber.isHidden()  # the wait that ended doesn't count towards this one
+    now[0] += 1.0
+    throbber.check()
+    assert throbber.isVisible() and throbber.caption.isVisible() and throbber.caption.text() == "Counting words…"
+    g = rule.geometry()
+    assert throbber.geometry().center().y() in (g.center().y() - 1, g.center().y(), g.center().y() + 1)
+    assert throbber.caption.geometry().right() <= g.right() and throbber.caption.y() >= beside.y()
+    beside.setText("x " * 400)  # text reaching the caption's place: the bar alone
+    throbber.check()
+    assert throbber.isVisible() and throbber.caption.isHidden()
+    waiting[0] = None
+    throbber.check()
+    assert throbber.isHidden() and throbber.caption.isHidden()
+    assert throbber._poll.isActive()
+    host.hide()  # minimized or closed: nothing asked while it can't be seen
+    assert not throbber._poll.isActive()
+    host.close()
+
+
+def test_opening_filtering_and_counting_a_big_subreddit_show_the_throbber_until_done(window, monkeypatch):
+    w = window
+    monkeypatch.setattr(w.throbber, "DELAY", 0.0)
+    assert w.waiting() is None
+    w.throbber.check()
+    assert w.throbber.isHidden()
+    monkeypatch.setattr(mw.MainWindow, "LOAD_THREAD_FROM", 0)
+    w._loaded.clear()
+    w._show_dataset("Other")
+    seen = set()
+
+    def watch():
+        w.throbber.check()
+        if w.throbber.isVisible():
+            seen.add(w.waiting())
+        return w.current == "Other" and w.waiting() is None
+    until(watch, 30)
+    assert "" in seen  # while it was read, the header saying so
+    w.throbber.check()
+    assert w.throbber.isHidden()
+    w.comment_score_pick.setCurrentIndex(2)  # a stricter filter: found among the rows in memory, a slice a frame
+    assert w.waiting() is not None
+    until(watch, 30)
+    w.throbber.check()
+    assert w.throbber.isHidden()

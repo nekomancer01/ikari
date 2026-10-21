@@ -22,7 +22,7 @@ import numpy as np
 
 from subsentiment.analysis import LABELS, Analysis, words_in
 from subsentiment.store import (COMMENT_COLUMNS, NO_SCORE, NOT_IMAGE, PACKED, POST_COLUMNS, SCORE_STEPS as STEPS,
-                                 CommentRow, DayPack, PostRow, score_bucket)
+                                 CommentRow, DayPack, PostRow, Search, score_bucket)
 
 LOOSE, HELD = -1, -2  # a row's pack when its text is in its row, or in a pack saved before packs had frames
 CLOSED = object()
@@ -42,6 +42,8 @@ class RowIndex:
         self._bulk: PackReader | None = None  # `column`'s, on a connection of its own
         self._lock = threading.Lock()  # around _changes and _bulk, touched from two threads
         self._sorted_ids: np.ndarray | None = None  # positions in id order, for `where`
+        self._keys: np.ndarray | None = None  # each row's Search.key, for `search`
+        self._key_order: np.ndarray | None = None  # positions in key order
         # Word counts (DayPack.word_keys): the packs' (_wkeys, _wn), pack i's in _wfrom[i]:_wfrom[i + 1], and what the
         # rows read one by one change of them, as (day, keys, n) pieces. _loose: those rows' word ids, by id.
         self._wfrom = np.zeros(1, np.int64)
@@ -194,7 +196,7 @@ class RowIndex:
         """The words a row with this text (values of PACKED[kind]) counts."""
         if text is None:
             return ()
-        return tuple(words_in((text[2] or "") if self.kind == "comments" else f"{text[0] or ''} {text[1] or ''}"))
+        return tuple(words_in(Search.text(self.kind, text)))
 
     def _change(self, words, created, label, score, sign: int) -> None:
         """Count rows' words (lists of words or of word ids) in, or with ``sign`` -1 take them back out, as rows
@@ -314,6 +316,34 @@ class RowIndex:
         found = np.minimum(np.searchsorted(self.ids, cut, sorter=self._sorted_ids), len(self.ids) - 1)
         at = self._sorted_ids[found]
         return np.where(fits & (self.ids[at] == cut), at, -1)
+
+    def search(self, typed: str) -> np.ndarray | None:
+        """Which rows' text has every word typed, the last one as the start of a word (Search), as a mask; None
+        when there's nothing to search for, or the database has no search index yet (being upgraded): sort or
+        filter by `column` then."""
+        with self._lock:
+            ids = self.ids
+        with self._reader.lock:
+            hits = self._reader.search.matches(self.kind, typed)
+        if hits is None:
+            return None
+        with self._lock:
+            keys, order = self._keys, self._key_order
+        if keys is None or len(keys) != len(ids):
+            keys, order = Search.keys(ids), None
+            with self._lock:
+                if self.ids is ids:  # not grown meanwhile
+                    self._keys, self._key_order = keys, None
+        if order is None or len(order) != len(keys):
+            order = np.argsort(keys)
+            with self._lock:
+                if self._keys is keys:
+                    self._key_order = order
+        out = np.zeros(len(keys), bool)
+        if len(keys) and len(hits):
+            at = order[np.minimum(np.searchsorted(keys, hits, sorter=order), len(keys) - 1)]
+            out[at[keys[at] == hits]] = True
+        return out
 
     # Words ---------------------------------------------------------------------------------------------------
 
@@ -469,6 +499,9 @@ class RowIndex:
             with self._lock:  # all at once, for a thread reading them together (`column`)
                 for name, values in grown.items():
                     setattr(self, name, values)
+                if self._keys is not None:
+                    self._keys = np.concatenate([self._keys, Search.keys(grown["ids"][start:])])
+                    self._key_order = None
             self._count(np.arange(start, len(self.ids)), 1)
         if self.with_words:
             changed = np.concatenate([old, np.arange(start, len(self.ids))]).astype(np.int64)
@@ -506,6 +539,9 @@ class RowIndex:
         with self._lock:
             for name, values in moved.items():
                 setattr(self, name, values)
+            if self._keys is not None:
+                self._keys = self._keys[order]
+                self._key_order = None
         self.ordered = len(self.ids)
         self._sorted_ids = None
         return order
@@ -552,6 +588,7 @@ class PackReader:
         self._frames: OrderedDict = OrderedDict()  # (pack, frame) -> its columns (DayPack.frame_columns)
         self._whole: OrderedDict = OrderedDict()  # (kind, day) -> (packed_at, a whole pack's text), read lately
         self._posts: OrderedDict = OrderedDict()  # day -> (packed_at, {post id: (title, permalink)}), for comments
+        self.search = Search(self.db, create=False)
 
     def _packed_at(self, kind: str, day: int):
         row = self.db.execute("SELECT packed_at FROM packs WHERE kind = ? AND subreddit = ? AND day = ?",

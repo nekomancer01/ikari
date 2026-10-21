@@ -8,7 +8,7 @@ import pytest
 from subsentiment.analysis import Analysis, WordCounts
 from subsentiment.index import STEPS, RowIndex, top_words
 from subsentiment.reddit import Comment, Post
-from subsentiment.store import PACKED, DayPack, Store, scoring_at_least
+from subsentiment.store import PACKED, DayPack, Search, Store, scoring_at_least
 
 WORDS = ("the game update finally fixed my save file and honestly I love the new music but the boss fight on "
          "chapter four is way too hard anyone else think the devs should nerf it a little before the next patch").split()
@@ -330,4 +330,42 @@ def test_a_column_has_the_newer_text_of_a_row_saved_again_since_the_index_was_re
     s.commit()
     at = int(index.where(["c6_1"])[0])
     assert index.column("body", at, at + 1) == ["edited since"]
+    index.close()
+
+
+def _found(rows, kind, typed):
+    import re
+    words = re.findall(r"\w+", typed.lower())
+    out = set()
+    for r in rows:
+        text = (r["body"] or "") if kind == "comments" else f"{r['title'] or ''} {r['selftext'] or ''}"
+        have = set(re.findall(r"\w+", text.lower()))
+        if all(w in have for w in words[:-1]) and any(h.startswith(words[-1]) for h in have):
+            out.add(r["id"])
+    return out
+
+
+@pytest.mark.skipif(not Search(sqlite3.connect(":memory:")).ready, reason="this SQLite has no contentless deletes (3.43)")
+@pytest.mark.parametrize("kind", ["posts", "comments"])
+def test_search_finds_every_word_typed_the_last_as_it_is_being_typed(saved, kind):
+    path, s = saved
+    index = RowIndex(path, kind, "deltarune")
+    rows = s.rows(kind, "deltarune")
+    for typed in ("boss", "bo", "BOSS fight", "chapter fo", "nerf patch", "zzz"):
+        found = {i.decode() for i in index.ids[index.search(typed)]}
+        assert found == _found(rows, kind, typed), typed
+    assert index.search("  ") is None and index.search("!?") is None
+    since = clock.time()
+    clock.sleep(0.01)
+    s.save_comment(Comment("c6_1", "p6", "Deltarune", "t3_p6", "v1", "a quokka appears", 3, DAY0 + 86400 + 6 * 37 + 30, 0,
+                           None), 0.1, "positive")  # saved again with new text
+    s.save_post(Post("np1", "Deltarune", "quokka news", "", "a", 1, 0.9, 1, DAY0 + 50, "", ""), 0.0, "neutral")
+    s.commit()
+    index.add(s.rows(kind, "deltarune", since=since))
+    assert {i.decode() for i in index.ids[index.search("quok")]} == ({"c6_1"} if kind == "comments" else {"np1"})
+    rows = s.rows(kind, "deltarune")
+    for typed in ("boss", "fight", "the"):  # the row saved again is found by its new text only
+        assert {i.decode() for i in index.ids[index.search(typed)]} == _found(rows, kind, typed), typed
+    index.reorder()
+    assert {i.decode() for i in index.ids[index.search("fight")]} == _found(rows, kind, "fight")
     index.close()
