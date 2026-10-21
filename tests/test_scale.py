@@ -33,7 +33,8 @@ def test_the_app_shows_its_window_before_reading_a_big_subreddit(tmp_path, monke
     fill(db)
     QSettings().setValue("ui/last_dataset", "Big")
     reads = [count_calls(monkeypatch, Store, name) for name in ("rows", "posts", "comments")]
-    w = mw.MainWindow(db, wait_for_data=False)  # as the app opens it
+    monkeypatch.setattr(mw.MainWindow, "wait_for_data", False)  # as the app opens it
+    w = mw.MainWindow(db)
     try:
         # Reading Ame's 650,000 comments took 17 s before the window first showed.
         assert reads == [[], [], []] and w.subheading.text() == "Opening r/Big…"

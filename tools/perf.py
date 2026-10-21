@@ -257,7 +257,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.stalls:
         beat.sample()
     t = time.perf_counter()
-    w = MainWindow(db, wait_for_data=False)  # as the app opens it
+    MainWindow.wait_for_data = False  # as the app opens it
+    w = MainWindow(db)
     w.resize(1280, 760)
     w.show()
     opened = time.perf_counter() - t

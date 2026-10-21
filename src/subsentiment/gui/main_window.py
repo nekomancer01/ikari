@@ -132,12 +132,12 @@ def when_text(ts: float | None) -> str:
 
 class MainWindow(QMainWindow):
     LOAD_THREAD_FROM = 10_000  # saved posts and comments; a subreddit this big is read on a thread
+    # A big saved subreddit to show at the start is read before the window is made. The app sets it False, so the
+    # window shows at once and the subreddit fills in once it's read on a thread.
+    wait_for_data = True
 
-    def __init__(self, db_path: str, wait_for_data: bool = True):
-        """``wait_for_data``: a big saved subreddit to show at the start is read before this returns. The app
-        passes False, so the window shows at once and the subreddit fills in once it's read on a thread."""
+    def __init__(self, db_path: str):
         super().__init__()
-        self._wait_for_data = wait_for_data
         self.setWindowTitle("ikari")
         self.resize(fit_to_screen(QSize(1320, 860), QGuiApplication.primaryScreen()))
         self.db_path = db_path
@@ -939,7 +939,7 @@ class MainWindow(QMainWindow):
         loaded = self._loaded.pop(key, None)
         if loaded is not None and (loaded[0] != stats or fetching):
             loaded = None
-        if (loaded is None and not wait and not fetching and (self.isVisible() or not self._wait_for_data) and stats
+        if (loaded is None and not wait and not fetching and (self.isVisible() or not self.wait_for_data) and stats
                 and stats[0] + stats[1] >= self.LOAD_THREAD_FROM):
             self._wanted = key
             self.subheading.setText(f"Opening r/{name}…")
