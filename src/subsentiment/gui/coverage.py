@@ -941,7 +941,7 @@ class CoveragePage(VerticalScrollArea):
         if self.body.direction() != direction:
             self.body.setDirection(direction)
         super().resizeEvent(event)
-        QTimer.singleShot(0, self._place_cap)  # after this resize: moving it within one upsets the layout
+        QTimer.singleShot(0, self, self._place_cap)  # after this resize: moving it within one upsets the layout
 
     def _place_cap(self) -> None:
         """The cap stays on the bar's line while the estimate beside it keeps room to say something."""
