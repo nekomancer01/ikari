@@ -20,8 +20,8 @@ from subsentiment.gui import days, motion, native, theme
 from subsentiment.gui.coverage import CoveragePage
 from subsentiment.gui.fetch_form import FetchForm
 from subsentiment.gui.charts import NoteDialog, TimelineChart
-from subsentiment.gui.overview import CardPage, OverviewPage
-from subsentiment.gui.words import KINDS, WordCloud, WordTally
+from subsentiment.gui.overview import CardPage, OverviewPage, WordsPage
+from subsentiment.gui.words import KINDS, Rescore, WordTally
 from subsentiment.gui.rail import DRAWERS, PAGES, NavRail
 from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
 from subsentiment.gui.theme import mark, paint_backdrop
@@ -448,10 +448,22 @@ class MainWindow(QMainWindow):
         for chart in self.timelines:
             chart.note_requested.connect(self._edit_note)
             chart.view_changed.connect(partial(self._on_view_changed, chart))
-        self.words_page = CardPage("Words used most", WordCloud())
+        self.words_page = WordsPage()
         self.word_tally = WordTally(self)
         self._words_for = None  # the subreddit whose words the clouds show
         self.word_tally.changed.connect(self._render_words)
+        # What a word means in a subreddit: set beside the cloud, and the saved items using it scored again.
+        self.rescore = Rescore(self.store, self.db_path, self)
+        self.rescore.rescored.connect(self._on_rescored)
+        self.rescore.progress.connect(self.words_page.meanings.show_progress)
+        self.rescore.finished.connect(self.words_page.meanings.show_progress)
+        self.rescore.finished.connect(self._on_rescore_finished)
+        self.rescore.failed.connect(self.words_page.meanings.show_failed)
+        self._set_mid_fetch: set[str] = set()  # words set in the subreddit a fetch is saving, scored again after it
+        self._rescored: dict[str, dict] = {k: {} for k in KINDS}  # rows rescored, for the tables once it's done
+        self._rescore_index: dict[str, tuple] = {}  # kind -> (the saved rows, {id: where it is in them})
+        self.words_page.meanings.changed.connect(self._set_word)
+        self.overview.words.word_clicked.connect(self._pick_word)
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
         self.comments_tab = TablePage(COMMENT_COLUMNS, stretch_col=2)
         # The post title would otherwise size to its text and squeeze the comment column.
@@ -807,6 +819,7 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, result: collect.FetchResult) -> None:
         self._loaded.clear()  # what it saved (scores too) is read again, not shown from memory
+        self._rescore_after_fetch()
         self.progress_msg.setText(finish_text(result, self.request))
         if self.request.days and not (result.stopped or result.timed_out):  # stopped: the ticks stay, to go on
             self.coverage.untick(self.request.days)
@@ -853,6 +866,7 @@ class MainWindow(QMainWindow):
 
     def _on_failed(self, message: str) -> None:
         self._loaded.clear()
+        self._rescore_after_fetch()
         self._live.stop()
         self._flush_rows()
         # Show anything stored before the error, unless the user went to look at another subreddit.
@@ -952,6 +966,8 @@ class MainWindow(QMainWindow):
         else:
             self._apply_span(reload=True)
         self._show_notes()
+        if switching or self.words_page.meanings.subreddit is None:
+            self.words_page.meanings.set_subreddit(self.current, self.store.words(self.current) if self.current else {})
         self._update_delete_enabled()
         self.coverage.set_subreddit(self.current)
 
@@ -1121,6 +1137,71 @@ class MainWindow(QMainWindow):
         self.store.save_note(subreddit, day, tag, text)
         self._show_notes()
 
+    def _pick_word(self, word: str) -> None:
+        """A word clicked in the Overview's cloud: set what it means on the Words page."""
+        self.show_page("words")
+        self.words_page.meanings.pick(word)
+
+    def _set_word(self, word: str, weight: float | None) -> None:
+        sub = self.words_page.meanings.subreddit
+        if sub:
+            self.store.save_word(sub, word, weight)
+            # The rows on screen are all there is of it, unless the score filter or a running fetch leaves some out.
+            fetching = self.fetch_job.busy and self.request is not None and self.request.subreddit.lower() == sub.lower()
+            if fetching:  # it may be saving items scored the old way as this runs
+                self._set_mid_fetch.add(word)
+            whole = self.min_score is None and not fetching
+            self.rescore.start(sub, {word}, self._saved if whole and self.current == sub else None)
+
+    def _rescore_after_fetch(self) -> None:
+        """Items the fetch saved while words were being set were scored the old way: go through them again."""
+        if self._set_mid_fetch:
+            self.rescore.start(self.request.subreddit, self._set_mid_fetch)
+            self._set_mid_fetch = set()
+
+    def _on_rescored(self, sub: str, kind: str, rows: list) -> None:
+        """Saved items scored again by a subreddit's words: the pages showing it follow, as with a fetch's rows."""
+        mine = self.current and self.current.lower() == sub
+        here = (sub, self.min_score)
+        for key in [k for k in self._loaded if k[0] == sub and not (mine and k == here)]:
+            del self._loaded[key]  # read again when next shown
+        if not mine:
+            return
+        if self._span_slices.running():  # the tables are mid-way to a new span: finish it with the rows as they are
+            self._apply_span()
+        saved, old, shown = self._saved[kind], [], []
+        # Where each saved row is, kept across a rescore's batches; looked up again if the rows changed meanwhile.
+        index = self._rescore_index.get(kind)
+        if index is None or index[0] is not saved:
+            index = self._rescore_index[kind] = (saved, {r["id"]: i for i, r in enumerate(saved)})
+        for r in rows:
+            i = index[1].get(r["id"])
+            if i is not None and (i >= len(saved) or saved[i]["id"] != r["id"]):
+                index = self._rescore_index[kind] = (saved, {s["id"]: i for i, s in enumerate(saved)})
+                i = index[1].get(r["id"])
+            if i is not None:  # (None: left out by the score filter)
+                old.append(saved[i])
+                # As shown, with its new score: a fetch may have saved it again since it was read.
+                shown.append({**saved[i], "sentiment": r["sentiment"], "label": r["label"]})
+                saved[i] = shown[-1]
+        if not old:
+            return
+        self._analysis[kind].add(old, -1)
+        self._analysis[kind].add(shown)
+        shown = days.keep(shown, self._table_days)
+        self.word_tally.add(kind, shown)  # by id: each row's lean follows its new label
+        self._rescored[kind].update((r["id"], r) for r in shown)
+        self._render_overview()
+
+    def _on_rescore_finished(self, sub: str) -> None:
+        """The tables (and what export writes) take the rescored rows in one go: each update sorts a table again."""
+        rows, self._rescored = self._rescored, {k: {} for k in KINDS}
+        self._rescore_index = {}
+        if self.current and self.current.lower() == sub:
+            for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
+                if rows[kind]:
+                    tab.update_rows(days.keep(rows[kind].values(), self._table_days))
+
     def days_deleted(self, subreddit: str, days: int, posts: int, comments: int) -> None:
         """Download coverage deleted some days of ``subreddit``: if it's still shown, show it again from the store
         on every page. If nothing of it is left it stays shown, empty, so its days can be downloaded again from
@@ -1247,6 +1328,7 @@ class MainWindow(QMainWindow):
             self.load_job.worker.failed.disconnect()
             self.load_job.qthread.quit()
             self.load_job.qthread.wait(3000)
+        self.rescore.stop()
         deleting = self.coverage.delete_job
         if deleting.busy:  # one transaction: let it end, rather than cut it short, but show nothing of it
             deleting.worker.finished.disconnect()
@@ -1262,5 +1344,6 @@ class MainWindow(QMainWindow):
     def running_threads(self) -> list[QThread]:
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
-        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job, self.load_job)
+        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job, self.load_job,
+                                    self.rescore.job)
                 if j.running()]
