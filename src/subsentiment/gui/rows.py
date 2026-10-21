@@ -186,16 +186,18 @@ class RowList(RowSource):
 
 class Saved(RowSource):
     """A subreddit's saved posts or comments (``kind``), in a RowIndex (``index``). The index may be read on a
-    thread (its word counts, a text column) while the window reads rows to draw and adds a fetch's."""
+    thread (its word counts, a text column) while the window reads rows to draw and adds a fetch's. Without
+    ``words`` their words aren't counted: a database still being upgraded has to split every row's text for them,
+    half a minute for 650,000 comments, where its upgraded packs have them counted."""
 
     TEXT_STEP = 50_000  # rows of a text column read at once, on a thread: a quarter of a second
     lazy = True  # 128 rows' text took 70 ms to read from their days' packs, 400 the first time
 
-    def __init__(self, db_path: str | Path, kind: str, subreddit: str):
+    def __init__(self, db_path: str | Path, kind: str, subreddit: str, words: bool = True):
         super().__init__()
-        self.kind = kind
+        self.kind, self.words = kind, words
         self.made_at = time.time()  # what was saved before this is in it
-        self.index = RowIndex(db_path, kind, subreddit)
+        self.index = RowIndex(db_path, kind, subreddit, words=words)
 
     # The index's arrays, as they are now: a fetch's rows add to them.
     ids = property(lambda self: self.index.ids)

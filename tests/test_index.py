@@ -249,6 +249,17 @@ def test_a_word_cloud_of_posts_and_comments_together_each_with_its_own_score_fil
     comments.close()
 
 
+def test_an_index_read_without_words_counts_none_and_still_holds_every_row(saved):
+    path, s = saved
+    posts, comments = RowIndex(path, "posts", "deltarune", words=False), RowIndex(path, "comments", "deltarune", words=False)
+    _same_rows(comments, s.rows("comments", "deltarune"))
+    for days in (None, (DAY0, DAY0 + 3 * 86400)):
+        assert all(not c.any() for c in comments.word_counts(days, 10))
+        assert top_words([(posts, None), (comments, 1)], days) == []
+    posts.close()
+    comments.close()
+
+
 @pytest.mark.parametrize("kind", ["posts", "comments"])
 def test_big_days_are_read_from_their_frames(tmp_path, kind):
     path = tmp_path / "x.db"
