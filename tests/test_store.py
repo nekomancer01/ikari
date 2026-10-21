@@ -11,6 +11,11 @@ from subsentiment.reddit import Comment, Post
 from subsentiment.analysis import Analysis
 from subsentiment.store import SCHEMA_VERSION, Store
 
+# How far Store.upgrade takes a database here: an SQLite before 3.43 (Ubuntu 22.04's) has no search index (version 4).
+SEARCHABLE = store.Search(sqlite3.connect(":memory:")).ready
+UPGRADED = SCHEMA_VERSION if SEARCHABLE else 3
+needs_search = pytest.mark.skipif(not SEARCHABLE, reason="this SQLite has no contentless deletes (3.43)")
+
 
 def make_post(i, sub="Python", ts=1_700_000_000.0):
     return Post(f"p{i}", sub, f"title {i}", "", "a", i, 0.9, 1, ts, f"https://r/{i}", "")
@@ -320,7 +325,7 @@ def test_a_database_from_an_older_ikari_is_shrunk_once_and_reads_back_the_same(t
     before = _contents(path)
     Store.upgrade(path)  # as the app's start does: Store(path) shrinks it, then its text is packed
     s = Store(path)
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == UPGRADED
     assert {"posts_sub", "comments_sub"}.isdisjoint(n for (n,) in s.db.execute("SELECT name FROM sqlite_master"))
     assert s.db.execute("SELECT COUNT(*) FROM comments WHERE permalink IS NULL").fetchone()[0] == 9
     assert s.db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -428,7 +433,7 @@ def test_a_migration_that_cant_finish_leaves_the_database_as_it_was_and_runs_at_
     Store._migration_tried.clear()  # the next start
     Store.upgrade(path)
     s = Store(path)
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == UPGRADED
     s.close()
     assert _contents(path) == before
 
@@ -466,7 +471,7 @@ def test_packing_an_older_database_cut_short_keeps_its_backup_and_carries_on_at_
     Store.upgrade(path)  # the next start
     assert list(tmp_path.iterdir()) == [path]
     s = Store(path)
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == UPGRADED
     assert s.db.execute("SELECT COUNT(*) FROM posts WHERE packed = 0").fetchone()[0] == 0
     s.close()
     assert _contents(path) == before
@@ -648,7 +653,7 @@ def test_a_database_from_an_older_ikari_gets_notes_and_imports_without_them(tmp_
     shutil.copy(OLD_DB, path)
     Store.upgrade(path)
     s = Store(path)  # migrated, and given the notes table
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == UPGRADED
     s.save_note("python", 0, "X", "kept")
     shutil.copy(OLD_DB, tmp_path / "old.db")
     s.import_from(tmp_path / "old.db")  # an older file has no notes table
@@ -838,7 +843,7 @@ def test_a_database_packed_by_0_4_is_packed_again_in_frames_and_reads_back_the_s
     assert list(tmp_path.iterdir()) == [path]  # its backup is gone once it worked
     assert _contents(path) == before
     s = Store(path)
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == UPGRADED and SCHEMA_VERSION == 4
     assert {k: s.rows(k, "deltarune") for k in rows} == rows
     packs = s.db.execute("SELECT data, cols, words FROM packs").fetchall()
     assert len(packs) == 8 and all(c and w for d, c, w in packs)  # small days stay one frame of JSON
@@ -866,7 +871,7 @@ def test_packing_a_0_4_database_cut_short_keeps_its_backup_and_reads_from_both_f
     Store.upgrade(path)  # the next start
     assert list(tmp_path.iterdir()) == [path]
     assert _contents(path) == before
-    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == UPGRADED
 
 
 def test_a_subreddits_packs_share_a_dictionary_made_from_a_big_day(tmp_path):
@@ -902,6 +907,7 @@ def test_a_subreddits_packs_share_a_dictionary_made_from_a_big_day(tmp_path):
     s.close()
 
 
+@needs_search
 def test_search_keeps_up_with_deletes_and_imports_and_a_0_4_database_gets_its_index(tmp_path, monkeypatch):
     import numpy as np
     key = lambda ids: sorted(store.Search.key(i) for i in ids)  # noqa: E731
@@ -943,6 +949,7 @@ def test_search_words_and_keys_match_how_fts5_and_ids_are_split():
     assert store.Search.key("") == 0
 
 
+@needs_search
 def test_a_version_3_database_with_unpacked_settled_rows_gets_its_index(tmp_path):
     path = tmp_path / "subsentiment.db"
     s = Store(path)
@@ -953,11 +960,12 @@ def test_a_version_3_database_with_unpacked_settled_rows_gets_its_index(tmp_path
     s.close()
     Store.upgrade(path)
     s = Store(path)
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == UPGRADED
     assert s.search.matches("posts", "t").tolist() == [store.Search.key("p1")]
     s.close()
 
 
+@needs_search
 def test_an_sqlite_without_search_leaves_the_index_for_one_with_it(tmp_path, monkeypatch):
     path = tmp_path / "subsentiment.db"
     probe = store.Search._probe
