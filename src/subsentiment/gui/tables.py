@@ -239,6 +239,10 @@ class RowsModel(QAbstractTableModel):
             yield
         return shown, keys, ids
 
+    def sorting(self) -> bool:
+        """A big table's new order is being worked out between frames."""
+        return self._slices.running()
+
     def sort(self, column: int, order=Qt.SortOrder.AscendingOrder) -> None:
         """Called by the view when a header is clicked. Selected rows stay selected."""
         wanted = (column, order == Qt.SortOrder.DescendingOrder)
@@ -552,6 +556,14 @@ class TablePage(QWidget):
     def all_rows(self) -> list:
         """Every row loaded or added, whatever the filters show."""
         return self._all_rows
+
+    def busy(self) -> str | None:
+        """What a big table is working out between frames, for the window's throbber; None for nothing."""
+        if self.model.sorting():
+            return "Sorting the table\u2026"
+        if self._slices.running():
+            return "Filtering the table\u2026"
+        return None
 
     def load(self, rows) -> None:
         for _ in self._loading(rows, None):
