@@ -637,6 +637,7 @@ class Rescore(QObject):
         if self.job.busy:
             self.job.worker.finished.disconnect()
             self.job.worker.failed.disconnect()
+            self.job.worker.stop()
             self.job.qthread.quit()
             self.job.qthread.wait(3000)
 
@@ -660,7 +661,7 @@ class Rescore(QObject):
         if rows is not None:
             self._on_read((self._run, rows, None))
             return
-        worker = LoadWorker(self.db_path, sub, None, self._run)
+        worker = LoadWorker(self.db_path, sub, (None, None), self._run)  # every row, whatever the window filters
         worker.finished.connect(self._on_read)
         worker.failed.connect(lambda message, sub=sub: (self._drop(), self._tally.pop(sub, None),
                                                         self.failed.emit(sub, message)))

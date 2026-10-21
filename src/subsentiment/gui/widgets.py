@@ -10,8 +10,8 @@ from typing import Callable
 from PySide6.QtCore import QDate, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath
 from PySide6.QtWidgets import (
-    QAbstractScrollArea, QCalendarWidget, QComboBox, QDateEdit, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QTableView, QToolButton, QVBoxLayout, QWidget,
+    QAbstractScrollArea, QCalendarWidget, QComboBox, QDateEdit, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QScrollArea, QSpinBox, QTableView, QToolButton, QVBoxLayout, QWidget,
 )
 
 from subsentiment.gui import motion, theme
@@ -134,6 +134,54 @@ class ShrinkingComboBox(QComboBox):
         full = super().minimumSizeHint()
         return QSize(min(full.width(), 120), full.height())
 
+
+class CommentCap(QObject):
+    """How many comments to keep on each post, ``count`` (0 shows as "All"), and which ones, ``pick``: the
+    highest-scored or a random sample that stays the same for each post. The Fetch drawer and the Coverage
+    page each place one, remembered under their own QSettings prefix as "comments_per_post" and
+    "comment_pick"."""
+
+    PICKS = {"top": "Top scoring", "random": "Random"}
+
+    def __init__(self, settings, prefix: str, default: int, most: int, parent=None):
+        super().__init__(parent)
+        self.settings, self.prefix, self.default = settings, prefix, default
+        self._enabled = True
+        self.count = QSpinBox()
+        self.count.setRange(0, most)
+        self.count.setSingleStep(10)
+        self.count.setSuffix(" per post")
+        # The stylesheet's horizontal padding doesn't reach a spin box's inner editor; match the other inputs.
+        self.count.findChild(QLineEdit).setTextMargins(8, 0, 0, 0)
+        self.count.setSpecialValueText("All")
+        self.count.setToolTip("The most comments kept on each post. Go below 1 for All: every comment on each post.")
+        self.count.setMinimumWidth(100)  # its size hint would squeeze a form's labels
+        self.pick = QComboBox()
+        for key, text in self.PICKS.items():
+            self.pick.addItem(text, key)
+        self.pick.setToolTip("Which comments a post keeps when it has more than that: the highest-scored, or a "
+                             "random sample that stays the same each time the post is asked about")
+        self.count.valueChanged.connect(lambda _: self.set_enabled(self._enabled))
+        self.restore()
+
+    def request(self) -> dict:
+        """The FetchRequest fields this sets."""
+        return {"comments_per_post": self.count.value(), "comment_pick": self.pick.currentData()}
+
+    def set_enabled(self, on: bool) -> None:
+        """Both off with ``on`` False; the pick is off under All too, as nothing is left out to choose from."""
+        self._enabled = on
+        self.count.setEnabled(on)
+        self.pick.setEnabled(on and self.count.value() > 0)
+
+    def restore(self) -> None:
+        self.count.setValue(self.settings.value(f"{self.prefix}/comments_per_post", self.default, int))
+        pick = self.settings.value(f"{self.prefix}/comment_pick", "top", str)
+        self.pick.setCurrentIndex(max(self.pick.findData(pick), 0))
+
+    def save(self) -> None:
+        self.settings.setValue(f"{self.prefix}/comments_per_post", self.count.value())
+        self.settings.setValue(f"{self.prefix}/comment_pick", self.pick.currentData())
 
 class Choice(QFrame):
     """A row of words in a soft track, one of them chosen (a raised pill): Download coverage's Posts / Comments /

@@ -16,6 +16,7 @@ What callers should know:
 """
 from __future__ import annotations
 
+import hashlib
 import itertools
 import math
 import queue
@@ -808,30 +809,33 @@ class ArcticShiftClient:
 
     # -- comments ---------------------------------------------------------------
 
-    def fetch_comments(self, post: Post, limit: int = 100) -> list[Comment]:
-        """The top ``limit`` comments on ``post`` by score, highest first (unscored ones last).
+    def fetch_comments(self, post: Post, limit: int = 100, pick: str = "top") -> list[Comment]:
+        """``limit`` comments on ``post``, picked by ``pick`` (see ``keep``) from what one request brings.
 
         Uses the archive's comment tree, which returns a whole thread in one request but can't sort it,
-        so the thread is ranked here. A thread with more than TREE_LIMIT comments is cut short by the
-        archive and ranked from what came back. Comments the archive hasn't re-checked yet have no
-        score, so on a post from the last day or two the "top" ones are only a sample.
+        and cuts it short in the order comments were posted (live, 21 Oct: limit=100 on a 1,065-comment
+        thread held 22 of its top 100). A thread with more than TREE_LIMIT comments is cut short and picked
+        from what came back. Comments the archive hasn't re-checked yet have no score, so on a post from the
+        last day or two the "top" ones are only a sample.
         """
         # Ask for the whole thread when its size is known, so the top ones are really the top ones;
         # half the cap while it isn't (the post's numbers haven't settled).
         known = post.num_comments + 20 if post.num_comments is not None else TREE_LIMIT // 2
         size = min(TREE_LIMIT, max(limit, PAGE, known))
-        comments = self._thread(post, size)[0]
-        comments.sort(key=lambda c: -1 if c.score is None else c.score, reverse=True)
-        return comments[:limit]
+        return keep(self._thread(post, size)[0], limit, pick, post.id)
 
-    def fetch_all_comments(self, post: Post) -> tuple[list[Comment], bool]:
-        """Every comment the archive has on ``post`` (up to TREE_MAX), and whether that is the whole
-        thread: False when the archive cut it short or left replies collapsed."""
+    def fetch_all_comments(self, post: Post, cap: int = 0, pick: str = "top") -> tuple[list[Comment], bool]:
+        """Every comment the archive has on ``post`` (up to TREE_MAX), or with ``cap`` that many of them
+        picked by ``pick`` from the whole thread, and whether what's returned is the whole thread: False when
+        the archive cut it short, left replies collapsed, or the cap left some out. The whole thread is asked
+        for either way, as the archive can't rank it, and a whole tree came back as fast as a 100-comment
+        one live (1.2-3 s for 141-1,123 comments, 21 Oct)."""
         known = post.num_comments if post.num_comments is not None else UNKNOWN_THREAD
         size = min(TREE_MAX, max(PAGE, known + 50))
         comments, items, collapsed = self._thread(post, size)
         sent = _number(self.last_params.get("limit"), size)  # smaller if the archive timed out
-        return comments, items < sent and not collapsed
+        kept = keep(comments, cap, pick, post.id)
+        return kept, items < sent and not collapsed and len(kept) == len(comments)
 
     def _thread(self, post: Post, size: int) -> tuple[list[Comment], int, bool]:
         """The usable comments of a post's tree (parents first), how many items came back, and whether
@@ -858,6 +862,19 @@ class ArcticShiftClient:
                 permalink="https://www.reddit.com" + permalink,
             ))
         return comments, items, _collapsed(tree)
+
+
+def keep(comments: list[Comment], n: int, pick: str, post_id: str) -> list[Comment]:
+    """``n`` of a thread's comments (0: all, as they came): the highest-scored first (unscored ones last), or
+    for pick "random" a sample that stays the same for the post: each comment's place comes from a hash of
+    its id with the post's, so asking again, or for more, keeps the ones already picked."""
+    if not n:
+        return comments
+    if pick == "random":
+        ranked = sorted(comments, key=lambda c: hashlib.blake2b(f"{post_id}/{c.id}".encode(), digest_size=8).digest())
+    else:
+        ranked = sorted(comments, key=lambda c: -1 if c.score is None else c.score, reverse=True)
+    return ranked[:n]
 
 
 def in_parallel(fn: Callable, items: Iterable, workers: int = WORKERS, should_stop: StopFn | None = None):

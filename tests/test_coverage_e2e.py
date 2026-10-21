@@ -12,6 +12,7 @@ from PySide6.QtCore import QSettings, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QCheckBox, QPushButton  # noqa: E402
 
+from subsentiment.arctic_shift import keep  # noqa: E402
 from subsentiment.gui import coverage, worker  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.reddit import Comment, Post  # noqa: E402
@@ -28,6 +29,7 @@ def post(pid, sub, created, num_comments=5):
 class FakeArchive:
     """Stands in for ArcticShiftClient; every call is logged on the class."""
     calls: list = []
+    caps: list = []  # (cap, pick) of each thread asked for
     archive = {"Python": [post(f"new{i}", "Python", TODAY - 3 * DAY + 100 + i) for i in range(4)]}
 
     def __init__(self, limiter=None, **kw):
@@ -50,14 +52,17 @@ class FakeArchive:
         FakeArchive.calls.append(("ids", list(ids)))
         return []
 
-    def fetch_comments(self, p, limit=100):
+    def fetch_comments(self, p, limit=100, pick="top"):
         FakeArchive.calls.append(("comments", p.id))
         return []
 
-    def fetch_all_comments(self, p):
+    def fetch_all_comments(self, p, cap=0, pick="top"):
         FakeArchive.calls.append(("all_comments", p.id))
-        return [Comment(f"c{p.id}{j}", p.id, p.subreddit, "t3_" + p.id, "b", "ok", 1, p.created_utc, 0, "u")
-                for j in range(5)], True
+        FakeArchive.caps.append((cap, pick))
+        thread = [Comment(f"c{p.id}{j}", p.id, p.subreddit, "t3_" + p.id, "b", "ok", j, p.created_utc, 0, "u")
+                  for j in range(5)]
+        kept = keep(thread, cap, pick, p.id)
+        return kept, len(kept) == len(thread)
 
 
 @pytest.fixture
@@ -77,6 +82,7 @@ def window(tmp_path, monkeypatch):
     s.commit()
     s.close()
     FakeArchive.calls = []
+    FakeArchive.caps = []
     monkeypatch.setattr(worker, "ArcticShiftClient", FakeArchive)
     # A failed fetch would open a modal box and hang the test; fail fast instead.
     monkeypatch.setattr(mw.QMessageBox, "warning", lambda *a: pytest.fail(f"fetch failed: {a[-1]}"))
@@ -325,6 +331,101 @@ def test_download_selected_with_comments_fetches_every_comment_on_those_days_onl
     assert threads == sorted(["p0", "p2", "new0", "new1", "new2", "new3"])  # p1, on the day between, isn't
     assert not [d for d in got if d[0] == "comments"]
     assert "p1" not in w.store.complete_keys("comments", "Python")
+
+
+def test_download_selected_keeps_the_picked_number_of_comments_per_thread_and_tops_up_later(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    assert c.comment_cap.count.text() == "All comments" and not c.comment_cap.pick.isEnabled()  # nothing left out to pick
+    c.comment_cap.count.setValue(2)
+    c.comment_cap.pick.setCurrentIndex(c.comment_cap.pick.findData("random"))
+    tick(c, TODAY - DAY)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert FakeArchive.caps == [(2, "random")]
+    picked = {x["id"] for x in w.store.comments("Python")}
+    assert len(picked) == 2
+    assert "p0" not in w.store.complete_keys("comments", "Python")  # 2 of its 5: not whole
+
+    FakeArchive.calls, FakeArchive.caps = [], []
+    tick(c, TODAY - DAY)  # the same day again at the same cap: its thread has its 2 already
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert not [d for d in downloads() if d[0] == "all_comments"]
+
+    c.comment_cap.count.setValue(4)  # a bigger cap tops the thread up, keeping the random ones it had
+    tick(c, TODAY - DAY)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert FakeArchive.caps == [(4, "random")]
+    now = {x["id"] for x in w.store.comments("Python")}
+    assert len(now) == 4 and picked < now
+    assert "2 comments" in w.progress_msg.text().replace("\u00a0", " ")  # only the new ones count
+
+    c.comment_cap.count.setValue(0)  # All: the rest of the thread, which is then whole
+    tick(c, TODAY - DAY)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert len(w.store.comments("Python")) == 5 and "p0" in w.store.complete_keys("comments", "Python")
+    settings = QSettings()
+    assert (settings.value("coverage/comments_per_post", type=int), settings.value("coverage/comment_pick")) == (0, "random")
+
+
+def test_a_cap_that_holds_a_whole_thread_marks_it_complete(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    c.comment_cap.count.setValue(50)
+    tick(c, TODAY - DAY)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert FakeArchive.caps == [(50, "top")]
+    assert "p0" in w.store.complete_keys("comments", "Python")  # all 5 fit under 50
+
+
+def test_comments_only_downloads_follow_the_cap_too(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    QTest.mouseClick(c.what.buttons["comments"], Qt.MouseButton.LeftButton)
+    c.comment_cap.count.setValue(3)
+    tick(c, TODAY - DAY)  # p0 is saved there, its thread not
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert FakeArchive.caps == [(3, "top")] and len(w.store.comments("Python")) == 3
+    FakeArchive.calls, FakeArchive.caps = [], []
+    tick(c, TODAY - DAY)  # it has its 3: nothing to ask
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert not [d for d in downloads() if d[0] == "all_comments"]
+    c.comment_cap.count.setValue(0)  # All: the day's comments button finishes it
+    c._download_day_threads(TODAY - DAY)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert FakeArchive.caps == [(0, "top")] and "p0" in w.store.complete_keys("comments", "Python")
+
+
+def test_the_comment_cap_is_remembered(tmp_path, window):
+    w = window
+    c = w.coverage
+    QTest.mouseClick(c.what.buttons["posts"], Qt.MouseButton.LeftButton)
+    assert not c.comment_cap.count.isEnabled()  # posts only: no comments to cap
+    c.comment_cap.count.setValue(300)
+    c.comment_cap.pick.setCurrentIndex(c.comment_cap.pick.findData("random"))
+    again = mw.MainWindow(w.db_path)
+    try:
+        cap = again.coverage.comment_cap
+        assert again.coverage.what.value() == "posts"
+        assert (cap.count.value(), cap.pick.currentData()) == (300, "random")
+        assert again.fetch_form.comments_per_post.value() == 50  # the Fetch drawer keeps its own
+    finally:
+        again.close()
 
 
 def answer(c, yes, wait=True):
