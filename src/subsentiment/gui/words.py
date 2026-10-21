@@ -20,7 +20,7 @@ from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPointF, QRectF, QSiz
                             QVariantAnimation, Signal)
 from PySide6.QtGui import QColor, QFontMetricsF, QLinearGradient, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLineEdit, QPushButton, QSizePolicy, QSlider, QToolTip, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLineEdit, QSizePolicy, QSlider, QToolTip, QVBoxLayout, QWidget,
 )
 
 from subsentiment.analysis import WordCounts
@@ -737,22 +737,22 @@ class MeaningSlider(QSlider):
         p.drawEllipse(QPointF(self._x(v), mid), 7.5, 7.5)
 
 
-class _Meaning(QFrame):
-    """One word's row in WordMeanings: the word, how it reads, a remove button and the slider."""
+class _Meaning(QWidget):
+    """One word's row in WordMeanings: the word, how it reads and a remove button over its slider, then one line
+    on what setting it did, with a hairline under it all."""
 
     def __init__(self, word: str, weight: float | None):
         super().__init__()
         self.word = word
-        self.setProperty("glass", "solid")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 8, 6, 8)
-        lay.setSpacing(4)
+        lay.setContentsMargins(2, 6, 0, 0)
+        lay.setSpacing(2)
         top = QHBoxLayout()
         top.setSpacing(6)
         self.name = ElidedLabel(word)
         self.name.setStyleSheet("font-weight: 600;")
         self.reads = label("", "caption")
-        self.remove = flat_button("✕")
+        self.remove = flat_button("\u2715")
         self.remove.setToolTip("Let it mean what it usually does again")
         top.addWidget(self.name, 1)
         top.addWidget(self.reads)
@@ -761,12 +761,19 @@ class _Meaning(QFrame):
         self.slider = MeaningSlider()
         self.slider.setToolTip(f"What \u201c{word}\u201d means here, from negative to positive")
         lay.addWidget(self.slider)
-        self.result = label("", "caption")  # what setting it did to the saved items (WordMeanings.show_result)
-        self.result.setWordWrap(True)
+        self.result = ElidedLabel("", "caption")  # what setting it did to the saved items (WordMeanings.show_result)
         self.result.hide()
         lay.addWidget(self.result)
+        lay.addSpacing(6)
+        lay.addWidget(theme.mark(QFrame(), "role", "divider"))
+        self.scoring = False  # its saved items are being scored again
         self.slider.valueChanged.connect(self._show)
         self.set(weight)
+
+    def show_result(self, text: str, details: str = "") -> None:
+        self.result.setText(text)
+        self.result.setToolTip(details)
+        self.result.show()
 
     def set(self, weight: float | None) -> None:
         """Show ``weight``, or None for a word picked but not set yet."""
@@ -800,30 +807,20 @@ class WordMeanings(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
-        self.intro = label("", "caption")
-        self.intro.setWordWrap(True)
-        lay.addWidget(self.intro)
-        add = QHBoxLayout()
-        add.setSpacing(6)
         self.entry = QLineEdit()
-        self.entry.setPlaceholderText("Word or phrase")
+        self.entry.setClearButtonEnabled(True)
         self.entry.returnPressed.connect(self._add_typed)
-        self.add_btn = QPushButton("Add")
-        self.add_btn.setAutoDefault(False)
-        self.add_btn.clicked.connect(self._add_typed)
-        self.entry.textChanged.connect(lambda text: self.add_btn.setEnabled(bool(Lexicon.key(text))))
-        self.add_btn.setEnabled(False)
-        add.addWidget(self.entry, 1)
-        add.addWidget(self.add_btn)
-        lay.addLayout(add)
-        self.status = ElidedLabel("", "caption")
+        lay.addWidget(self.entry)
+        self.status = label("", "caption")  # only when scoring failed
+        self.status.setWordWrap(True)
+        self.status.hide()
         lay.addWidget(self.status)
         self.scroll = VerticalScrollArea()
         inner = QWidget()
         self.list = QVBoxLayout(inner)
         self.list.setContentsMargins(0, 0, 4, 0)
-        self.list.setSpacing(6)
-        self.empty = label("No words set yet. Usual meanings apply.", "caption")
+        self.list.setSpacing(0)
+        self.empty = label("No words set yet, so they mean what they usually do.", "caption")
         self.empty.setWordWrap(True)
         self.list.addWidget(self.empty)
         self.list.addStretch(1)
@@ -850,11 +847,10 @@ class WordMeanings(QWidget):
         self.rows = {}
         for word, weight in sorted(words.items(), reverse=True):
             self._row(word, weight)
-        self.intro.setText(f"What a word means in r/{name}, from negative to positive. Click one in the cloud, "
-                           "or type it." if name else "Open a subreddit to set what its words mean.")
-        for w in (self.entry, self.add_btn):
-            w.setEnabled(bool(name) and (w is self.entry or bool(Lexicon.key(self.entry.text()))))
-        self.status.setText("")
+        self.entry.setPlaceholderText("Click a word in the cloud, or type one" if name
+                                      else "Open a subreddit to set what its words mean")
+        self.entry.setEnabled(bool(name))
+        self.status.hide()
         self._update_empty()
 
     def pick(self, word: str) -> None:
@@ -876,6 +872,11 @@ class WordMeanings(QWidget):
     def show_failed(self, subreddit: str, message: str) -> None:
         if self.subreddit and subreddit == self.subreddit.lower():
             self.status.setText(f"Couldn't score saved items again: {message}")
+            self.status.show()
+            for row in self.rows.values():
+                if row.scoring:
+                    row.scoring = False
+                    row.result.hide()
 
     def show_result(self, subreddit: str, words, using: int, changed: Counter, stale: int = 0) -> None:
         """Under each of ``words``, what scoring the saved items again by them did: so it shows the setting is
@@ -884,28 +885,27 @@ class WordMeanings(QWidget):
         mentioned apart."""
         if not (self.subreddit and subreddit == self.subreddit.lower()):
             return
-        it = "these words" if len(words) > 1 else "it"
         if not using:
-            text = f"No saved items use {it} yet"
+            text, details = "No saved items use it yet", ""
         else:
             moved = sum(changed.values())
-            text = f"{using:,} saved {'item uses' if using == 1 else 'items use'} {it}. "
-            text += (f"Setting {it} changes no labels" if not moved else f"Setting {it} changes {moved:,} "
-                     + ("label" if moved == 1 else "labels") + ": "
-                     + ", ".join(f"{n:,} {a} \u2192 {b}" for (a, b), n in changed.most_common(3)))
-            if stale:
-                text += f". Also updated {stale:,} scored by an older version"
+            text = f"\u2713 {f'{moved:,}' if moved else 'None'} of {using:,} saved items changed label"
+            details = "\n".join(f"{n:,} {a} \u2192 {b}" for (a, b), n in changed.most_common())
+            if stale:  # out of date, not changed by the setting
+                details += f"{chr(10) if details else ''}Also updated {stale:,} scored by an older version"
         for word in words:
             row = self.rows.get(word)
             if row is not None:
-                row.result.setText(text)
-                row.result.show()
+                row.scoring = False
+                row.show_result(text, details)
 
     def show_progress(self, subreddit: str, done: int | None = None, total: int = 0) -> None:
-        """How far scoring the saved items again has got; done None once it's finished."""
-        if self.subreddit and subreddit == self.subreddit.lower():
-            self.status.setText("Saved items scored again" if done is None
-                                else f"Scoring saved items again… {100 * done // max(total, 1)}%")
+        """How far scoring the saved items again has got, under the words being scored; done None once it's
+        finished."""
+        if done is not None and self.subreddit and subreddit == self.subreddit.lower():
+            for row in self.rows.values():
+                if row.scoring:
+                    row.show_result(f"Scoring saved items\u2026 {100 * done // max(total, 1)}%")
 
     def _row(self, word: str, weight: float | None) -> _Meaning:
         row = self.rows[word] = _Meaning(word, weight)
@@ -928,8 +928,8 @@ class WordMeanings(QWidget):
     def _save(self, row: _Meaning) -> None:
         weight = row.weight()
         row.set(weight)  # snapped, and set from now on
-        row.result.setText("Scoring the saved items that use it\u2026")
-        row.result.show()
+        row.scoring = True
+        row.show_result("Scoring saved items\u2026")
         self.changed.emit(row.word, weight)
 
     def _remove(self, row: _Meaning) -> None:
