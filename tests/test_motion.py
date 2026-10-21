@@ -320,7 +320,11 @@ def test_a_waiting_bar_throbs_on_one_clock_that_stops_with_it(make_window):
         bar.show()
     pump(80)
     clock = motion._throbbers
-    assert clock._timer.isActive() and set(clock._painted) == set(bars)  # one timer for every bar
+    # One timer for every bar. Each tick empties the list and the bars' repaints fill it again, so look between.
+    end = time.monotonic() + 2
+    while set(clock._painted) != set(bars) and time.monotonic() < end:
+        QApplication.processEvents()
+    assert clock._timer.isActive() and set(clock._painted) == set(bars)
     for bar in bars:
         bar.set(0.5)  # the number is in: the bar shows it and stops asking for frames
     pump(80)
