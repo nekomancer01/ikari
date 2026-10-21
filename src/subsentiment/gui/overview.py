@@ -1,5 +1,5 @@
 """The Overview page (four stat tiles, the timeline across the full width, the distribution under it) and
-the pages beside it in the rail: Timeline, a single card, and Words."""
+the Words page beside it in the rail."""
 from __future__ import annotations
 
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
@@ -24,18 +24,6 @@ def card(title: str, body: QWidget, extra: QWidget | None = None) -> QFrame:
     inner.addLayout(head)
     inner.addWidget(body, 1)
     return frame
-
-
-class CardPage(QWidget):
-    """A page that is one titled card filling the content area, such as Timeline."""
-
-    def __init__(self, title: str, body: QWidget, extra: QWidget | None = None):
-        super().__init__()
-        self.body = body
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(card(title, body, extra), 1)
-        self.cards = [body.parentWidget()]
 
 
 class WordsPage(QWidget):

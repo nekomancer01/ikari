@@ -1,20 +1,20 @@
 """The navigation rail down the window's left edge.
 
-The rail has one button per page (Overview, Timeline, Words, Posts, Comments, Coverage) and two that open a drawer
+The rail has one button per page (Overview, Words, Posts, Comments, Coverage) and two that open a drawer
 beside it instead of a page: Fetch at the top and Saved at the bottom. Icons are drawn here, in the theme's
 colours, so they follow light and dark without image files.
 """
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import QAbstractButton, QButtonGroup, QFrame, QSizePolicy, QSpacerItem, QVBoxLayout
 
 from subsentiment.gui import theme
 from subsentiment.gui.theme import mark
 from subsentiment.gui.widgets import label
 
-PAGES = {"overview": "Overview", "timeline": "Timeline", "words": "Words", "posts": "Posts", "comments": "Comments",
+PAGES = {"overview": "Overview", "words": "Words", "posts": "Posts", "comments": "Comments",
          "coverage": "Coverage"}
 DRAWERS = {"fetch": "Fetch", "saved": "Saved"}
 
@@ -93,12 +93,6 @@ class RailButton(QAbstractButton):
             for dx in (-6, 2):
                 for dy in (-6, 2):
                     p.drawRoundedRect(QRectF(c.x() + dx, c.y() + dy, 5, 5), 1.2, 1.2)
-        elif k == "timeline":
-            path = QPainterPath(c + QPointF(-8, 3))
-            for x, y in ((-4, -2), (0, 1), (4, -5), (8, -2)):
-                path.lineTo(c + QPointF(x, y))
-            p.drawPath(path)
-            p.drawLine(c + QPointF(-8, 7), c + QPointF(8, 7))
         elif k == "words":
             f = QFont(theme.DISPLAY_FAMILY)
             f.setPixelSize(15)
