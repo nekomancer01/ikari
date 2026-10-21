@@ -4,15 +4,23 @@ rem First run creates a private Python environment in .venv (takes a minute).
 rem Delete the .venv folder to reinstall from scratch.
 setlocal
 cd /d "%~dp0"
-if exist ".venv\Scripts\pythonw.exe" goto :run
+if exist ".venv\Scripts\pythonw.exe" goto :deps
 
 where py >nul 2>nul && (set "PY=py -3") || (set "PY=python")
 echo First run: setting up ikari...
 %PY% -m venv .venv
 if errorlevel 1 goto :nopython
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
-".venv\Scripts\python.exe" -m pip install -e .
+
+:deps
+rem Re-sync dependencies whenever pyproject.toml changes (new deps never break a launch).
+if exist ".venv\.deps-stamp" (
+    for /f %%i in ('powershell -nologo -command "if ((Get-Item pyproject.toml).LastWriteTime -gt (Get-Item .venv\.deps-stamp).LastWriteTime) {1} else {0}"') do if "%%i"=="0" goto :run
+)
+echo Installing ikari dependencies...
+".venv\Scripts\python.exe" -m pip install -q -e .
 if errorlevel 1 goto :fail
+type nul > ".venv\.deps-stamp"
 
 :run
 start "" ".venv\Scripts\pythonw.exe" -m subsentiment

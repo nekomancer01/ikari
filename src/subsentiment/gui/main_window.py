@@ -99,13 +99,14 @@ def finish_text(result: collect.FetchResult, req: collect.FetchRequest) -> str:
         if result.stopped:
             parts.append("Stopped early.")
         return " ".join(parts)
-    if not (result.posts or result.updated or result.already):
+    if not (result.posts or result.updated or result.already or result.comments):
         if result.stopped:
             return "Stopped before any posts were fetched."
         if result.timed_out:
             return f"Arctic Shift timed out on r/{result.subreddit} in this range; try again in a few minutes."
         matching = f" matching \u201c{req.query}\u201d" if req.query else ""
-        return f"No new posts found in r/{result.subreddit}{matching} in this date range."
+        return f"No new posts found in r/{result.subreddit}{matching} " + (
+            "on the ticked days." if req.days else "in this date range.")
     parts = [f"Added {plural(result.posts, 'new post')}"
              + (f" and {plural(result.comments, 'comment')}" if req.include_comments else "")
              + f" from r/{result.subreddit}."]
@@ -686,13 +687,20 @@ class MainWindow(QMainWindow):
             self._live.start()
 
     def _open_fetched(self) -> None:
-        """Show the subreddit being fetched, if anything of it is saved yet."""
+        """Show the subreddit being fetched."""
         self._refresh_datasets(select=self.request.subreddit, reload=False)
-        item = self.datasets.currentItem()
-        name = item.data(Qt.ItemDataRole.UserRole) if item else None
-        if not name or name.lower() != self.request.subreddit.lower() or self._showing_fetch():
+        if self._showing_fetch():
             return
-        self._show_dataset(name)
+        # Nothing of it saved yet shows empty, filling as its first rows arrive.
+        item = self.datasets.currentItem()
+        saved = item and item.data(Qt.ItemDataRole.UserRole)
+        if saved and saved.lower() == self.request.subreddit.lower():
+            self._show_dataset(saved)
+        else:
+            self.datasets.blockSignals(True)
+            self.datasets.setCurrentRow(-1)  # it has no row yet
+            self.datasets.blockSignals(False)
+            self._show_dataset(self.request.subreddit)
         for kind, rows in self._saved.items():
             # What was just loaded needn't be read again; rows sharing the last instant are caught by id.
             self._read_to[kind] = max([self._read_to[kind]] + [r["fetched_at"] for r in rows])
@@ -789,6 +797,8 @@ class MainWindow(QMainWindow):
     def _on_finished(self, result: collect.FetchResult) -> None:
         self._loaded.clear()  # what it saved (scores too) is read again, not shown from memory
         self.progress_msg.setText(finish_text(result, self.request))
+        if self.request.days and not (result.stopped or result.timed_out):  # stopped: the ticks stay, to go on
+            self.coverage.untick(self.request.days)
         self._live.stop()
         self._flush_rows()
         if self.current and self.current.lower() == result.subreddit.lower():
@@ -843,6 +853,8 @@ class MainWindow(QMainWindow):
 
     def _on_fetch_ended(self) -> None:
         self._set_busy(False)
+        if self.current and self.current.lower() not in self._stats:  # it saved nothing: back to a saved one
+            self._refresh_datasets(select=self.settings.value("ui/last_dataset", "", str))
 
     # -- datasets -------------------------------------------------------------
 
@@ -865,8 +877,10 @@ class MainWindow(QMainWindow):
         lowered = [n.lower() for n in names]
         row = next((lowered.index(c.lower()) for c in (select, self.current) if c and c.lower() in lowered),
                    0 if names else None)
-        if row is not None:
-            self.datasets.setCurrentRow(row)
+        if row is not None and not (self.fetch_job.busy and self._showing_fetch() and self.current.lower() not in lowered):
+            self.datasets.setCurrentRow(row)  # (a fetch's subreddit with nothing saved yet has no row)
+        else:
+            self.datasets.setCurrentRow(-1)
         self.datasets.blockSignals(False)
         if reload:
             self._on_dataset_selected(self.datasets.currentItem())  # reload even when the selection is unchanged

@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QPushButton  # noqa: E402
+from PySide6.QtWidgets import QApplication, QCheckBox, QPushButton  # noqa: E402
 
 from subsentiment.gui import worker  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
@@ -183,3 +183,110 @@ def test_a_posts_download_all_fetches_only_that_posts_comments(window):
     assert downloads() == [("all_comments", "p0")]
     cell = c.post_table.cellWidget(0, 1)
     assert cell.main.text() == "5 saved" and "Complete" in cell.side.text()
+
+
+def tick(c, day, shift=False):
+    """A real click on a day's tick box, with Shift held for a run of days."""
+    box = c.day_table.cellWidget(c.days.index(day), 0).findChild(QCheckBox)
+    QTest.mouseClick(box, Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.ShiftModifier if shift else Qt.KeyboardModifier.NoModifier)
+    settle(c.window_)
+
+
+def test_ticking_days_downloads_nothing_until_download_selected(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    assert not c.download_ticked.isEnabled()
+    tick(c, TODAY - DAY)
+    tick(c, TODAY - 4 * DAY, shift=True)  # a run: four days
+    assert c.ticked == {TODAY - k * DAY for k in range(1, 5)}
+    assert c.download_ticked.text() == "Download 4\u00a0days" and c.download_ticked.isEnabled()
+    tick(c, TODAY - 2 * DAY)  # one unticked again
+    assert c.ticked == {TODAY - DAY, TODAY - 3 * DAY, TODAY - 4 * DAY}
+    c.tick_all.click()
+    assert c.ticked == set(c.days) and c.tick_all.text() == "Select none"
+    boxes = [c.day_table.cellWidget(r, 0).findChild(QCheckBox) for r in range(c.day_table.rowCount())]
+    assert all(b.isChecked() for b in boxes)
+    w.show_page("overview")
+    w.show_page("coverage")  # the page rebuilt its rows: the ticks stay
+    settle(w)
+    assert all(c.day_table.cellWidget(r, 0).findChild(QCheckBox).isChecked() for r in range(c.day_table.rowCount()))
+    c.tick_all.click()
+    assert c.ticked == set() and c.tick_all.text() == "Select all"
+    tick(c, TODAY - DAY)
+    select(w, "rust")  # another subreddit starts with nothing ticked
+    assert c.ticked == set() and not c.download_ticked.isEnabled()
+    assert downloads() == []
+
+
+def test_download_selected_fetches_only_the_ticked_days(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    c.with_comments.setChecked(False)
+    tick(c, TODAY - 3 * DAY)
+    tick(c, TODAY - DAY)  # not a run: the day between stays out
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert downloads() == [("posts", "Python", TODAY - DAY, TODAY), ("posts", "Python", TODAY - 3 * DAY, TODAY - 2 * DAY)]
+    assert w.store.posts_per_day("Python", TODAY - 3 * DAY, TODAY - 2 * DAY) == {TODAY - 3 * DAY: 5}
+    assert c.ticked == set()  # all read, so unticked for the next batch
+
+
+def test_a_stopped_download_selected_keeps_its_ticks(window, monkeypatch):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    reads = FakeArchive.fetch_posts
+
+    def stop_after_one(self, *a, **kw):
+        got = reads(self, *a, **kw)
+        w.fetch_job.stop()  # Stop pressed while the first day is read
+        return got
+    monkeypatch.setattr(FakeArchive, "fetch_posts", stop_after_one)
+    tick(c, TODAY - DAY)
+    tick(c, TODAY - 3 * DAY, shift=True)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert len([d for d in downloads() if d[0] == "posts"]) == 1
+    assert c.ticked == {TODAY - DAY, TODAY - 2 * DAY, TODAY - 3 * DAY}
+    assert c.download_ticked.isEnabled()
+
+
+def test_download_selected_says_what_comments_it_added(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    tick(c, TODAY - DAY)  # its one post is saved already, so only comments are new
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert "5 comments" in w.progress_msg.text().replace("\u00a0", " ")
+
+
+def test_download_selected_with_comments_fetches_every_comment_on_those_days_only(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    assert c.with_comments.isChecked()
+    tick(c, TODAY - 3 * DAY)
+    tick(c, TODAY - DAY)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    got = downloads()
+    assert [d for d in got if d[0] == "posts"] == [("posts", "Python", TODAY - DAY, TODAY),
+                                                   ("posts", "Python", TODAY - 3 * DAY, TODAY - 2 * DAY)]
+    threads = sorted(d[1] for d in got if d[0] == "all_comments")
+    assert threads == sorted(["p0", "p2", "new0", "new1", "new2", "new3"])  # p1, on the day between, isn't
+    assert not [d for d in got if d[0] == "comments"]
+    assert "p1" not in w.store.complete_keys("comments", "Python")
