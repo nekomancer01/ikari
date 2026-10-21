@@ -3,19 +3,23 @@ from __future__ import annotations
 
 import csv
 import json
+import multiprocessing
 import os
 import sqlite3
+import struct
 import sys
 import threading
 import time
 from collections import OrderedDict, namedtuple
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from operator import attrgetter, itemgetter
 from pathlib import Path
 
+import numpy as np
 import zstandard
 
-from subsentiment.analysis import words_in
+from subsentiment.analysis import LABELS, words_in
 from subsentiment.reddit import Comment, Post, is_image_post
 from subsentiment.sentiment import Lexicon
 
@@ -42,12 +46,24 @@ CREATE TABLE IF NOT EXISTS comments (
     packed INTEGER NOT NULL DEFAULT 0
 );
 -- The text of a subreddit's posts or comments created on one settled UTC day (day: its start / 86400),
--- compressed together: short texts barely shrink one by one, a day of them about 4x. data is zstd-compressed
--- JSON {"columns": [...], "rows": {id: [values]}}. See Store.pack_settled.
+-- compressed together: short texts barely shrink one by one, a day of them about 4x. data holds the text in
+-- frames of a few hundred rows, so one row's text is read without the rest of the day's; cols the rows'
+-- numbers and words how many of them use each word, for the window's RowIndex. See DayPack and Store.pack_settled.
 CREATE TABLE IF NOT EXISTS packs (
     kind TEXT NOT NULL, subreddit TEXT NOT NULL, day INTEGER NOT NULL, packed_at REAL, data BLOB NOT NULL,
     PRIMARY KEY (kind, subreddit, day)  -- subreddit lowercased
+    -- plus cols and words: see Store.__init__, which adds them to databases saved before they existed
 );
+-- The zstd dictionary a subreddit's packs of one kind are compressed with, made from its first big day.
+CREATE TABLE IF NOT EXISTS dicts (
+    kind TEXT NOT NULL, subreddit TEXT NOT NULL, data BLOB NOT NULL,
+    PRIMARY KEY (kind, subreddit)  -- subreddit lowercased
+) WITHOUT ROWID;
+-- The words of a subreddit's packed posts and comments, numbered in the order they were first packed.
+CREATE TABLE IF NOT EXISTS vocab (
+    subreddit TEXT NOT NULL, id INTEGER NOT NULL, word TEXT NOT NULL,
+    PRIMARY KEY (subreddit, id)  -- subreddit lowercased
+) WITHOUT ROWID;
 -- One row per post whose comments ikari has asked for: whether that worked, and whether the post's
 -- scores were settled at the time (if not, its comments are fetched again once they are).
 CREATE TABLE IF NOT EXISTS comment_fetches (
@@ -103,8 +119,9 @@ _COMMENT_SELECT = "SELECT " + ", ".join(
     for col in COMMENT_COLUMNS) + (", c.packed, p.title AS post_title, p.score AS post_score, p.packed AS post_packed, "
                                    "p.subreddit AS post_sub, p.created_utc AS post_created "
                                    "FROM comments c LEFT JOIN posts p ON p.id = c.post_id")
-SCHEMA_VERSION = 2  # 1: derivable comment permalinks not stored, posts_sub and comments_sub indexes dropped
+SCHEMA_VERSION = 3  # 1: derivable comment permalinks not stored, posts_sub and comments_sub indexes dropped
 #                    2: settled days' text packed (packs table, packed columns)
+#                    3: packs in frames, with each row's numbers and words (DayPack)
 
 # The columns kept in day packs: the text, which is most of what's saved. The rest stays in its row, so
 # counts, filters and lookups by id still run in SQL. (A comment's permalink is mostly NULL already, rebuilt
@@ -112,6 +129,17 @@ SCHEMA_VERSION = 2  # 1: derivable comment permalinks not stored, posts_sub and 
 PACKED = {"posts": ("title", "selftext", "author", "permalink", "url"), "comments": ("parent_id", "author", "body")}
 SETTLE = 2 * 86400  # a day is packed once it's this old: scores have settled, so its rows rarely change
 _ZSTD_LEVEL = 12
+# A row's packed column: 0 its text is in the row; 1 in its day's pack; 2 in its day's pack, but its score was set
+# again since (Store.rescore), so the pack's copy of its numbers is out of date until the day is packed again.
+NO_SCORE = -2 ** 31  # a score Arctic Shift hasn't filled in yet, among a pack's numbers
+# The score filter's steps (the window's MIN_SCORES). A pack's word counts and RowIndex's overview numbers are kept
+# per label and the bucket between two steps, so any step's are a sum. Bucket 0 is no score yet, 1 below the first.
+SCORE_STEPS = (1, 10, 50, 100, 500, 1000)
+
+
+def score_bucket(score: np.ndarray) -> np.ndarray:
+    """Each score's (NO_SCORE: none yet) bucket between two SCORE_STEPS."""
+    return np.where(score == NO_SCORE, 0, np.searchsorted(np.array(SCORE_STEPS), score, side="right") + 1).astype(np.int64)
 
 
 # How many of post p's comments are saved, and whether its whole thread is (1 or 0): as the comment downloader
@@ -222,8 +250,233 @@ class CommentRow(Row, namedtuple("_Comment", COMMENT_COLUMNS[:9] + ("link",) + C
         return self.post_link + self.id + "/"
 
 
-def _unpack(blob: bytes) -> dict:
-    return json.loads(zstandard.ZstdDecompressor().decompress(blob))
+class DayPack:
+    """How a settled day's posts or comments of a subreddit are kept, in a row of the packs table.
+
+    ``data`` is the text (the PACKED columns): b"IKP3", the header's length, the header as JSON ({"columns",
+    "rows", "keys": where the keys end, "frames": where each frame ends, "dict": the zstd dictionary's id or 0}),
+    the keys (the ids, and the columns `split_columns` keeps for the whole day) as one zstd frame, then the rest of
+    the text a few hundred rows a zstd frame. Each frame has its row count, then each column as a null flag a row,
+    the offsets of the values and their UTF-8. A row's text is two frames' read, not the whole day's.
+    Packs saved before this format are one zstd frame of JSON {"columns", "rows": {id: [values]}}; `read` takes both.
+
+    ``cols`` is the rows' numbers in the same order, zstd-compressed: their count, the ids' width, the ids, then
+    created_utc, score (NO_SCORE when there's none yet), sentiment, label (its LABELS index, -1 for another) and
+    hidden (an image post, or a comment on one) as arrays. ``words`` is each row's words (`words_in`), as ids in
+    the vocab table: a count a row, then the ids.
+    """
+
+    MAGIC = b"IKP3"
+    FRAME = 256  # rows a frame: a frame takes about a tenth of a millisecond to read, and with a dictionary
+    #              packs barely bigger than a whole day in one frame
+    DICT_SIZE = 112_640
+    NUMBERS = (("created", np.float64), ("score", np.int32), ("sentiment", np.float64), ("label", np.int8),
+               ("hidden", np.int8))
+    dicts: dict[int, zstandard.ZstdCompressionDict] = {}  # every dictionary read or made here, by its id
+
+    @classmethod
+    def frame_bytes(cls, columns: list[list]) -> bytes:
+        """Columns of values (str or None) as a frame's bytes, before compressing."""
+        out = [struct.pack("<I", len(columns[0]))]
+        for values in columns:
+            encoded = []
+            for v in values:
+                if v is not None and not isinstance(v, str):
+                    raise TypeError(f"only text is packed, not {type(v).__name__}")
+                encoded.append(b"" if v is None else v.encode())
+            out.append(bytes(v is None for v in values))
+            out.append(np.cumsum([0] + [len(e) for e in encoded], dtype=np.uint32).tobytes())
+            out.append(b"".join(encoded))
+        return b"".join(out)
+
+    @staticmethod
+    def frame_columns(raw: bytes, width: int) -> list[tuple[bytes, list[int], int, bytes]]:
+        """A frame's ``width`` columns as (null flags, offsets, where the text starts, the frame), to read a row
+        from without decoding the others."""
+        n = struct.unpack_from("<I", raw)[0]
+        at, out = 4, []
+        for _ in range(width):
+            nulls = raw[at:at + n]
+            offsets = np.frombuffer(raw, np.uint32, n + 1, at + n).tolist()
+            start = at + n + 4 * (n + 1)
+            out.append((nulls, offsets, start, raw))
+            at = start + offsets[-1]
+        return out
+
+    @staticmethod
+    def value(column: tuple, k: int) -> str | None:
+        nulls, offsets, start, raw = column
+        return None if nulls[k] else raw[start + offsets[k]:start + offsets[k + 1]].decode()
+
+    @classmethod
+    def encode(cls, columns, ids: list[str], text: dict, zdict: zstandard.ZstdCompressionDict | None) -> bytes:
+        """The data of a pack of ``ids`` in that order, their text being ``text[id]`` (values of ``columns``). A day of
+        no more than a frame of rows is kept as one frame of JSON (the format before frames): frames would only
+        add their headers to it."""
+        if len(ids) <= cls.FRAME:
+            return zstandard.ZstdCompressor(level=_ZSTD_LEVEL).compress(
+                json.dumps({"columns": list(columns), "rows": {i: text[i] for i in ids}}, ensure_ascii=False).encode())
+        packer = zstandard.ZstdCompressor(level=_ZSTD_LEVEL, dict_data=zdict) if zdict else zstandard.ZstdCompressor(level=_ZSTD_LEVEL)
+        keys, prose = cls.split_columns(columns)
+        at = {c: k for k, c in enumerate(columns)}
+        blocks = [packer.compress(cls.frame_bytes([ids] + [[text[i][at[c]] for i in ids] for c in keys]))]
+        ends = [len(blocks[0])]
+        for k in range(0, len(ids), cls.FRAME):
+            chunk = ids[k:k + cls.FRAME]
+            blocks.append(packer.compress(cls.frame_bytes([[text[i][at[c]] for i in chunk] for c in prose])))
+            ends.append(ends[-1] + len(blocks[-1]))
+        header = json.dumps({"columns": list(columns), "rows": len(ids), "keys": ends[0], "frames": ends[1:],
+                             "dict": zdict.dict_id() if zdict else 0}).encode()
+        return cls.MAGIC + struct.pack("<I", len(header)) + header + b"".join(blocks)
+
+    @staticmethod
+    def split_columns(columns) -> tuple[list[str], list[str]]:
+        """The columns kept for the whole day at once (short, alike values: links, parent ids), and the ones kept
+        a frame at a time (the text itself)."""
+        keys = [c for c in columns if c in ("permalink", "url", "parent_id")]
+        return keys, [c for c in columns if c not in keys]
+
+    @classmethod
+    def header(cls, head: bytes) -> tuple[dict, int]:
+        """A pack's header and where the rest starts, from its first bytes (at least 8, then the header's)."""
+        size = struct.unpack_from("<I", head, 4)[0]
+        return json.loads(head[8:8 + size]), 8 + size
+
+    @classmethod
+    def decompressor(cls, dict_id: int, db: sqlite3.Connection | None = None, schema: str = "main"):
+        if not dict_id:
+            return zstandard.ZstdDecompressor()
+        if dict_id not in cls.dicts and db is not None:
+            cls.remember(db, schema)
+        return zstandard.ZstdDecompressor(dict_data=cls.dicts[dict_id])  # KeyError: its dictionary is gone
+
+    @classmethod
+    def remember(cls, db: sqlite3.Connection, schema: str = "main") -> None:
+        """Keep every dictionary in a database (or an attached one) for reading its packs."""
+        for (data,) in db.execute(f"SELECT data FROM {schema}.dicts"):
+            d = zstandard.ZstdCompressionDict(data)
+            cls.dicts[d.dict_id()] = d
+
+    @classmethod
+    def assemble(cls, head: dict, keys: list, frame: list, at: int) -> list:
+        """Row ``at`` (its place in the day) of a pack: values of its columns, from the day's keys and its frame."""
+        names, prose = cls.split_columns(head["columns"])
+        got = dict(zip(names, (cls.value(c, at) for c in keys[1:])))
+        got.update(zip(prose, (cls.value(c, at % cls.FRAME) for c in frame)))
+        return [got[c] for c in head["columns"]]
+
+    @classmethod
+    def read(cls, blob: bytes, db: sqlite3.Connection | None = None, schema: str = "main") -> dict:
+        """A whole pack's text, as {"columns": [...], "rows": {id: [values]}}, in either format."""
+        if not blob.startswith(cls.MAGIC):
+            return json.loads(zstandard.ZstdDecompressor().decompress(blob))
+        head, start = cls.header(blob)
+        unpacker = cls.decompressor(head["dict"], db, schema)
+        names, prose = cls.split_columns(head["columns"])
+        keys = cls.frame_columns(unpacker.decompress(blob[start:start + head["keys"]]), len(names) + 1)
+        n = head["rows"]
+        values = {c: [cls.value(col, k) for k in range(n)] for c, col in zip(["id"] + names, keys)}
+        for c in prose:
+            values[c] = []
+        begin = start + head["keys"]
+        for end in head["frames"]:
+            frame = cls.frame_columns(unpacker.decompress(blob[begin:start + end]), len(prose))
+            begin = start + end
+            for c, col in zip(prose, frame):
+                values[c] += [cls.value(col, k) for k in range(len(col[1]) - 1)]
+        return {"columns": head["columns"], "rows": dict(zip(values["id"], map(list, zip(*(values[c] for c in head["columns"])))))}
+
+    @classmethod
+    def encode_cols(cls, ids: list[str], numbers: dict[str, list]) -> bytes:
+        encoded = [i.encode() for i in ids]
+        width = max(map(len, encoded), default=1)
+        parts = [struct.pack("<II", len(ids), width), np.array(encoded, dtype=f"S{width}").tobytes()]
+        parts += [np.array(numbers[name], dtype=t).tobytes() for name, t in cls.NUMBERS]
+        return zstandard.ZstdCompressor(level=3).compress(b"".join(parts))
+
+    @classmethod
+    def decode_cols(cls, blob: bytes) -> dict[str, np.ndarray]:
+        """A pack's numbers as arrays, "ids" among them (bytes, as numpy keeps them)."""
+        raw = zstandard.ZstdDecompressor().decompress(blob)
+        n, width = struct.unpack_from("<II", raw)
+        out = {"ids": np.frombuffer(raw, f"S{width}", n, 8)}
+        at = 8 + n * width
+        for name, t in cls.NUMBERS:
+            out[name] = np.frombuffer(raw, t, n, at)
+            at += out[name].nbytes
+        return out
+
+    # A day's word counts: how many of its rows of each label and score bucket use each word, keyed
+    # word id * 32 + label (0 to 2, 3 for none) * 8 + bucket (score_bucket), sorted.
+    @staticmethod
+    def word_keys(words: np.ndarray, label: np.ndarray, bucket: np.ndarray) -> np.ndarray:
+        """The keys of words (vocab ids) used by rows of these labels (an index into LABELS, -1 for none) and buckets."""
+        return words.astype(np.int64) * 32 + np.where(label < 0, 3, label).astype(np.int64) * 8 + bucket
+
+    @staticmethod
+    def encode_counts(keys: np.ndarray, n: np.ndarray) -> bytes:
+        words = (keys >> 5).astype(np.uint32)
+        steps = np.diff(words, prepend=np.uint32(0))  # small numbers, which compress far better
+        return zstandard.ZstdCompressor(level=9).compress(struct.pack("<I", len(keys)) + steps.tobytes()
+                                                          + (keys & 31).astype(np.uint8).tobytes() + n.astype(np.uint32).tobytes())
+
+    @staticmethod
+    def decode_counts(blob: bytes) -> tuple[np.ndarray, np.ndarray]:
+        """A day's word count keys and counts."""
+        raw = zstandard.ZstdDecompressor().decompress(blob)
+        size = struct.unpack_from("<I", raw)[0]
+        words = np.cumsum(np.frombuffer(raw, np.uint32, size, 4), dtype=np.int64)
+        combos = np.frombuffer(raw, np.uint8, size, 4 + 4 * size)
+        return words * 32 + combos, np.frombuffer(raw, np.uint32, size, 4 + 5 * size).astype(np.int64)
+
+    @staticmethod
+    def merge_counts(keys: np.ndarray, n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Counts with each key once, summed, and those summing to nothing left out."""
+        if not len(keys):
+            return keys.astype(np.int64), n.astype(np.int64)
+        unique, inverse = np.unique(keys, return_inverse=True)
+        total = np.bincount(inverse, weights=n, minlength=len(unique)).astype(np.int64)
+        kept = total != 0
+        return unique[kept], total[kept]
+
+    @classmethod
+    def train(cls, columns: list[list]) -> zstandard.ZstdCompressionDict | None:
+        """A dictionary for a subreddit's packs of a kind, from a day of its rows (the prose columns, as
+        `split_columns` has them), or None when the day is too small to make one worth having."""
+        n = len(columns[0])
+        if n < 4 * cls.FRAME:
+            return None
+        samples = [cls.frame_bytes([c[k:k + 64] for c in columns]) for k in range(0, n, 64)]
+        try:
+            return zstandard.train_dictionary(min(cls.DICT_SIZE, sum(map(len, samples)) // 20), samples)
+        except zstandard.ZstdError:
+            return None
+
+
+def _unpack(blob: bytes, db: sqlite3.Connection | None = None) -> dict:
+    return DayPack.read(blob, db)
+
+
+def _split(texts: list[str]) -> list[tuple[str, ...]]:
+    """Each text's words (`words_in`); run in worker processes by a big Store.upgrade."""
+    return [tuple(words_in(t)) for t in texts]
+
+
+def _pack_all(path: str) -> None:
+    """A big Store.upgrade's packing, in a process of its own, splitting words in a few more."""
+    store = Store(path)
+    pool = None
+    try:
+        pool = ProcessPoolExecutor(max(1, min(8, (os.cpu_count() or 2) - 1)), mp_context=multiprocessing.get_context("spawn"))
+    except Exception:  # noqa: BLE001 - split them here
+        pool = None
+    try:
+        store.pack_settled(vacuum=False, split=pool, old=True)
+        store.drop_rebuilt_links()
+    finally:
+        if pool is not None:
+            pool.shutdown(cancel_futures=True)
+        store.close()
 
 
 def _storable(value):
@@ -260,6 +513,13 @@ class Store:
             if "packed" not in {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN packed INTEGER NOT NULL DEFAULT 0")
                 self.db.commit()
+            if fresh:  # an older database gets it from Store.upgrade, on its thread
+                self._index_unpacked(table)
+        for column in {"cols", "words"} - {r["name"] for r in self.db.execute("PRAGMA table_info(packs)")}:
+            self.db.execute(f"ALTER TABLE packs ADD COLUMN {column} BLOB")
+        self.db.commit()
+        DayPack.remember(self.db)
+        self._vocab: dict[str, dict[str, int]] = {}  # subreddit lowercased -> its vocab table, while packing
         # Image posts are kept as rows (so Download coverage counts them as checked and a refetch doesn't
         # download them again) but hidden from every read here and never given comments.
         if "image" not in {r["name"] for r in self.db.execute("PRAGMA table_info(posts)")}:
@@ -330,16 +590,20 @@ class Store:
 
     @classmethod
     def upgrade(cls, path: str | Path, stop: threading.Event | None = None) -> None:
-        """Pack every settled day of a database saved before packs existed, on its own connection. It can
-        take seconds on a big one, so the app runs it on its own thread. A copy of the database is kept
-        until every settled day is packed, across starts if it's cut short: each day is its own
-        transaction, checked before it's committed (see pack_settled), so a day not reached is left as it
-        was and packed next time."""
+        """Pack every settled day of a database saved before packs existed (version 1), or before they were kept
+        in frames with their rows' numbers and words (version 2), on its own connection. It can take a minute on
+        a big one, so the app runs it on its own thread, and splits the words in worker processes. A copy of the
+        database is kept until every settled day is packed, across starts if it's cut short: each day is its own
+        transaction, checked before it's committed (see pack_settled), so a day not reached is left as it was
+        and packed next time."""
         self = cls(path)
-        backup = Path(str(self.path) + "-before-v2")
         try:
-            if self.db.execute("PRAGMA user_version").fetchone()[0] != 1:
+            for table in PACKED:
+                self._index_unpacked(table)
+            version = self.db.execute("PRAGMA user_version").fetchone()[0]
+            if version not in (1, 2):
                 return
+            backup = Path(str(self.path) + f"-before-v{version + 1}")
             if not backup.exists():  # one from a start that was cut short holds the database before any packing
                 part = Path(str(backup) + "-part")
                 copy = sqlite3.connect(part)
@@ -348,9 +612,11 @@ class Store:
                 finally:
                     copy.close()
                 os.replace(part, backup)
-            self.pack_settled(vacuum=False, stop=stop)
-            left = " + ".join(f"(SELECT COUNT(*) FROM {t} WHERE packed = 0 AND created_utc < ?)" for t in PACKED)
-            if self.db.execute(f"SELECT {left}", (self._settled_before(),) * len(PACKED)).fetchone()[0]:
+            rows = self.db.execute("SELECT (SELECT COUNT(*) FROM posts) + (SELECT COUNT(*) FROM comments)").fetchone()[0]
+            if rows < 50_000 or not self._pack_elsewhere(stop):
+                self.pack_settled(vacuum=False, stop=stop, old=True)
+                self.drop_rebuilt_links()
+            if self._left_to_pack():
                 return  # stopped, or some day couldn't be packed: carried on at the next start
             self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self.db.commit()
@@ -361,56 +627,217 @@ class Store:
         finally:
             self.close()
 
+    def _index_unpacked(self, table: str) -> None:
+        """The rows a RowIndex reads one by one: those whose numbers aren't in their day's pack."""
+        self.db.execute(f"CREATE INDEX IF NOT EXISTS {table}_unpacked ON {table}(subreddit COLLATE NOCASE, "
+                        "created_utc) WHERE packed != 1")
+        self.db.commit()
+
+    def drop_rebuilt_links(self) -> None:
+        """Clear the permalinks comments were saved with that are their post's plus their id, as they're rebuilt
+        when read. Comments saved after their post was packed kept theirs (0.4 compared with the post's row, whose
+        link is in its pack then): 68 of a 230 MB database."""
+        posts = self.db.execute("SELECT id, subreddit, created_utc, permalink, packed FROM posts WHERE id IN "
+                                "(SELECT post_id FROM comments WHERE permalink IS NOT NULL)").fetchall()
+        self.db.execute("CREATE TEMP TABLE IF NOT EXISTS links (id TEXT PRIMARY KEY, permalink TEXT)")
+        try:
+            self.db.execute("DELETE FROM temp.links")
+            self.db.executemany("INSERT INTO temp.links VALUES (?, ?)",
+                                [(r["id"], r["permalink"]) for r in self._unpacked("posts", posts) if r["permalink"]])
+            self.db.execute("UPDATE comments SET permalink = NULL WHERE permalink IS NOT NULL AND permalink = "
+                            "(SELECT l.permalink FROM temp.links l WHERE l.id = comments.post_id) || id || '/'")
+            self.db.commit()
+        finally:
+            self.db.execute("DROP TABLE IF EXISTS temp.links")
+
+    def _pack_elsewhere(self, stop: threading.Event | None) -> bool:
+        """Pack in a process of its own (`_pack_all`), so a minute of it doesn't take the interpreter from the
+        window this thread is in; ``stop`` ends it, between days or mid-day (its transaction is then rolled
+        back). False if no process could be started here."""
+        try:
+            worker = multiprocessing.get_context("spawn").Process(target=_pack_all, args=(str(self.path),), daemon=False)
+            worker.start()
+        except Exception:  # noqa: BLE001
+            return False
+        while worker.is_alive():
+            worker.join(0.2)
+            if stop is not None and stop.is_set():
+                worker.terminate()
+                worker.join()
+                return True
+        return worker.exitcode == 0  # one that failed (a build missing a module, say): packed here instead
+
+    def _left_to_pack(self) -> int:
+        """Settled rows not packed yet, and packs saved before packs had their rows' numbers."""
+        left = " + ".join(f"(SELECT COUNT(*) FROM {t} WHERE packed = 0 AND created_utc < ?)" for t in PACKED)
+        return self.db.execute(f"SELECT {left} + (SELECT COUNT(*) FROM packs WHERE cols IS NULL)",
+                               (self._settled_before(),) * len(PACKED)).fetchone()[0]
+
     @staticmethod
     def _settled_before(now: float | None = None) -> float:
         """The start of the first day too recent to pack."""
         return ((now if now is not None else time.time()) - SETTLE) // 86400 * 86400
 
-    def pack_settled(self, now: float | None = None, vacuum: bool = True, stop: threading.Event | None = None) -> int:
-        """Pack the text of every settled day that has rows not packed yet: ones saved since the day was last
-        packed, or never packed. Each day is one transaction: the new pack is checked to read back exactly the
-        text it replaces before the rows' copies are cleared. Returns how many days were packed."""
+    def pack_settled(self, now: float | None = None, vacuum: bool = True, stop: threading.Event | None = None,
+                     split: ProcessPoolExecutor | None = None, old: bool = False) -> int:
+        """Pack every settled day that has rows not packed yet (ones saved since the day was last packed, or
+        never packed), rows whose scores were set since (packed 2), or a pack saved in the format before
+        frames when ``old`` (Store.upgrade's, which runs it in a process of its own). Each day is one transaction:
+        the new pack is checked to read back exactly the text it replaces before the rows' copies are cleared.
+        ``split``: worker processes to split the words in. Returns how many days were packed."""
         self.db.commit()
         before = self._settled_before(now)
-        days: dict[tuple, list[str]] = {}  # (kind, subreddit, day) -> ids of its rows not packed yet
+        days: dict[tuple, set[str]] = {}  # (kind, subreddit, day) -> ids of its rows not packed yet
         for kind in PACKED:
             for i, sub, day in self.db.execute(
                     f"SELECT id, lower(subreddit), CAST(created_utc / 86400 AS INTEGER) FROM {kind} "
-                    "WHERE packed = 0 AND created_utc < ?", (before,)):
-                days.setdefault((kind, sub, day), []).append(i)
-        packer = zstandard.ZstdCompressor(level=_ZSTD_LEVEL)
+                    "WHERE packed != 1 AND created_utc < ?", (before,)):
+                days.setdefault((kind, sub, day), set()).add(i)
+            for sub, day in self.db.execute("SELECT subreddit, day FROM packs WHERE kind = ? AND cols IS NULL", (kind,)) if old else ():
+                days.setdefault((kind, sub, day), set())
         done = 0
-        for (kind, sub, day), ids in days.items():
+        for (kind, sub, day), ids in sorted(days.items()):
             if stop is not None and stop.is_set():
                 break
-            cols = PACKED[kind]
             try:
                 self.db.execute("BEGIN IMMEDIATE")
+                vocab = len(self._vocab.get(sub, ()))
                 try:
-                    # Read inside the lock, so a row saved again since is packed with its new text; one another
-                    # connection packed meanwhile is skipped, its text being in the old pack read here.
-                    text = dict(self._pack(kind, sub, day, cached=False))
-                    for k in range(0, len(ids), 500):
-                        chunk = ids[k:k + 500]
-                        for r in self.db.execute(f"SELECT id, {', '.join(cols)} FROM {kind} WHERE packed = 0 AND "
-                                                 f"id IN ({', '.join('?' * len(chunk))})", chunk):
-                            text[r["id"]] = [r[c] for c in cols]
-                    blob = packer.compress(json.dumps({"columns": cols, "rows": text}, ensure_ascii=False).encode())
-                    if _unpack(blob) != {"columns": list(cols), "rows": text}:
-                        raise sqlite3.DatabaseError(f"{kind} of r/{sub} on day {day} wouldn't read back the same")
-                    self.db.execute("INSERT OR REPLACE INTO packs VALUES (?, ?, ?, ?, ?)", (kind, sub, day, time.time(), blob))
-                    self.db.executemany(f"UPDATE {kind} SET packed = 1, {', '.join(c + ' = NULL' for c in cols)} "
-                                        "WHERE id = ? AND packed = 0", [(i,) for i in ids])
+                    self._write_pack(kind, sub, day, ids, split=split)
                     self.db.commit()
                     done += 1
                 except BaseException:
                     self.db.rollback()
+                    if sub in self._vocab:  # words it numbered weren't saved
+                        self._vocab[sub] = dict(list(self._vocab[sub].items())[:vocab])
                     raise
-            except Exception:  # noqa: BLE001 - busy, or text JSON can't hold: leave the day as it is
+            except Exception:  # noqa: BLE001 - busy, or text that can't be packed: leave the day as it is
                 continue
         if done and vacuum:  # the cleared text leaves its pages part empty, which only a VACUUM gives back
             self._compact()
         return done
+
+    def _write_pack(self, kind: str, sub: str, day: int, fresh, drop=(), split: ProcessPoolExecutor | None = None) -> None:
+        """Pack one day again, inside a transaction: the rows already in its pack (less ``drop``) and the rows
+        ``fresh`` names whose text or numbers changed since. Rows no longer saved are left out; a day left
+        with none has its pack removed."""
+        cols = PACKED[kind]
+        # Read inside the lock, so a row saved again since is packed with its new text; one another connection
+        # packed meanwhile is skipped, its text being in the old pack read here.
+        packed = self._pack(kind, sub, day, cached=False)  # in the old pack's order
+        text = {i: v for i, v in packed.items() if i not in drop}
+        old = self.db.execute("SELECT cols, words FROM packs WHERE kind = ? AND subreddit = ? AND day = ?",
+                              (kind, sub, day)).fetchone()
+        new_text = set()
+        fresh = [i for i in fresh if i not in drop]
+        for k in range(0, len(fresh), 500):
+            chunk = fresh[k:k + 500]
+            for r in self.db.execute(f"SELECT id, {', '.join(cols)} FROM {kind} WHERE packed = 0 AND "
+                                     f"id IN ({', '.join('?' * len(chunk))})", chunk):
+                text[r["id"]] = [r[c] for c in cols]
+                new_text.add(r["id"])
+        hidden = "image" if kind == "posts" else "post_id IN (SELECT id FROM posts WHERE image = 1)"
+        numbers = {}
+        ids = list(text)
+        for k in range(0, len(ids), 500):
+            chunk = ids[k:k + 500]
+            for r in self.db.execute(f"SELECT id, created_utc, score, sentiment, label, {hidden} FROM {kind} "
+                                     f"WHERE id IN ({', '.join('?' * len(chunk))})", chunk):
+                numbers[r[0]] = r
+        ids = sorted(numbers, key=lambda i: (numbers[i][1], i))
+        if not ids:
+            self.db.execute("DELETE FROM packs WHERE kind = ? AND subreddit = ? AND day = ?", (kind, sub, day))
+            return
+        prose = [cols.index(c) for c in DayPack.split_columns(cols)[1]]
+        zdict = self._dictionary(kind, sub, [[text[i][c] for i in ids] for c in prose])
+        blob = DayPack.encode(cols, ids, text, zdict)
+        if DayPack.read(blob, self.db) != {"columns": list(cols), "rows": {i: text[i] for i in ids}}:
+            raise sqlite3.DatabaseError(f"{kind} of r/{sub} on day {day} wouldn't read back the same")
+        label = {lab: k for k, lab in enumerate(LABELS)}
+        packed_numbers = {"created": [numbers[i][1] for i in ids],
+                          "score": [NO_SCORE if numbers[i][2] is None else numbers[i][2] for i in ids],
+                          "sentiment": [numbers[i][3] if numbers[i][3] is not None else 0.0 for i in ids],
+                          "label": [label.get(numbers[i][4], -1) for i in ids],
+                          "hidden": [int(bool(numbers[i][5])) for i in ids]}
+        counts = self._word_counts(kind, sub, ids, text, packed_numbers, packed, new_text, old, split)
+        self.db.execute("INSERT OR REPLACE INTO packs (kind, subreddit, day, packed_at, data, cols, words) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)", (kind, sub, day, time.time(), blob,
+                                                         DayPack.encode_cols(ids, packed_numbers), DayPack.encode_counts(*counts)))
+        # A row saved again since that isn't in ``fresh`` keeps its newer text in its row (packed 0).
+        self.db.executemany(f"UPDATE {kind} SET packed = 1, {', '.join(c + ' = NULL' for c in cols)} "
+                            "WHERE id = ? AND packed = 0", [(i,) for i in new_text])
+        self.db.executemany(f"UPDATE {kind} SET packed = 1 WHERE id = ? AND packed = 2", [(i,) for i in ids])
+
+    def _word_counts(self, kind, sub, ids, text, numbers, packed, new_text, old, split) -> tuple[np.ndarray, np.ndarray]:
+        """A day's word counts (DayPack.word_keys) for its new pack: its old pack's, less what the rows that changed
+        since counted there and plus what they count now, so only those rows' text is split again. Every row's
+        is when the old pack has no counts."""
+        new = {i: k for k, i in enumerate(ids)}
+        now = DayPack.word_keys(np.zeros(len(ids), np.int64), np.array(numbers["label"], np.int64),
+                                score_bucket(np.array(numbers["score"], np.int64)))  # each row's label and bucket
+        visible = np.array(numbers["hidden"]) == 0
+        before: dict[str, int] = {}  # id -> its label and bucket in the old pack, for one counted there
+        if old is not None and old["cols"] is not None and old["words"] is not None:
+            was = DayPack.decode_cols(old["cols"])
+            keys = DayPack.word_keys(np.zeros(len(was["ids"]), np.int64), was["label"].astype(np.int64),
+                                     score_bucket(was["score"].astype(np.int64)))
+            before = {i.decode(): int(k) for i, k, h in zip(was["ids"], keys, was["hidden"]) if not h}
+            old_keys, old_n = DayPack.decode_counts(old["words"])
+        else:
+            old_keys = old_n = np.zeros(0, np.int64)
+        less = [i for i, k in before.items()  # gone, saved again, hidden or rescored since
+                if i not in new or i in new_text or not visible[new[i]] or now[new[i]] != k]
+        more = [i for i in ids if visible[new[i]] and (i not in before or i in less)]
+        texts = [(packed if i in less else text)[i] for i in less] + [text[i] for i in more]
+        split_words = self._split_all([(t[2] or "") if kind == "comments" else f"{t[0] or ''} {t[1] or ''}"
+                                       for t in texts], split)
+        vocab = self._vocabulary(sub)
+        known = len(vocab)
+        combos = [before[i] for i in less] + [int(now[new[i]]) for i in more]
+        signs = [-1] * len(less) + [1] * len(more)
+        keys, n = [old_keys], [old_n]
+        for words, combo, sign in zip(split_words, combos, signs):
+            if words:
+                keys.append(np.array([vocab.setdefault(w, len(vocab)) for w in words], np.int64) * 32 + combo)
+                n.append(np.full(len(words), sign, np.int64))
+        if len(vocab) > known:
+            self.db.executemany("INSERT INTO vocab VALUES (?, ?, ?)", [(sub, k, w) for w, k in list(vocab.items())[known:]])
+        keys, n = DayPack.merge_counts(np.concatenate(keys), np.concatenate(n))
+        if (n < 0).any():
+            raise sqlite3.DatabaseError(f"{kind} of r/{sub}: the old pack's word counts don't match its rows")
+        return keys, n
+
+    @staticmethod
+    def _split_all(texts: list[str], pool: ProcessPoolExecutor | None) -> list[tuple[str, ...]]:
+        if pool is None or len(texts) < 2000:
+            return _split(texts)
+        try:
+            return [w for part in pool.map(_split, [texts[k:k + 2000] for k in range(0, len(texts), 2000)]) for w in part]
+        except Exception:  # noqa: BLE001 - the processes died: split them here
+            return _split(texts)
+
+    def _vocabulary(self, sub: str) -> dict[str, int]:
+        """A subreddit's vocab table as {word: id}, kept while packing."""
+        vocab = self._vocab.get(sub)
+        if vocab is None or len(vocab) != self.db.execute(
+                "SELECT COALESCE(MAX(id) + 1, 0) FROM vocab WHERE subreddit = ?", (sub,)).fetchone()[0]:  # another connection added some
+            vocab = self._vocab[sub] = {w: i for i, w in self.db.execute(
+                "SELECT id, word FROM vocab WHERE subreddit = ? ORDER BY id", (sub,))}
+        return vocab
+
+    def _dictionary(self, kind: str, sub: str, columns: list[list]) -> zstandard.ZstdCompressionDict | None:
+        """The dictionary a subreddit's packs of a kind are compressed with: made from this day's rows if it
+        has none yet and they're enough."""
+        row = self.db.execute("SELECT data FROM dicts WHERE kind = ? AND subreddit = ?", (kind, sub)).fetchone()
+        if row is not None:
+            d = zstandard.ZstdCompressionDict(row[0])
+        else:
+            d = DayPack.train(columns)
+            if d is None:
+                return None
+            self.db.execute("INSERT INTO dicts VALUES (?, ?, ?)", (kind, sub, d.as_bytes()))
+        DayPack.dicts[d.dict_id()] = d
+        return d
 
     def _pack(self, kind: str, sub: str, day: int, cached: bool = True, keep: bool = True) -> dict[str, list]:
         """One day's packed text, as {id: [values of PACKED[kind]]}; {} if there's no pack. Unless ``keep``, a
@@ -424,7 +851,7 @@ class Store:
             if cached and hit and hit[0] == row[0]:
                 Store._packs.move_to_end((self.path, *key))
                 return hit[1]
-        data = _unpack(self.db.execute("SELECT data FROM packs WHERE kind = ? AND subreddit = ? AND day = ?", key).fetchone()[0])
+        data = _unpack(self.db.execute("SELECT data FROM packs WHERE kind = ? AND subreddit = ? AND day = ?", key).fetchone()[0], self.db)
         rows = data["rows"] if data["columns"] == list(PACKED[kind]) else {  # packed with other columns
             i: [dict(zip(data["columns"], v)).get(c) for c in PACKED[kind]] for i, v in data["rows"].items()}
         if not keep:
@@ -580,11 +1007,15 @@ class Store:
                         f"VALUES ({','.join('?' * len(values))})", values)
 
     def save_comment(self, c: Comment, sentiment: float, label: str) -> None:
+        post = self.db.execute("SELECT id, subreddit, created_utc, permalink, packed FROM posts WHERE id = ?",
+                               (c.post_id,)).fetchall()
+        link = self._unpacked("posts", post)[0]["permalink"] if post else None  # in its pack once it's packed
+        permalink = None if link is not None and c.permalink == f"{link}{c.id}/" else c.permalink
         values = (c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score,
-                  c.created_utc, c.depth, c.permalink, c.post_id, c.id, sentiment, label, self._saved_at())
+                  c.created_utc, c.depth, permalink, sentiment, label, self._saved_at())
         values = tuple(map(_storable, values))
-        self.db.execute(f"INSERT OR REPLACE INTO comments ({', '.join(COMMENT_COLUMNS)}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                        "NULLIF(?, (SELECT permalink FROM posts WHERE id = ?) || ? || '/'), ?, ?, ?)", values)
+        self.db.execute(f"INSERT OR REPLACE INTO comments ({', '.join(COMMENT_COLUMNS)}) "
+                        f"VALUES ({', '.join('?' * len(values))})", values)
 
     def comment_ids(self, post_id: str) -> set[str]:
         """The ids of the comments saved on one post."""
@@ -803,9 +1234,10 @@ class Store:
 
     def rescore(self, kind: str, scores) -> None:
         """Save new scores, [(id, sentiment, label)], on posts or comments (``kind``), leaving the rest as it is.
-        Like save_post, it's kept once committed."""
-        self.db.executemany(f"UPDATE {kind} SET sentiment = ?, label = ? WHERE id = ?",
-                            [(s, label, i) for i, s, label in scores])
+        Like save_post, it's kept once committed. A packed row's pack still has its old score, so it's marked
+        (packed 2) for its day to be packed again; till then RowIndex reads its numbers from the row."""
+        self.db.executemany(f"UPDATE {kind} SET sentiment = ?, label = ?, packed = CASE packed WHEN 1 THEN 2 ELSE packed END "
+                            "WHERE id = ?", [(s, label, i) for i, s, label in scores])
 
     def delete_subreddit(self, subreddit: str) -> None:
         self.db.execute("DELETE FROM posts WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
@@ -816,6 +1248,9 @@ class Store:
         self.db.execute("DELETE FROM notes WHERE subreddit = ?", (subreddit.lower(),))
         self.db.execute("DELETE FROM words WHERE subreddit = ?", (subreddit.lower(),))
         self.db.execute("DELETE FROM packs WHERE subreddit = ?", (subreddit.lower(),))
+        self.db.execute("DELETE FROM dicts WHERE subreddit = ?", (subreddit.lower(),))
+        self.db.execute("DELETE FROM vocab WHERE subreddit = ?", (subreddit.lower(),))
+        self._vocab.pop(subreddit.lower(), None)
         self.db.commit()
         self._compact()
 
@@ -841,7 +1276,7 @@ class Store:
             # The comments' text sits in the packs of the days they were written, beside other posts' comments.
             repack: dict[int, set[str]] = {}
             for r in self.db.execute("SELECT id, CAST(created_utc / 86400 AS INTEGER) d FROM comments "
-                                     "WHERE packed = 1 AND post_id IN temp.gone"):
+                                     "WHERE packed != 0 AND post_id IN temp.gone"):
                 repack.setdefault(r["d"], set()).add(r["id"])
             self.db.execute("DELETE FROM comments WHERE post_id IN temp.gone")
             self.db.execute("DELETE FROM comment_fetches WHERE post_id IN temp.gone")
@@ -854,18 +1289,8 @@ class Store:
                                 [(sub, d, d + 86400) for d in days])
             self.db.executemany("DELETE FROM packs WHERE kind = 'posts' AND subreddit = ? AND day = ?",
                                 [(sub, d // 86400) for d in days])
-            packer = zstandard.ZstdCompressor(level=_ZSTD_LEVEL)
             for day, ids in repack.items():
-                left = {i: v for i, v in self._pack("comments", sub, day, cached=False).items() if i not in ids}
-                if left:
-                    blob = packer.compress(json.dumps({"columns": PACKED["comments"], "rows": left},
-                                                      ensure_ascii=False).encode())
-                    if _unpack(blob) != {"columns": list(PACKED["comments"]), "rows": left}:  # as pack_settled checks
-                        raise sqlite3.DatabaseError(f"comments of r/{sub} on day {day} wouldn't read back the same")
-                    self.db.execute("UPDATE packs SET data = ?, packed_at = ? WHERE kind = 'comments' AND subreddit = ? "
-                                    "AND day = ?", (blob, time.time(), sub, day))
-                else:
-                    self.db.execute("DELETE FROM packs WHERE kind = 'comments' AND subreddit = ? AND day = ?", (sub, day))
+                self._write_pack("comments", sub, day, (), drop=ids)
             # What fetches read through, less the days deleted.
             spans = []
             for a, b in self.read_spans(subreddit):
@@ -896,6 +1321,9 @@ class Store:
         self.db.execute("DELETE FROM notes")
         self.db.execute("DELETE FROM words")
         self.db.execute("DELETE FROM packs")
+        self.db.execute("DELETE FROM dicts")
+        self.db.execute("DELETE FROM vocab")
+        self._vocab.clear()
         self.db.execute("DELETE FROM archive_counts")
         self.db.commit()
         self._compact()
@@ -983,13 +1411,13 @@ class Store:
         """Fill in the text of the rows import_from just took packed from the attached file, from its packs."""
         cols = PACKED[table]
         days: dict[tuple, list[str]] = {}
-        for r in self.db.execute(f"SELECT id, subreddit, created_utc FROM other.{table} WHERE packed = 1 "
+        for r in self.db.execute(f"SELECT id, subreddit, created_utc FROM other.{table} WHERE packed != 0 "
                                  f"AND id IN (SELECT id FROM temp.taken_{table})"):
             days.setdefault((r["subreddit"].lower(), int(r["created_utc"] // 86400)), []).append(r["id"])
         for (sub, day), ids in days.items():
             blob = self.db.execute("SELECT data FROM other.packs WHERE kind = ? AND subreddit = ? AND day = ?",
                                    (table, sub, day)).fetchone()
-            data = _unpack(blob[0]) if blob else {"columns": [], "rows": {}}
+            data = DayPack.read(blob[0], self.db, "other") if blob else {"columns": [], "rows": {}}
             self.db.executemany(
                 f"UPDATE main.{table} SET packed = 0, {', '.join(c + ' = ?' for c in cols)} WHERE id = ?",
                 [(*(dict(zip(data["columns"], data["rows"].get(i, ()))).get(c) for c in cols), i) for i in ids])

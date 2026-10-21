@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+import zstandard
 
 from subsentiment import collect, store
 from subsentiment.reddit import Comment, Post
@@ -236,6 +237,27 @@ def test_a_comments_permalink_made_from_its_posts_is_rebuilt_when_read_not_store
     assert {r["id"]: r["permalink"] for r in s.comments_since("python", 0)} == expected
     s.export_csv("python", "comments", tmp_path / "c.csv")
     assert {r["id"]: r["permalink"] for r in csv.DictReader(open(tmp_path / "c.csv", encoding="utf-8-sig"))} == expected
+
+
+def test_a_comment_saved_after_its_post_was_packed_doesnt_store_its_permalink_either(tmp_path):
+    path = tmp_path / "subsentiment.db"
+    s = Store(path)
+    s.save_post(Post("p1", "Python", "t", "", "a", 1, 0.9, 2, 1_700_000_000, POST_LINK, ""), 0.0, "neutral")
+    s.commit()
+    s.pack_settled()  # the post's link is in its pack now, not its row
+    s.save_comment(Comment("c1", "p1", "Python", "t3_p1", "b", "hi", 1, 1_700_000_100, 0, POST_LINK + "c1/"), 0.0, "neutral")
+    s.commit()
+    assert s.db.execute("SELECT permalink FROM comments").fetchone()[0] is None
+    assert s.comments("python")[0]["permalink"] == POST_LINK + "c1/"
+    s.db.execute("UPDATE comments SET permalink = ?", (POST_LINK + "c1/",))  # as 0.4 saved it
+    s.db.execute("PRAGMA user_version = 2")
+    s.commit()
+    s.close()
+    Store.upgrade(path)
+    db = sqlite3.connect(path)
+    assert db.execute("SELECT permalink FROM comments").fetchone()[0] is None
+    db.close()
+    assert Store(path).comments("python")[0]["permalink"] == POST_LINK + "c1/"
 
 
 def test_a_comment_keeps_its_permalink_when_its_posts_changes(tmp_path):
@@ -758,6 +780,23 @@ def test_deleting_days_forgets_them_whole_and_leaves_other_days_and_subreddits_a
     s.close()
 
 
+def test_deleting_a_day_keeps_the_newer_text_of_a_comment_saved_again_on_a_day_it_shares(tmp_path):
+    s = Store(tmp_path / "x.db")
+    day = 1_700_000_000 // 86400 * 86400
+    s.save_post(Post("pA", "Python", "t", "", "a", 1, 0.9, 2, day - 3600, POST_LINK, ""), 0.0, "neutral")  # the day before
+    s.save_post(Post("pB", "Python", "t", "", "a", 1, 0.9, 2, day + 60, POST_LINK, ""), 0.0, "neutral")
+    for post in ("pA", "pB"):  # both comments on pB's day
+        s.save_comment(Comment("c" + post, post, "Python", f"t3_{post}", "b", "first", 1, day + 100, 0, None), 0.0, "neutral")
+    s.commit()
+    s.pack_settled()
+    s.save_comment(Comment("cpB", "pB", "Python", "t3_pB", "b", "edited", 1, day + 100, 0, None), 0.0, "neutral")
+    s.commit()
+    s.delete_days("python", [day - 86400])  # takes pA and its comment out of the comments' pack of pB's day
+    assert {r["id"]: r["body"] for r in s.comments("python")} == {"cpB": "edited"}
+    s.pack_settled()
+    assert {r["id"]: r["body"] for r in s.comments("python")} == {"cpB": "edited"}
+
+
 def test_archive_counts_are_kept_with_when_they_were_asked(tmp_path):
     s = Store(tmp_path / "s.db")
     s.save_archive_counts("Python", {86400: 5, 2 * 86400: 7}, at=1000.0)
@@ -780,3 +819,84 @@ def test_open_threads_are_the_days_posts_without_every_comment(tmp_path):
     assert s.open_threads("Python", [day]) == ["a"]  # b has no comments, c is saved whole
     assert s.open_threads("Python", [day + 86400, day]) == ["d", "a"]
     assert s.open_threads("Python", []) == []
+
+
+V2_DB = Path(__file__).parent / "data" / "store-v2.db"  # saved by 0.4's store: days packed as JSON, no column blocks
+
+
+def test_a_database_packed_by_0_4_is_packed_again_in_frames_and_reads_back_the_same(tmp_path):
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(V2_DB, path)
+    db = sqlite3.connect(path)
+    assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+    db.close()
+    before = _contents(path)
+    s = Store(path)
+    rows = {k: s.rows(k, "deltarune") for k in ("posts", "comments")}
+    s.close()
+    Store.upgrade(path)
+    assert list(tmp_path.iterdir()) == [path]  # its backup is gone once it worked
+    assert _contents(path) == before
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
+    assert {k: s.rows(k, "deltarune") for k in rows} == rows
+    packs = s.db.execute("SELECT data, cols, words FROM packs").fetchall()
+    assert len(packs) == 8 and all(c and w for d, c, w in packs)  # small days stay one frame of JSON
+    assert s.db.execute("SELECT COUNT(*) FROM comments WHERE packed != 1").fetchone()[0] == 0
+    assert s.db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    s.close()
+
+
+def test_packing_a_0_4_database_cut_short_keeps_its_backup_and_reads_from_both_formats(tmp_path):
+    import threading
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(V2_DB, path)
+    before = _contents(path)
+    stop = threading.Event()
+    stop.set()  # the app is closed before any day is packed again
+    Store.upgrade(path, stop)
+    backup = tmp_path / "subsentiment.db-before-v3"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [path.name, backup.name]
+    assert _contents(path) == _contents(backup) == before
+    s = Store(path)
+    s._write_pack("comments", "deltarune", s.db.execute("SELECT MIN(day) FROM packs").fetchone()[0], ())
+    s.commit()
+    s.close()
+    assert _contents(path) == before  # one day in frames, the rest still JSON
+    Store.upgrade(path)  # the next start
+    assert list(tmp_path.iterdir()) == [path]
+    assert _contents(path) == before
+    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+
+def test_a_subreddits_packs_share_a_dictionary_made_from_a_big_day(tmp_path):
+    import random
+    rng = random.Random(6)
+    path = tmp_path / "x.db"
+    s = Store(path)
+    day0 = 1_690_000_000 // 86400 * 86400
+    link = "https://www.reddit.com/r/Deltarune/comments/p1/x/"
+    s.save_post(Post("p1", "Deltarune", "t", "", "a", 1, 0.9, 2, day0, link, link), 0.0, "neutral")
+    for i in range(1500):  # the first day big enough to make one; the next day is packed with it too
+        s.save_comment(Comment(f"c{i}", "p1", "Deltarune", "t3_p1", f"user{rng.randint(1, 400)}", _chatter(rng, rng.randint(3, 30)),
+                               1, day0 + (i // 1100) * 86400 + i, 0, link + f"c{i}/"), 0.0, "neutral")
+    s.commit()
+    before = s.comments("deltarune")
+    s.pack_settled()
+    (made,) = s.db.execute("SELECT data FROM dicts WHERE kind = 'comments' AND subreddit = 'deltarune'").fetchone()
+    assert 1000 < len(made) <= store.DayPack.DICT_SIZE
+    assert s.db.execute("SELECT COUNT(*) FROM dicts WHERE kind = 'posts'").fetchone()[0] == 0  # one post: too few
+    heads = [store.DayPack.header(d)[0] for (d,) in s.db.execute("SELECT data FROM packs WHERE kind = 'comments'")]
+    assert len(heads) == 2 and {h["dict"] for h in heads} == {zstandard.ZstdCompressionDict(made).dict_id()}
+    s.close()
+    store.DayPack.dicts.clear()  # a new start reads it back from the file
+    s = Store(path)
+    assert s.comments("deltarune") == before
+    other = tmp_path / "other.db"
+    Store(other).close()
+    store.DayPack.dicts.clear()
+    o = Store(other)
+    assert o.import_from(path) == (1, 1500)  # another file's packs read with its own dictionary
+    assert [r["body"] for r in o.comments("deltarune")] == [r["body"] for r in before]
+    o.close()
+    s.close()
