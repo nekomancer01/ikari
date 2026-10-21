@@ -89,6 +89,15 @@ def drag(tl, lo: float, hi: float) -> None:
     QTest.mouseRelease(tl, Qt.MouseButton.LeftButton, pos=QPoint(x1, y))
 
 
+def settle(w) -> None:
+    """Until the tables follow the span: its settling delay has run out and the steps after it are done. A fixed
+    wait past the delay missed the steps on a busy runner (3 posts shown of 5 on Linux CI)."""
+    end = time.monotonic() + 5
+    while (w._span_settled.isActive() or w._span_slices.running()) and time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.01)
+
+
 def tiles(w) -> int:
     return int(w.overview.tiles["count"].value.text())
 
@@ -110,7 +119,7 @@ def test_every_view_counts_the_days_the_timeline_shows(window, tmp_path, monkeyp
     assert w.overview.distribution._counts == {"negative": 2, "neutral": 0, "positive": 4}
     assert w.overview.tiles["mean"].value.text() == "+0.167"
     assert [d for d, _, _ in tl.points] == [D1, D2, D3]  # the timeline still has every day, to zoom back out
-    pump(400)  # past the tables' settling delay
+    settle(w)
     assert len(w.posts) == 3 and len(w.comments) == 3
     assert w.posts_tab.model.rowCount() == 3 and w.comments_tab.model.rowCount() == 3
     assert w.subheading.full_text().endswith("· 5 – 7 Oct · 3\xa0posts · 3\xa0comments")
@@ -128,7 +137,7 @@ def test_every_view_counts_the_days_the_timeline_shows(window, tmp_path, monkeyp
 
     QTest.mouseDClick(tl, Qt.MouseButton.LeftButton, pos=tl._areas()[0].center().toPoint())  # every day again
     assert w.span is None and tiles(w) == 10
-    pump(400)
+    settle(w)
     assert len(w.posts) == 5
 
 
