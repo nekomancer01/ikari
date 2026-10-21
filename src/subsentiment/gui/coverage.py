@@ -31,6 +31,9 @@ NOTE = ("Totals come from Arctic Shift and include posts and comments later remo
         "of 100%. A check mark means everything the archive still has is saved. Days are UTC. A day's Download all fetches its posts only; comments download "
         "from the buttons in the Posts list, or with the ticked days when \u201cWith comments\u201d is on.")
 
+THREADS_TIP = ("A post with no comments counts as complete, and so does one whose whole thread was downloaded "
+               "before Arctic Shift counted its comments.")
+
 
 def day_text(day: int) -> str:
     d = datetime.fromtimestamp(day, timezone.utc)
@@ -162,6 +165,34 @@ class Cell(QWidget):
         self.side.setVisible(bool(self.side.text()) and need <= room)
 
 
+class FitLabel(QLabel):
+    """A muted line that shows its short form where the long one doesn't fit: a day of thousands of posts
+    drops the word "threads" rather than run past the date's column."""
+
+    def __init__(self):
+        super().__init__()
+        theme.mark(self, "role", "muted")
+        self.forms = ("", "")
+
+    def set(self, full: str, short: str) -> None:
+        self.forms = (full, short)
+        self._fit()
+
+    def full_text(self) -> str:
+        return self.forms[0]
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, super().minimumSizeHint().height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit()
+
+    def _fit(self) -> None:
+        full, short = self.forms
+        self.setText(full if self.fontMetrics().horizontalAdvance(full) <= self.width() else short)
+
+
 def small_button(text: str) -> QPushButton:
     b = QPushButton(text)
     b.setStyleSheet("padding: 5px 12px;")
@@ -223,6 +254,14 @@ class CoveragePage(VerticalScrollArea):
         self._comments_done: set[str] = set()
         self._comments_so_far: set[str] = set()
         self._day_rows: list[int] = []
+        # Day -> (posts with every comment saved, saved posts), for self._threads_for: (subreddit lowercased, after,
+        # before). Counted on a thread, as counting a month's comments takes a busy subreddit's ~650k about 70 ms.
+        self._threads: dict[int, tuple[int, int]] = {}
+        self._threads_for: tuple = ()
+        self.threads_job = BackgroundJob(self)
+        self.threads_job.ended.connect(self._on_threads_ended)
+        self._threads_got: tuple = ((), None)  # what the running count asked for, and its answer once in
+        self._threads_again = False  # asked for while one ran: counted again when it ends
         self.ticked: set[int] = set()  # days ticked for Download selected or Delete selected
         self.delete_job = BackgroundJob(self)  # deletes ticked days on a connection of its own
         self.delete_job.ended.connect(self._on_delete_ended)
@@ -296,7 +335,9 @@ class CoveragePage(VerticalScrollArea):
         left_lay.addWidget(self.delete_question)
         days_foot = QHBoxLayout()
         days_foot.setSpacing(10)
-        days_foot.addStretch(1)
+        # The days' comment threads added up: the ticked ones, or every day listed when none are.
+        self.threads_total = ElidedLabel("", "muted")
+        days_foot.addWidget(self.threads_total, 1)
         for b in (self.delete_ticked, self.delete_cancel, self.delete_confirm):
             days_foot.addWidget(b)
         left_lay.addLayout(days_foot)
@@ -401,6 +442,7 @@ class CoveragePage(VerticalScrollArea):
         for day, n in store.posts_per_day(self.subreddit, self.days[-1], self.days[0] + DAY, images=True).items():
             removed[day] = removed.get(day, 0) + n  # skipped image posts are checked too
         complete = store.complete_keys("posts", self.subreddit)
+        self._count_threads()
         t = self.day_table
         if rebuild or self._day_rows != self.days:
             keep = self._selected_day()
@@ -419,7 +461,13 @@ class CoveragePage(VerticalScrollArea):
                 lay.setContentsMargins(10, 0, 0, 0)
                 lay.setSpacing(8)
                 lay.addWidget(tick)
-                lay.addWidget(QLabel(day_text(day)), 1)  # a click on the date still picks the row
+                # A click on the date still picks the row. Under it, how many of the day's comment threads
+                # are saved whole.
+                when = QVBoxLayout()
+                when.setSpacing(0)
+                when.addWidget(QLabel(day_text(day)))
+                when.addWidget(FitLabel())
+                lay.addLayout(when, 1)
                 t.setCellWidget(row, 0, box)
                 t.setCellWidget(row, 1, Cell())
                 button = small_button("Download all")
@@ -431,6 +479,7 @@ class CoveragePage(VerticalScrollArea):
         counting = self.count_job.busy
         current = today()
         self._waiting = set()
+        self._show_threads()
         for row, day in enumerate(self.days):
             n, total, done = saved.get(day, 0), totals.get(day), str(day) in complete
             cell: Cell = t.cellWidget(row, 1)
@@ -459,6 +508,52 @@ class CoveragePage(VerticalScrollArea):
                 f"Fetch every post from {day_text(day)}"
                 + (f" (up to {total - n - gone:,} more)" if total and total > n + gone else ""))
         self._show_ticked()
+
+    # -- comment threads saved whole ------------------------------------------
+
+    def _count_threads(self) -> None:
+        """Count the listed days' whole comment threads again (a download may have added some)."""
+        if self.threads_job.busy:
+            self._threads_again = True
+            return
+        self._threads_again = False
+        want = (self.subreddit.lower(), self.days[-1], self.days[0] + DAY)
+        worker = StoreWorker(self.window_.db_path, "whole_threads_per_day", *want)
+        worker.finished.connect(self._on_threads)  # a failed count leaves what's shown, until the next one
+        self._threads_got = (want, None)
+        self.threads_job.start(worker)
+
+    @Slot(object)
+    def _on_threads(self, counts: dict) -> None:
+        self._threads_got = (self._threads_got[0], counts)
+
+    @Slot()
+    def _on_threads_ended(self) -> None:
+        asked, counts = self._threads_got
+        if counts is not None:
+            self._threads, self._threads_for = counts, asked
+        if not (self.subreddit and self.days and self.isVisible()):
+            return  # left meanwhile; showing the page again counts them
+        if self._threads_again or asked != (self.subreddit.lower(), self.days[-1], self.days[0] + DAY):
+            self._count_threads()
+        self._show_threads()
+        self._show_ticked()
+
+    def _threads_on(self, day: int) -> tuple[int, int]:
+        """(posts with every comment saved, saved posts) on a listed day, as last counted; (0, 0) until then."""
+        current = self._threads_for[:1] == ((self.subreddit or "").lower(),)
+        return self._threads.get(day, (0, 0)) if current else (0, 0)
+
+    def _show_threads(self) -> None:
+        """Each day's line under its date: how many of its saved posts have every comment saved."""
+        for row, day in enumerate(self._day_rows):
+            line: FitLabel = self.day_table.cellWidget(row, 0).findChild(FitLabel)
+            whole, posts = self._threads_on(day)
+            line.setVisible(bool(posts))
+            line.set(f"✓ {plural(posts, 'thread')}" if whole == posts else f"{whole:,} of {plural(posts, 'thread')}",
+                     f"✓ {posts:,}" if whole == posts else f"{whole:,} of {posts:,}")
+            line.setToolTip(f"Every comment is saved on {whole:,} of the {plural(posts, 'post')} saved from this "
+                            "day. " + THREADS_TIP)
 
     # -- ticked days ----------------------------------------------------------
 
@@ -514,6 +609,12 @@ class CoveragePage(VerticalScrollArea):
                 "sentiment? The days show as not downloaded, ready to download again. Timeline notes stay. "
                 "This can't be undone.")
             self.delete_confirm.setText(f"Delete {plural(n, 'day')}")
+        days = sorted(self.ticked) or self._day_rows
+        whole, posts = (sum(self._threads_on(d)[i] for d in days) for i in (0, 1))
+        where = "the ticked days" if self.ticked else f"these {plural(len(days), 'day')}"
+        self.threads_total.setText(f"Comments complete on {whole:,} of {plural(posts, 'post')}" if posts else "")
+        self.threads_total.setToolTip(f"Every comment is saved on {whole:,} of the {plural(posts, 'post')} saved "
+                                      f"from {where}. " + THREADS_TIP if posts else "")
         self.delete_question.setVisible(self._asking)
         self.delete_cancel.setVisible(self._asking)
         self.delete_confirm.setVisible(self._asking)
@@ -562,12 +663,7 @@ class CoveragePage(VerticalScrollArea):
         self._comments_done, self._comments_so_far = complete, so_far
         # Not offered again: threads saved whole, or saved whole before the archive counted them (until it
         # has, there's nothing to say more came; once it has, a count above what's saved brings them back).
-        todo = []
-        for r in rows:
-            total = r["num_comments"]
-            if total != 0 and not (r["id"] in complete or (total is None and r["id"] in so_far)
-                                   or (bool(total) and r["saved_comments"] >= total)):
-                todo.append(r["id"])
+        todo = [r["id"] for r in rows if not r["whole"]]
         self._fill_visible()
         self._todo_comments = todo
         self.all_comments.setText(f"Download all comments ({len(todo):,} posts)" if todo else "Download all comments")
@@ -786,11 +882,16 @@ class CoveragePage(VerticalScrollArea):
             self._show_ticked()
 
     def stop_count(self) -> None:
-        """As the app closes. Not waited for: a request still out held the app's close for up to 3 s. It ends
-        by itself; app.main ends the process if it still runs when the app quits."""
+        """As the app closes. The archive count isn't waited for: a request still out held the app's close for
+        up to 3 s. It ends by itself; app.main ends the process if it still runs when the app quits. Counting
+        threads reads the file, so that is waited for, with nothing of it shown."""
         if self.count_job.busy:
             self.count_job.stop()
             self._count_stopped = True
+        if self.threads_job.busy:
+            self.threads_job.ended.disconnect()
+            self.threads_job.qthread.quit()
+            self.threads_job.qthread.wait(3000)
 
 
 def mark_flat(button: QPushButton) -> QPushButton:
