@@ -565,8 +565,11 @@ class Search:
             self.ready = self._probe()
             if not self.ready:
                 return None
-        cur = self.db.execute(f"SELECT rowid FROM search_{kind} WHERE search_{kind} MATCH ?", (query,))
-        return np.fromiter((r[0] for r in cur), np.int64)  # FTS5 gives them by rowid
+        # As one row: read a row at a time, each step let go of the interpreter lock and waited for it back, so
+        # on a thread beside a busy window 5,000 matches took 1.5 s instead of 3 ms.
+        (hits,) = self.db.execute(f"SELECT group_concat(rowid) FROM search_{kind} WHERE search_{kind} MATCH ?",
+                                  (query,)).fetchone()
+        return np.sort(np.array(hits.split(","), np.int64)) if hits else np.zeros(0, np.int64)
 
 
 def _unpack(blob: bytes, db: sqlite3.Connection | None = None) -> dict:

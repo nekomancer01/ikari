@@ -276,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
           f"memory {rss_mb():.0f} MB")
     print(f"{'interaction':<34}{'worst ms':>9}{'>16.7ms':>9}{'busy ms':>9}")
 
-    def report(name, steps):
+    def report(name, steps, settle_ms=1200):
         if args.only not in name:
             return
         for _ in range(args.repeat):
@@ -284,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
             if prof:
                 prof.enable()
             beat.stalls = []
-            r = beat.run(steps)
+            r = beat.run(steps, settle_ms)
             for ms, where in beat.stalls:
                 print(f"    {ms:6.0f} ms  " + " | ".join(f"{n}x {w}" for w, n in where))
             if prof:
@@ -316,17 +316,28 @@ def main(argv: list[str] | None = None) -> int:
         for name in (second["name"], biggest["name"]):  # as a click in the Saved list does it
             row = next(i for i in range(w.datasets.count()) if w.datasets.item(i).data(Qt.ItemDataRole.UserRole) == name)
             report(f"{page}: switch to {name}", [lambda r=row: w.datasets.setCurrentRow(r)])
-    for page in ("overview", "words"):
-        # A fetch saving comments, a request's 100 at a time: the word clouds follow every 250 ms (the overview's
-        # refresh) for two seconds.
+    for page in ("overview", "comments"):
+        # The comments pill (as a click picks it), and on the Comments page a click on the Score header and back.
         w.show_page(page)
-        half = len(w.comments) // 2
-        w.word_tally.count(w.posts, w.comments[:half])
-        beat.run([], 3000)
-        rest = w.comments[half:]
+        beat.run([], 800)
+        for i, text in ((1, "comments 1+"), (0, "any comments")):
+            report(f"{page}: {text}", [lambda i=i: w.comment_score_pick.setCurrentIndex(i)], 3000)
+    for col, order, text in ((3, Qt.SortOrder.DescendingOrder, "by score"), (6, Qt.SortOrder.AscendingOrder, "by date")):
+        report(f"comments: sort {text}", [lambda c=col, o=order: w.comments_tab.view.sortByColumn(c, o)], 3000)
+    for typed in ("raid", "the"):  # typed into the Comments table's filter, a key a frame, then cleared
+        report(f"comments: filter {typed}", [lambda t=typed[:k]: w.comments_tab.filter.setText(t)
+                                             for k in range(1, len(typed) + 1)], 3000)
+        report(f"comments: clear filter {typed}", [lambda: w.comments_tab.filter.setText("")], 3000)
+    for page in ("overview", "words"):
+        # A fetch saving comments, a request's 100 at a time (here its latest ones saved again): the window counts
+        # them in and the overview and word clouds follow every 250 ms, for two seconds.
+        w.show_page(page)
+        beat.run([], 800)
+        saved = w._saved["comments"]
+        rest = saved.rows(range(max(0, len(saved) - 800), len(saved)))
         batch = 100
         report(f"{page}: words during a fetch",
-               [(lambda b=rest[i // 15 * batch:(i // 15 + 1) * batch]: (w.word_tally.add("comments", b), w._render_words()))
+               [(lambda b=rest[i // 15 * batch:(i // 15 + 1) * batch]: w._count_new("comments", b))
                 if i % 15 == 0 else (lambda: None) for i in range(120)])
     for page in ("overview", "words", "comments"):
         w.show_page(page)
