@@ -984,3 +984,26 @@ def test_an_sqlite_without_search_leaves_the_index_for_one_with_it(tmp_path, mon
     s = Store(path)
     assert s.search.matches("posts", "t").tolist() == [store.Search.key("p1")]
     s.close()
+
+
+def test_an_older_sqlite_is_swapped_for_pysqlite3s_where_it_is_installed():
+    import subprocess
+    import sys
+    pytest.importorskip("pysqlite3")  # Linux x86_64 only
+    code = ("import sqlite3; sqlite3.sqlite_version_info = (3, 37, 2); import subsentiment.store as s; "
+            "print(s.sqlite3.__name__, s.Search(s.sqlite3.connect(':memory:')).ready)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.split()
+    assert out == ["pysqlite3", "True"]
+
+
+def test_a_stopped_upgrade_process_stops_by_itself_and_leaves_no_word_splitting_processes(tmp_path):
+    import multiprocessing
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(V2_DB, path)
+    stop = multiprocessing.get_context("spawn").Event()
+    stop.set()  # the window closed: it ends its pool itself (ended from outside, the pool's processes were left)
+    store._pack_all(str(path), True, stop)
+    assert multiprocessing.active_children() == []
+    s = Store(path)
+    assert s._left_to_pack()  # carried on at the next start
+    s.close()

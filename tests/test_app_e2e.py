@@ -1103,7 +1103,7 @@ def test_coverage_left_and_opened_again_mid_count_counts_without_an_error(env):
 
 
 def test_choosing_a_span_on_the_timeline_never_downloads_and_a_fetch_only_adds_rows_from_it(env):
-    """Ame: the Overview's sentiment follows the stretch of time picked on the chart, and the Days picker that
+    """The owner: the Overview's sentiment follows the stretch of time picked on the chart, and the Days picker that
     used to choose it is gone. Dragging across the timeline counts only those days on every page."""
     w = env.window()
     fetch(w, comments=False)  # the past week, so the month's fetch below adds more
@@ -1171,7 +1171,7 @@ def test_a_second_fetch_into_a_shown_subreddit_ends_without_reading_it_all_back(
 
 
 def test_the_word_cloud_keeps_its_words_in_place_while_a_fetch_adds_to_them(env):
-    """Ame: the cloud "should update dynamically while you scrape instead of constantly resetting". Each refresh
+    """The owner: the cloud "should update dynamically while you scrape instead of constantly resetting". Each refresh
     used to lay every word out again from the middle, so all of them jumped about; now a word stays where it is
     and only grows or shrinks, unless something bigger needs its place."""
     w = env.window()
@@ -1200,7 +1200,7 @@ def test_the_word_cloud_keeps_its_words_in_place_while_a_fetch_adds_to_them(env)
 
 
 def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
-    """Ame: "basically I just want everything to update live". The overview used to be redrawn only a second
+    """The owner: "basically I just want everything to update live". The overview used to be redrawn only a second
     after a save, from the rows dripped into the tables by then, so while the fetch waited on a slow request
     the tables kept filling and the overview, day picker and coverage stood still behind them."""
     w = env.window()
@@ -1477,7 +1477,7 @@ def test_coverage_downloads_a_days_comments_many_threads_at_once(env, monkeypatc
 
 
 def test_download_all_comments_asks_nothing_for_posts_that_turn_out_to_have_none(env):
-    # Ame, 21 Oct: Coverage's Download all comments "checks posts with empty comments". Posts saved before the
+    # The owner, 21 Oct: Coverage's Download all comments "checks posts with empty comments". Posts saved before the
     # archive counted their comments are offered; re-checked, many have none, and each still cost a request.
     def usable(day):
         return [p for p in env.archive.posts if p["subreddit"] == "Python" and day <= p["created_utc"] < day + DAY
