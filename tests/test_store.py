@@ -627,3 +627,66 @@ def test_read_spans_merge_and_go_with_the_subreddit(tmp_path):
     s.delete_subreddit("Python")  # its posts are gone, so a download must read them again
     assert s.read_spans("python") == []
     s.close()
+
+
+def test_deleting_days_forgets_them_whole_and_leaves_other_days_and_subreddits_as_they_were(tmp_path):
+    s = Store(tmp_path / "x.db")
+    d0 = 1_700_000_000 // 86400 * 86400
+    days = [d0, d0 + 86400, d0 + 2 * 86400]
+
+    def save_day(sub, k, day):
+        s.save_post(Post(f"{sub}{k}", sub, f"title {sub}{k}", "text", "a", 1, 0.9, 2, day + 100, POST_LINK, ""), 0.1, "positive")
+        # one reply the same day, and a late one written the next day, packed with that day's comments
+        for j, at in enumerate((day + 200, day + 86400 + 300)):
+            s.save_comment(Comment(f"c{sub}{k}_{j}", f"{sub}{k}", sub, f"t3_{sub}{k}", "b", f"reply {j}", 1, at, 0,
+                                   POST_LINK + f"c{sub}{k}_{j}/"), 0.0, "neutral")
+        s.mark_comments(f"{sub}{k}", True, True)
+        s.mark_complete("comments", sub, f"{sub}{k}")
+        s.mark_complete("posts", sub, str(day))
+    for sub in ("Python", "rust"):
+        for k, day in enumerate(days):
+            save_day(sub, k, day)
+    s.save_post(Post("img1", "Python", "pic", "", "a", 1, 0.9, 0, days[1] + 50, "https://i.redd.it/x.png",
+                     "https://i.redd.it/x.png", image=True), 0.0, "neutral")
+    s.save_removed("Python", {"gone1": days[1] + 10, "gone0": days[0] + 10})
+    s.save_read_spans("Python", [(days[0], days[2] + 86399)])
+    s.save_read_spans("rust", [(days[0], days[2] + 86399)])
+    s.save_note("Python", days[1], "UP", "kept")
+    s.commit()
+    assert s.pack_settled() == 2 * (3 + 4)  # posts on three days, comments on those and the day after
+    before = {sub: (s.posts(sub), s.comments(sub)) for sub in ("Python", "rust")}
+    assert s.posts("python")[0]["title"] == "title Python2"  # its pack is in the cache now
+
+    assert s.delete_days("python", [days[1] + 5000]) == (1, 2)  # any second of the day names it; the image post isn't shown
+
+    posts, comments = before["Python"]
+    assert s.posts("Python") == [r for r in posts if r["id"] != "Python1"]
+    assert s.comments("Python") == [r for r in comments if r["post_id"] != "Python1"]
+    assert (s.posts("rust"), s.comments("rust")) == before["rust"]
+    assert s.posts_per_day("Python", days[0], days[2] + 86400, images=True) == {}
+    assert s.removed_per_day("Python", days[0], days[2] + 86400) == {days[0]: 1}
+    assert s.complete_keys("posts", "python") == {str(days[0]), str(days[2])}
+    assert s.complete_keys("comments", "python") == {"Python0", "Python2"}
+    assert len(s.complete_keys("posts", "rust")) == 3
+    assert s.read_spans("python") == [(days[0], days[0] + 86399), (days[2], days[2] + 86399)]
+    assert s.read_spans("rust") == [(days[0], days[2] + 86399)]
+    assert s.db.execute("SELECT COUNT(*) FROM comment_fetches WHERE post_id = 'Python1'").fetchone()[0] == 0
+    assert s.notes("python") == {days[1]: ("UP", "kept")}
+    # The day's posts pack is gone, and the deleted comments are out of the packs they shared with others.
+    packs = {(k, sub, day): store._unpack(blob)["rows"] for k, sub, day, blob in s.db.execute("SELECT kind, subreddit, day, data FROM packs")}
+    assert ("posts", "python", days[1] // 86400) not in packs
+    assert set(packs["comments", "python", days[2] // 86400]) == {"cPython2_0"}
+    assert set(packs["comments", "python", days[1] // 86400]) == {"cPython0_1"}
+    assert len(packs) == 2 * 7 - 1
+
+    # They don't come back: not when the settled days are packed again, nor when the file is opened anew.
+    assert s.pack_settled() == 0
+    s.close()
+    s = Store(tmp_path / "x.db")
+    assert [r["id"] for r in s.posts("python")] == ["Python2", "Python0"]
+    # A download of the day saves it again, with its new text read back (not an old cached pack's).
+    s.save_post(Post("Python1", "Python", "downloaded again", "", "a", 1, 0.9, 2, days[1] + 100, POST_LINK, ""), 0.0, "neutral")
+    s.commit()
+    assert s.pack_settled() == 1
+    assert {r["id"]: r["title"] for r in s.posts("python")}["Python1"] == "downloaded again"
+    s.close()
