@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPointF, QRectF, QSize, QSizeF, Qt, QVariantAnimation,
+                            Signal)
 from PySide6.QtGui import QColor, QFontMetricsF, QPainter, QPixmap
 from PySide6.QtWidgets import QToolTip, QWidget
 
 from subsentiment.analysis import WordCounts
-from subsentiment.gui import theme
+from subsentiment.gui import motion, theme
 from subsentiment.gui.charts import palette
 from subsentiment.gui.worker import Slices
 
@@ -103,12 +104,47 @@ class WordTally(QObject):
         return self._top
 
 
+class _Word:
+    """A word in the cloud: where it's headed (its box and pixel size, ``shown`` 1, or 0 on its way out) and
+    where it's drawn now (centre, size, alpha and tint), eased there from where it was when it got the target."""
+
+    __slots__ = ("word", "n", "lean", "box", "px", "shown", "x", "y", "size", "alpha", "tint", "start", "was")
+
+    def __init__(self, word: str, box: QRectF, px: float):
+        self.word, self.box, self.px, self.shown = word, box, px, 1.0
+        c = box.center()
+        self.x, self.y, self.size, self.alpha, self.tint = c.x(), c.y(), px * WordCloud.GROW_FROM, 0.0, 1.0
+        self.start = (self.x, self.y, self.size, self.alpha, self.tint)
+        self.lean = self.was = 0.0  # its lean, and the one it had when it got its target (a colour fades across)
+
+    def ease(self, move: float, grow: float) -> None:
+        """Step from where the word was to its target: ``move`` of the way for its place and colour, ``grow``
+        for its size (which overshoots a little, so a word arriving or growing pops)."""
+        x0, y0, s0, a0, t0 = self.start
+        c = self.box.center()
+        self.x, self.y = x0 + (c.x() - x0) * move, y0 + (c.y() - y0) * move
+        self.size = s0 + (self.px * (1 if self.shown else WordCloud.GROW_FROM) - s0) * grow
+        self.alpha = a0 + (self.shown - a0) * move
+        self.tint = t0 + (WordCloud.hue(self.lean)[1] - t0) * move
+
+
 class WordCloud(QWidget):
     """Words placed outward from the middle along a spiral, the most used first and biggest, each where it
     overlaps none placed before it. Words that don't fit are left out. Hovering one says how many items use
-    it and how they split."""
+    it and how they split.
+
+    The cloud keeps its shape as the words change, as live word clouds do (Cui et al.'s context-preserving
+    clouds, d3-cloud's enter/update/exit): a word already shown is tried where it is first, then ever further
+    out from there, so it stays put unless something bigger needs its place; new words go in from the middle.
+    Then everything eases to the new layout: words slide, grow and shrink, new ones pop in and dropped ones
+    fade. Each frame of that draws a prepared picture of each word, scaled; at rest the cloud is one picture."""
 
     MIN_PX, MAX_PX = 11.0, 54.0  # font sizes of the least and most used word, at most
+    MOVE_MS = 650  # a change easing in
+    GROW_FROM = 0.4  # of its size, where a word pops in from and fades out to
+    BUSY_DIM = 0.45  # how far the cloud fades while new counts are worked out
+    PULL = 0.12  # of the way to the middle, a step a word takes each update where that's free
+    FAR = 0.3  # of the widget's shorter side: a word moved further fades out and in rather than sliding
 
     def __init__(self, empty: str = "No words yet", parent=None):
         super().__init__(parent)
@@ -117,80 +153,225 @@ class WordCloud(QWidget):
         self.empty = empty
         self.busy = False
         self._words: list[tuple[str, int, float]] = []
+        self._version = 0  # counts every change to the words
         self._placed: list[tuple[QRectF, str, int, float, float]] = []  # box, word, items, lean, pixel size
-        self._placed_for = None
-        self._placing = None  # the words still to place, a few each frame (_place)
+        self._shown: dict = {}  # every word drawn: those on their way out first (by id), then the rest (by word)
+        self._placed_for = None  # (width, height, version) of the words placed
+        self._placing = None  # the words being placed, a few each frame (_place), and what for
+        self._placing_for = None
+        self._next: list[tuple[QRectF, str, int, float, float]] = []
         self._slices = Slices(self)
-        self._drawn: QPixmap | None = None  # the words as last painted, and what for
+        self._spiral, self._spiral_for = [], None
+        self._painted = False  # painted since last shown: a change can ease in from what's on screen
+        self._anim = QVariantAnimation(self, duration=self.MOVE_MS, startValue=0.0, endValue=1.0)
+        self._anim.valueChanged.connect(self._step)
+        self._anim.finished.connect(self._settled)
+        self._move, self._grow = QEasingCurve(QEasingCurve.Type.OutCubic), QEasingCurve(QEasingCurve.Type.OutBack)
+        self._grow.setOvershoot(1.2)
+        self._dim = 1.0
+        self._moved = 1.0  # how far the change easing in has got
+        self._dimming = motion.Tween(lambda v: (setattr(self, "_dim", v), self.update()), self, motion.VIEW_MS)
+        self._sprites: dict[tuple, QPixmap] = {}  # each word's picture, by word, size, colour and pixel ratio
+        self._drawn: QPixmap | None = None  # the words at rest, and what for
         self._drawn_for = None
+        self._next_drawn = (None, None)  # the same for the words being placed
 
     def set_words(self, words: list[tuple[str, int, float]], busy: bool = False) -> None:
+        """Show these words: faded while ``busy`` (new counts are on their way)."""
         words = list(words)
         if (words, busy) == (self._words, self.busy):
             return  # placed already
-        self._words, self.busy = words, busy
-        self._placed_for = None
+        if words != self._words:
+            self._words, self._version = words, self._version + 1
+        self.busy = busy
+        self._dimming.set(self.BUSY_DIM if busy and words else 1.0, animate=self._painted)
         self.update()
 
     def placed(self) -> list[tuple[QRectF, str, int, float, float]]:
         """Where each shown word is drawn (for tests and the tooltip), placing any still to place."""
         self._layout()
-        if self._placing is not None:
+        while self._placing is not None:
             self._slices.stop()
             for _ in self._placing:
                 pass
-            self._placing = None
+            self._placed_all()
+            self._layout()
         return self._placed
 
     def _layout(self) -> None:
-        """Start placing the words afresh if they or the size changed; they go down a few each frame, the
-        biggest first, so a new cloud grows out from the middle instead of holding up the window."""
-        key = (self.width(), self.height(), id(self._words))
-        if self._placed_for != key:
-            self._placed, self._placed_for = [], key
+        """Start placing the words if they or the size changed; they go down a few each frame, the biggest
+        first, so a new layout never holds up the window. Words changed while one is placed are placed next."""
+        key = (self.width(), self.height(), self._version)
+        if self._placing is None and self._placed_for != key:
+            self._placing_for, self._next, self._next_drawn = (key, self._painted), [], (None, None)
             self._placing = self._place()
             self._slices.start(self._placing, self._placed_all)
 
     def _placed_all(self) -> None:
-        self._placing = None
+        """Ease every word to where it was just placed: from where it is on screen when the cloud was showing
+        at this size, straight there otherwise (a resize, a page just opened, or motion off)."""
+        (key, painted), before = self._placing_for, self._placed_for
+        self._placing, self._placed_for, self._placed = None, key, self._next
+        self._drawn, self._drawn_for = self._next_drawn
+        # Placed for a cloud that wasn't on screen (a page just opened): the words pop in instead.
+        fresh = not (painted and self._painted)
+        if fresh:
+            self._shown = {}
+        ease = motion.enabled() and self.isVisible() and (fresh or before is not None and before[:2] == key[:2])
+        shown, far = {}, self.FAR * min(key[0], key[1])
+        for box, word, n, lean, px in self._placed:
+            w = self._shown.get(word)
+            if w is None or math.hypot(w.x - box.center().x(), w.y - box.center().y()) > far:
+                w = _Word(word, box, px)  # one that had to go far fades there and pops in where it goes
+            w.was = w.lean if w.alpha else lean
+            w.box, w.n, w.lean, w.px, w.shown = box, n, lean, px, 1.0
+            shown[word] = w
+        # Words on their way out, by id: one that comes back while it fades is a new word.
+        leaving = {id(w): w for w in self._shown.values() if shown.get(w.word) is not w and ease and w.alpha > 0.01}
+        for w in leaving.values():
+            w.shown = 0.0
+        self._shown = leaving | shown  # drawn first, so under the words staying
+        self._anim.stop()
+        for w in self._shown.values():
+            w.start = (w.x, w.y, w.size, w.alpha, w.tint)
+        if ease:
+            self._anim.start()
+        else:
+            self._step(1.0)
+            self._settled()
+
+    def _step(self, t: float) -> None:
+        move, grow = self._move.valueForProgress(t), self._grow.valueForProgress(t)
+        self._moved = move
+        for w in self._shown.values():
+            w.ease(move, grow)
+        self.update()
+
+    def _settled(self) -> None:
+        self._shown = {word: w for word, w in self._shown.items() if w.shown}
         self.update()
 
     def _place(self):
-        """Put each word's box in self._placed, yielding after each. Boxes are tried along the spiral against a
-        grid of 2 px cells (a bit mask per row of them), so a try costs a few integer ANDs however many words
-        are down already."""
+        """Work out each word's box into self._next, a few words each step. Boxes are tried against a grid of
+        2 px cells (a bit mask per row of them), so a try costs a few integer ANDs however many words are down.
+
+        Words already shown keep their place first, the biggest first, wherever nothing bigger has grown into it;
+        a new word that's among the biggest goes in with them, as near the middle as it can. The rest are tried
+        along a spiral: a word that lost its place out from where it was, so it shifts as little as it can; a
+        new word out from the middle. Last, each word takes a small step towards the middle
+        where that's free, so gaps left by words that shrank or went close up over a few updates without
+        pushing anything else aside."""
         if not self._words:
             return
+        if len(self._sprites) > 2000:  # pictures of words long gone, and of sizes they had
+            self._sprites.clear()
         w, h = self.width(), self.height()
         most, least = self._words[0][1], self._words[-1][1]
         biggest = min(self.MAX_PX, max(self.MIN_PX + 4, h / 6))
         cx, cy = w / 2, h / 2
-        aspect = w / max(h, 1)  # the spiral is stretched to the widget's shape, so the cloud fills it
-        reach = max(w, h) / min(aspect, 1)  # past this radius the spiral has left the widget on every side
-        spiral = [(1.6 * a * math.cos(a) * aspect, 1.6 * a * math.sin(a))
-                  for a in (step * 0.35 for step in range(3000)) if 1.6 * a <= reach]
+        if self._spiral_for != (w, h):
+            # Stretched to the widget's shape, so the cloud fills it; out to where it has left the widget wherever
+            # it starts. Close steps near the start (small shifts first), wider further out.
+            aspect, reach, spiral, a = w / max(h, 1), max(w, h) / min(w / max(h, 1), 1), [], 0.0
+            while 1.6 * a <= reach:
+                spiral.append((1.6 * a * math.cos(a) * aspect, 1.6 * a * math.sin(a)))
+                a += max(0.12, 3 / max(1.6 * a, 1))
+            self._spiral, self._spiral_for = spiral, (w, h)
+        # Where the words shown are; at a new size the cloud is laid out afresh to fill it.
+        same = self._placed_for is not None and self._placed_for[:2] == (w, h)
+        was = {word: s.box.center().toTuple() for word, s in self._shown.items() if s.shown and same}
         rows = [0] * (int(h) // _CELL + 2)  # the cells taken, a row of them per int
+
+        def free(x, y, bw, bh):
+            """The cells a box at x, y takes (mask, rows), or None where it's off the widget or taken."""
+            if x < 0 or y < 0 or x + bw > w or y + bh > h:
+                return None
+            c0 = int(x) // _CELL
+            mask = ((1 << (int(x + bw) // _CELL - c0 + 1)) - 1) << c0
+            taken = range(int(y) // _CELL, int(y + bh) // _CELL + 1)
+            return None if any(rows[r] & mask for r in taken) else (mask, taken)
+
+        sized = []
         for word, n, lean in self._words:
             share = (math.sqrt(n) - math.sqrt(least)) / ((math.sqrt(most) - math.sqrt(least)) or 1)
             px = self.MIN_PX + (biggest - self.MIN_PX) * share
             m = QFontMetricsF(self._font(px))
             bw, bh = m.horizontalAdvance(word) + px * 0.35, m.height() * 0.92
-            if bw > w or bh > h:
+            if bw <= w and bh <= h:
+                sized.append((word, n, lean, px, bw, bh))
+        at = {}  # word: (x, y, the cells it takes)
+
+        def put(word, bw, bh, origin, tries):
+            """Put the word at the first free spot of tries (offsets from origin), if there is one."""
+            for dx, dy in tries:
+                x, y = origin[0] + dx - bw / 2, origin[1] + dy - bh / 2
+                cells = free(x, y, bw, bh)
+                if cells:
+                    for r in cells[1]:
+                        rows[r] |= cells[0]
+                    at[word] = (x, y, cells)
+                    return
+
+        # First the words shown keep their place, and a new word big enough to belong in the middle (one that's
+        # suddenly used a lot) takes the free space nearest it, with them; then the rest find room.
+        big = (self.MIN_PX + biggest) / 2
+        for word, n, lean, px, bw, bh in sized:
+            if word in was:
+                put(word, bw, bh, was[word], ((0, 0),))
+            elif px >= big:
+                put(word, bw, bh, (cx, cy), self._spiral)
+                yield
+        yield
+        for word, n, lean, px, bw, bh in sized:
+            if word not in at and (word in was or px < big):
+                put(word, bw, bh, was.get(word, (cx, cy)), self._spiral)
+                yield
+        for word, n, lean, px, bw, bh in sized:
+            if word not in at:
                 continue
-            for dx, dy in spiral:
-                x, y = cx + dx - bw / 2, cy + dy - bh / 2
-                if x < 0 or y < 0 or x + bw > w or y + bh > h:
-                    continue
-                c0 = int(x) // _CELL
-                mask = ((1 << (int(x + bw) // _CELL - c0 + 1)) - 1) << c0
-                taken = range(int(y) // _CELL, int(y + bh) // _CELL + 1)
-                if not any(rows[r] & mask for r in taken):
-                    for r in taken:
-                        rows[r] |= mask
-                    self._placed.append((QRectF(x, y, bw, bh), word, n, lean, px))
-                    self.update()
-                    break
+            x, y, (mask, taken) = at[word]
+            for r in taken:
+                rows[r] &= ~mask
+            nx, ny = x + (cx - x - bw / 2) * self.PULL, y + (cy - y - bh / 2) * self.PULL
+            cells = free(nx, ny, bw, bh)
+            if cells:
+                x, y, (mask, taken) = nx, ny, cells
+            for r in taken:
+                rows[r] |= mask
+            self._next.append((QRectF(x, y, bw, bh), word, n, lean, px))
+        # The pictures the change is drawn with, made here a few at a time rather than in the frame it starts:
+        # each word's (in its old colour too, if that changed) and the cloud's at rest.
+        colors, dpr = palette(), self.devicePixelRatioF()
+        for box, word, n, lean, px in self._next:
+            self._sprite(word, px, colors[self.hue(lean)[0]], dpr)
+            if word in self._shown:
+                self._sprite(word, px, colors[self.hue(self._shown[word].lean)[0]], dpr)
             yield
+        steps = self._draw(self._next, colors, dpr)
+        picture = next(steps)
+        yield from steps
+        self._next_drawn = (picture, (self._placing_for[0], dpr, tuple(colors.values())))
+
+    def _draw(self, placed: list, colors: dict, dpr: float):
+        """Draw the words at rest into a picture: yields the picture, then once after each word."""
+        picture = QPixmap(self.size() * dpr)
+        picture.setDevicePixelRatio(dpr)
+        picture.fill(Qt.GlobalColor.transparent)
+        yield picture
+        if picture.isNull():  # no room at all
+            return
+        q = QPainter(picture)
+        q.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for box, word, n, lean, px in placed:
+            hue, tint = self.hue(lean)
+            color = QColor(colors[hue])
+            if hue != "text":
+                color.setAlphaF(tint)
+            q.setFont(self._font(px))
+            q.setPen(color)
+            q.drawText(box, Qt.AlignmentFlag.AlignCenter, word)
+            yield
+        q.end()
 
     @staticmethod
     def _font(px: float):
@@ -201,44 +382,78 @@ class WordCloud(QWidget):
         return _FONTS[size]
 
     @staticmethod
-    def _color(lean: float, colors: dict) -> QColor:
+    def hue(lean: float) -> tuple[str, float]:
         """Blue for words that lean positive, orange for negative, fainter the less they lean; the text colour
-        for words used about as much either way."""
+        for words used about as much either way. The palette's colour, and how opaque."""
         if abs(lean) < 0.15:
-            return QColor(colors["text"])
-        c = QColor(colors["positive" if lean > 0 else "negative"])
-        c.setAlphaF(min(1.0, 0.55 + abs(lean)))
-        return c
+            return "text", 1.0
+        return "positive" if lean > 0 else "negative", min(1.0, 0.55 + abs(lean))
+
+    def _sprite(self, word: str, px: float, color: str, dpr: float) -> tuple[QPixmap, float]:
+        """A picture of the word in a colour at the font size it's drawn at when still (drawn scaled while it
+        moves), and that size. Made once per word, size and colour, so a frame only draws pictures."""
+        px = max(1, round(px))
+        key = (word, px, color, dpr)
+        if key not in self._sprites:
+            font = self._font(px)
+            m = QFontMetricsF(font)
+            size = QSizeF(m.horizontalAdvance(word) + px * 0.35, m.height())
+            sprite = QPixmap((size * dpr).toSize() + QSize(2, 2))
+            sprite.setDevicePixelRatio(dpr)
+            sprite.fill(Qt.GlobalColor.transparent)
+            q = QPainter(sprite)
+            q.setRenderHint(QPainter.RenderHint.Antialiasing)
+            q.setFont(font)
+            q.setPen(QColor(color))
+            q.drawText(QRectF(QPointF(0, 0), sprite.deviceIndependentSize()), Qt.AlignmentFlag.AlignCenter, word)
+            q.end()
+            self._sprites[key] = sprite
+        return self._sprites[key], px
 
     def paintEvent(self, event) -> None:
         self._layout()
         colors = palette()
         p = QPainter(self)
-        if not self._placed:
+        if self._placing is not None and not self._placing_for[1]:
+            return  # the words that were here before it was shown aren't shown again; the new ones pop in shortly
+        if not self._shown:
             if self._placing is None:
                 p.setPen(QColor(colors["muted"]))
                 p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Counting words…" if self.busy else self.empty)
+            self._painted = True
             return
-        # Kept as a picture: a crossfade or the window's tint repaints the cloud without drawing every word again.
-        # Words placed since the last paint are added to it, so a growing cloud draws each word once.
         dpr = self.devicePixelRatioF()
+        if self._anim.state() == QVariantAnimation.State.Running:
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            for w in self._shown.values():
+                if w.alpha * w.tint < 0.004:
+                    continue
+                # A word changing colour: the new one fades in over the old.
+                hue, was = self.hue(w.lean)[0], self.hue(w.was)[0]
+                for color, share in ((colors[hue], 1.0),) if hue == was else (
+                        (colors[was], 1.0), (colors[hue], self._moved)):
+                    sprite, px = self._sprite(w.word, w.px, color, dpr)
+                    size = sprite.deviceIndependentSize() * (w.size / px)
+                    p.setOpacity(self._dim * w.alpha * w.tint * share)
+                    p.drawPixmap(QRectF(w.x - size.width() / 2, w.y - size.height() / 2, size.width(), size.height()),
+                                 sprite, QRectF(sprite.rect()))
+            self._painted = True
+            return
+        # At rest, kept as a picture: a crossfade or the window's tint repaints the cloud without drawing every
+        # word again.
         key = (self._placed_for, dpr, tuple(colors.values()))
-        if self._drawn_for is None or self._drawn_for[0] != key:
-            self._drawn = QPixmap(self.size() * dpr)
-            self._drawn.setDevicePixelRatio(dpr)
-            self._drawn.fill(Qt.GlobalColor.transparent)
-            self._drawn_for = (key, 0)
-        done = self._drawn_for[1]
-        if done < len(self._placed):
-            q = QPainter(self._drawn)
-            q.setRenderHint(QPainter.RenderHint.Antialiasing)
-            for box, word, n, lean, px in self._placed[done:]:
-                q.setFont(self._font(px))
-                q.setPen(self._color(lean, colors))
-                q.drawText(box, Qt.AlignmentFlag.AlignCenter, word)
-            q.end()
-            self._drawn_for = (key, len(self._placed))
+        if self._drawn_for != key:  # drawn as the words were placed, unless the theme or screen changed since
+            steps = self._draw(self._placed, colors, dpr)
+            self._drawn, self._drawn_for = next(steps), key
+            for _ in steps:
+                pass
+        p.setOpacity(self._dim)
         p.drawPixmap(0, 0, self._drawn)
+        self._painted = True
+
+    def hideEvent(self, event) -> None:
+        self._painted = False  # shown again, it starts from its new words rather than easing from old ones
+        super().hideEvent(event)
 
     def event(self, e) -> bool:
         if e.type() == QEvent.Type.ToolTip:

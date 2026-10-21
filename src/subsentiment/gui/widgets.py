@@ -4,6 +4,7 @@ Nothing here knows about ikari's data; the windows put these together.
 """
 from __future__ import annotations
 
+import math
 from typing import Callable
 
 from PySide6.QtCore import QDate, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt
@@ -162,20 +163,24 @@ class ShareBar(QWidget):
     """Thin rounded bar showing a share from 0 to 1 (None draws the empty track).
 
     Filled in the palette colour ``color_key`` when one is given, else in the accent; a complete
-    bar is green."""
+    bar is green. While ``waiting`` (for the number it will show) a short stretch of accent sweeps across
+    it instead; with motion off the whole track is tinted."""
 
     def __init__(self, color_key: str | None = None):
         super().__init__()
         self.color_key = color_key
         self.share: float | None = None
         self.complete = False
+        self.waiting = False
         self._drawn = motion.Tween(lambda _: self.update(), self)  # the share on screen, easing to self.share
         self.setFixedHeight(6)
 
-    def set(self, share: float | None, complete: bool = False, animate: bool = False) -> None:
+    def set(self, share: float | None, complete: bool = False, animate: bool = False,
+            waiting: bool = False) -> None:
         """With animate, the bar grows or shrinks to its new length instead of jumping there."""
         self.share = None if share is None else max(0.0, min(1.0, share))
         self.complete = complete
+        self.waiting = waiting
         self._drawn.set(self.share or 0.0, animate)
 
     def paintEvent(self, event) -> None:
@@ -186,6 +191,21 @@ class ShareBar(QWidget):
         t = theme.tokens()
         p.setBrush(QColor(t["soft"]))
         p.drawRoundedRect(r, 3, 3)
+        if self.waiting:
+            accent = QColor(t["accent"])
+            phase = motion.throb(self)
+            if phase is None:
+                accent.setAlpha(90)
+                p.setBrush(accent)
+                p.drawRoundedRect(r, 3, 3)
+                return
+            # A third of the track wide, in from the left edge and out at the right, easing in and out.
+            span = r.width() / 3
+            x = r.x() - span + (r.width() + span) * (0.5 - math.cos(math.pi * phase) / 2)
+            p.setClipRect(r)
+            p.setBrush(accent)
+            p.drawRoundedRect(QRectF(x, r.y(), span, r.height()), 3, 3)
+            return
         share = self._drawn.value
         if not share:
             return

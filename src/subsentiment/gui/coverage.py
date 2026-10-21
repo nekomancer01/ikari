@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 from subsentiment import collect
 from subsentiment.gui import theme
 from subsentiment.gui.widgets import ElidedLabel, ShareBar, VerticalScrollArea, label, panel, plural, section
-from subsentiment.gui.worker import BackgroundJob, CountWorker
+from subsentiment.gui.worker import BackgroundJob, CountWorker, StoreWorker
 
 DAY = 86400
 MAX_DAY_POSTS = collect.MAX_DAY_POSTS
@@ -134,14 +134,18 @@ class Cell(QWidget):
             f"Arctic Shift counted {total or 0:,} posts for this day, fewer than are already saved, so the "
             "count can't be right. Download all fetches everything posted that day.")
 
-    def set(self, saved: int, total: int | None, complete: bool, noun: str, removed: int = 0) -> None:
+    def set(self, saved: int, total: int | None, complete: bool, noun: str, removed: int = 0,
+            waiting: bool = False) -> None:
+        """``waiting``: the archive's count is still being asked for, which the bar shows with a throbber."""
         main, side, share, tip = share_text(saved, total, complete, noun, removed)
+        if waiting:
+            side, tip = "counting…", "Asking Arctic Shift how many posts this day has."
         self.bar.setVisible(True)
         self.note.setVisible(False)
         self._pad(open_day=False)
         self.main.setText(main)
         self.side.setText(side)
-        self.bar.set(share, complete)
+        self.bar.set(share, complete, waiting=waiting)
         self.setToolTip(tip if tip else (f"{main}, {side}" if side else main))
         self._fit()
 
@@ -205,6 +209,7 @@ class CoveragePage(VerticalScrollArea):
         self.window_ = window
         self.subreddit: str | None = None
         self.busy = False
+        self._waiting: set[int] = set()  # days whose Download waits for the archive's count of them
         self.days: list[int] = []
         self.totals: dict[str, dict[int, int]] = {}  # subreddit (lowercase) -> day -> archive count
         self.count_error = ""
@@ -218,7 +223,10 @@ class CoveragePage(VerticalScrollArea):
         self._comments_done: set[str] = set()
         self._comments_so_far: set[str] = set()
         self._day_rows: list[int] = []
-        self.ticked: set[int] = set()  # days ticked for Download selected
+        self.ticked: set[int] = set()  # days ticked for Download selected or Delete selected
+        self.delete_job = BackgroundJob(self)  # deletes ticked days on a connection of its own
+        self.delete_job.ended.connect(self._on_delete_ended)
+        self._deleting: tuple = ("", (), None)  # (subreddit, days, (posts, comments) deleted or an error)
         self._anchor: int | None = None  # the day last ticked or unticked, where a shift-click range starts
 
         inner = QWidget()
@@ -271,6 +279,27 @@ class CoveragePage(VerticalScrollArea):
         days_top.addWidget(self.download_ticked)
         left_lay.addLayout(days_top)
         left_lay.addWidget(self.day_table, 1)
+        # Under the table, away from the downloads: what's saved from the ticked days can be deleted, so they
+        # download again from scratch. It asks first, right here: the question names what goes, over its two
+        # buttons.
+        self.delete_ticked = mark_flat(small_button("Delete selected"))
+        self.delete_ticked.clicked.connect(lambda: self._ask_delete(True))
+        self.delete_question = label("", "muted")
+        self.delete_question.setWordWrap(True)
+        self.delete_cancel = mark_flat(small_button("Cancel"))
+        self.delete_cancel.clicked.connect(lambda: self._ask_delete(False))
+        self.delete_confirm = small_button("Delete")
+        self.delete_confirm.clicked.connect(self._delete_ticked)
+        self._asking = False  # the question is showing
+        for w in (self.delete_question, self.delete_cancel, self.delete_confirm):
+            w.setVisible(False)
+        left_lay.addWidget(self.delete_question)
+        days_foot = QHBoxLayout()
+        days_foot.setSpacing(10)
+        days_foot.addStretch(1)
+        for b in (self.delete_ticked, self.delete_cancel, self.delete_confirm):
+            days_foot.addWidget(b)
+        left_lay.addLayout(days_foot)
 
         self.post_table = table(["Post", "Comments saved", ""])
         h = self.post_table.horizontalHeader()
@@ -327,6 +356,7 @@ class CoveragePage(VerticalScrollArea):
             self.day_table.clearSelection()
             self.ticked.clear()
             self._anchor = None
+            self._asking = False
             self.count_error = ""
         if self.isVisible():
             self.refresh_saved(rebuild=True)
@@ -398,9 +428,9 @@ class CoveragePage(VerticalScrollArea):
             self._day_rows = list(self.days)
             row = self.days.index(keep) if keep in self.days else 0
             t.selectRow(row)
-        self._show_ticked()
         counting = self.count_job.busy
         current = today()
+        self._waiting = set()
         for row, day in enumerate(self.days):
             n, total, done = saved.get(day, 0), totals.get(day), str(day) in complete
             cell: Cell = t.cellWidget(row, 1)
@@ -413,16 +443,22 @@ class CoveragePage(VerticalScrollArea):
                                   else f"Fetch every post from {day_text(day)}")
                 continue
             gone = removed.get(day, 0)
-            cell.set(n, total, done, "post", gone)
-            if total is None and counting and not done:
-                cell.side.setText("counting…")
+            # Until its count is in, a day can't be told apart from one that's done or empty, so it waits;
+            # a complete day needs no count to be checked again.
+            waiting = total is None and counting and not done
+            if waiting:
+                self._waiting.add(day)
+            cell.set(n, total, done, "post", gone, waiting)
             full = done or (total is not None and 0 < total <= n + gone)
             button.setText("Check again" if full else "Download all")
-            button.setEnabled(not self.busy and not (total == 0 and not done and day < self.days[0]))
+            button.setEnabled(not self.busy and not waiting
+                              and not (total == 0 and not done and day < self.days[0]))
             button.setToolTip(
+                "Waiting for Arctic Shift's count of this day" if waiting else
                 "Look for posts the archive has added since" if full else
                 f"Fetch every post from {day_text(day)}"
                 + (f" (up to {total - n - gone:,} more)" if total and total > n + gone else ""))
+        self._show_ticked()
 
     # -- ticked days ----------------------------------------------------------
 
@@ -455,10 +491,33 @@ class CoveragePage(VerticalScrollArea):
         self.tick_all.setText("Select none" if every else "Select all")
         self.tick_all.setEnabled(bool(self._day_rows))
         self.download_ticked.setText(f"Download {plural(n, 'day')}" if n else "Download selected")
-        self.download_ticked.setEnabled(bool(n) and not self.busy)
+        idle = not self.busy and not self.delete_job.busy
+        counting = self.ticked & self._waiting
+        self.download_ticked.setEnabled(bool(n) and idle and not counting)
         what = "every post and comment" if self.with_comments.isChecked() else "every post"
-        self.download_ticked.setToolTip(f"Download {what} from the ticked days, newest first" if n
-                                        else "Tick days on the left to download them together")
+        self.download_ticked.setToolTip(
+            "Waiting for Arctic Shift's count of the ticked days" if counting else
+            f"Download {what} from the ticked days, newest first" if n else
+            "Tick days on the left to download them together")
+        self.delete_ticked.setText(f"Delete {plural(n, 'day')}…" if n else "Delete selected")
+        self.delete_ticked.setEnabled(bool(n) and idle and bool(self.subreddit))
+        self.delete_ticked.setToolTip("Delete the posts and comments saved from the ticked days, so they show as "
+                                      "not downloaded" if n else "Tick days to delete what's saved from them")
+        self._asking = self._asking and bool(n) and idle and bool(self.subreddit)
+        if self._asking:  # the ticks can change while it asks: it always names what the button deletes
+            days = sorted(self.ticked)
+            saved = self.window_.store.posts_per_day(self.subreddit, days[0], days[-1] + DAY)
+            posts = sum(saved.get(d, 0) for d in days)
+            when = day_text(days[0]) if n == 1 else f"{range_text(days[0], days[-1])} ({plural(n, 'day')})"
+            self.delete_question.setText(
+                f"Delete {plural(posts, 'post')} saved from {when} in r/{self.subreddit}, with their comments and "
+                "sentiment? The days show as not downloaded, ready to download again. Timeline notes stay. "
+                "This can't be undone.")
+            self.delete_confirm.setText(f"Delete {plural(n, 'day')}")
+        self.delete_question.setVisible(self._asking)
+        self.delete_cancel.setVisible(self._asking)
+        self.delete_confirm.setVisible(self._asking)
+        self.delete_ticked.setVisible(not self._asking)
 
     def _selected_day(self) -> int | None:
         rows = self.day_table.selectionModel().selectedRows() if self.day_table.selectionModel() else []
@@ -682,6 +741,49 @@ class CoveragePage(VerticalScrollArea):
 
     def _download_day_comments(self) -> None:
         self._download_comments(list(getattr(self, "_todo_comments", [])))
+
+    # -- deleting -------------------------------------------------------------
+
+    def _ask_delete(self, on: bool) -> None:
+        """Show or take back the question Delete selected asks before it deletes anything."""
+        self._asking = on
+        self._show_ticked()
+
+    def _delete_ticked(self) -> None:
+        if not self._asking or not self.subreddit or not self.ticked or self.busy or self.delete_job.busy:
+            return
+        sub, days = self.subreddit, tuple(sorted(self.ticked))
+        worker = StoreWorker(self.window_.db_path, "delete_days", sub, days)
+        worker.finished.connect(self._on_deleted)
+        worker.failed.connect(self._on_delete_failed)
+        self._asking = False
+        self._deleting = (sub, days, None)
+        self.status.setText(f"Deleting {plural(len(days), 'day')} of r/{sub}…")
+        self.delete_job.start(worker)
+        self.window_.set_deleting(True)
+        self._show_ticked()
+
+    @Slot(object)
+    def _on_deleted(self, counts: tuple) -> None:
+        self._deleting = (*self._deleting[:2], counts)
+
+    @Slot(str)
+    def _on_delete_failed(self, message: str) -> None:
+        self._deleting = (*self._deleting[:2], message)
+
+    @Slot()
+    def _on_delete_ended(self) -> None:
+        """Its thread is done, so the saved data can be written again; every page shows what's left."""
+        sub, days, got = self._deleting
+        self.window_.set_deleting(False)
+        if isinstance(got, tuple):
+            if (self.subreddit or "").lower() == sub.lower():
+                self.untick(days)
+            self.status.setText("")
+            self.window_.days_deleted(sub, len(days), *got)
+        else:
+            self.status.setText(f"Couldn't delete those days: {got}")
+            self._show_ticked()
 
     def stop_count(self) -> None:
         """As the app closes. Not waited for: a request still out held the app's close for up to 3 s. It ends

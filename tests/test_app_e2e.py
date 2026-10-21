@@ -18,7 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QSettings, QSize, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QLabel, QMessageBox  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton  # noqa: E402
 
 from subsentiment import arctic_shift  # noqa: E402
 from subsentiment.gui import coverage, days  # noqa: E402
@@ -950,6 +950,51 @@ def test_coverage_counts_a_subreddit_picked_while_another_is_being_counted(env):
     assert all(d in cov.totals["rust"] for d in cov.days)
 
 
+def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
+    # A day still being counted read "0 saved" with Download all live, as if there were nothing to fetch or
+    # it could be fetched blind. Until its count is in it shows a throbber and can't be downloaded, alone or
+    # ticked; today (never counted) and complete days (no count needed) stay usable throughout.
+    w = env.window()
+    fetch(w, comments=False)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
+    complete = env.store().complete_keys("posts", "python")
+    env.archive.clear()
+    env.archive.delays[AGG] = 1.5
+    w.coverage_act.trigger()
+    pump(200)
+    cov = w.coverage
+    assert cov.count_job.busy
+
+    def rows():
+        for row, day in enumerate(cov.days):
+            yield day, cov.day_table.cellWidget(row, 1), cov.day_table.cellWidget(row, 2).findChild(QPushButton)
+
+    waiting = []
+    for day, cell, button in rows():
+        if day >= coverage.today() or str(day) in complete:
+            assert button.isEnabled() and not cell.bar.waiting, day
+        else:
+            assert cell.bar.waiting and cell.side.text() == "counting…" and not button.isEnabled(), day
+            waiting.append(day)
+    done = [d for d in cov.days if str(d) in complete]
+    assert waiting and done
+    cov._tick(done[0], True)
+    assert cov.download_ticked.isEnabled()  # a complete day can be checked again at once
+    cov._tick(waiting[0], True)
+    assert not cov.download_ticked.isEnabled()
+    end = time.monotonic() + 15
+    while cov.count_job.busy and time.monotonic() < end:
+        pump(20)
+    pump(50)
+    totals = cov.totals["python"]
+    assert not any(cell.bar.waiting for _, cell, _ in rows())
+    # Every day with posts to look for can be downloaded now; only past days the archive has none for can't.
+    assert all(button.isEnabled() == (totals.get(day) != 0 or str(day) in complete or day == cov.days[0])
+               for day, _, button in rows())
+    assert cov.download_ticked.isEnabled()
+    assert set(env.archive.paths()) == {AGG}  # waiting downloaded nothing
+
+
 def test_coverage_follows_a_change_of_date_range_in_the_sidebar(env):
     w = env.window()
     fetch(w, comments=False)
@@ -1098,6 +1143,30 @@ def test_a_second_fetch_into_a_shown_subreddit_ends_without_reading_it_all_back(
         shown = {tab.model.row_at(i)["id"]: tuple(tab.model.row_at(i)) for i in range(tab.model.rowCount())}
         assert shown == {r["id"]: tuple(r) for r in saved}  # new scores included
     assert w.overview.tiles["count"].value.text() == f"{len(store.posts('python')) + len(store.comments('python')):,}"
+
+
+def test_the_word_cloud_keeps_its_words_in_place_while_a_fetch_adds_to_them(env):
+    """Ame: the cloud "should update dynamically while you scrape instead of constantly resetting". Each refresh
+    used to lay every word out again from the middle, so all of them jumped about; now a word stays where it is
+    and only grows or shrinks, unless something bigger needs its place."""
+    w = env.window()
+    w.show_page("words")
+    env.archive.delay = 0.03  # a few refreshes of the cloud while it runs
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(True)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    cloud, shown = w.words_page.body, []
+    while w.fetch_job.busy:
+        pump(120)
+        shown.append({word: box.center() for box, word, *_ in cloud.placed()})
+    moves = []  # how far the words shown both times moved between two looks: the median, for each pair
+    for a, b in zip(shown, shown[1:]):
+        if a and a != b and set(a) & set(b):
+            d = sorted((a[k] - b[k]).manhattanLength() for k in set(a) & set(b))
+            moves.append(d[len(d) // 2])
+    assert len(moves) >= 3  # the cloud changed during the fetch
+    assert max(moves) < 15, moves  # on main the median word moved 50-200 px each time
 
 
 def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
@@ -1297,7 +1366,10 @@ def test_a_count_that_keeps_timing_out_doesnt_hold_up_a_download(env, monkeypatc
     cov = w.coverage
     row = next(r for r, d in enumerate(cov.days) if d < coverage.today() - DAY
                and any(d <= p["created_utc"] < d + DAY for p in env.archive.posts if p["subreddit"] == "Python"))
-    QTest.mouseClick(cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    # An uncounted day's Download all now waits for its count, so the same download is started as its button
+    # would once enabled: what's checked here is that the count's back-offs don't hold up a download.
+    assert not cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)).isEnabled()
+    cov._download_day(cov.days[row])
     wait_idle(w)
     paths = env.archive.paths()
     assert SEARCH in paths and paths.count(AGG) == 1  # done within the count's first 2 s pause, not after it
@@ -1345,3 +1417,30 @@ def test_starting_a_saved_subreddit_after_another_switches_to_it_at_once(env):
     assert w.fetch_job.busy and w.current.lower() == "python" and w.posts_tab.model.rowCount() > 0
     env.archive.delay = 0
     wait_idle(w)
+
+
+def test_coverage_downloads_a_days_comments_many_threads_at_once(env, monkeypatch):
+    # Live on 21 Oct, Download all comments went through a day's posts about two a second: four threads in
+    # flight, each started 0.4 s after the last, while the archive took 1-2.5 s to answer each.
+    monkeypatch.setattr(worker.LIMITER, "base", arctic_shift.BASE_INTERVAL)  # the app's real pace
+    monkeypatch.setattr(worker.LIMITER, "interval", arctic_shift.BASE_INTERVAL)
+    day = busy_day(env, "bigday", 40)
+    env.archive.posts += [dict(env.archive.posts[-1], id="other", created_utc=NOW - 3600)]
+    w = env.window()
+    fetch(w, sub="bigday", comments=False, rng="week")
+    cov = open_coverage(w)
+    cov.day_table.selectRow(cov.days.index(day))
+    pump(50)
+    assert cov.all_comments.text() == "Download all comments (40 posts)"
+    env.archive.clear()
+    env.archive.peak = 0
+    env.archive.delays[TREE] = 1.6  # as long as the archive takes
+    started = time.monotonic()
+    QTest.mouseClick(cov.all_comments, Qt.MouseButton.LeftButton)
+    wait_idle(w, 60)
+    took = time.monotonic() - started
+    assert [p for p, _ in env.archive.requests].count(TREE) == 40
+    assert env.archive.peak == arctic_shift.TREE_WORKERS
+    starts = 40 * arctic_shift.BASE_INTERVAL * arctic_shift.TREE_SHARE
+    assert took < 40 * arctic_shift.BASE_INTERVAL  # on main, 4 at a time took 40 / 4 * 1.6 s = 16 s
+    assert took >= starts  # still spaced out: at most one start every 0.2 s
