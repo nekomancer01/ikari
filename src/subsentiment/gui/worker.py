@@ -12,6 +12,7 @@ from subsentiment import collect
 from subsentiment.arctic_shift import ArcticShiftClient, RateLimiter
 from subsentiment.reddit import FetchError
 from subsentiment.analysis import Analysis
+from subsentiment.gui.days import SavedRows
 from subsentiment.store import Store, scoring_at_least
 
 # One limiter for every request the app sends, so a count running beside a fetch doesn't double the rate.
@@ -123,9 +124,10 @@ class LoadWorker(QObject):
         try:
             store = Store(db_path)
             with store.snapshot():
-                rows = {"posts": scoring_at_least(store.posts(subreddit), min_post),
-                        "comments": scoring_at_least(store.comments(subreddit), min_comment)}
-            self.finished.emit((self.tag, rows, {k: Analysis(v) for k, v in rows.items()}))
+                rows = {k: SavedRows(scoring_at_least(store.rows(k, subreddit), least))
+                        for k, least in (("posts", min_post), ("comments", min_comment))}
+            # Counted newest first, as Store.posts reads them: a total's last digits depend on the order it's added up in.
+            self.finished.emit((self.tag, rows, {k: Analysis(reversed(v)) for k, v in rows.items()}))
         except Exception as e:
             self.failed.emit(failure_text(e))
         finally:

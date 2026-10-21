@@ -4,7 +4,7 @@ from __future__ import annotations
 import heapq
 import sqlite3
 import time
-from operator import itemgetter
+from operator import attrgetter, itemgetter
 from datetime import datetime
 from typing import Any, Callable
 
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from subsentiment.gui import motion, theme
 from subsentiment.gui.charts import palette
 from subsentiment.gui.widgets import label, mark, plural
+from subsentiment.store import Row
 
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1  # the value a column sorts by (the model sorts by it itself)
 NUMERIC = ("sentiment", "score", "num_comments")
@@ -135,9 +136,12 @@ class ChipDelegate(QStyledItemDelegate):
 
 
 def column(rows: list, key: str):
-    """Every row's ``key``, quickly: a saved row (sqlite3.Row) finds a column by name by comparing it with each
-    name in turn, so it's read by position instead."""
-    if rows and set(map(type, rows)) == {sqlite3.Row}:  # rows a fetch adds can be dicts
+    """Every row's ``key``, quickly: a saved row (store.Row) is read as an attribute and an sqlite3.Row by
+    position, both far quicker than by name."""
+    kinds = set(map(type, rows))
+    if len(kinds) == 1 and issubclass(next(iter(kinds)), Row):  # rows a fetch adds can be dicts
+        return map(attrgetter(key), rows)
+    if kinds == {sqlite3.Row}:
         return map(itemgetter(rows[0].keys().index(key)), rows)
     return map(itemgetter(key), rows)
 
@@ -220,7 +224,7 @@ class RowsModel(QAbstractTableModel):
             return
         self.beginResetModel()
         self.rows = self._sorted(rows)
-        self._ids = set(map(itemgetter("id"), self.rows))
+        self._ids = set(column(self.rows, "id"))
         self._born.clear()
         self._fade.stop()
         self._restyle()
@@ -433,7 +437,7 @@ class TablePage(QWidget):
 
     def load(self, rows) -> None:
         self._all_rows = rows
-        self._ids = set(map(itemgetter("id"), rows))
+        self._ids = set(column(rows, "id"))
         self._haystacks = {}
         self._apply_filters()
 
