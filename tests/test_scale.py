@@ -2,6 +2,7 @@
 and memory are counted, not timed, so these hold on a slow runner too; tools/perf.py --db measures the frame times
 on a real database."""
 import os
+import sqlite3
 import threading
 import time
 import tracemalloc
@@ -25,7 +26,7 @@ from subsentiment.gui.rows import RowSource, Saved  # noqa: E402
 from subsentiment.gui.words import WordTally  # noqa: E402
 from subsentiment.gui.worker import LoadWorker  # noqa: E402
 from subsentiment import store as store_module  # noqa: E402
-from subsentiment.store import Store, scoring_at_least  # noqa: E402
+from subsentiment.store import Search, Store, scoring_at_least  # noqa: E402
 
 from test_big_data import COMMENTS, POSTS, count_calls, fill  # noqa: E402
 from test_responsive import until  # noqa: E402
@@ -322,6 +323,7 @@ def test_a_stricter_score_filter_finds_its_rows_among_those_in_memory(tmp_path, 
         w.close()
 
 
+@pytest.mark.skipif(not Search(sqlite3.connect(":memory:")).ready, reason="this SQLite has no contentless deletes (3.43)")
 def test_filtering_a_big_subreddit_looks_its_words_up_on_a_thread_once_typing_pauses(tmp_path, monkeypatch):
     """Going through 650,000 comments' text took seconds; the search index finds a word's in a few milliseconds."""
     QApplication.instance() or QApplication([])
