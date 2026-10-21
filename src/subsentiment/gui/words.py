@@ -29,7 +29,7 @@ from subsentiment.gui import motion, theme
 from subsentiment.gui.charts import palette
 from subsentiment.gui.days import flat_button
 from subsentiment.gui.widgets import ElidedLabel, VerticalScrollArea, label
-from subsentiment.gui.worker import BackgroundJob, LoadWorker, Slices
+from subsentiment.gui.worker import BackgroundJob, LoadWorker, ScorePool, Slices
 from subsentiment.sentiment import Lexicon
 from subsentiment.store import column
 
@@ -567,13 +567,14 @@ def meaning(weight: float) -> str:
 class Rescore(QObject):
     """Scores a subreddit's saved posts and comments again by its words as they're set now, once some words'
     meanings there changed: only the items using one of those words. They're the rows the window has of it, or
-    else read on a thread (the window's LoadWorker, which goes through the day packs), and scored a slice at a
-    time between frames, each saved as it's scored. Every quarter second what's done is committed and sent out
-    with ``rescored``, so the pages follow as it goes. A change while one runs starts it again with every word
-    it was doing."""
+    else read on a thread (the window's LoadWorker, which goes through the day packs). They're searched for the
+    words a slice at a time between frames, and what's found is scored by a ScorePool in other processes, a
+    chunk at a time, or here between frames when there's little of it or the processes can't run. Each is saved
+    as it's scored. Every quarter second what's done is committed and sent out with ``rescored``, so the pages
+    follow as it goes. A change while one runs starts it again with every word it was doing."""
 
     rescored = Signal(str, str, object)  # subreddit (lowercased), "posts" or "comments", the rows with new scores
-    progress = Signal(str, int, int)  # subreddit, items gone through, of
+    progress = Signal(str, int, int)  # subreddit, thousandths done, 1000
     finished = Signal(str)  # subreddit: every item using the words is scored again and saved
     # Just before finished: subreddit, the words, how many items use them, how many labels the words changed
     # each way ({(label without them, label with them): items}), and how many others' scores were only out of
@@ -583,6 +584,8 @@ class Rescore(QObject):
 
     BATCH = 0.25  # seconds between two batches sent out
     COMMIT = 0.05  # seconds between two commits: other connections (a fetch) wait while one is open
+    CHUNK = 200  # items found sent to the processes at once; fewer than this in all are scored here
+    SCORE_COST = 400  # scoring an item found takes about as long as searching this many, for the progress
 
     def __init__(self, store, db_path: str, parent: QObject | None = None):
         super().__init__(parent)
@@ -590,15 +593,24 @@ class Rescore(QObject):
         self.job = BackgroundJob(self)
         self.job.ended.connect(self._next)
         self._slices = Slices(self)
+        self.pool = ScorePool(self)
+        self.pool.scored.connect(self._pooled)
+        self.pool.failed.connect(self._unpooled)
         self._todo: dict[str, set[str]] = {}  # subreddit -> words to rescore for, waiting their turn
         self._doing: tuple[str, set[str]] | None = None
         self._rows: dict[str, dict | None] = {}  # what start was given to go through, by subreddit
-        self._run = 0  # counts runs, so a read for one dropped since is ignored
+        self._run = 0  # counts runs, so a read or chunk for one dropped since is ignored
         self._batch: dict[str, list] = {k: [] for k in KINDS}  # rescored, not saved yet
         # By subreddit, the items its run found using the words, those whose label the words change (without
         # them, with them), and those it gave a new label for another reason (scored by an older version): kept
         # when a run starts again with more words, so the end tells everything it did.
         self._tally: dict[str, tuple[set, dict, set]] = {}
+        self._out = 0  # chunks the run has in the processes
+        self._retry: list[list] = []  # chunks they couldn't score, scored here once the search is done
+        self._lexicon: tuple[dict, frozenset] = ({}, frozenset())  # the run's weights, and the words it's for
+        self._counts = [0, 0, 0, 0]  # the run's items to search, searched, found and scored
+        self._shown = 0  # how far it's got, in thousandths, as last sent
+        self._sent_at = self._committed_at = 0.0
 
     def start(self, subreddit: str, words, rows: dict | None = None) -> None:
         """Rescore for ``words``; ``rows`` ({kind: rows}) are every saved post and comment of it, when the
@@ -621,6 +633,7 @@ class Rescore(QObject):
         self._todo.clear()
         self._rows.clear()
         self._drop()
+        self.pool.close()
         if self.job.busy:
             self.job.worker.finished.disconnect()
             self.job.worker.failed.disconnect()
@@ -633,6 +646,9 @@ class Rescore(QObject):
             self._save(self._doing[0])
         self._doing = None
         self._run += 1
+        if self._out:
+            self.pool.close()  # what's queued there is for the run dropped
+        self._out, self._retry = 0, []
 
     def _next(self) -> None:
         if self._doing is not None or self.job.busy or not self._todo:
@@ -653,42 +669,102 @@ class Rescore(QObject):
     def _on_read(self, read: tuple) -> None:
         run, rows, _ = read
         if run == self._run and self._doing is not None:
-            self._slices.start(self._steps(*self._doing, rows), self._finished)
+            self._slices.start(self._search(*self._doing, rows), self._settle)
 
-    def _steps(self, sub: str, words: set[str], rows: dict):
-        """Score the items using ``words`` again, yielding after each; saved a batch at a time."""
-        lexicon, uses = self.store.lexicon(sub), Lexicon(dict.fromkeys(words, 0.0)).uses
-        without = Lexicon({w: v for w, v in lexicon.weights.items() if w not in words})  # the words as usual
-        using, changed, stale = self._tally.setdefault(sub, (set(), {}, set()))
-        total, done = sum(map(len, rows.values())), 0
-        sent_at = committed_at = time.perf_counter()
+    def _search(self, sub: str, words: set[str], rows: dict):
+        """Find the items using ``words``, yielding after each, and send them to be scored a chunk at a time."""
+        self._lexicon = (self.store.lexicon(sub).weights, frozenset(words))
+        uses = Lexicon(dict.fromkeys(words, 0.0)).uses
+        self._counts, self._shown = [sum(map(len, rows.values())), 0, 0, 0], 0
+        self._sent_at = self._committed_at = time.perf_counter()
+        chunk, sent = [], False
         for kind in KINDS:
             for r in rows[kind]:
                 text = (r["body"] or "") if kind == "comments" else f"{r['title'] or ''}\n\n{r['selftext'] or ''}".strip()
-                done += 1
+                self._counts[1] += 1
                 if uses(text):
-                    s, label = lexicon.score(text)
-                    usual = without.score(text)[1]
-                    item = (kind, r["id"])
-                    using.add(item)
-                    if label != usual:
-                        changed[item] = (usual, label)
-                    else:
-                        changed.pop(item, None)
-                        if label != r["label"]:
-                            stale.add(item)
-                    if (s, label) != (r["sentiment"], r["label"]):
-                        self._batch[kind].append(r._replace(sentiment=s, label=label))
-                        self.store.rescore(kind, [(r["id"], s, label)])
-                now = time.perf_counter()
-                if now - sent_at > self.BATCH:
-                    self._save(sub)
-                    self.progress.emit(sub, done, total)
-                    sent_at = committed_at = time.perf_counter()
-                elif now - committed_at > self.COMMIT:
-                    self.store.commit()
-                    committed_at = now
+                    self._counts[2] += 1
+                    chunk.append((kind, r, text))
+                    if len(chunk) == self.CHUNK:
+                        self._submit(sub, chunk)
+                        chunk, sent = [], True
+                self._tick(sub)
                 yield
+        if sent and chunk:
+            self._submit(sub, chunk)
+        elif chunk:
+            yield from self._score_here(sub, [chunk])
+
+    def _submit(self, sub: str, chunk: list) -> None:
+        self._out += 1
+        self.pool.submit((self._run, sub, chunk), *self._lexicon, [t for *_, t in chunk])
+
+    def _score_here(self, sub: str, chunks: list[list]):
+        for chunk in chunks:
+            for item in chunk:
+                self._apply(sub, [item], Lexicon.compare(*self._lexicon, [item[2]]))
+                yield
+
+    def _pooled(self, tag, results: list) -> None:
+        run, sub, chunk = tag
+        if run == self._run:
+            self._out -= 1
+            self._apply(sub, chunk, results)
+            self._settle()
+
+    def _unpooled(self, tag) -> None:
+        run, sub, chunk = tag
+        if run == self._run:
+            self._out -= 1
+            self._retry.append(chunk)
+            self._settle()
+
+    def _settle(self) -> None:
+        """Once the search is done and every chunk is back: score what the processes couldn't, then finish."""
+        if self._doing is None or self._slices.running() or self._out:
+            return
+        if self._retry:
+            self._slices.start(self._score_here(self._doing[0], self._retry), self._settle)
+            self._retry = []
+        else:
+            self._finished()
+
+    def _apply(self, sub: str, items: list, results: list) -> None:
+        """Keep and save the scores ``results`` of ``items`` [(kind, row, text)], and tell what they changed."""
+        using, changed, stale = self._tally.setdefault(sub, (set(), {}, set()))
+        saves = {k: [] for k in KINDS}
+        for (kind, r, _), (s, label, usual) in zip(items, results):
+            item = (kind, r["id"])
+            using.add(item)
+            if label != usual:
+                changed[item] = (usual, label)
+            else:
+                changed.pop(item, None)
+                if label != r["label"]:
+                    stale.add(item)
+            if (s, label) != (r["sentiment"], r["label"]):
+                self._batch[kind].append(r._replace(sentiment=s, label=label))
+                saves[kind].append((r["id"], s, label))
+        for kind, scores in saves.items():
+            if scores:
+                self.store.rescore(kind, scores)
+        self._counts[3] += len(items)
+        self._tick(sub)
+
+    def _tick(self, sub: str) -> None:
+        """Commit now and then, and send out what's done every BATCH seconds, with how far it's got."""
+        now = time.perf_counter()
+        if now - self._sent_at > self.BATCH:
+            self._save(sub)
+            total, searched, found, scored = self._counts
+            likely = found * total / max(searched, 1)  # found by the end, at this rate
+            done = (searched + self.SCORE_COST * scored) / max(total + self.SCORE_COST * likely, 1)
+            self._shown = max(self._shown, round(1000 * done))  # an estimate that grew doesn't take it back
+            self.progress.emit(sub, self._shown, 1000)
+            self._sent_at = self._committed_at = time.perf_counter()
+        elif now - self._committed_at > self.COMMIT:
+            self.store.commit()
+            self._committed_at = now
 
     def _save(self, sub: str) -> None:
         self.store.commit()
@@ -701,6 +777,8 @@ class Rescore(QObject):
         sub, words = self._doing
         self._save(sub)
         self._doing = None
+        if not self._todo:
+            self.pool.rest()
         using, changed, stale = self._tally.pop(sub, (set(), {}, set()))
         self.scored.emit(sub, words, len(using), Counter(changed.values()), len(stale - changed.keys()))
         self.finished.emit(sub)
