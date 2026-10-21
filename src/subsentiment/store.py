@@ -470,6 +470,14 @@ class Store:
             "FROM posts p WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? "
             "AND p.image = 0 ORDER BY p.created_utc DESC", (subreddit, after, before)))
 
+    def comment_counts(self, subreddit: str, after: float | None, before: float | None) -> dict[str, int]:
+        """How many comments are saved on each post created in [after, before) that has any."""
+        return dict(self.db.execute(
+            "SELECT c.post_id, COUNT(*) FROM comments c JOIN posts p ON p.id = c.post_id "
+            "WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? GROUP BY c.post_id",
+            (subreddit, after if after is not None else float("-inf"),
+             before if before is not None else float("inf"))).fetchall())
+
     def posts_by_ids(self, ids) -> list[sqlite3.Row]:
         ids = list(ids)
         return self._unpacked("posts", self.db.execute(f"SELECT * FROM posts WHERE id IN ({','.join('?' * len(ids))})", ids))

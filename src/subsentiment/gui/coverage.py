@@ -18,8 +18,9 @@ from PySide6.QtWidgets import (
 )
 
 from subsentiment import collect
+from subsentiment.arctic_shift import TREE_MAX
 from subsentiment.gui import theme
-from subsentiment.gui.widgets import ElidedLabel, ShareBar, VerticalScrollArea, label, panel, plural, section
+from subsentiment.gui.widgets import CommentCap, ElidedLabel, ShareBar, VerticalScrollArea, label, panel, plural, section
 from subsentiment.gui.worker import BackgroundJob, CountWorker, StoreWorker
 
 DAY = 86400
@@ -263,11 +264,24 @@ class CoveragePage(VerticalScrollArea):
         self.tick_all.clicked.connect(self._tick_all)
         self.tick_all.setText("Select none")
         self.tick_all.setMinimumWidth(self.tick_all.sizeHint().width())  # doesn't shift as its text changes
+        settings = window.settings
         self.with_comments = QCheckBox("With comments")
         self.with_comments.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.with_comments.setToolTip("Also download every comment on each ticked day's posts")
-        self.with_comments.setChecked(True)
+        self.with_comments.setToolTip("Also download the comments on each ticked day's posts, as many "
+                                      "as the cap under the list allows")
+        self.with_comments.setChecked(settings.value("coverage/with_comments", True, bool))
         self.with_comments.toggled.connect(self._show_ticked)
+        self.with_comments.toggled.connect(lambda on: settings.setValue("coverage/with_comments", on))
+        # How many comments each thread of the ticked days keeps, and which. A thread with that many saved isn't
+        # asked about again; a bigger cap later tops it up.
+        self.comment_cap = CommentCap(settings, "coverage", 0, TREE_MAX, self)
+        self.comment_cap.count.setSingleStep(50)
+        self.comment_cap.count.setSuffix(" per thread")
+        self.comment_cap.count.setSpecialValueText("All comments")
+        self.comment_cap.count.setMinimumWidth(self.comment_cap.count.sizeHint().width())  # "1,000 per thread" whole
+        self.comment_cap.count.valueChanged.connect(self._show_ticked)
+        self.comment_cap.count.valueChanged.connect(self.comment_cap.save)
+        self.comment_cap.pick.currentIndexChanged.connect(self.comment_cap.save)
         self.download_ticked = small_button("Download selected")
         self.download_ticked.clicked.connect(self._download_ticked)
         left, left_lay = panel("solid", margins=14, spacing=8)
@@ -294,8 +308,11 @@ class CoveragePage(VerticalScrollArea):
         for w in (self.delete_question, self.delete_cancel, self.delete_confirm):
             w.setVisible(False)
         left_lay.addWidget(self.delete_question)
+        # The comment cap goes under the table, so the Days and Posts tables still start level.
         days_foot = QHBoxLayout()
         days_foot.setSpacing(10)
+        for w in (self.comment_cap.count, self.comment_cap.pick):
+            days_foot.addWidget(w)
         days_foot.addStretch(1)
         for b in (self.delete_ticked, self.delete_cancel, self.delete_confirm):
             days_foot.addWidget(b)
@@ -494,7 +511,10 @@ class CoveragePage(VerticalScrollArea):
         idle = not self.busy and not self.delete_job.busy
         counting = self.ticked & self._waiting
         self.download_ticked.setEnabled(bool(n) and idle and not counting)
-        what = "every post and comment" if self.with_comments.isChecked() else "every post"
+        comments, cap = self.with_comments.isChecked(), self.comment_cap.count.value()
+        self.comment_cap.set_enabled(comments)
+        what = ("every post" if not comments else "every post and comment" if not cap else
+                f"every post and up to {plural(cap, 'comment')} on each")
         self.download_ticked.setToolTip(
             "Waiting for Arctic Shift's count of the ticked days" if counting else
             f"Download {what} from the ticked days, newest first" if n else
@@ -728,8 +748,10 @@ class CoveragePage(VerticalScrollArea):
         days = tuple(sorted(self.ticked, reverse=True))
         comments = self.with_comments.isChecked()
         req = collect.FetchRequest(subreddit=self.subreddit, after=days[-1], before=days[0] + DAY, limit=None,
-                                   include_comments=comments, comments_per_post=0, days=days)
-        what = "post and comment" if comments else "post"
+                                   include_comments=comments, fill_threads=True, days=days,
+                                   **self.comment_cap.request())
+        cap = self.comment_cap.count.value()
+        what = "post" if not comments else "post and comment" if not cap else f"post, with up to {cap:,} comments each,"
         # The ticks stay until it ends: unticked once it has read them all, kept if it's stopped.
         self.window_.start_request(req, f"Downloading every {what} from {plural(len(days), 'day')} in r/{self.subreddit}…")
 

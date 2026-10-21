@@ -45,7 +45,7 @@ class FakeClient:
     def fetch_posts(self, *a, **kw):
         return [make_post(1, sub="AskScience"), make_post(2, sub="AskScience")]
 
-    def fetch_comments(self, post, limit):
+    def fetch_comments(self, post, limit, pick="top"):
         return [Comment(f"c{post.id}", post.id, "AskScience", "", "b", "This is wonderful", 1, 1.0, 0, "u")]
 
 
