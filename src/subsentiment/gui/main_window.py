@@ -29,7 +29,7 @@ from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.widgets import (
     ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatusLabel, fit_to_screen, label, panel, plural, section,
 )
-from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices
+from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices, lasting
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, scoring_at_least
 
@@ -785,11 +785,9 @@ class MainWindow(QMainWindow):
         self._update_dataset_labels()
 
     def _add_rows(self, kind: str, tab: TablePage, rows) -> None:
-        before = len(tab.all_rows)
         tab.add_rows(rows)
-        new = tab.all_rows[before:]
-        if kind == "posts" and new:
-            self._last_fetched = max([self._last_fetched or 0.0] + [r["fetched_at"] for r in new])
+        if kind == "posts" and rows:  # (a big table being worked out takes them once it's done)
+            self._last_fetched = max([self._last_fetched or 0.0] + [r["fetched_at"] for r in rows])
 
     def _flush_rows(self) -> None:
         self._drip.stop()
@@ -962,7 +960,7 @@ class MainWindow(QMainWindow):
             motion.crossfade(self.content)
         self.current = name or None
         if loaded is None:
-            with self.store.snapshot():
+            with self.store.snapshot(), lasting():
                 saved = {k: days.SavedRows(scoring_at_least(self.store.rows(k, name, words=True) if name else [], self.min_scores[i]))
                          for i, k in enumerate(KINDS)}
             loaded = (stats, saved, {k: Analysis(reversed(rows)) for k, rows in saved.items()})  # as LoadWorker does
@@ -1061,10 +1059,10 @@ class MainWindow(QMainWindow):
         self._drip.stop()
         self._queued = {"posts": [], "comments": []}
         self.posts = self._saved["posts"].between(whole)
-        self.posts_tab.load(self.posts)
+        yield from self.posts_tab.load_steps(self.posts)  # a big table a step at a time
         yield
         self.comments = self._saved["comments"].between(whole)
-        self.comments_tab.load(self.comments)
+        yield from self.comments_tab.load_steps(self.comments)
         self._update_dataset_labels()
         yield
         self.word_tally.count(self.posts, self.comments, fresh=reload)
