@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QCheckBox, QPushButton  # noqa: E402
+from PySide6.QtWidgets import QApplication, QCheckBox, QLabel, QPushButton  # noqa: E402
 
 from subsentiment.gui import worker  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
@@ -94,7 +94,8 @@ def settle(w, until=lambda: True, timeout=5.0):
     while time.time() < end:
         QApplication.processEvents()
         cov = w.coverage
-        idle = not w.fetch_job.busy and (cov is None or not (cov.count_job.busy or cov.delete_job.busy))
+        idle = not w.fetch_job.busy and (cov is None or not (cov.count_job.busy or cov.delete_job.busy
+                                                             or cov.threads_job.busy))
         if idle and until():
             break
         time.sleep(0.01)
@@ -183,6 +184,30 @@ def test_a_posts_download_all_fetches_only_that_posts_comments(window):
     assert downloads() == [("all_comments", "p0")]
     cell = c.post_table.cellWidget(0, 1)
     assert cell.main.text() == "5 saved" and "Complete" in cell.side.text()
+
+
+def test_each_day_says_how_many_comment_threads_are_saved_whole_and_follows_downloads(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+
+    def line(day):
+        return c.day_table.cellWidget(c.days.index(day), 0).findChildren(QLabel)[1]
+    day = TODAY - DAY  # p0 is on this day; p1 and p2 on the two before, each with 5 comments to get
+    assert [line(TODAY - k * DAY).text() for k in (1, 2, 3)] == ["0 of 1\u00a0thread"] * 3
+    assert not line(TODAY).isVisible() and line(day).isVisible()  # nothing saved today: no line
+    assert c.threads_total.text() == "Comments complete on 0 of 3\u00a0posts"
+    c.day_table.selectRow(c.days.index(day))
+    settle(w)
+    click(c.post_table, 0)  # p0's comments, read to the end
+    settle(w, lambda: not w.fetch_job.busy and line(day).text().startswith("\u2713"))
+    assert line(day).text() == "\u2713 1\u00a0thread"
+    assert c.threads_total.text() == "Comments complete on 1 of 3\u00a0posts"
+    tick(c, TODAY - 2 * DAY)  # the total covers the ticked days once any are
+    assert c.threads_total.text() == "Comments complete on 0 of 1\u00a0post"
+    assert downloads() == [("all_comments", "p0")]
 
 
 def tick(c, day, shift=False):
