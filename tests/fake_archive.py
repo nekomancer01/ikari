@@ -53,20 +53,21 @@ def make_posts(subreddit: str, now: float, days: int = 10, per_day=(6, 12, 0), s
         day = today - d * DAY
         for k in range(per_day[d % len(per_day)]):
             created = day + 3600 + k * 600
-            if created > now:
-                continue
             n += 1
             pid = f"{subreddit[:2].lower()}{n:04d}"
             settled = now - created > 36 * 3600
-            post = {"id": pid, "subreddit": subreddit, "title": f"{rng.choice(words)} #{n}",
-                    "selftext": rng.choice(["", "details inside", "[removed]"]), "author": f"user{n}",
-                    "score": rng.randint(2, 500) if settled else 1, "upvote_ratio": 0.9,
-                    "num_comments": rng.randint(0, 6) if settled else 0, "created_utc": created,
+            title, selftext = rng.choice(words), rng.choice(["", "details inside", "[removed]"])
+            score, comments = rng.randint(2, 500), rng.randint(0, 6)  # drawn either way, for the same reason
+            post = {"id": pid, "subreddit": subreddit, "title": f"{title} #{n}",
+                    "selftext": selftext, "author": f"user{n}",
+                    "score": score if settled else 1, "upvote_ratio": 0.9,
+                    "num_comments": comments if settled else 0, "created_utc": created,
                     "retrieved_on": created + (40 * 3600 if settled else 60),
                     "permalink": f"/r/{subreddit}/comments/{pid}/x/", "url": ""}
             if n % 5 == 0:
                 post["removed_by_category"] = "moderator"
-            out.append(post)
+            if created <= now:  # dropped only after it's made, so the older days' posts never shift
+                out.append(post)
     return out
 
 

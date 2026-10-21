@@ -559,7 +559,7 @@ def window(path):
             close()
         elif sys.argv[3] == "top":
             QTimer.singleShot(1500, close)  # the day's candidates are ranked; the download of the picks is out
-        elif len(w.store.posts("python")) >= 5:
+        elif w.store.posts("python"):  # not a count: in the hour after 01:00 UTC today has only a post or two
             QTimer.singleShot(1500, close)  # the rest of the posts, then the comments start
         else:
             QTimer.singleShot(50, close_once_posts_are_saved)
@@ -678,8 +678,14 @@ def test_a_big_download_reads_each_new_row_back_about_once(env, monkeypatch):
     fetch(w, comments=True, rng="month")
     s = env.store()
     saved = len(s.posts("python")) + len(s.comments("python"))
-    # 60 or more: in the hour after midnight UTC the fake archive has no posts for today yet.
-    assert saved >= 60 and sum(read) < 4 * saved  # linear; it was about saved² / 2
+    # How many of today's and yesterday's rows exist changes through the day, so the size check counts only
+    # older days' rows: all of their posts, and 50 or more rows with comments (failed from 01:00 UTC).
+    cut = NOW // DAY * DAY - DAY
+    old = [r for r in s.posts("python") + s.comments("python") if r["created_utc"] < cut]
+    assert len([r for r in s.posts("python") if r["created_utc"] < cut]) == len(
+        [p for p in env.archive.posts if p["subreddit"] == "Python" and p["created_utc"] < cut
+         and not p.get("removed_by_category")])
+    assert len(old) >= 50 and sum(read) < 4 * saved  # linear; it was about saved² / 2
 
 
 def test_a_busy_subreddit_that_times_out_still_fetches_with_narrower_queries(env, monkeypatch):
@@ -1101,7 +1107,8 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
     w = env.window()
     # The first day's posts come at once, more than the tables show in a second; then a long wait on that
     # day's comments before the next day's posts (#69), so `want` is what is saved once that wait starts.
-    env.archive.posts += make_posts("Burst", NOW, days=3, per_day=(80,), seed=4)
+    # Yesterday's: today's grow through the day from 01:00 UTC, a post every 10 minutes.
+    env.archive.posts += make_posts("Burst", NOW, days=4, per_day=(0, 80), seed=4)
     env.archive.delays[TREE] = 20  # long enough that no comment lands before the checks below, even on a busy runner
     w.fetch_form.subreddit.setText("Burst")
     w.fetch_form.include_comments.setChecked(True)
