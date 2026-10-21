@@ -17,6 +17,7 @@ from subsentiment import sentiment  # noqa: E402
 from subsentiment.analysis import WordCounts, words_in  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import motion  # noqa: E402
+from subsentiment.gui.rows import Saved  # noqa: E402
 from subsentiment.gui.words import KINDS, WordCloud, WordTally  # noqa: E402
 from subsentiment.reddit import Comment, Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
@@ -141,22 +142,35 @@ def test_a_little_less_room_keeps_the_words_where_they_are_and_a_lot_lays_them_o
     assert all(abs(big[k][0] - 700) < 700 for k in big) and len(big) == 25  # filled afresh, every word fits
 
 
-def test_a_big_recount_runs_on_a_thread_and_keeps_rows_added_meanwhile(monkeypatch):
+def saved_comments(path, sub, bodies) -> dict:
+    """A subreddit with these comments saved (no posts), as the window reads it: {kind: rows.Saved}."""
+    s = Store(path)
+    for i, body in enumerate(bodies):
+        s.save_comment(Comment(f"{sub}{i}", "p", sub, "t3_p", "b", body, 1, 1_700_000_000.0 + i, 0, "/r/x/"), 0.0,
+                       "neutral")
+    s.commit()
+    s.close()
+    return {k: Saved(str(path), k, sub) for k in KINDS}
+
+
+def test_a_big_recount_runs_on_a_thread_and_takes_rows_added_meanwhile(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(WordTally, "THREAD_FROM", 10)
+    saved = saved_comments(tmp_path / "w.db", "big", ["river market"] * 2000)
     tally = WordTally()
     done = []
     tally.changed.connect(lambda: done.append(True))
-    tally.count([], [comment(i, "river market") for i in range(2000)])
+    tally.count(saved, None, (None, None))
     assert not tally.ready  # counting on its thread; the window carries on
-    tally.add("comments", [comment(5000, "river bridge")])  # a fetch saved one meanwhile
+    saved["comments"].add([dict(comment(5000, "river bridge"), score=1, sentiment=0.0, created_utc=1_700_000_000.0)])
+    tally.count(saved, None, (None, None))  # a fetch saved one meanwhile, and the overview refreshed
     end = time.monotonic() + 10
-    while not done:
+    while not (tally.ready and not tally._slices.running()):
         assert time.monotonic() < end
         app.processEvents()
         time.sleep(0.01)
-    assert tally.ready and dict((w, n) for w, n, _ in tally.top(["comments"])) == {
-        "river": 2001, "market": 2000, "bridge": 1}
+    assert dict((w, n) for w, n, _ in tally.top(["comments"])) == {"river": 2001, "market": 2000, "bridge": 1}
+    assert done
 
 
 @pytest.fixture
@@ -202,13 +216,14 @@ def test_the_words_page_shows_the_saved_words_and_follows_scope_and_span(window)
     assert shown() == {"harbour": 1, "festival": 2, "tonight": 1, "lights": 1, "lovely": 1}
 
 
-def test_a_small_recount_drops_rows_added_for_a_big_one_still_running(monkeypatch):
+def test_a_small_count_lets_a_big_one_still_running_go(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(WordTally, "THREAD_FROM", 10)
+    big = saved_comments(tmp_path / "w.db", "big", ["river market"] * 2000)
+    small = saved_comments(tmp_path / "w.db", "small", ["quiet lane"])
     tally = WordTally()
-    tally.count([], [comment(i, "river market") for i in range(2000)])
-    tally.add("comments", [comment(5000, "river bridge")])  # saved for the big subreddit meanwhile
-    tally.count([], [comment(1, "quiet lane")])  # then a small one is chosen: counted at once
+    tally.count(big, None, (None, None))
+    tally.count(small, None, (None, None))  # then a small one is chosen: counted at once
     assert tally.ready and [w for w, *_ in tally.top(["comments"])] == ["lane", "quiet"]
     end = time.monotonic() + 3
     while time.monotonic() < end:  # the big count ends and is let go

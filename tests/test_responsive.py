@@ -19,7 +19,9 @@ from subsentiment.analysis import WordCounts  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import motion, theme  # noqa: E402
 from subsentiment.gui.charts import TimelineChart  # noqa: E402
-from subsentiment.gui.words import WordCloud, WordTally  # noqa: E402
+from subsentiment.gui.rows import Saved  # noqa: E402
+from subsentiment.gui.words import KINDS, WordCloud, WordTally  # noqa: E402
+from subsentiment.reddit import Comment, Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
 from test_big_data import COMMENTS, count_calls, fill  # noqa: E402
@@ -80,7 +82,7 @@ def wheel(chart, dy: int) -> None:
 def test_zooming_only_moves_the_chart_and_the_rest_catches_up_once_it_settles(window, monkeypatch):
     w = window
     chart = w.overview.timeline
-    loads = count_calls(monkeypatch, type(w.comments_tab), "load_steps")  # the span loads the tables a step at a time
+    loads = count_calls(monkeypatch, type(w.comments_tab), "set_rows_steps")  # the span loads the tables a step at a time
     recounts = count_calls(monkeypatch, WordTally, "count")
     places = count_calls(monkeypatch, WordCloud, "_place")
     split, real_words_in = [], analysis.words_in
@@ -95,7 +97,7 @@ def test_zooming_only_moves_the_chart_and_the_rest_catches_up_once_it_settles(wi
     until(lambda: not w._span_slices.running() and w.word_tally.ready)
     assert len(loads) == 2 and len(recounts) == 1
     assert len(w.comments) == w.comments_tab.model.rowCount() < COMMENTS
-    # Each row's text was split into words when the subreddit opened; the new span only adds them up.
+    # Each day's words were counted when they were saved; the new span only adds them up.
     assert split == []
     whole = WordCounts.top(WordCounts("posts", w.posts), WordCounts("comments", w.comments), n=150)
     assert w.word_tally.top(["posts", "comments"], 150) == whole
@@ -156,24 +158,45 @@ def test_a_big_subreddit_opens_on_a_thread_and_the_last_one_picked_wins(window, 
     assert {w.comments_tab.model.row_at(i)["subreddit"] for i in range(w.comments_tab.model.rowCount())} == {"Other"}
 
 
-def test_moving_the_span_counts_only_the_rows_it_gained_and_lost():
+def saved_rows(path, posts=(), comments=()) -> dict:
+    """Subreddit "town" with these posts and comments saved (dicts: id, text, label, day), as the window reads it."""
+    s = Store(path)
+    for p in posts:
+        s.save_post(Post(p["id"], "town", p["text"], "", "a", 1, 0.9, 0, p["day"], "https://r", ""), 0.0, p["label"])
+    for c in comments:
+        s.save_comment(Comment(c["id"], "p", "town", "t3_p", "b", c["text"], 1, c["day"], 0, "/r/x/"), 0.0, c["label"])
+    s.commit()
+    s.close()
+    return {k: Saved(str(path), k, "town") for k in KINDS}
+
+
+def test_moving_the_span_counts_its_days_words_without_splitting_any_text_again(tmp_path, monkeypatch):
     QApplication.instance() or QApplication([])
-    rows = [{"id": f"c{i}", "body": f"river {'market' if i % 2 else 'bridge'} {i}", "label": "positive"}
-            for i in range(3000)]
+    rows = [{"id": f"c{i}", "text": f"river {'market' if i % 2 else 'bridge'} {i}", "label": "positive",
+             "day": 1_700_000_000.0 + i * 600} for i in range(3000)]
+    saved = saved_rows(tmp_path / "w.db", comments=rows)
     tally = WordTally()
-    tally.count([], rows[:2000])
+    tally.count(saved, None, (None, None))
     until(lambda: tally.ready)
-    tally.count([], rows[500:2500])  # a span moved along: 500 rows off, 500 on
-    assert tally.ready  # at once
-    fresh = WordCounts("comments", rows[500:2500])
+    split, real_words_in = [], analysis.words_in
+    monkeypatch.setattr(analysis, "words_in", lambda text: split.append(1) or real_words_in(text))
+    span = (int(rows[500]["day"] // 86400 + 1) * 86400, int(rows[2500]["day"] // 86400) * 86400)
+    tally.count(saved, span, (None, None))  # a span moved along
+    until(lambda: tally.ready)
+    assert split == []
+    fresh = WordCounts("comments", [dict(r, body=r["text"]) for r in rows if span[0] <= r["day"] < span[1]])
     assert tally.top(["comments"], 50) == WordCounts.top(fresh, n=50)
 
 
-def test_rows_saved_again_with_a_new_label_are_counted_again_when_the_span_reloads():
+def test_rows_saved_again_with_a_new_label_are_counted_again(tmp_path):
     QApplication.instance() or QApplication([])
+    saved = saved_rows(tmp_path / "w.db", posts=[{"id": "a", "text": "happy banana", "label": "positive",
+                                                  "day": 1_700_000_000.0}])
     tally = WordTally()
-    tally.count([{"id": "a", "title": "happy banana", "selftext": "", "label": "positive"}], [])
-    tally.count([{"id": "a", "title": "sad banana", "selftext": "", "label": "negative"}], [], fresh=True)
+    tally.count(saved, None, (None, None))
+    saved["posts"].add([{"id": "a", "title": "sad banana", "selftext": "", "label": "negative", "sentiment": -0.5,
+                         "score": 1, "created_utc": 1_700_000_000.0}])
+    tally.count(saved, None, (None, None))
     assert tally.top(["posts"]) == [("banana", 1, -1.0), ("sad", 1, -1.0)]
 
 

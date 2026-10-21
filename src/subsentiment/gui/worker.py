@@ -1,12 +1,13 @@
 """Runs work without holding up the window: fetch jobs and archive counts on threads, which mostly wait on
-the network, and long Python work on the GUI thread a slice at a time (`Slices`)."""
+the network, numpy work on a thread (`on_thread`), and long Python work on the GUI thread a slice at a time
+(`Slices`)."""
 from __future__ import annotations
 
 import gc
 import multiprocessing
 import os
 import sqlite3
-import sys
+import threading
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -20,9 +21,7 @@ from subsentiment import collect
 from subsentiment.arctic_shift import ArcticShiftClient, RateLimiter
 from subsentiment.reddit import FetchError
 from subsentiment.sentiment import Lexicon
-from subsentiment.analysis import Analysis, words_in
-from subsentiment.gui.days import SavedRows
-from subsentiment.store import Store, scoring_at_least
+from subsentiment.store import Store
 
 # One limiter for every request the app sends, so a count running beside a fetch doesn't double the rate.
 LIMITER = RateLimiter()
@@ -46,6 +45,7 @@ class Slices(QObject):
     are no more. Starting again, or ``stop``, drops the work underway."""
 
     BUDGET = 0.006  # seconds of work between two frames
+    WAIT = object()  # yielded by a step waiting on other work (`on_thread`): the rest of this frame is let go
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
@@ -68,12 +68,48 @@ class Slices(QObject):
 
     def _step(self) -> None:
         end = time.perf_counter() + self.BUDGET
-        for _ in self._steps:
+        for item in self._steps:
+            if item is self.WAIT:
+                self._timer.setInterval(4)  # looked at again in a few milliseconds, not spun on
+                return
+            self._timer.setInterval(0)
             if time.perf_counter() >= end:
                 return
         done = self._done
         self.stop()
         done()
+
+
+def finish(steps: Iterator):
+    """Go through ``steps`` (as Slices would) here and now, waiting out any `on_thread` work; returns what the
+    generator returns."""
+    while True:
+        try:
+            if next(steps) is Slices.WAIT:
+                time.sleep(0.001)  # (lets the thread have the interpreter lock)
+        except StopIteration as done:
+            return done.value
+
+
+def on_thread(work: Callable):
+    """Run ``work`` on a thread of its own, yielding Slices.WAIT until it's done; what it returns is this
+    generator's return value (an error it raised is raised here). For numpy work, which lets go of the interpreter
+    lock as it goes: sorting 650,000 numbers there took 100 ms, and left every frame on time."""
+    box: list = []
+
+    def run():
+        try:
+            box.append((work(), None))
+        except Exception as e:  # handed to the window's thread
+            box.append((None, e))
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    while not box:
+        yield Slices.WAIT
+    result, error = box[0]
+    if error is not None:
+        raise error
+    return result
 
 
 class ScorePool(QObject):
@@ -202,135 +238,54 @@ def lasting():
             gc.enable()
 
 
-def split_words(db_path: str, kind: str, subreddit: str, days: tuple[float, float]) -> list[tuple]:
-    """[(id, its words)] for a subreddit's posts or comments posted in ``days``: run in another process, a few
-    of which split a big subreddit's words (much of the time it took to open) while its rows are read."""
-    store = Store(db_path)
-    try:
-        return [(r.id, r.words) for r in store.rows(kind, subreddit, words=True, days=days)]
-    finally:
-        store.db.close()
-
-
 class LoadWorker(QObject):
-    """Reads a saved subreddit with a connection of its own and counts it up, so opening a big one doesn't
-    hold up the window: sqlite lets go of the interpreter while it reads, so the window paints meanwhile.
-
-    First ``summed`` sends its days' totals counted by the store, in a second; then ``read`` its rows, without
-    their words; then ``finished`` the words of each row, {kind: {id: words}}, split meanwhile in other
-    processes (``words``; else None)."""
-    summed = Signal(object)  # (tag, {kind: Analysis})
-    read = Signal(object)  # (tag, {kind: rows}, {kind: Analysis}): the tag it was given
-    finished = Signal(object)  # (tag, {kind: {id: words}} or None)
+    """Reads a saved subreddit with connections of its own, so opening a big one doesn't hold up the window: numpy,
+    zstd and sqlite let go of the interpreter lock as they work, so the window paints meanwhile. ``read`` sends its
+    posts and comments as rows.Saved (a RowIndex each, 0.7 s for 650,000 comments); with ``rows``, every one of
+    them as a store.Row instead (half a minute for those), for Rescore to search through."""
+    read = Signal(object)  # (tag, {kind: rows.Saved, or a list of rows}): the tag it was given
+    finished = Signal(object)  # (tag,)
     failed = Signal(str)
 
-    PARTS = 3  # day ranges a worker process is given, about as many items each
-
-    def __init__(self, db_path: str, subreddit: str, min_scores: tuple, tag=None, words: bool = True):
+    def __init__(self, db_path: str, subreddit: str, tag=None, rows: bool = False):
         super().__init__()
-        self.args = (db_path, subreddit, min_scores)
-        self.tag, self.words = tag, words
+        self.db_path, self.subreddit, self.tag, self.rows = db_path, subreddit, tag, rows
         self.store: Store | None = None
-        self._pool: ProcessPoolExecutor | None = None
         self._stop = False
 
     def stop(self) -> None:
-        """Cut the read short (the window is closing): reading a big subreddit takes half a minute, and Qt aborted
-        the process when the window went with its thread still running."""
+        """Cut the read short (the window is closing): Qt aborted the process when the window went with its thread
+        still running."""
         self._stop = True
         store = self.store
         if store is not None:
             store.db.interrupt()  # (from any thread) the query being read fails at its next row
-        self._end_pool()
-
-    def _end_pool(self) -> None:
-        """End the processes splitting words, and what they're on with them."""
-        pool, self._pool = self._pool, None
-        if pool is not None:
-            pool.shutdown(wait=False, cancel_futures=True)
-            for process in list((pool._processes or {}).values()):
-                process.terminate()
 
     @Slot()
     def run(self) -> None:
-        db_path, subreddit, (min_post, min_comment) = self.args
-        store, least = None, {"posts": min_post, "comments": min_comment}
+        from subsentiment.gui.rows import Saved  # (it runs work on threads with on_thread, from here)
+        store = None
         try:
-            store = self.store = Store(db_path)
-            if self._stop:
-                raise sqlite3.OperationalError("interrupted")
-            with store.snapshot():
-                if self.words:
-                    every = {k: store.day_totals(k, subreddit) for k in least}  # words for any score filter
-                    sums = {k: Analysis.from_days(every[k] if least[k] is None else
-                                                  store.day_totals(k, subreddit, least[k])) for k in least}
-                    self.summed.emit((self.tag, sums))
-                    splits = self._split(db_path, subreddit, every)
-                with lasting():
-                    rows = {k: SavedRows(scoring_at_least(store.rows(k, subreddit), least[k])) for k in least}
-            # Counted newest first, as Store.posts reads them: a total's last digits depend on the order it's added up in.
-            self.read.emit((self.tag, rows, {k: Analysis(reversed(v)) for k, v in rows.items()}))
-            words = None
-            if self.words:
-                with lasting():
-                    words = {k: dict(self._words(k, splits.get(k), rows[k])) for k in least}
-                if self._stop:  # cut short: not every row's
-                    words = None
-            self.finished.emit((self.tag, words))
+            if self.rows:
+                store = self.store = Store(self.db_path)
+                if self._stop:
+                    raise sqlite3.OperationalError("interrupted")
+                with store.snapshot(), lasting():
+                    got = {k: store.rows(k, self.subreddit) for k in ("posts", "comments")}
+            else:
+                got = {}
+                for kind in ("posts", "comments"):
+                    if self._stop:
+                        raise sqlite3.OperationalError("interrupted")
+                    got[kind] = Saved(self.db_path, kind, self.subreddit)
+            self.read.emit((self.tag, got))
+            self.finished.emit((self.tag,))
         except Exception as e:
             self.failed.emit(failure_text(e))
         finally:
-            self._end_pool()
             if store is not None:
                 self.store = None
                 store.close()
-
-    def _split(self, db_path: str, subreddit: str, totals: dict) -> dict:
-        """{kind: [the futures of its words a day range at a time]}, or {} where processes can't run."""
-        if sum(n for t in totals.values() for _, _, n, _ in t) < 20_000:
-            return {}
-        try:
-            self._pool = ProcessPoolExecutor(ScorePool.WORKERS, mp_context=multiprocessing.get_context("spawn"))
-            out = {}
-            for kind, rows in totals.items():
-                per_day: dict[int, int] = {}
-                for day, _, n, _ in rows:
-                    per_day[day] = per_day.get(day, 0) + n
-                size, ranges, start, n = sum(per_day.values()) / (ScorePool.WORKERS * self.PARTS), [], None, 0
-                for day in sorted(per_day):
-                    start = day if start is None else start
-                    n += per_day[day]
-                    if n >= size:
-                        ranges.append((start, day + 86400))
-                        start, n = None, 0
-                if start is not None:
-                    ranges.append((start, float("inf")))
-                if ranges:
-                    ranges[0] = (float("-inf"), ranges[0][1])
-                out[kind] = [self._pool.submit(split_words, db_path, kind, subreddit, r) for r in ranges]
-            return out
-        except Exception:  # processes can't start here: split on this thread instead
-            return {}
-
-    def _words(self, kind: str, futures: list | None, rows):
-        """(id, words) for every one of ``rows``: from the processes, interned here (each word kept once), or
-        split on this thread if they couldn't."""
-        intern = sys.intern
-        try:
-            for future in futures or ():
-                for rid, words in future.result():
-                    if self._stop:
-                        return
-                    yield rid, tuple(map(intern, words))
-            if futures:
-                return
-        except Exception:
-            pass
-        for r in rows:  # (rows the processes did split are split again: only when they fail)
-            if self._stop:
-                return
-            text = r.body if kind == "comments" else f"{r.title or ''} {r.selftext or ''}"
-            yield r.id, tuple(map(intern, words_in(text or "")))
 
 
 class StoreWorker(QObject):
