@@ -830,8 +830,8 @@ class MainWindow(QMainWindow):
         self._loaded.clear()  # what it saved (scores too) is read again, not shown from memory
         self._rescore_after_fetch()
         self.progress_msg.setText(finish_text(result, self.request))
-        if self.request.days and not (result.stopped or result.timed_out):  # stopped: the ticks stay, to go on
-            self.coverage.untick(self.request.days)
+        # Download coverage's ticked days: unticked once read to the end; stopped, they stay, offered to resume.
+        self.coverage.fetch_ended(self.request, result.stopped or result.timed_out)
         self._live.stop()
         self._flush_rows()
         if self.current and self.current.lower() == result.subreddit.lower():
@@ -883,6 +883,7 @@ class MainWindow(QMainWindow):
         self._rescore_after_fetch()
         self._live.stop()
         self._flush_rows()
+        self.coverage.fetch_ended(self.request, True)
         # Show anything stored before the error, unless the user went to look at another subreddit.
         self._refresh_datasets(select=self.request.subreddit if self._follow else None)
         kept = self.current and self.current.lower() == self.request.subreddit.lower()

@@ -79,6 +79,12 @@ CREATE TABLE IF NOT EXISTS words (
     subreddit TEXT NOT NULL, word TEXT NOT NULL, weight REAL NOT NULL, saved_at REAL,  -- subreddit lowercased
     PRIMARY KEY (subreddit, word)
 ) WITHOUT ROWID;
+-- Arctic Shift's count of a subreddit's posts on each UTC day (its start, in epoch seconds), and when it was asked:
+-- Download coverage asks for a day's count at most once a UTC day (CoveragePage).
+CREATE TABLE IF NOT EXISTS archive_counts (
+    subreddit TEXT NOT NULL, day INTEGER NOT NULL, posts INTEGER NOT NULL, counted_at REAL NOT NULL,  -- subreddit lowercased
+    PRIMARY KEY (subreddit, day)
+) WITHOUT ROWID;
 -- (Lookups by subreddit alone use the *_fetched indexes below, which start with it.)
 CREATE INDEX IF NOT EXISTS comments_post ON comments(post_id);
 -- A running fetch's new rows are read back by when they were saved.
@@ -619,6 +625,32 @@ class Store:
             (subreddit.lower(), after, before))
         return {r["d"]: r["n"] for r in rows}
 
+    def save_archive_counts(self, subreddit: str, counts: dict[int, int], at: float | None = None) -> None:
+        at = time.time() if at is None else at
+        self.db.executemany("INSERT OR REPLACE INTO archive_counts VALUES (?, ?, ?, ?)",
+                            [(subreddit.lower(), int(d), int(n), at) for d, n in counts.items()])
+        self.db.commit()
+
+    def archive_counts(self, subreddit: str, after: float, before: float, since: float = 0) -> dict[int, int]:
+        """The archive's post count of each UTC day in [after, before) that was asked for at or after ``since``."""
+        rows = self.db.execute("SELECT day, posts FROM archive_counts WHERE subreddit = ? AND day >= ? AND day < ? "
+                               "AND counted_at >= ?", (subreddit.lower(), after, before, since))
+        return {r["day"]: r["posts"] for r in rows}
+
+    def open_threads(self, subreddit: str, days, every: bool = False) -> list[str]:
+        """Saved posts from these UTC days (their starts) whose comment threads aren't saved whole, or with
+        ``every`` all of them, newest first: what Download coverage's comment downloads fetch."""
+        days = sorted(days)
+        if not days:
+            return []
+        rows = self.db.execute(
+            "SELECT p.id, CAST(p.created_utc / 86400 AS INTEGER) * 86400 d FROM posts p WHERE p.subreddit = ? "
+            "COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? AND p.image = 0 "
+            + ("" if every else f"AND NOT {WHOLE_THREAD} ") + "ORDER BY p.created_utc DESC",
+            (subreddit, days[0], days[-1] + 86400))
+        want = set(days)
+        return [r["id"] for r in rows if r["d"] in want]
+
     def posts_per_day(self, subreddit: str, after: float, before: float, images: bool = False) -> dict[int, int]:
         """Saved posts per UTC day in [after, before), as {day start: count}; ``images`` counts the image
         posts that were skipped instead (the archive's daily totals include them)."""
@@ -836,6 +868,7 @@ class Store:
         self.db.execute("DELETE FROM notes")
         self.db.execute("DELETE FROM words")
         self.db.execute("DELETE FROM packs")
+        self.db.execute("DELETE FROM archive_counts")
         self.db.commit()
         self._compact()
 
