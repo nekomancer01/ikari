@@ -94,7 +94,7 @@ def settle(w, until=lambda: True, timeout=5.0):
     while time.time() < end:
         QApplication.processEvents()
         cov = w.coverage
-        idle = not w.fetch_job.busy and (cov is None or not cov.count_job.busy)
+        idle = not w.fetch_job.busy and (cov is None or not (cov.count_job.busy or cov.delete_job.busy))
         if idle and until():
             break
         time.sleep(0.01)
@@ -290,3 +290,125 @@ def test_download_selected_with_comments_fetches_every_comment_on_those_days_onl
     assert threads == sorted(["p0", "p2", "new0", "new1", "new2", "new3"])  # p1, on the day between, isn't
     assert not [d for d in got if d[0] == "comments"]
     assert "p1" not in w.store.complete_keys("comments", "Python")
+
+
+def answer(c, yes, wait=True):
+    """Answer the question Delete selected asks under the Days table, and let what it starts end."""
+    assert c.delete_question.isVisible() and not c.delete_ticked.isVisible()
+    QTest.mouseClick(c.delete_confirm if yes else c.delete_cancel, Qt.MouseButton.LeftButton)
+    if wait:
+        settle(c.window_)
+    QApplication.processEvents()
+
+
+def test_delete_selected_asks_then_forgets_only_the_ticked_days_and_they_download_again(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    tick(c, TODAY - 3 * DAY)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)  # posts and comments of one day saved first
+    settle(w, lambda: not w.fetch_job.busy)
+    assert w.store.posts_per_day("Python", TODAY - 3 * DAY, TODAY - 2 * DAY) == {TODAY - 3 * DAY: 5}
+    assert str(TODAY - 3 * DAY) in w.store.complete_keys("posts", "Python")
+    rust = (w.store.posts("rust"), w.store.comments("rust"))
+    FakeArchive.calls = []
+
+    assert not c.delete_ticked.isEnabled()
+    tick(c, TODAY - 3 * DAY)
+    tick(c, TODAY - DAY)
+    assert c.delete_ticked.text().replace("\u00a0", " ") == "Delete 2 days…" and c.delete_ticked.isEnabled()
+    QTest.mouseClick(c.delete_ticked, Qt.MouseButton.LeftButton)
+    settle(w)
+    asked = c.delete_question.text().replace("\u00a0", " ")
+    assert "6 posts" in asked and "2 days" in asked and "r/Python" in asked and "can't be undone" in asked
+    assert c.delete_confirm.text().replace("\u00a0", " ") == "Delete 2 days"
+    tick(c, TODAY - 2 * DAY)  # ticked while it asks: the question follows
+    assert "3 days" in c.delete_question.text().replace("\u00a0", " ")
+    tick(c, TODAY - 2 * DAY)
+    answer(c, False)  # nothing goes
+    assert not c.delete_question.isVisible() and c.delete_ticked.isVisible()
+    assert w.store.posts_per_day("Python", TODAY - 7 * DAY, TODAY + DAY) == {
+        TODAY - DAY: 1, TODAY - 2 * DAY: 1, TODAY - 3 * DAY: 5}
+
+    QTest.mouseClick(c.delete_ticked, Qt.MouseButton.LeftButton)
+    settle(w)
+    answer(c, True)
+    settle(w, lambda: not c.delete_job.busy)
+    assert downloads() == []  # deleting fetches nothing
+    store = w.store
+    assert store.posts_per_day("Python", TODAY - 7 * DAY, TODAY + DAY) == {TODAY - 2 * DAY: 1}  # the day between stays
+    assert [r["post_id"] for r in store.comments("Python")] == []
+    assert str(TODAY - 3 * DAY) not in store.complete_keys("posts", "Python")
+    assert not store.complete_keys("comments", "Python")
+    assert (store.posts("rust"), store.comments("rust")) == rust
+    assert c.ticked == set()
+    # Every page shows what's left, at once.
+    assert [r["id"] for r in w.posts] == ["p1"] and w.comments == []
+    assert w.posts_tab.model.rowCount() == 1 and w.comments_tab.model.rowCount() == 0
+    assert w._counted.counts and sum(w._counted.counts.values()) == 1
+    row = c.days.index(TODAY - 3 * DAY)
+    assert c.day_table.cellWidget(row, 1).main.text() == "0 of 10"
+    button = c.day_table.cellWidget(row, 2).findChild(QPushButton)
+    assert button.text() == "Download all" and button.isEnabled()
+    assert "2 days" in w.statusBar().currentMessage().replace("\u00a0", " ")
+
+    # Deleted, it stays deleted: not back when the subreddit is opened again, and a download reads it in full.
+    select(w, "rust")
+    select(w, "Python")
+    assert store.posts_per_day("Python", TODAY - 3 * DAY, TODAY - 2 * DAY) == {}
+    click(c.day_table, row)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert downloads() == [("posts", "Python", TODAY - 3 * DAY, TODAY - 2 * DAY)]
+    assert store.posts_per_day("Python", TODAY - 3 * DAY, TODAY - 2 * DAY) == {TODAY - 3 * DAY: 4}
+
+
+def test_deleting_every_saved_day_keeps_the_subreddit_on_screen_to_download_again(window):
+    w = window
+    select(w, "rust")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    tick(c, TODAY - DAY)  # r0, its only post
+    QTest.mouseClick(c.delete_ticked, Qt.MouseButton.LeftButton)
+    settle(w)
+    answer(c, True)
+    settle(w, lambda: not c.delete_job.busy)
+    names = [w.datasets.item(i).data(Qt.ItemDataRole.UserRole) for i in range(w.datasets.count())]
+    assert names == ["Python"] and w.current == "rust" and c.subreddit == "rust"
+    assert w.posts == [] and w.store.posts("Python")
+    assert downloads() == []
+    FakeArchive.archive = dict(FakeArchive.archive, rust=[post("r0", "rust", TODAY - DAY + 500)])
+    try:
+        click(c.day_table, c.days.index(TODAY - DAY))
+        settle(w, lambda: not w.fetch_job.busy)
+    finally:
+        del FakeArchive.archive["rust"]
+    names = [w.datasets.item(i).data(Qt.ItemDataRole.UserRole) for i in range(w.datasets.count())]
+    assert "rust" in names and [r["id"] for r in w.posts] == ["r0"]
+
+
+def test_nothing_else_writes_while_days_are_deleted(window, monkeypatch):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    tick(c, TODAY - DAY)
+    QTest.mouseClick(c.delete_ticked, Qt.MouseButton.LeftButton)
+    settle(w)
+    import threading
+    hold = threading.Event()
+    deleting = Store.delete_days
+    monkeypatch.setattr(Store, "delete_days", lambda self, *a: (hold.wait(5), deleting(self, *a))[1])
+    answer(c, True, wait=False)
+    assert c.delete_job.busy
+    assert not w.fetch_btn.isEnabled() and not c.download_ticked.isEnabled() and not w.delete_btn.isEnabled()
+    assert not c.day_table.cellWidget(0, 2).findChild(QPushButton).isEnabled()
+    assert not w.start_request(mw.collect.FetchRequest(subreddit="Python"), "x")
+    hold.set()
+    settle(w, lambda: not c.delete_job.busy)
+    assert w.fetch_btn.isEnabled() and w.delete_btn.isEnabled()
+    assert c.day_table.cellWidget(0, 2).findChild(QPushButton).isEnabled()
+    assert downloads() == []

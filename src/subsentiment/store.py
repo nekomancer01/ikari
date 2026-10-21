@@ -549,6 +549,75 @@ class Store:
         self.db.commit()
         self._compact()
 
+    def delete_days(self, subreddit: str, days) -> tuple[int, int]:
+        """Forget what's saved from some UTC days (their starts) of a subreddit: the posts created on them, the
+        comments on those posts, their text in the day packs, and every record of downloading them (complete
+        days and threads, read-through spans, removed posts seen), so each day shows as never downloaded and
+        a download reads it again in full. Timeline notes stay. One transaction. Returns the (posts, comments)
+        deleted that the app shows (image posts and their comments are deleted too, but never shown)."""
+        sub, days = subreddit.lower(), sorted({int(d) // 86400 * 86400 for d in days})
+        if not days:
+            return 0, 0
+        self.db.commit()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute("CREATE TEMP TABLE gone (id TEXT PRIMARY KEY)")
+            for d in days:
+                self.db.execute("INSERT OR IGNORE INTO temp.gone SELECT id FROM posts WHERE subreddit = ? COLLATE NOCASE "
+                                "AND created_utc >= ? AND created_utc < ?", (subreddit, d, d + 86400))
+            shown = self.db.execute(
+                "SELECT (SELECT COUNT(*) FROM posts WHERE image = 0 AND id IN temp.gone), (SELECT COUNT(*) FROM comments "
+                "c WHERE c.post_id IN temp.gone AND " + NOT_IMAGE + ")").fetchone()
+            # The comments' text sits in the packs of the days they were written, beside other posts' comments.
+            repack: dict[int, set[str]] = {}
+            for r in self.db.execute("SELECT id, CAST(created_utc / 86400 AS INTEGER) d FROM comments "
+                                     "WHERE packed = 1 AND post_id IN temp.gone"):
+                repack.setdefault(r["d"], set()).add(r["id"])
+            self.db.execute("DELETE FROM comments WHERE post_id IN temp.gone")
+            self.db.execute("DELETE FROM comment_fetches WHERE post_id IN temp.gone")
+            self.db.execute("DELETE FROM complete WHERE kind IN ('comments', 'comments_so_far') AND subreddit = ? "
+                            "AND key IN temp.gone", (sub,))
+            self.db.execute("DELETE FROM posts WHERE id IN temp.gone")
+            self.db.executemany("DELETE FROM complete WHERE kind = 'posts' AND subreddit = ? AND key = ?",
+                                [(sub, str(d)) for d in days])
+            self.db.executemany("DELETE FROM removed_posts WHERE subreddit = ? AND created_utc >= ? AND created_utc < ?",
+                                [(sub, d, d + 86400) for d in days])
+            self.db.executemany("DELETE FROM packs WHERE kind = 'posts' AND subreddit = ? AND day = ?",
+                                [(sub, d // 86400) for d in days])
+            packer = zstandard.ZstdCompressor(level=_ZSTD_LEVEL)
+            for day, ids in repack.items():
+                left = {i: v for i, v in self._pack("comments", sub, day, cached=False).items() if i not in ids}
+                if left:
+                    blob = packer.compress(json.dumps({"columns": PACKED["comments"], "rows": left},
+                                                      ensure_ascii=False).encode())
+                    self.db.execute("UPDATE packs SET data = ?, packed_at = ? WHERE kind = 'comments' AND subreddit = ? "
+                                    "AND day = ?", (blob, time.time(), sub, day))
+                else:
+                    self.db.execute("DELETE FROM packs WHERE kind = 'comments' AND subreddit = ? AND day = ?", (sub, day))
+            # What fetches read through, less the days deleted.
+            spans = []
+            for a, b in self.read_spans(subreddit):
+                for d in days:
+                    if a < d <= b:
+                        spans.append((a, d - 1))
+                    a = max(a, d + 86400) if a <= d + 86399 and b >= d else a
+                if a <= b:
+                    spans.append((a, b))
+            self.db.execute("DELETE FROM complete WHERE kind = 'posts_read' AND subreddit = ?", (sub,))
+            for a, b in spans:
+                self.mark_complete("posts_read", subreddit, f"{a}:{b}")
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+        finally:
+            self.db.execute("DROP TABLE IF EXISTS temp.gone")
+        with Store._packs_lock:
+            for key in [k for k in Store._packs if k[0] == self.path and k[2] == sub]:
+                del Store._packs[key]
+        self._compact()
+        return shown[0], shown[1]
+
     def delete_all(self) -> None:
         self.db.execute("DELETE FROM posts")
         self.db.execute("DELETE FROM comments")
