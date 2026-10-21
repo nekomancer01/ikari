@@ -6,6 +6,7 @@ import gc
 import multiprocessing
 import os
 import sqlite3
+import sys
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -19,7 +20,7 @@ from subsentiment import collect
 from subsentiment.arctic_shift import ArcticShiftClient, RateLimiter
 from subsentiment.reddit import FetchError
 from subsentiment.sentiment import Lexicon
-from subsentiment.analysis import Analysis
+from subsentiment.analysis import Analysis, words_in
 from subsentiment.gui.days import SavedRows
 from subsentiment.store import Store, scoring_at_least
 
@@ -201,17 +202,36 @@ def lasting():
             gc.enable()
 
 
+def split_words(db_path: str, kind: str, subreddit: str, days: tuple[float, float]) -> list[tuple]:
+    """[(id, its words)] for a subreddit's posts or comments posted in ``days``: run in another process, a few
+    of which split a big subreddit's words (much of the time it took to open) while its rows are read."""
+    store = Store(db_path)
+    try:
+        return [(r.id, r.words) for r in store.rows(kind, subreddit, words=True, days=days)]
+    finally:
+        store.db.close()
+
+
 class LoadWorker(QObject):
     """Reads a saved subreddit with a connection of its own and counts it up, so opening a big one doesn't
-    hold up the window: sqlite lets go of the interpreter while it reads, so the window paints meanwhile."""
-    finished = Signal(object)  # (tag, rows, analysis): the tag it was given, {kind: rows}, {kind: Analysis}
+    hold up the window: sqlite lets go of the interpreter while it reads, so the window paints meanwhile.
+
+    First ``summed`` sends its days' totals counted by the store, in a second; then ``read`` its rows, without
+    their words; then ``finished`` the words of each row, {kind: {id: words}}, split meanwhile in other
+    processes (``words``; else None)."""
+    summed = Signal(object)  # (tag, {kind: Analysis})
+    read = Signal(object)  # (tag, {kind: rows}, {kind: Analysis}): the tag it was given
+    finished = Signal(object)  # (tag, {kind: {id: words}} or None)
     failed = Signal(str)
 
-    def __init__(self, db_path: str, subreddit: str, min_scores: tuple, tag=None):
+    PARTS = 3  # day ranges a worker process is given, about as many items each
+
+    def __init__(self, db_path: str, subreddit: str, min_scores: tuple, tag=None, words: bool = True):
         super().__init__()
         self.args = (db_path, subreddit, min_scores)
-        self.tag = tag
+        self.tag, self.words = tag, words
         self.store: Store | None = None
+        self._pool: ProcessPoolExecutor | None = None
         self._stop = False
 
     def stop(self) -> None:
@@ -221,26 +241,96 @@ class LoadWorker(QObject):
         store = self.store
         if store is not None:
             store.db.interrupt()  # (from any thread) the query being read fails at its next row
+        self._end_pool()
+
+    def _end_pool(self) -> None:
+        """End the processes splitting words, and what they're on with them."""
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+            for process in list((pool._processes or {}).values()):
+                process.terminate()
 
     @Slot()
     def run(self) -> None:
         db_path, subreddit, (min_post, min_comment) = self.args
-        store = None
+        store, least = None, {"posts": min_post, "comments": min_comment}
         try:
             store = self.store = Store(db_path)
             if self._stop:
                 raise sqlite3.OperationalError("interrupted")
-            with store.snapshot(), lasting():
-                rows = {k: SavedRows(scoring_at_least(store.rows(k, subreddit, words=True), least))
-                        for k, least in (("posts", min_post), ("comments", min_comment))}
+            with store.snapshot():
+                if self.words:
+                    every = {k: store.day_totals(k, subreddit) for k in least}  # words for any score filter
+                    sums = {k: Analysis.from_days(every[k] if least[k] is None else
+                                                  store.day_totals(k, subreddit, least[k])) for k in least}
+                    self.summed.emit((self.tag, sums))
+                    splits = self._split(db_path, subreddit, every)
+                with lasting():
+                    rows = {k: SavedRows(scoring_at_least(store.rows(k, subreddit), least[k])) for k in least}
             # Counted newest first, as Store.posts reads them: a total's last digits depend on the order it's added up in.
-            self.finished.emit((self.tag, rows, {k: Analysis(reversed(v)) for k, v in rows.items()}))
+            self.read.emit((self.tag, rows, {k: Analysis(reversed(v)) for k, v in rows.items()}))
+            words = None
+            if self.words:
+                with lasting():
+                    words = {k: dict(self._words(k, splits.get(k), rows[k])) for k in least}
+                if self._stop:  # cut short: not every row's
+                    words = None
+            self.finished.emit((self.tag, words))
         except Exception as e:
             self.failed.emit(failure_text(e))
         finally:
+            self._end_pool()
             if store is not None:
                 self.store = None
                 store.close()
+
+    def _split(self, db_path: str, subreddit: str, totals: dict) -> dict:
+        """{kind: [the futures of its words a day range at a time]}, or {} where processes can't run."""
+        if sum(n for t in totals.values() for _, _, n, _ in t) < 20_000:
+            return {}
+        try:
+            self._pool = ProcessPoolExecutor(ScorePool.WORKERS, mp_context=multiprocessing.get_context("spawn"))
+            out = {}
+            for kind, rows in totals.items():
+                per_day: dict[int, int] = {}
+                for day, _, n, _ in rows:
+                    per_day[day] = per_day.get(day, 0) + n
+                size, ranges, start, n = sum(per_day.values()) / (ScorePool.WORKERS * self.PARTS), [], None, 0
+                for day in sorted(per_day):
+                    start = day if start is None else start
+                    n += per_day[day]
+                    if n >= size:
+                        ranges.append((start, day + 86400))
+                        start, n = None, 0
+                if start is not None:
+                    ranges.append((start, float("inf")))
+                if ranges:
+                    ranges[0] = (float("-inf"), ranges[0][1])
+                out[kind] = [self._pool.submit(split_words, db_path, kind, subreddit, r) for r in ranges]
+            return out
+        except Exception:  # processes can't start here: split on this thread instead
+            return {}
+
+    def _words(self, kind: str, futures: list | None, rows):
+        """(id, words) for every one of ``rows``: from the processes, interned here (each word kept once), or
+        split on this thread if they couldn't."""
+        intern = sys.intern
+        try:
+            for future in futures or ():
+                for rid, words in future.result():
+                    if self._stop:
+                        return
+                    yield rid, tuple(map(intern, words))
+            if futures:
+                return
+        except Exception:
+            pass
+        for r in rows:  # (rows the processes did split are split again: only when they fail)
+            if self._stop:
+                return
+            text = r.body if kind == "comments" else f"{r.title or ''} {r.selftext or ''}"
+            yield r.id, tuple(map(intern, words_in(text or "")))
 
 
 class StoreWorker(QObject):

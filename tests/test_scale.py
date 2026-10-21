@@ -12,7 +12,7 @@ from PySide6.QtCore import QItemSelectionModel, QSettings, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from subsentiment.analysis import WordCounts  # noqa: E402
+from subsentiment.analysis import Analysis, WordCounts  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import tables  # noqa: E402
 from subsentiment.gui.tables import COMMENT_COLUMNS as TABLE_COMMENTS, TablePage  # noqa: E402
@@ -58,7 +58,8 @@ def test_a_big_subreddit_takes_half_the_memory_it_did(tmp_path):
     fill(db)
     got = []
     worker = LoadWorker(db, "Big", (None, None))
-    worker.finished.connect(got.append)
+    worker.read.connect(got.append)
+    worker.finished.connect(got.append)  # each row's words: kept as long as its rows, so counted with them
     tracemalloc.start()
     try:
         before = tracemalloc.get_traced_memory()[0]
@@ -66,7 +67,8 @@ def test_a_big_subreddit_takes_half_the_memory_it_did(tmp_path):
         held = tracemalloc.get_traced_memory()[0] - before
     finally:
         tracemalloc.stop()
-    _, rows, analysis = got[0]
+    (_, rows, analysis), (_, words) = got
+    assert len(words["comments"]) == COMMENTS
     assert len(rows["comments"]) == COMMENTS and analysis["comments"].count == COMMENTS
     # A dict per row took about 1,040 bytes a row here; a tuple of its values, with what rows share (post ids and
     # titles, labels, authors) kept once, about 530.
@@ -227,3 +229,78 @@ def test_closing_the_window_while_a_big_subreddit_is_read_stops_the_read(tmp_pat
     started = time.monotonic()
     w.close()
     assert not w.load_job.running() and time.monotonic() - started < 2
+
+
+def test_a_big_subreddit_is_summed_up_by_the_store_before_its_rows_are_read_and_its_words_split_meanwhile(tmp_path):
+    """Opening Ame's r/classicwow showed nothing for half a minute: every row was read, and its words split, before
+    the overview had anything to count. Its days are now counted by the store first (a second), and the words
+    split in other processes while the rows are read."""
+    db = str(tmp_path / "big.db")
+    fill(db)
+    got = []
+    worker = LoadWorker(db, "Big", (None, 10))
+    for name in ("summed", "read", "finished"):
+        getattr(worker, name).connect(lambda payload, name=name: got.append((name, payload)))
+    worker.run()
+    assert [name for name, _ in got] == ["summed", "read", "finished"]
+    sums, (rows, counted), (_, words) = got[0][1][1], got[1][1][1:], got[2][1]
+    for kind in ("posts", "comments"):
+        assert sums[kind].counts == counted[kind].counts
+        assert {d: (n, labels) for d, (_, n, labels) in sums[kind].days.items()} == {
+            d: (n, labels) for d, (_, n, labels) in counted[kind].days.items()}
+        assert abs(sums[kind].total - counted[kind].total) < 1e-6
+    assert all(r.words is None for r in rows["comments"])
+    split = Store(db).rows("comments", "Big", words=True)
+    # Every comment's, whatever the score filter (in any order: another process orders a set its own way).
+    assert {i: set(w) for i, w in words["comments"].items()} == {r.id: set(r.words) for r in split}
+
+
+def test_opening_a_big_subreddit_shows_its_overview_then_its_rows_then_its_words(tmp_path, monkeypatch):
+    settings(tmp_path)
+    db = str(tmp_path / "big.db")
+    fill(db)
+    QSettings().setValue("ui/last_dataset", "Big")
+    monkeypatch.setattr(mw.MainWindow, "wait_for_data", False)
+    seen = []
+    w = mw.MainWindow(db)
+    try:
+        w.show()
+
+        def look():
+            state = (w._counted.count > 0, len(w._saved["comments"]) > 0,
+                     w.word_tally.ready and bool(w.word_tally.counts["comments"].ids()))
+            if not seen or seen[-1] != state:
+                seen.append(state)
+            return (state == (True, True, True) and w.comments_tab.model.rowCount() and not w._span_slices.running()
+                    and not w.load_job.busy)
+        until(look, 60)
+        assert (True, False, False) in seen  # the overview before the rows were in
+        assert w._counted.count == POSTS + COMMENTS
+        fresh = WordCounts.top(WordCounts("posts", Store(db).posts("Big")), WordCounts("comments", Store(db).comments("Big")), n=150)
+        assert w.word_tally.top(["posts", "comments"], 150) == fresh
+    finally:
+        w.close()
+
+
+def test_a_stricter_score_filter_finds_its_rows_among_those_in_memory(tmp_path, monkeypatch):
+    settings(tmp_path)
+    db = str(tmp_path / "big.db")
+    fill(db)
+    QSettings().setValue("ui/last_dataset", "Big")
+    monkeypatch.setattr(mw.MainWindow, "wait_for_data", False)
+    w = mw.MainWindow(db)
+    try:
+        w.show()
+        until(lambda: w.comments_tab.model.rowCount() and not w._span_slices.running() and not w.load_job.busy, 60)
+        reads = [count_calls(monkeypatch, Store, name) for name in ("rows", "day_totals")]
+        pick = w.comment_score_pick
+        pick.setCurrentIndex(pick.findText("Comments 10+"))
+        until(lambda: not w._narrow_slices.running() and not w._span_slices.running()
+              and w.comments_tab.model.rowCount() < COMMENTS, 30)
+        # Ame's comments were read again from the database for each change: 40 seconds.
+        assert reads == [[], []]
+        expected = [r for r in Store(db).comments("Big") if r["score"] is not None and r["score"] >= 10]
+        assert sorted(r["id"] for r in w.comments) == sorted(r["id"] for r in expected)
+        assert w._analysis["comments"].counts == Analysis(expected).counts
+    finally:
+        w.close()

@@ -179,6 +179,7 @@ class MainWindow(QMainWindow):
         self._span_settled.setInterval(300)
         self._span_settled.timeout.connect(self._span_settle)
         self._span_slices = Slices(self)
+        self._narrow_slices = Slices(self)  # a stricter score filter's rows found among those in memory
         self._queued: dict[str, list] = {"posts": [], "comments": []}
         self._queued_ids: set[str] = set()
         self._since = 0.0  # rows saved since this moment belong to the running fetch
@@ -202,6 +203,8 @@ class MainWindow(QMainWindow):
         # The last few subreddits shown, (_saved, _analysis) by (name, score filter), with what the saved-data list
         # said of each then (posts, comments, last fetched): switching back to one needn't read and count it again.
         self._loaded: dict[tuple, tuple] = {}
+        self._unsplit: set[tuple] = set()  # loaded ones whose words are still being split (LoadWorker)
+        self._shown_key: tuple | None = None  # the _loaded key of what's shown
         self._stats: dict[str, tuple] = {}
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
         # A native material (Mica/Acrylic/vibrancy) needs a translucent window from the start,
@@ -935,9 +938,22 @@ class MainWindow(QMainWindow):
         thread (unless ``wait``, or the window isn't up yet) and shown once it's in, the window carrying on."""
         key, stats = (name.lower(), *self.min_scores), self._stats.get(name.lower())
         fetching = bool(self.fetch_job.busy and self.request and name.lower() == self.request.subreddit.lower())
+        self._narrow_slices.stop()
         loaded = self._loaded.pop(key, None)
         if loaded is not None and (loaded[0] != stats or fetching):
             loaded = None
+        wider = None if loaded is not None or fetching or wait else next((
+            got for (sub, *least), got in self._loaded.items() if sub == key[0] and got[0] == stats
+            and all(a is None or (b is not None and a <= b) for a, b in zip(least, key[1:]))), None)
+        if wider is not None and sum(map(len, wider[1].values())) >= self.LOAD_THREAD_FROM:
+            # A score filter made stricter: its rows are among those in memory, rather than read again (most of a
+            # minute with 650,000 comments).
+            self._wanted = None  # (nothing to read: a read ending meanwhile starts none)
+            self.subheading.setText(f"Filtering r/{name}…")
+            self._narrow_slices.start(self._narrowing(key, wider), lambda: self._show_dataset(name))
+            return
+        if wider is not None:
+            loaded = self._narrowed(key, wider)
         if (loaded is None and not wait and not fetching and (self.isVisible() or not self.wait_for_data) and stats
                 and stats[0] + stats[1] >= self.LOAD_THREAD_FROM):
             self._wanted = key
@@ -954,6 +970,7 @@ class MainWindow(QMainWindow):
             motion.crossfade(self.content)
         self.current = name or None
         if loaded is None:
+            self._unsplit.discard(key)  # read here with their words
             with self.store.snapshot(), lasting():
                 saved = {k: days.SavedRows(scoring_at_least(self.store.rows(k, name, words=True) if name else [], self.min_scores[i]))
                          for i, k in enumerate(KINDS)}
@@ -962,6 +979,8 @@ class MainWindow(QMainWindow):
         while len(self._loaded) > 4:
             del self._loaded[next(iter(self._loaded))]
         _, self._saved, self._analysis = loaded
+        self._shown_key = key
+        self.word_tally.learn({k: self._saved[k].words for k in KINDS})  # (None: the rows have theirs, or soon will)
         self._known = {}
         self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
         # The span remembered for it, shown on the timeline once they have its days.
@@ -978,21 +997,99 @@ class MainWindow(QMainWindow):
         self._update_delete_enabled()
         self.coverage.set_subreddit(self.current)
 
+    def _narrowing(self, key: tuple, wider: tuple):
+        """Find the rows of ``key``'s score filters among ``wider``'s (a looser filter's, in memory), yielding
+        every few thousand rows, and keep them in _loaded."""
+        stats, rows, _ = wider
+        saved, analysis = {}, {}
+        for kind, least in zip(KINDS, key[1:]):
+            kept, every = [], rows[kind]
+            for a in range(0, len(every), 20_000):
+                kept += scoring_at_least(every[a:a + 20_000], least)
+                yield
+            saved[kind] = days.SavedRows(kept)
+            counted = analysis[kind] = Analysis()
+            for b in range(len(kept), 0, -5_000):  # newest first, as LoadWorker counts them
+                counted.add(reversed(kept[max(0, b - 5_000):b]))
+                yield
+        for kind in KINDS:  # (in the same step as the check: their words may have come in meanwhile)
+            saved[kind].words = rows[kind].words
+        if any(k[0] == key[0] for k in self._unsplit):  # their words are on their way: these get them too
+            self._unsplit.add(key)
+        self._loaded[key] = (stats, saved, analysis)
+
+    def _narrowed(self, key: tuple, wider: tuple) -> tuple:
+        for _ in self._narrowing(key, wider):
+            pass
+        return self._loaded.pop(key)
+
     def _load_wanted(self) -> None:
-        """Read the subreddit last asked for on load_job's thread, once the one before is in."""
-        if self._wanted is None or self.load_job.busy:
+        """Read the subreddit last asked for on load_job's thread, once the one before is in (or, if that one's
+        rows are in and only their words are being split, once that's cut short: its words are then split as
+        it's counted, should it be shown)."""
+        if self._wanted is None:
+            return
+        if self.load_job.busy:
+            if self.load_job.worker.tag[0] in self._loaded:
+                self.load_job.worker.stop()
             return
         name, *min_scores = key = self._wanted
         worker = LoadWorker(self.db_path, name, tuple(min_scores), (key, self._stats.get(name)))
-        worker.finished.connect(self._on_loaded)
+        worker.summed.connect(self._on_summed)
+        worker.read.connect(self._on_loaded)
+        worker.finished.connect(self._on_split)
         worker.failed.connect(self._on_load_failed)
         self.load_job.start(worker)
+
+    def _on_summed(self, summed: tuple) -> None:
+        """A big subreddit's days counted by the store, a second in, while its rows are read: the overview shows
+        them meanwhile (the tables and words follow with the rows)."""
+        (key, stats), analysis = summed
+        if self._wanted != key:
+            return
+        name = self._name_of(key[0])
+        if name != self.current:  # the old subreddit fades out over the new one
+            motion.crossfade(self.content)
+        self._drip.stop()
+        self._queued = {"posts": [], "comments": []}
+        self._span_slices.stop()
+        self.current, self._shown_key = name, None
+        self._saved, self._analysis = {k: days.SavedRows() for k in KINDS}, analysis
+        self.posts, self.comments, self._table_days = [], [], None
+        self.posts_tab.load([])
+        self.comments_tab.load([])
+        self.word_tally.hold()
+        self.span, self._preset = days.load_range(self.settings, name)
+        self._render_overview(restore=True)
+        self._show_notes()
+        self.words_page.meanings.set_subreddit(name, self.store.words(name))
+        self._update_delete_enabled()
+        self.coverage.set_subreddit(name)
+        self.heading.setText(f"r/{name}")
+        self.subheading.setText(f"Reading r/{name}'s {plural(analysis['posts'].count, 'post')} and "
+                                f"{plural(analysis['comments'].count, 'comment')}…")
 
     def _on_loaded(self, read: tuple) -> None:
         (key, stats), saved, analysis = read
         self._loaded[key] = (stats, saved, analysis)
+        self._unsplit.add(key)  # its words are being split meanwhile
         if self._wanted == key:
             self._show_dataset(self._name_of(key[0]))
+
+    def _on_split(self, split: tuple) -> None:
+        """The words of a subreddit read without them: counted into the word clouds if it's shown."""
+        (key, _), words = split
+        waiting = self._shown_key in self._unsplit
+        for other in [k for k in self._unsplit if k[0] == key[0]]:  # (and the stricter score filters' found in it)
+            self._unsplit.discard(other)
+            loaded = self._loaded.get(other)
+            if loaded is not None and words is not None:
+                for k in KINDS:
+                    loaded[1][k].words = words[k]
+        if waiting and self._shown_key not in self._unsplit:
+            self.word_tally.learn(words or {})
+            if not self._span_slices.running():  # (else the span's last step counts them)
+                self.word_tally.count(self.posts, self.comments, fresh=True)
 
     def _on_load_failed(self, message: str) -> None:
         if self._wanted is not None:  # read it here instead, where an error shows as it always has
@@ -1058,7 +1155,10 @@ class MainWindow(QMainWindow):
         yield from self.comments_tab.load_steps(self.comments)
         self._update_dataset_labels()
         yield
-        self.word_tally.count(self.posts, self.comments, fresh=reload)
+        if self._shown_key in self._unsplit:  # counted once they're split
+            self.word_tally.hold()
+        else:
+            self.word_tally.count(self.posts, self.comments, fresh=reload)
 
     @property
     def min_scores(self) -> tuple[int | None, int | None]:
@@ -1325,10 +1425,12 @@ class MainWindow(QMainWindow):
         self._shown_live.stop()
         self._span_settled.stop()
         self._span_slices.stop()
+        self._narrow_slices.stop()
         self._wanted = None
         if self.load_job.busy:  # what it read is let go; its thread is waited for, as it uses the file
-            self.load_job.worker.finished.disconnect()
-            self.load_job.worker.failed.disconnect()
+            for sig in (self.load_job.worker.summed, self.load_job.worker.read, self.load_job.worker.finished,
+                        self.load_job.worker.failed):
+                sig.disconnect()
             self.load_job.worker.stop()
             self.load_job.qthread.quit()
             self.load_job.qthread.wait(3000)
