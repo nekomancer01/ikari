@@ -678,7 +678,8 @@ def test_a_big_download_reads_each_new_row_back_about_once(env, monkeypatch):
     fetch(w, comments=True, rng="month")
     s = env.store()
     saved = len(s.posts("python")) + len(s.comments("python"))
-    assert saved > 60 and sum(read) < 4 * saved  # linear; it was about saved² / 2
+    # 60 or more: in the hour after midnight UTC the fake archive has no posts for today yet.
+    assert saved >= 60 and sum(read) < 4 * saved  # linear; it was about saved² / 2
 
 
 def test_a_busy_subreddit_that_times_out_still_fetches_with_narrower_queries(env, monkeypatch):
@@ -785,7 +786,7 @@ def no_total_day(cov, day):
 def busy_day(env, sub: str, n: int) -> int:
     """Adds ``n`` posts to the archive on the day three days back, and returns that day."""
     day = int((NOW - 3 * DAY) // DAY * DAY)
-    base = make_posts(sub, NOW, days=1, per_day=(1,), seed=4)[0]
+    base = make_posts(sub, NOW, days=2, per_day=(1,), seed=4)[0]  # days=2: in the hour after midnight UTC, today has none
     env.archive.posts += [dict(base, id=f"bd{i:05d}", title=f"question {i}", created_utc=day + 30 + i * 50,
                                num_comments=3, permalink=f"/r/{sub}/comments/bd{i:05d}/x/") for i in range(n)]
     return day
@@ -848,6 +849,8 @@ def test_download_all_comments_on_new_posts_says_what_it_got_and_doesnt_offer_th
     pump(100)
     assert cov.all_comments.text() == "Download all comments" and not cov.all_comments.isEnabled()
     for i in range(n):
+        cov.post_table.scrollTo(cov.post_table.model().index(i, 0))  # rows get their widgets once on screen
+        pump(10)
         cell, button = cov.post_table.cellWidget(i, 1), cov.post_table.cellWidget(i, 2).findChild(type(w.fetch_btn))
         assert cell.side.text() == "all so far" and "36 hours" in cell.toolTip()
         assert button.text() == "Check again" and button.isEnabled()
