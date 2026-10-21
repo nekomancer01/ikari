@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     native.set_appearance(requested)
     theme.apply(app, requested,
                 settings.value("ui/reduce_transparency", False, bool))
+    MainWindow.wait_for_data = False  # a big subreddit is read once the window is up
     window = MainWindow(default_db_path())
     window.show()
     code = app.exec()
