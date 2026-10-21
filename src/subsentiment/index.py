@@ -25,6 +25,7 @@ from subsentiment.store import (COMMENT_COLUMNS, NO_SCORE, NOT_IMAGE, PACKED, PO
                                  CommentRow, DayPack, PostRow, score_bucket)
 
 LOOSE, HELD = -1, -2  # a row's pack when its text is in its row, or in a pack saved before packs had frames
+CLOSED = object()
 
 
 class RowIndex:
@@ -185,7 +186,8 @@ class RowIndex:
             return pieces
         merged = tuple(np.concatenate(c) for c in zip(*pieces))
         with self._lock:
-            self._changes = [merged] + self._changes[len(pieces):]
+            if all(a is b for a, b in zip(self._changes, pieces)):  # not merged by another thread meanwhile
+                self._changes = [merged] + self._changes[len(pieces):]
             return list(self._changes)
 
     def _words_of(self, text) -> tuple[str, ...]:
@@ -360,14 +362,17 @@ class RowIndex:
         if name != "post_title" and name not in PACKED[self.kind] or name == "post_title" and self.kind != "comments":
             raise ValueError(f"{name} isn't a text column of {self.kind}")
         with self._lock:
+            if self._bulk is CLOSED:
+                raise ValueError("the index is closed")
             if self._bulk is None:
                 self._bulk = PackReader(self._db_path, self.kind, self.subreddit, self._packs)
-        reader = self._bulk
-        ids = [i.decode() for i in self.ids[start:stop]]
+            reader = self._bulk
+            ids, packs = self.ids[start:stop].copy(), self._pack_of[start:stop].copy()  # as one, whatever `add` does
+            at, created = self._at[start:stop].copy(), self.created[start:stop].copy()
+        ids = [i.decode() for i in ids]
         if name == "post_title":
             return reader.post_titles(ids)
         out: list = [None] * len(ids)
-        packs, at = self._pack_of[start:stop], self._at[start:stop]
         unread = np.flatnonzero(packs < 0).tolist()  # read from their row, or their whole pack
         for pack in np.unique(packs[packs >= 0]):
             mine = np.flatnonzero(packs == pack)
@@ -377,7 +382,11 @@ class RowIndex:
                     unread.append(int(k))
                 else:
                     out[k] = value
-        for k, value in reader.by_id(name, [ids[k] for k in unread], self.created[start:stop][unread]):
+        # A row saved again since it was read here has its newer text in its row.
+        skipped = set(unread)
+        framed = [k for k in range(len(ids)) if packs[k] >= 0 and k not in skipped]
+        unread += reader.unpacked([ids[k] for k in framed], framed)
+        for k, value in reader.by_id(name, [ids[k] for k in unread], created[unread]):
             out[unread[k]] = value
         return out
 
@@ -450,13 +459,16 @@ class RowIndex:
         self._count(old, 1)
         start = len(self.ids)
         if new:
-            self.ids = np.concatenate([self.ids, np.array([r["id"].encode() for r in new])])
-            self.created = np.concatenate([self.created, [np.nan if r["created_utc"] is None else r["created_utc"] for r in new]])
-            self.score = np.concatenate([self.score, np.array([NO_SCORE if r["score"] is None else r["score"] for r in new], np.int32)])
-            self.sentiment = np.concatenate([self.sentiment, [r["sentiment"] or 0.0 for r in new]])
-            self.label = np.concatenate([self.label, np.array([label.get(r["label"], -1) for r in new], np.int8)])
-            self._pack_of = np.concatenate([self._pack_of, np.full(len(new), LOOSE, np.int32)])
-            self._at = np.concatenate([self._at, np.zeros(len(new), np.int32)])
+            grown = {"ids": np.concatenate([self.ids, np.array([r["id"].encode() for r in new])]),
+                     "created": np.concatenate([self.created, [np.nan if r["created_utc"] is None else r["created_utc"] for r in new]]),
+                     "score": np.concatenate([self.score, np.array([NO_SCORE if r["score"] is None else r["score"] for r in new], np.int32)]),
+                     "sentiment": np.concatenate([self.sentiment, [r["sentiment"] or 0.0 for r in new]]),
+                     "label": np.concatenate([self.label, np.array([label.get(r["label"], -1) for r in new], np.int8)]),
+                     "_pack_of": np.concatenate([self._pack_of, np.full(len(new), LOOSE, np.int32)]),
+                     "_at": np.concatenate([self._at, np.zeros(len(new), np.int32)])}
+            with self._lock:  # all at once, for a thread reading them together (`column`)
+                for name, values in grown.items():
+                    setattr(self, name, values)
             self._count(np.arange(start, len(self.ids)), 1)
         if self.with_words:
             changed = np.concatenate([old, np.arange(start, len(self.ids))]).astype(np.int64)
@@ -464,7 +476,8 @@ class RowIndex:
                      for r in [r for r, a in zip(rows, at) if a >= 0] + new]
             self._loose.update(zip(self.ids[changed], words))
             self._change(words, self.created[changed], self.label[changed], self.score[changed], 1)
-        if new and self.ordered == start and (not start or np.all(self.created[start - 1:-1] <= self.created[start:])):
+        tail = self.created[max(start - 1, 0):]
+        if new and self.ordered == start and np.all(tail[:-1] <= tail[1:]):
             self.ordered = len(self.ids)  # all the newest, in order
         self._sorted_ids = None
 
@@ -489,8 +502,10 @@ class RowIndex:
         if self.ordered == len(self.ids):
             return np.arange(len(self.ids))
         order = np.argsort(self.created, kind="stable")
-        for name in ("ids", "created", "score", "sentiment", "label", "_pack_of", "_at"):
-            setattr(self, name, getattr(self, name)[order])
+        moved = {name: getattr(self, name)[order] for name in ("ids", "created", "score", "sentiment", "label", "_pack_of", "_at")}
+        with self._lock:
+            for name, values in moved.items():
+                setattr(self, name, values)
         self.ordered = len(self.ids)
         self._sorted_ids = None
         return order
@@ -515,9 +530,11 @@ class RowIndex:
             self._change(words, self.created[positions], self.label[positions], self.score[positions], 1)
 
     def close(self) -> None:
+        with self._lock:
+            bulk, self._bulk = self._bulk, CLOSED
         self._reader.close()
-        if self._bulk is not None:
-            self._bulk.close()
+        if isinstance(bulk, PackReader):
+            bulk.close()
 
 
 class PackReader:
@@ -534,19 +551,25 @@ class PackReader:
         self._heads: dict[int, tuple[dict, int] | None] = {}  # pack -> its header and where its frames start
         self._frames: OrderedDict = OrderedDict()  # (pack, frame) -> its columns (DayPack.frame_columns)
         self._whole: OrderedDict = OrderedDict()  # (kind, day) -> (packed_at, a whole pack's text), read lately
-        self._posts: dict[int, tuple] = {}  # day -> (packed_at, {post id: (title, permalink)}), for comments
+        self._posts: OrderedDict = OrderedDict()  # day -> (packed_at, {post id: (title, permalink)}), for comments
 
     def _packed_at(self, kind: str, day: int):
         row = self.db.execute("SELECT packed_at FROM packs WHERE kind = ? AND subreddit = ? AND day = ?",
                               (kind, self.subreddit, day)).fetchone()
         return row[0] if row else None
 
-    def whole(self, kind: str, created: float) -> dict[str, list]:
-        """A whole day's pack, {id: [values of PACKED[kind]]}: for a row whose place in it isn't known."""
+    def whole(self, kind: str, created: float, checked: set | None = None) -> dict[str, list]:
+        """A whole day's pack, {id: [values of PACKED[kind]]}: for a row whose place in it isn't known. ``checked``:
+        (kind, day)s already checked to be packed as read, in this call."""
         with self.lock:
             key = (kind, int(created // 86400))
-            now = self._packed_at(*key)
             hit = self._whole.get(key)
+            if hit is not None and checked is not None and key in checked:
+                self._whole.move_to_end(key)
+                return hit[1]
+            now = self._packed_at(*key)
+            if checked is not None:
+                checked.add(key)
             if hit is None or hit[0] != now:  # not read yet, or packed again since
                 row = self.db.execute("SELECT data FROM packs WHERE kind = ? AND subreddit = ? AND day = ?",
                                       (kind, self.subreddit, key[1])).fetchone()
@@ -637,12 +660,22 @@ class PackReader:
                 chunk = ids[k:k + 500]
                 got.update((i, (packed, v)) for i, packed, v in self.db.execute(
                     f"SELECT id, packed, {name} FROM {self.kind} WHERE id IN ({', '.join('?' * len(chunk))})", chunk))
-            at = PACKED[self.kind].index(name)
+            at, checked = PACKED[self.kind].index(name), set()
             for k, rid in enumerate(ids):
                 packed, value = got.get(rid, (0, None))
                 if packed:
-                    value = (self.whole(self.kind, float(created[k])).get(rid) or [None] * len(PACKED[self.kind]))[at]
+                    value = (self.whole(self.kind, float(created[k]), checked).get(rid) or [None] * len(PACKED[self.kind]))[at]
                 yield k, value
+
+    def unpacked(self, ids: list[str], keys: list) -> list:
+        """The ``keys`` of the rows ``ids`` whose text is in their row now (saved again since they were packed)."""
+        with self.lock:
+            fresh = set()
+            for k in range(0, len(ids), 500):
+                chunk = ids[k:k + 500]
+                fresh.update(i for (i,) in self.db.execute(
+                    f"SELECT id FROM {self.kind} WHERE packed = 0 AND id IN ({', '.join('?' * len(chunk))})", chunk))
+            return [key for i, key in zip(ids, keys) if i in fresh]
 
     def post(self, post_id: str, created: float, checked: set | None = None) -> tuple[str | None, str | None] | None:
         """A packed post's title and permalink, from its day's pack, read once (only these two kept). ``checked``:
@@ -650,14 +683,17 @@ class PackReader:
         with self.lock:
             day = int(created // 86400)
             hit = self._posts.get(day)
-            if checked is None or day not in checked:
+            if hit is None or checked is None or day not in checked:
                 now = self._packed_at("posts", day)
                 if hit is None or hit[0] != now:
                     rows = self.whole("posts", created) if now is not None else {}
                     at = PACKED["posts"].index("title"), PACKED["posts"].index("permalink")
                     hit = self._posts[day] = (now, {i: (v[at[0]], v[at[1]]) for i, v in rows.items()})
+                    while len(self._posts) > 1024:  # about three years of days
+                        self._posts.popitem(last=False)
                 if checked is not None:
                     checked.add(day)
+            self._posts.move_to_end(day)
             return hit[1].get(post_id)
 
     def post_titles(self, ids: list[str]) -> list[str | None]:
