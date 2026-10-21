@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import time
 from collections import Counter
+from itertools import islice
 
 from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPointF, QRectF, QSize, QSizeF, Qt, QTimer,
                             QVariantAnimation, Signal)
@@ -30,6 +31,7 @@ from subsentiment.gui.days import flat_button
 from subsentiment.gui.widgets import ElidedLabel, VerticalScrollArea, label
 from subsentiment.gui.worker import BackgroundJob, LoadWorker, ScorePool, Slices
 from subsentiment.sentiment import Lexicon
+from subsentiment.store import column
 
 KINDS = ("posts", "comments")
 _CELL = 2  # px; the word cloud's grid of taken space
@@ -46,14 +48,14 @@ class WordTally(QObject):
 
     THREAD_FROM = 2000  # rows to count (or take off) at once; more are counted a slice at a time
     SLICE = 100  # rows counted between two frames: a few milliseconds, even for rows not split into words yet
-    SEEN_MAX = 400_000  # rows whose words are remembered beyond those counted; about 250 bytes each
+    LOOK = 20_000  # rows gone through at once to find what a moved span gained and lost; more, a slice at a time
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
-        self._seen = {k: {} for k in KINDS}  # {id: (text, words)}: each row's text is split into words once
-        self.counts = {k: WordCounts(k, (), self._seen[k]) for k in KINDS}
+        self.counts = {k: WordCounts(k) for k in KINDS}
         self.ready = True
-        self._pending: dict[str, list] = {k: [] for k in KINDS}  # rows added while a recount runs
+        self._moving = False  # working out what a moved span gained and lost, a slice at a time
+        self._pending: dict[str, list] = {k: [] for k in KINDS}  # rows added while a recount or a move runs
         self._slices = Slices(self)
         self._version = 0  # counts every change to the counts, for top()
         self._top, self._top_for = [], None
@@ -61,37 +63,74 @@ class WordTally(QObject):
     def count(self, posts: list, comments: list, fresh: bool = False) -> None:
         """Count these rows' words instead. Rows the counts have already are kept, so moving the span a few days
         only counts the days it gained and takes off the ones it left; ``fresh`` (rows that may have been saved
-        again with a new label or text) counts them all again, still without splitting a known text again."""
+        again with a new label or text) counts them all again. Working out what a moved span gained and lost
+        goes through every row of it, so with a big subreddit that's done a slice at a time too, the counts
+        shown meanwhile."""
         self._slices.stop()
+        self._moving = False
         self._pending = {k: [] for k in KINDS}  # rows added for an earlier count's rows don't carry over
         rows = {"posts": list(posts), "comments": list(comments)}
-        if sum(map(len, self._seen.values())) > max(self.SEEN_MAX, 2 * sum(map(len, rows.values()))):
-            # Others' words go (another subreddit's), these rows' stay: a subreddit with more rows than the
-            # limit was split into words all over again at every count.
-            self._seen = {k: {r["id"]: hit for r in rows[k] if (hit := self._seen[k].get(r["id"])) is not None}
-                          for k in KINDS}
-            for k in KINDS:
-                self.counts[k].seen = self._seen[k]
         if self.ready and not fresh:
-            ids = {k: {r["id"] for r in rows[k]} for k in KINDS}
-            gone = {k: self.counts[k].ids() - ids[k] for k in KINDS}
-            new = {k: [r for r in rows[k] if r["id"] not in self.counts[k].ids()] for k in KINDS}
-            if sum(len(gone[k]) + len(new[k]) for k in KINDS) < self.THREAD_FROM:
-                for k in KINDS:
-                    self.counts[k].remove(gone[k])
-                    self.counts[k].add(new[k])
-                self._version += 1
-                self.changed.emit()
-                return
-        counts = {k: WordCounts(k, (), self._seen[k]) for k in KINDS}
+            if sum(map(len, rows.values())) < self.LOOK:
+                for _ in self._moved(rows, sliced=False):
+                    pass
+            else:
+                self._moving = True  # rows added meanwhile wait, so the counts and ids looked through hold still
+                self._slices.start(self._moved(rows, sliced=True), lambda: None)
+            return
+        self._recount(rows)
+
+    def _moved(self, rows: dict, sliced: bool):
+        """Count in the rows not counted yet and take off the ones counted that aren't in ``rows``, yielding as
+        it goes through them; a big change is counted afresh instead (in these slices, when ``sliced``)."""
+        gone, new = {}, {}
+        for k in KINDS:
+            counted, ids, look = self.counts[k].ids(), set(), self.LOOK
+            for i in range(0, len(rows[k]), look):
+                ids.update(column(rows[k][i:i + look], "id"))
+                yield
+            gone[k], was = [], iter(counted)
+            while chunk := list(islice(was, look)):
+                gone[k] += [rid for rid in chunk if rid not in ids]
+                yield
+            new[k] = []
+            for i in range(0, len(rows[k]), look):
+                new[k] += [r for r in rows[k][i:i + look] if r["id"] not in counted]
+                yield
+        self._moving = False
+        if sum(len(gone[k]) + len(new[k]) for k in KINDS) < self.THREAD_FROM:
+            for k in KINDS:
+                self.counts[k].remove(gone[k])
+                self.counts[k].add(new[k] + self._pending[k])
+                self._pending[k] = []
+            self._version += 1
+            self.changed.emit()
+        elif sliced:  # counted afresh a slice at a time: about as quick, and the counts shown stay whole meanwhile
+            yield from self._recounting(rows)
+        else:
+            self._recount(rows)
+
+    def _recount(self, rows: dict) -> None:
         if sum(map(len, rows.values())) < self.THREAD_FROM:
+            counts = {k: WordCounts(k) for k in KINDS}
             for k in KINDS:
                 counts[k].add(rows[k])
             self._on_counted(counts)
-            return
+        else:
+            self._slices.start(self._recounting(rows), lambda: None)
+
+    def _recounting(self, rows: dict):
+        """Not ready from now; the steps that count ``rows`` afresh, a slice each."""
+        counts = {k: WordCounts(k) for k in KINDS}
         self.ready = False
-        self._slices.start((counts[k].add(rows[k][i:i + self.SLICE]) for k in KINDS
-                            for i in range(0, len(rows[k]), self.SLICE)), lambda: self._on_counted(counts))
+
+        def steps():
+            for k in KINDS:
+                for i in range(0, len(rows[k]), self.SLICE):
+                    counts[k].add(rows[k][i:i + self.SLICE])
+                    yield
+            self._on_counted(counts)
+        return steps()
 
     def _on_counted(self, counts: dict) -> None:
         for k in KINDS:
@@ -104,7 +143,7 @@ class WordTally(QObject):
     def add(self, kind: str, rows: list) -> None:
         if not rows:
             return
-        if not self.ready:
+        if not self.ready or self._moving:
             self._pending[kind].extend(rows)
             return
         self.counts[kind].add(rows)

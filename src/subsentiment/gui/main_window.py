@@ -962,7 +962,7 @@ class MainWindow(QMainWindow):
         self.current = name or None
         if loaded is None:
             with self.store.snapshot():
-                saved = {k: days.SavedRows(scoring_at_least(self.store.rows(k, name) if name else [], self.min_scores[i]))
+                saved = {k: days.SavedRows(scoring_at_least(self.store.rows(k, name, words=True) if name else [], self.min_scores[i]))
                          for i, k in enumerate(KINDS)}
             loaded = (stats, saved, {k: Analysis(reversed(rows)) for k, rows in saved.items()})  # as LoadWorker does
         self._loaded[key] = loaded  # the newest last; a running fetch's rows go into these as they're counted
