@@ -282,9 +282,15 @@ def test_opening_a_big_subreddit_shows_its_overview_rows_and_words(tmp_path, mon
         assert w._counted.count == POSTS + COMMENTS
         fresh = WordCounts.top(WordCounts("posts", Store(db).posts("Big")), WordCounts("comments", Store(db).comments("Big")), n=150)
         assert w.word_tally.top(["posts", "comments"], 150) == fresh
-        # Only the rows the table draws were read.
+        # Only the rows the table draws were read, on a thread: 128 comments took 400 ms to read from Ame's packs.
+        reads = []
+        real = Saved._read
+        monkeypatch.setattr(Saved, "_read", lambda self, at: (reads.append(threading.current_thread()), real(self, at))[1])
         w.show_page("comments")
-        w.comments_tab.view.viewport().repaint()
+        model = w.comments_tab.model
+        until(lambda: model.data(model.index(0, 2)), 30)
+        assert model.data(model.index(0, 2)) == tables._one_line(model.row_at(0)["body"])
+        assert reads and threading.main_thread() not in reads
         assert 0 < len(w._saved["comments"]._drawn) <= RowSource.KEEP < COMMENTS
     finally:
         w.close()

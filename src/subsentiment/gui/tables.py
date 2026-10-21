@@ -8,7 +8,8 @@ from itertools import islice
 from typing import Any, Callable
 
 import numpy as np
-from PySide6.QtCore import QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRectF, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import (QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRectF, QSize, Qt, QTimer,
+                            QUrl, Signal)
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QHeaderView, QLineEdit, QStyle, QStyledItemDelegate,
@@ -18,7 +19,7 @@ from PySide6.QtWidgets import (
 from subsentiment.gui import motion, theme
 from subsentiment.gui.charts import palette
 from subsentiment.gui.widgets import label, mark, plural
-from subsentiment.gui.rows import LABEL_AT, RowList, Rows, RowSource
+from subsentiment.gui.rows import ARRAYS, LABEL_AT, RowList, Rows, RowSource
 from subsentiment.gui.worker import Slices, finish, on_thread
 from subsentiment.analysis import LABELS
 from subsentiment.store import NO_SCORE, column
@@ -149,6 +150,8 @@ class RowsModel(QAbstractTableModel):
     rows at a time between frames (a run each, then the runs merged). Either way the rows show in their new
     order at once."""
 
+    read = Signal()  # rows of a lazy source were read on a thread (and drawn)
+
     BIG = 50_000  # rows from which a sort is worked out away from the frames
     STEP = 20_000  # rows gone through between two frames: a few milliseconds
     SLOTTED = 5_000_000  # rows added times rows shown up to which added rows are slotted in one at a time
@@ -170,6 +173,8 @@ class RowsModel(QAbstractTableModel):
         self._late: list[int] = []  # rows added while a sort is worked out: placed once it's done
         self._sorting = False
         self._slices = Slices(self)
+        self._asked: set[int] = set()  # rows drawn before they were read (a lazy source's): read on a thread
+        self._reads = Slices(self)
         self._born: dict[int, float] = {}  # source position -> when it arrived, while it is fading in
         self._fade = QTimer(self)
         self._fade.setInterval(33)
@@ -354,6 +359,14 @@ class RowsModel(QAbstractTableModel):
         self._fade.stop()
         self._restyle()
         self.endResetModel()
+        if source.lazy:  # the rows drawn first and the ones the columns are sized to, read before the table shows
+            for i in self.ends():
+                self._ask(i)
+
+    def ends(self) -> list[int]:
+        """The rows shown first and last, the ones a table's columns are sized to."""
+        n = len(self.order)
+        return list(range(min(n, 60))) + list(range(max(60, n - 20), n))
 
     def set_rows(self, rows: list, animate: bool = False) -> None:
         """Show ``rows`` (a list). With ``animate``, when they are the current rows plus new ones (a fetch in
@@ -564,7 +577,13 @@ class RowsModel(QAbstractTableModel):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter) if key in NUMERIC else None
         if role not in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole, SORT_ROLE):
             return None
-        row = self.row_at(index.row())
+        if role != SORT_ROLE and self.source.lazy:
+            row = self.source.kept(int(self.order[index.row()]))
+            if row is None:  # drawn blank for the frame or two it takes to read on a thread
+                self._ask(index.row())
+                return None
+        else:
+            row = self.row_at(index.row())
         value = row[key]
         if role == Qt.ItemDataRole.DisplayRole:
             if value is None:
@@ -577,6 +596,26 @@ class RowsModel(QAbstractTableModel):
         if key in ("title", "body"):
             return (row["title"] + "\n\n" + (row["selftext"] or "")) if key == "title" else row["body"]
         return None
+
+    def _ask(self, i: int) -> None:
+        self._asked.add(i)
+        if not self._reads.running():
+            self._reads.start(self._reading(), lambda: None)
+
+    def _reading(self):
+        """Read the rows drawn before they were read, with the rows around them, on a thread; then draw them."""
+        while self._asked:
+            asked, self._asked = self._asked, set()
+            source, order = self.source, self.order
+            lo, hi = max(0, min(asked) - RowSource.READ // 4), min(len(order), max(asked) + 1 + RowSource.READ)
+            at = order[lo:hi].tolist() if hi - lo <= 4 * RowSource.READ else [int(order[i]) for i in asked if i < len(order)]
+            version = source.version
+            got = yield from on_thread(lambda: source._read(at))
+            if source is self.source and source.version == version:
+                source.keep(at, got)
+            if len(self.order):  # the view draws what it shows of it again
+                self.dataChanged.emit(self.index(0, 0), self.index(len(self.order) - 1, len(self.columns) - 1))
+            self.read.emit()
 
     def row_at(self, i: int):
         """The row shown ``i``-th, read with the rows around it when it isn't kept yet (it's being drawn)."""
@@ -656,6 +695,8 @@ class TablePage(QWidget):
         lay.addWidget(self.view)
         for sig in (self.model.rowsInserted, self.model.rowsRemoved, self.model.modelReset, self.model.layoutChanged):
             sig.connect(self._update_count)
+        self._fit_unread = False  # columns sized before the rows they're sized to were read
+        self.model.read.connect(self._on_read)
 
     @property
     def all_rows(self) -> Rows:
@@ -863,14 +904,18 @@ class TablePage(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if self._fit_due:
+        if self._fit_due or self._fit_unread:
+            self._fit_columns()
+
+    def _on_read(self) -> None:
+        if self._fit_unread and self.isVisible():
             self._fit_columns()
 
     def _fit_columns(self) -> None:
         """Size each column to its values and its full header title, leaving the rest to the text column.
 
         Qt's own sizing leaves out room for the sort arrow, so a sorted column's title got cut short."""
-        self._fit_due = False
+        self._fit_due = self._fit_unread = False
         self.view.ensurePolished()  # the stylesheet's font and padding, before the window first shows
         header = self.view.horizontalHeader()
         font = QFont(self.view.font())  # the font the stylesheet draws headers with (8.5pt medium)
@@ -911,27 +956,32 @@ class TablePage(QWidget):
         metrics = QFontMetrics(self.view.font())
         cell = self.view.sizeHintForIndex(self.model.index(0, col)).width()
         padding = cell - metrics.horizontalAdvance(self.model.data(self.model.index(0, col)) or "")
-        return padding + max(metrics.horizontalAdvance(t) for t in texts)
+        return padding + max((metrics.horizontalAdvance(t) for t in texts), default=0)
 
     def _values_at(self, key: str, at: np.ndarray) -> set:
-        """The distinct values of ``key`` among the rows at ``at``, as rows hold them. Text not read for every row
-        is read for the first rows shown (and a few last) of a source read from disk: the ones drawn first."""
+        """The distinct values of ``key`` among the rows at ``at``, as rows hold them. Of a source read from disk,
+        text not read for every row is taken from the first rows shown and a few last: the ones drawn first."""
         source = self.model.source
-        got = source.values(key)
-        if isinstance(got, np.ndarray):
-            got = got[at]
+        if key in ARRAYS:
+            got = getattr(source, ARRAYS[key])[at]
             if key == "label":
                 return {LABELS[k] if k >= 0 else None for k in got.tolist()}
             if key == "score":
                 return {None if v == NO_SCORE else v for v in got.tolist()}
             if key == "created_utc":
-                return {None if v == -np.inf else v for v in got.tolist()}
+                return {None if v != v else v for v in got.tolist()}  # (NaN: not known)
             return set(got.tolist())
+        got = source.values(key)
         if got is not None:
             return {got[p] for p in at.tolist()}
-        if not isinstance(source, RowList):
-            order = self.model.order
-            at = np.concatenate([order[:60], order[-20:]])
+        if source.lazy:  # the ones read yet (RowsModel.ends asks for them on a thread): sized again once they are
+            ends = self.model.ends()
+            rows = [r for i in ends if (r := source.kept(int(self.model.order[i]))) is not None]
+            if len(rows) < len(ends):
+                self._fit_unread = True
+                for i in ends:
+                    self.model._ask(i)
+            return set(column(rows, key))
         return set(column(source.rows(at), key))
 
     def _share_width(self) -> None:

@@ -31,6 +31,7 @@ class RowSource:
 
     KEEP = 8192  # rows kept read for drawing
     READ = 128  # rows read at once around one a table asks for
+    lazy = False  # whether reading rows takes long enough that a table reads them on a thread (`kept`, `keep`)
 
     def __init__(self):
         self._drawn: OrderedDict[int, object] = OrderedDict()  # position -> its row, read lately
@@ -50,9 +51,7 @@ class RowSource:
             if p not in out:
                 out[p] = drawn[p]
                 drawn.move_to_end(p)
-        drawn.update(out)
-        while len(drawn) > self.KEEP:
-            drawn.popitem(last=False)
+        self.keep(out, out.values())
         return [out[p] for p in positions]
 
     def row(self, p: int, around=None):
@@ -61,6 +60,19 @@ class RowSource:
         if got is None:
             return self.rows([p] if around is None else [p, *around])[0]
         return got
+
+    def kept(self, p: int):
+        """Row ``p`` if it's kept read, else None."""
+        got = self._drawn.get(p)
+        if got is not None:
+            self._drawn.move_to_end(p)
+        return got
+
+    def keep(self, positions, rows) -> None:
+        """Keep ``rows`` (read elsewhere, at ``positions``) for drawing."""
+        self._drawn.update(zip(positions, rows))
+        while len(self._drawn) > self.KEEP:
+            self._drawn.popitem(last=False)
 
     def values(self, key: str):
         """Every row's ``key``: an array for the numbers kept as arrays, else a list, or None when that column
@@ -89,9 +101,7 @@ class RowSource:
         for p in positions:
             self._drawn.pop(p, None)
         if rows is not None:
-            self._drawn.update(zip(positions, rows))
-            while len(self._drawn) > self.KEEP:
-                self._drawn.popitem(last=False)
+            self.keep(positions, rows)
         if self._values and positions:
             fresh = dict(zip(positions, self._read(positions) if rows is None else rows))
             for key, got in list(self._values.items()):
@@ -160,6 +170,7 @@ class Saved(RowSource):
     thread (its word counts, a text column) while the window reads rows to draw and adds a fetch's."""
 
     TEXT_STEP = 50_000  # rows of a text column read at once, on a thread: a quarter of a second
+    lazy = True  # 128 rows' text took 70 ms to read from their days' packs, 400 the first time
 
     def __init__(self, db_path: str | Path, kind: str, subreddit: str):
         super().__init__()
