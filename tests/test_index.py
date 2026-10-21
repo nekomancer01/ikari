@@ -8,7 +8,7 @@ import pytest
 from subsentiment.analysis import Analysis, WordCounts
 from subsentiment.index import STEPS, RowIndex, top_words
 from subsentiment.reddit import Comment, Post
-from subsentiment.store import PACKED, DayPack, Store, scoring_at_least
+from subsentiment.store import PACKED, DayPack, Search, Store, scoring_at_least
 
 WORDS = ("the game update finally fixed my save file and honestly I love the new music but the boss fight on "
          "chapter four is way too hard anyone else think the devs should nerf it a little before the next patch").split()
@@ -345,6 +345,7 @@ def _found(rows, kind, typed):
     return out
 
 
+@pytest.mark.skipif(not Search(sqlite3.connect(":memory:")).ready, reason="this SQLite has no contentless deletes (3.43)")
 @pytest.mark.parametrize("kind", ["posts", "comments"])
 def test_search_finds_every_word_typed_the_last_as_it_is_being_typed(saved, kind):
     path, s = saved

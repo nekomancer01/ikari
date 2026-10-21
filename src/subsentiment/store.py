@@ -594,8 +594,7 @@ def _pack_all(path: str, pack: bool = True) -> None:
             store.drop_rebuilt_links()
             if store._left_to_pack():
                 return
-        if not store.index_text():
-            raise SystemExit(1)  # no search index here: Store.upgrade leaves the version as it was
+        store.index_text()
     finally:
         if pool is not None:
             pool.shutdown(cancel_futures=True)
@@ -731,6 +730,8 @@ class Store:
             if version not in (1, 2, 3):
                 return
             pack = version < 3  # 3 only needs its search index
+            if not pack and not self.search.ready:
+                return  # no search index on this SQLite: made by a later start on one that has it
             backup = Path(str(self.path) + f"-before-v{version + 1}")
             if pack and not backup.exists():  # one from a start that was cut short holds it before any packing
                 part = Path(str(backup) + "-part")
@@ -747,9 +748,9 @@ class Store:
                 self.drop_rebuilt_links()
             if pack and self._left_to_pack():
                 return  # stopped, or some day couldn't be packed: carried on at the next start
-            if not elsewhere and not self.index_text(stop) or elsewhere and (stop is not None and stop.is_set()):
-                return  # cut short, or no search here: indexed again from the start next time
-            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            if elsewhere and stop is not None and stop.is_set() or not elsewhere and not self.index_text(stop) and self.search.ready:
+                return  # cut short: indexed again from the start next time
+            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION if self.search.ready else 3}")
             self.db.commit()
             self._compact()
             if pack:
