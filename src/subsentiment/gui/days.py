@@ -61,6 +61,8 @@ class SavedRows(list):
     going through every row (hundreds of thousands, with a big subreddit's comments). Rows without a time come
     first. Give it rows in that order; ``add`` puts more where they belong."""
 
+    words: dict | None = None  # {id: words} of rows read without theirs (LoadWorker), once they're split
+
     @staticmethod
     def when(row) -> float:
         t = row["created_utc"]

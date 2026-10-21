@@ -462,12 +462,28 @@ class Store:
                 r.pop(k, None)
         return out
 
-    def rows(self, kind: str, subreddit: str, since: float | None = None, words: bool = False) -> list[Row]:
+    def day_totals(self, kind: str, subreddit: str, min_score: int | None = None) -> list[tuple]:
+        """How many of a subreddit's posts or comments (``kind``) scoring at least ``min_score`` each day has with
+        each label, and their sentiment added up: [(day start, label, items, sum)]. Counted here, where reading
+        the rows of a big subreddit to count them takes seconds (analysis.Analysis.from_days)."""
+        if kind == "posts":
+            sql = "SELECT created_utc, label, sentiment, score FROM posts WHERE subreddit = ? COLLATE NOCASE AND image = 0"
+        else:
+            sql = ("SELECT c.created_utc, c.label, c.sentiment, c.score FROM comments c "
+                   "WHERE c.subreddit = ? COLLATE NOCASE AND " + NOT_IMAGE)
+        where = "created_utc IS NOT NULL" + ("" if min_score is None else " AND score IS NOT NULL AND score >= ?")
+        return self.db.execute(
+            f"SELECT CAST(created_utc / 86400 AS INTEGER) * 86400, label, COUNT(*), SUM(sentiment) FROM ({sql}) "
+            f"WHERE {where} GROUP BY 1, 2", (subreddit, *([] if min_score is None else [min_score]))).fetchall()
+
+    def rows(self, kind: str, subreddit: str, since: float | None = None, words: bool = False,
+             days: tuple[float, float] | None = None) -> list[Row]:
         """Every saved post or comment (``kind``) of a subreddit as `Row`s, oldest first; or with ``since``, those
         saved at or after it, in the order they were saved (what a running fetch has added). Strings many rows
         share (a comment's post id and title, its author) are kept once. With ``words``, each row's text is split
         into the words the word cloud counts (``Row.words``), once, here: the window reads a big subreddit on a
-        thread, and splitting 650,000 comments took longer than reading them."""
+        thread, and splitting 650,000 comments took longer than reading them. With ``days`` ([start, end)), only the
+        rows posted then."""
         if kind == "posts":
             cols = ", ".join(POST_COLUMNS)
             sql = (f"SELECT {cols}, packed, NULL, NULL, NULL, NULL, NULL, NULL FROM posts "
@@ -477,6 +493,8 @@ class Store:
             sql = (f"SELECT {cols}, c.packed, p.id, p.title, p.score, p.permalink, p.packed, "
                    "CAST(p.created_utc / 86400 AS INTEGER) FROM comments c LEFT JOIN posts p ON p.id = c.post_id "
                    "WHERE c.subreddit = ? COLLATE NOCASE AND " + NOT_IMAGE)
+        if days is not None:
+            sql += " AND created_utc >= ? AND created_utc < ?"
         sql += " AND fetched_at >= ? ORDER BY fetched_at" if since is not None else " ORDER BY created_utc"
         if kind == "comments":
             sql = sql.replace(" fetched_at", " c.fetched_at").replace(" created_utc", " c.created_utc")
@@ -501,7 +519,7 @@ class Store:
         out = []
         make, cls, share, intern = tuple.__new__, PostRow if kind == "posts" else CommentRow, shared.setdefault, sys.intern
         # Read as it goes rather than all at once, so what each row is read into is let go of meanwhile.
-        for r in cur.execute(sql, (subreddit, *([since] if since is not None else []))):
+        for r in cur.execute(sql, (subreddit, *(days or ()), *([since] if since is not None else []))):
             values = list(r[:n])
             if r[n]:  # its text is in its day's pack
                 text = pack(kind, int(r[created_at] // 86400)).get(r[0])
