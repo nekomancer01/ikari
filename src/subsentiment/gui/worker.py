@@ -108,9 +108,9 @@ class LoadWorker(QObject):
     finished = Signal(object)  # (tag, rows, analysis): the tag it was given, {kind: rows}, {kind: Analysis}
     failed = Signal(str)
 
-    def __init__(self, db_path: str, subreddit: str, min_score: int | None, tag=None):
+    def __init__(self, db_path: str, subreddit: str, min_scores: tuple, tag=None):
         super().__init__()
-        self.args = (db_path, subreddit, min_score)
+        self.args = (db_path, subreddit, min_scores)
         self.tag = tag
 
     def stop(self) -> None:
@@ -118,13 +118,13 @@ class LoadWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        db_path, subreddit, min_score = self.args
+        db_path, subreddit, (min_post, min_comment) = self.args
         store = None
         try:
             store = Store(db_path)
             with store.snapshot():
-                rows = {"posts": scoring_at_least(store.posts(subreddit), min_score),
-                        "comments": scoring_at_least(store.comments(subreddit), min_score)}
+                rows = {"posts": scoring_at_least(store.posts(subreddit), min_post),
+                        "comments": scoring_at_least(store.comments(subreddit), min_comment)}
             self.finished.emit((self.tag, rows, {k: Analysis(v) for k, v in rows.items()}))
         except Exception as e:
             self.failed.emit(failure_text(e))

@@ -110,14 +110,13 @@ NOT_IMAGE = "c.post_id NOT IN (SELECT id FROM posts WHERE image = 1)"
 
 
 def scoring_at_least(rows, min_score: int | None) -> list:
-    """The posts scoring at least ``min_score``, or the comments on them (a comment goes by its post's score,
-    so it shows with its post); every row when None. With a filter on, a score Arctic Shift hasn't filled in
-    yet (None, for about 36 hours) doesn't pass: those rows come back once it has. Always a new list."""
+    """The posts or comments scoring at least ``min_score`` themselves; every row when None. With a filter
+    on, a score Arctic Shift hasn't filled in yet (None, for about 36 hours) doesn't pass: those rows come
+    back once it has. Always a new list."""
     rows = list(rows)
-    if min_score is None or not rows:
+    if min_score is None:
         return rows
-    col = "post_score" if "post_score" in rows[0].keys() else "score"
-    return [r for r in rows if r[col] is not None and r[col] >= min_score]
+    return [r for r in rows if r["score"] is not None and r["score"] >= min_score]
 
 
 def _unpack(blob: bytes) -> dict:
@@ -796,8 +795,7 @@ class Store:
     def export_csv(self, subreddit: str, kind: str, path: str | Path, days: set[int] | None = None,
                    min_score: int | None = None) -> int:
         """Write a subreddit's posts or comments to a CSV file: only those created on ``days`` (UTC day
-        starts) when given, and only posts scoring ``min_score`` or more and their comments (see
-        `scoring_at_least`). Returns how many rows were written."""
+        starts) when given, and only rows scoring ``min_score`` or more (see `scoring_at_least`). Returns how many rows were written."""
         rows = scoring_at_least(self.posts(subreddit) if kind == "posts" else self.comments(subreddit), min_score)
         if days is not None:
             rows = [r for r in rows if r["created_utc"] is not None and int(r["created_utc"] // 86400 * 86400) in days]
