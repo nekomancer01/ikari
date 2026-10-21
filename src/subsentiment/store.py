@@ -10,10 +10,12 @@ import threading
 import time
 from collections import OrderedDict, namedtuple
 from contextlib import contextmanager
+from operator import attrgetter, itemgetter
 from pathlib import Path
 
 import zstandard
 
+from subsentiment.analysis import words_in
 from subsentiment.reddit import Comment, Post, is_image_post
 from subsentiment.sentiment import Lexicon
 
@@ -180,15 +182,28 @@ class Row(tuple):
             return default
 
 
-class PostRow(Row, namedtuple("_Post", POST_COLUMNS)):
+def column(rows: list, key: str):
+    """Every row's ``key``, quickly: a saved row (`Row`) is read as an attribute and an sqlite3.Row by position,
+    both far quicker than by name."""
+    kinds = set(map(type, rows))
+    if len(kinds) == 1 and issubclass(next(iter(kinds)), Row):  # rows a fetch adds can be dicts
+        return map(attrgetter(key), rows)
+    if kinds == {sqlite3.Row}:
+        return map(itemgetter(rows[0].keys().index(key)), rows)
+    return map(itemgetter(key), rows)
+
+
+class PostRow(Row, namedtuple("_Post", POST_COLUMNS + ("words",))):
+    """``words``: the words its title and text use (analysis.words_in), when read for the word cloud; else None."""
     __slots__ = ()
     COLUMNS = POST_COLUMNS
     _at = {c: i for i, c in enumerate(POST_COLUMNS)}
 
 
 class CommentRow(Row, namedtuple("_Comment", COMMENT_COLUMNS[:9] + ("link",) + COMMENT_COLUMNS[10:]
-                                 + ("post_title", "post_score", "post_link"))):
-    """``link`` is the permalink as saved, mostly None: rebuilt then from its post's (``post_link``), as read."""
+                                 + ("post_title", "post_score", "post_link", "words"))):
+    """``link`` is the permalink as saved, mostly None: rebuilt then from its post's (``post_link``), as read.
+    ``words``: as a post's, of its body."""
     __slots__ = ()
     COLUMNS = COMMENT_COLUMNS + ("post_title", "post_score")
     _at = {c: i for i, c in enumerate(COMMENT_COLUMNS[:9] + ("link",) + COMMENT_COLUMNS[10:]
@@ -441,10 +456,12 @@ class Store:
                 r.pop(k, None)
         return out
 
-    def rows(self, kind: str, subreddit: str, since: float | None = None) -> list[Row]:
+    def rows(self, kind: str, subreddit: str, since: float | None = None, words: bool = False) -> list[Row]:
         """Every saved post or comment (``kind``) of a subreddit as `Row`s, oldest first; or with ``since``, those
         saved at or after it, in the order they were saved (what a running fetch has added). Strings many rows
-        share (a comment's post id and title, its author) are kept once."""
+        share (a comment's post id and title, its author) are kept once. With ``words``, each row's text is split
+        into the words the word cloud counts (``Row.words``), once, here: the window reads a big subreddit on a
+        thread, and splitting 650,000 comments took longer than reading them."""
         if kind == "posts":
             cols = ", ".join(POST_COLUMNS)
             sql = (f"SELECT {cols}, packed, NULL, NULL, NULL, NULL, NULL, NULL FROM posts "
@@ -476,7 +493,7 @@ class Store:
             return got
 
         out = []
-        make, cls, share = tuple.__new__, PostRow if kind == "posts" else CommentRow, shared.setdefault
+        make, cls, share, intern = tuple.__new__, PostRow if kind == "posts" else CommentRow, shared.setdefault, sys.intern
         # Read as it goes rather than all at once, so what each row is read into is let go of meanwhile.
         for r in cur.execute(sql, (subreddit, *([since] if since is not None else []))):
             values = list(r[:n])
@@ -499,6 +516,11 @@ class Store:
                 if post[2] is not None and values[9] == post[2] + values[0] + "/":  # rebuilt as read instead
                     values[9] = None
                 values += (post[1], r[n + 3], post[2])
+            if words:
+                text = values[5] if kind == "comments" else f"{values[2] or ''} {values[3] or ''}"
+                values.append(tuple(map(intern, words_in(text or ""))))
+            else:
+                values.append(None)
             out.append(make(cls, values))
         return out
 
@@ -670,10 +692,10 @@ class Store:
 
     def posts_since(self, subreddit: str, ts: float) -> list[Row]:
         """Posts saved at or after ``ts``, in the order they were saved: what a running fetch has added."""
-        return self.rows("posts", subreddit, ts)
+        return self.rows("posts", subreddit, ts, words=True)
 
     def comments_since(self, subreddit: str, ts: float) -> list[Row]:
-        return self.rows("comments", subreddit, ts)
+        return self.rows("comments", subreddit, ts, words=True)
 
     def comments(self, subreddit: str) -> list[Row]:
         return self.rows("comments", subreddit)[::-1]
