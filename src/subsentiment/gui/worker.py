@@ -2,11 +2,14 @@
 the network, and long Python work on the GUI thread a slice at a time (`Slices`)."""
 from __future__ import annotations
 
+import gc
 import multiprocessing
 import os
+import sqlite3
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from contextlib import contextmanager
 from typing import Callable, Iterator
 
 import requests
@@ -182,6 +185,22 @@ class FetchWorker(QObject):
                 store.close()
 
 
+@contextmanager
+def lasting():
+    """Read rows that stay for as long as their subreddit is open: the garbage collector went through every one of
+    them again and again, a third of a second each time with 650,000 comments, while they were read and after,
+    holding up the window's frames. They never make a cycle, so they're read with it off, then left out of its
+    passes (gc.freeze); their refcounts still let them go."""
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if collecting:
+            gc.freeze()
+            gc.enable()
+
+
 class LoadWorker(QObject):
     """Reads a saved subreddit with a connection of its own and counts it up, so opening a big one doesn't
     hold up the window: sqlite lets go of the interpreter while it reads, so the window paints meanwhile."""
@@ -192,17 +211,26 @@ class LoadWorker(QObject):
         super().__init__()
         self.args = (db_path, subreddit, min_scores)
         self.tag = tag
+        self.store: Store | None = None
+        self._stop = False
 
     def stop(self) -> None:
-        pass  # one read; the window ignores what it sends once closed
+        """Cut the read short (the window is closing): reading a big subreddit takes half a minute, and Qt aborted
+        the process when the window went with its thread still running."""
+        self._stop = True
+        store = self.store
+        if store is not None:
+            store.db.interrupt()  # (from any thread) the query being read fails at its next row
 
     @Slot()
     def run(self) -> None:
         db_path, subreddit, (min_post, min_comment) = self.args
         store = None
         try:
-            store = Store(db_path)
-            with store.snapshot():
+            store = self.store = Store(db_path)
+            if self._stop:
+                raise sqlite3.OperationalError("interrupted")
+            with store.snapshot(), lasting():
                 rows = {k: SavedRows(scoring_at_least(store.rows(k, subreddit, words=True), least))
                         for k, least in (("posts", min_post), ("comments", min_comment))}
             # Counted newest first, as Store.posts reads them: a total's last digits depend on the order it's added up in.
@@ -211,6 +239,7 @@ class LoadWorker(QObject):
             self.failed.emit(failure_text(e))
         finally:
             if store is not None:
+                self.store = None
                 store.close()
 
 

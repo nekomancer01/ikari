@@ -203,17 +203,23 @@ class WordCounts:
         if len(alls) == 1:
             total = alls[0]
         else:
-            # Adding whole counts up took ~60 ms with a big subreddit's comments. A word outside the biggest part's
-            # top n (and its ties) is used by no more items than each of those, unless another part uses it, so
-            # only those words and the other parts' are added up.
+            # Adding whole counts up took ~60 ms with a big subreddit's comments, and adding up every word another
+            # part uses, ~100 ms. The biggest part's top n words, added up, give a total the n-th word reaches at
+            # least; any other word has at most the n-th of those counts from that part, so it needs the rest of
+            # that total from the others. Only words that can get there are added up.
             big = max(range(len(alls)), key=lambda i: len(alls[i]))
+            others = [c for i, c in enumerate(alls) if i != big]
             best = heapq.nlargest(n, alls[big].items(), key=itemgetter(1))
             least = best[-1][1] if len(best) == n else 0
-            words = {w for w, k in alls[big].items() if k >= least} if least > 0 else set(alls[big])
-            for i, c in enumerate(alls):
-                if i != big:
-                    words.update(c)
-            total = {w: sum(c[w] for c in alls) for w in words}
+            total = {w: sum(c[w] for c in alls) for w, _ in best}
+            floor = heapq.nlargest(n, total.values())[-1] if len(total) == n else 0
+            need = floor - least  # from the other parts together: one of them has at least its share
+            words = set()
+            for c in others:
+                words.update(w for w, k in c.items() if k * len(others) >= need)
+            if floor <= least:  # a word only the biggest part uses can tie the n-th
+                words.update(w for w, k in alls[big].items() if k >= floor)
+            total.update((w, sum(c[w] for c in alls)) for w in words - total.keys())
         out = []
         for w, k in heapq.nsmallest(n, ((w, k) for w, k in total.items() if k > 0), key=lambda wk: (-wk[1], wk[0])):
             lean = sum(p.counts["positive"][w] - p.counts["negative"][w] for p in parts) / k

@@ -80,7 +80,7 @@ def wheel(chart, dy: int) -> None:
 def test_zooming_only_moves_the_chart_and_the_rest_catches_up_once_it_settles(window, monkeypatch):
     w = window
     chart = w.overview.timeline
-    loads = count_calls(monkeypatch, type(w.comments_tab), "load")
+    loads = count_calls(monkeypatch, type(w.comments_tab), "load_steps")  # the span loads the tables a step at a time
     recounts = count_calls(monkeypatch, WordTally, "count")
     places = count_calls(monkeypatch, WordCloud, "_place")
     split, real_words_in = [], analysis.words_in

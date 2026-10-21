@@ -388,6 +388,32 @@ def test_the_result_counts_only_what_the_setting_changes_and_old_scores_apart(tm
         QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
 
 
+def test_a_word_set_where_the_window_doesnt_have_every_row_rescores_from_the_saved_ones(tmp_path):
+    """With a score filter on (or another subreddit shown), the rescore reads the subreddit itself. It failed at
+    once: its read was asked for one minimum score, where it takes one for posts and one for comments."""
+    QApplication.instance() or QApplication([])
+    from subsentiment.gui.words import Rescore
+    s = Store(tmp_path / "w.db")
+    s.save_post(Post("p1", "town", "Grinding the boss all night", "", "a", 1, 0.9, 0, 1_700_000_000.0, "https://r", ""),
+                *sentiment.score("Grinding the boss all night"))
+    s.commit()
+    s.save_word("town", "grinding", 1.0)
+    rescore = Rescore(s, str(tmp_path / "w.db"))
+    failed, done = [], []
+    rescore.failed.connect(lambda sub, message: failed.append(message))
+    rescore.finished.connect(done.append)
+    rescore.start("town", {"grinding"})  # no rows given: read on a thread
+    end = time.monotonic() + 10
+    while not done and not failed:
+        assert time.monotonic() < end
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert failed == [] and done == ["town"]
+    assert s.posts("town")[0]["label"] == "positive"
+    rescore.stop()
+    s.close()
+
+
 @pytest.mark.parametrize("processes, again", [(True, False), (False, False), (True, True)],
                          ids=["in other processes", "where they can't run", "set again while it runs"])
 def test_a_big_rescore_is_scored_a_chunk_at_a_time_in_other_processes(tmp_path, monkeypatch, processes, again):

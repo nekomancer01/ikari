@@ -4,6 +4,7 @@ from __future__ import annotations
 import heapq
 import time
 from datetime import datetime
+from itertools import islice
 from typing import Any, Callable
 
 from PySide6.QtCore import QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRectF, QSize, Qt, QTimer, QUrl
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
 from subsentiment.gui import motion, theme
 from subsentiment.gui.charts import palette
 from subsentiment.gui.widgets import label, mark, plural
+from subsentiment.gui.worker import Slices
 from subsentiment.store import column
 
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1  # the value a column sorts by (the model sorts by it itself)
@@ -137,7 +139,14 @@ class RowsModel(QAbstractTableModel):
     """The rows a table shows, sorted here in Python.
 
     Qt's QSortFilterProxyModel sorted by asking this model for each value through data(), a Python call
-    per comparison: about 3.4 million of them, and 17 seconds, for a subreddit with 100,000 comments."""
+    per comparison: about 3.4 million of them, and 17 seconds, for a subreddit with 100,000 comments.
+
+    From BIG rows on, sorting is worked out a STEP of rows at a time between frames (a run each, then the runs
+    merged) and the rows shown in their new order at once: sorting 650,000 comments took a second and a half
+    in one go."""
+
+    BIG = 50_000  # rows from which a sort is worked out between frames
+    STEP = 20_000  # rows gone through between two frames: a few milliseconds
 
     def __init__(self, columns: list[Column], parent=None, clock: Callable[[], float] = time.monotonic):
         super().__init__(parent)
@@ -148,10 +157,32 @@ class RowsModel(QAbstractTableModel):
         self._clock = clock
         self._sort: tuple[int, bool] | None = None  # (column, descending) once the view has sorted
         self._keys: list = []  # each row's sort key, in step with self.rows while sorted
+        self._edits = 0  # rows replaced in place so far, so a sort worked out between frames can tell
+        self._resets = 0  # times other rows were put in: a sort worked out for the old ones is let go
+        self._sorting = False  # a sort is being worked out: rows added meanwhile go at the end until it's done
+        self._slices = Slices(self)
         self._born: dict[str, float] = {}  # row id -> when it arrived, while it is fading in
         self._fade = QTimer(self)
         self._fade.setInterval(33)
         self._fade.timeout.connect(self._tick)
+
+    def _keys_for(self, rows: list) -> list:
+        """The rows' keys in the current sort, as _key_of gives them, without a call a row."""
+        key = self.columns[self._sort[0]][1]
+        missing = float("-inf") if key in NUMERIC or key == "created_utc" else ""
+        return [missing if v is None else v for v in column(rows, key)]
+
+    @staticmethod
+    def _place(keys: list, k, descending: bool) -> int:
+        """Where a row with key ``k`` goes among ``keys``: after any equal keys, as a stable sort would put it."""
+        lo, hi = 0, len(keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if (k > keys[mid]) if descending else (k < keys[mid]):
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
 
     def _key_of(self, column: int) -> Callable:
         key = self.columns[column][1]
@@ -166,27 +197,98 @@ class RowsModel(QAbstractTableModel):
             self._keys = []
             return list(rows)
         if keys is None:
-            key = self.columns[self._sort[0]][1]
-            missing = float("-inf") if key in NUMERIC or key == "created_utc" else ""
-            keys = [missing if v is None else v for v in column(rows, key)]  # as _key_of, without a call a row
+            keys = self._keys_for(rows)
         order = sorted(range(len(rows)), key=keys.__getitem__, reverse=self._sort[1])
         self._keys = [keys[i] for i in order]
         return [rows[i] for i in order]
+
+    def _ordering(self, rows: list, step: int):
+        """The order the current sort puts ``rows`` in, as (their indexes in it, each row's key), worked out
+        ``step`` rows at a time and yielding between: each step sorts a run, then the runs are merged a step at a
+        time, as one stable sort would order them. It's the generator's return value."""
+        descending, keys, runs = self._sort[1], [], []
+        for a in range(0, len(rows), step):
+            keys += self._keys_for(rows[a:a + step])
+            runs.append(sorted(range(a, min(a + step, len(rows))), key=keys.__getitem__, reverse=descending))
+            yield
+        if len(runs) <= 1:
+            return (runs[0] if runs else []), keys
+        merged, order = heapq.merge(*runs, key=keys.__getitem__, reverse=descending), []
+        while part := list(islice(merged, step // 4)):  # merging is a microsecond a row, sorting a run far less
+            order += part
+            yield
+        return order, keys
+
+    def _placed(self, rows: list, step: int):
+        """``rows`` in the current sort order, as (the rows, their keys, their ids), worked out between frames
+        (see _ordering); the generator's return value."""
+        if self._sort is None:
+            shown, keys = list(rows), []
+        else:
+            order, keys = yield from self._ordering(rows, step)
+            shown, kept = [], []
+            for a in range(0, len(order), step):
+                part = order[a:a + step]
+                shown += map(rows.__getitem__, part)
+                kept += map(keys.__getitem__, part)
+                yield
+            keys = kept
+        ids = []
+        for a in range(0, len(shown), step):
+            ids += column(shown[a:a + step], "id")
+            yield
+        return shown, keys, ids
 
     def sort(self, column: int, order=Qt.SortOrder.AscendingOrder) -> None:
         """Called by the view when a header is clicked. Selected rows stay selected."""
         wanted = (column, order == Qt.SortOrder.DescendingOrder)
         if wanted != self._sort:  # the view asks twice for one sortByColumn
             self._sort = wanted
-            self._resort()
+            if len(self.rows) < self.BIG:
+                self._slices.stop()
+                self._resort()
+            else:
+                self._slices.start(self._resort_steps(), lambda: None)
 
-    def _resort(self, keys_kept: bool = False) -> None:
-        """Put the rows back in sort order; with ``keys_kept``, self._keys still holds each row's key."""
+    def _resort_steps(self):
+        """Sort a big table, worked out between frames, then shown in its new order at once. Rows a fetch adds
+        meanwhile go at the end, then where the new order puts them; rows replaced meanwhile start it over."""
+        self._sorting = True
+        try:
+            while True:
+                rows, n, edits, resets, sort = self.rows, len(self.rows), self._edits, self._resets, self._sort
+                shown, keys, ids = yield from self._placed(rows, self.STEP)
+                if self._resets != resets:  # other rows were put in, sorted as they were
+                    return
+                if self.rows is rows and self._edits == edits and self._sort == sort:
+                    break
+            key_of, descending = self._key_of(sort[0]), sort[1]
+            for r in rows[n:]:  # added meanwhile
+                k = key_of(r)
+                i = self._place(keys, k, descending)
+                shown.insert(i, r)
+                keys.insert(i, k)
+                ids.insert(i, r["id"])
+        finally:
+            self._sorting = False
+        self._resort(placed=(shown, keys, ids))
+
+    def _resort(self, keys_kept: bool = False, placed: tuple | None = None) -> None:
+        """Put the rows back in sort order; with ``keys_kept``, self._keys still holds each row's key. ``placed``
+        is that order already worked out: (the rows in it, their keys, their ids)."""
         self.layoutAboutToBeChanged.emit()
         old = self.persistentIndexList()
         ids = [self.rows[i.row()]["id"] for i in old]
-        self.rows = self._sorted(self.rows, self._keys if keys_kept else None)
-        where = {r["id"]: i for i, r in enumerate(self.rows)} if old else {}
+        if placed is not None:
+            self.rows, self._keys, order = placed
+            if len(old) <= 20:  # looked for in C, a few milliseconds each
+                where = {rid: order.index(rid) for rid in ids}
+            else:
+                wanted = set(ids)
+                where = {rid: i for i, rid in enumerate(order) if rid in wanted}
+        else:
+            self.rows = self._sorted(self.rows, self._keys if keys_kept else None)
+            where = {r["id"]: i for i, r in enumerate(self.rows)} if old else {}
         self.changePersistentIndexList(old, [self.index(where[rid], i.column()) for rid, i in zip(ids, old)])
         self.layoutChanged.emit()
 
@@ -209,9 +311,36 @@ class RowsModel(QAbstractTableModel):
         if animate and self.rows and self._ids <= {r["id"] for r in rows}:
             self.update_rows(rows)
             return
+        self._slices.stop()
+        rows = self._sorted(rows)
+        self._show(rows, self._keys, set(column(rows, "id")))
+
+    def set_rows_steps(self, rows: list):
+        """set_rows (without ``animate``) with the order worked out between frames (see _ordering), then the
+        rows shown in it at once; a click on a header meanwhile starts it over, and other rows put in end it.
+        Returns the shown rows' ids, in order."""
+        resets = self._resets
+        while True:
+            sort = self._sort
+            shown, keys, ids = yield from self._placed(rows, self.STEP)
+            if self._resets != resets:
+                return None
+            if self._sort == sort:
+                break
+        known = set()
+        for a in range(0, len(ids), self.STEP):
+            known.update(ids[a:a + self.STEP])
+            yield
+        if self._resets != resets or self._sort != sort:  # (sorted again meanwhile: once more, from the top)
+            return (yield from self.set_rows_steps(rows)) if self._resets == resets else None
+        self._slices.stop()  # a header clicked meanwhile: these rows are already in its order
+        self._show(shown, keys, known)
+        return ids
+
+    def _show(self, rows: list, keys: list, ids: set) -> None:
         self.beginResetModel()
-        self.rows = self._sorted(rows)
-        self._ids = set(column(self.rows, "id"))
+        self._resets += 1
+        self.rows, self._keys, self._ids = rows, keys, ids
         self._born.clear()
         self._fade.stop()
         self._restyle()
@@ -221,7 +350,8 @@ class RowsModel(QAbstractTableModel):
         """Rows saved again (with new scores) replace the ones shown; rows not shown yet are added and fade
         in. The view keeps its place."""
         where = {r["id"]: i for i, r in enumerate(self.rows)} if rows else {}
-        key_of = self._key_of(self._sort[0]) if self._sort is not None else None
+        # (While a sort is worked out the keys are the old order's; it starts over, as a row was replaced.)
+        key_of = self._key_of(self._sort[0]) if self._sort is not None and not self._sorting else None
         added, changed, moved = [], False, False
         for r in rows:
             i = where.get(r["id"])
@@ -229,6 +359,7 @@ class RowsModel(QAbstractTableModel):
                 added.append(r)
             elif self.rows[i] != r:
                 self.rows[i] = r
+                self._edits += 1
                 if key_of is not None and (k := key_of(r)) != self._keys[i]:
                     self._keys[i], moved = k, True
                 changed = True
@@ -248,31 +379,25 @@ class RowsModel(QAbstractTableModel):
         """Put each new row where the current sort order puts it (at the end when unsorted); they fade in.
         With ``resort``, rows already shown have new keys, so the whole table is put back in order."""
         if not added:
-            if resort and self._sort is not None:
+            if resort and self._sort is not None and not self._sorting:
                 self._resort(keys_kept=True)
             return
         self._ids.update(r["id"] for r in added)
         now = self._clock()
-        if self._sort is None or resort or len(added) > 1000:  # one insert at the end, then one re-sort
+        if self._sort is None or self._sorting or resort or len(added) > 1000:  # one insert at the end, then one re-sort
             start = len(self.rows)
             self.beginInsertRows(QModelIndex(), start, start + len(added) - 1)
             self.rows.extend(added)
             if self._sort is not None:
                 self._keys.extend(map(self._key_of(self._sort[0]), added))
             self.endInsertRows()
-            if self._sort is not None:
+            if self._sort is not None and not self._sorting:  # (a sort being worked out places them once it's done)
                 self._resort(keys_kept=True)
         else:
             descending, key_of = self._sort[1], self._key_of(self._sort[0])
             for r in added:
                 k = key_of(r)
-                lo, hi = 0, len(self._keys)
-                while lo < hi:  # after any equal keys, as a stable sort would put it
-                    mid = (lo + hi) // 2
-                    if (k > self._keys[mid]) if descending else (k < self._keys[mid]):
-                        hi = mid
-                    else:
-                        lo = mid + 1
+                lo = self._place(self._keys, k, descending)
                 self.beginInsertRows(QModelIndex(), lo, lo)
                 self.rows.insert(lo, r)
                 self._keys.insert(lo, k)
@@ -353,7 +478,10 @@ class RowsModel(QAbstractTableModel):
 
 
 class TablePage(QWidget):
-    """Filterable, sortable table in an outlined box; double-click opens the item on Reddit."""
+    """Filterable, sortable table in an outlined box; double-click opens the item on Reddit.
+
+    A big table (RowsModel.BIG rows on) is loaded and filtered a step at a time between frames, its rows shown
+    once they're all worked out; until then it shows what it did, and rows a fetch saves meanwhile wait for it."""
 
     SHRINKS = ("author", "post_title")  # free text that can end in "…" to leave room for the main text
     OPTIONAL = ("author", "post_title", "num_comments")  # hidden in this order when there's still no room
@@ -365,7 +493,10 @@ class TablePage(QWidget):
         self._all_rows: list = []
         self._ids: set[str] = set()
         self._text_key = columns[stretch_col][1]
-        self._haystacks: dict[str, str] = {}  # row id -> its text lowercased on one line, once filtered by
+        self._builds = 0  # counts loads and filterings, so one worked out between frames sees it's been overtaken
+        self._waiting: list | None = None  # while one is: [(rows added, or None), (rows saved again, or None)], in turn
+        self._last: tuple | None = None  # (label, needle, the rows they let through), for the next keystroke
+        self._slices = Slices(self)
 
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("Filter by text…")
@@ -423,23 +554,50 @@ class TablePage(QWidget):
         return self._all_rows
 
     def load(self, rows) -> None:
-        self._all_rows = rows
-        self._ids = set(column(rows, "id"))
-        self._haystacks = {}
-        self._apply_filters()
+        for _ in self._loading(rows, None):
+            pass
+
+    def load_steps(self, rows):
+        """load, a step at a time between frames for a big table: for Slices (the window's span)."""
+        yield from self._loading(rows, self.model.STEP)
+
+    def _loading(self, rows, step: int | None):
+        """load, going through ``step`` rows (or all of them) between two yields."""
+        self._slices.stop()
+        self._builds += 1
+        builds, self._all_rows, self._last, self._ids = self._builds, rows, None, None
+        self._waiting = []
+        ids = set()
+        for a in range(0, len(rows), step or len(rows) or 1):
+            ids.update(column(rows[a:a + (step or len(rows))], "id"))
+            yield
+        if self._all_rows is not rows:  # loaded again meanwhile
+            return
+        self._ids = ids
+        if builds == self._builds:
+            yield from self._filtering(step, builds)
+        elif not self._slices.running():  # a filtering that overtook it is done: it left the rows saved meanwhile
+            self._take_waiting()
 
     def add_rows(self, rows) -> int:
-        """Add rows a running fetch has just saved; they fade in. Returns how many were new."""
+        """Add rows a running fetch has just saved; they fade in. Returns how many were new (or are to be
+        looked at, while a big table is being worked out)."""
+        if self._waiting is not None:
+            self._waiting.append((list(rows), None))
+            return len(rows)
         new = [r for r in rows if r["id"] not in self._ids]
         self._ids.update(r["id"] for r in new)
         self._all_rows.extend(new)
-        shows = self._matcher()
-        self.model.append_rows([r for r in new if shows is None or shows(r)])
+        self._last = None
+        self.model.append_rows(self._filtered(new, *self._wanted()))
         return len(new)
 
     def update_rows(self, rows) -> int:
         """Bring in rows a finished fetch saved: ones saved again (new scores) replace the rows shown, the
         rest are added and fade in. Returns how many shown rows changed."""
+        if self._waiting is not None:
+            self._waiting.append((None, list(rows)))
+            return 0
         where = {r["id"]: i for i, r in enumerate(self._all_rows)}
         new, changed = [], []
         for r in rows:
@@ -448,52 +606,84 @@ class TablePage(QWidget):
                 new.append(r)
             elif self._all_rows[i] != r:  # most were dripped in as they were saved, and are unchanged
                 self._all_rows[i] = r
-                self._haystacks.pop(r["id"], None)
                 changed.append(r)
         self._ids.update(r["id"] for r in new)
         self._all_rows.extend(new)
-        shows = self._matcher()
-        if shows is None:
+        self._last = None
+        label, needle = self._wanted()
+        if label == "all labels" and not needle:
             self.model.update_rows(changed + new)
         else:  # a rescored row can change its label
-            self.model.set_rows(list(filter(shows, self._all_rows)), animate=True)
+            self.model.set_rows(self._filtered(self._all_rows, label, needle), animate=True)
         self._update_count()
         return len(changed)
 
-    def _matcher(self):
-        """Whether a row passes the label and text filters, or None when nothing is filtered."""
-        label = self.label_filter.currentText().lower()
-        needle = " ".join(self.filter.text().lower().split())
-        if label == "all labels" and not needle:
-            return None
-        key, hays = self._text_key, self._haystacks
+    def _wanted(self) -> tuple[str, str]:
+        """The label filter lowercased, and the text filter lowercased on one line."""
+        return self.label_filter.currentText().lower(), " ".join(self.filter.text().lower().split())
 
-        def shows(row) -> bool:
-            if label != "all labels" and row["label"] != label:
-                return False
-            if not needle:
-                return True
-            hay = hays.get(row["id"])
-            if hay is None:  # the text on one line, lowercased, kept for the next keystroke
-                hay = hays[row["id"]] = " ".join((row[key] or "").lower().split())
-            return needle in hay
-        return shows
+    def _filtered(self, rows: list, label: str, needle: str) -> list:
+        """The rows the label and text filters let through: the text on one line, ignoring case."""
+        if label != "all labels":
+            rows = [r for r, lab in zip(rows, column(rows, "label")) if lab == label]
+        if needle:
+            texts = column(rows, self._text_key)
+            if " " in needle:  # line breaks and runs of spaces count as one space
+                rows = [r for r, t in zip(rows, texts) if t and needle in " ".join(t.lower().split())]
+            else:  # which they do anyway for a single word, so it's looked for as it is
+                rows = [r for r, t in zip(rows, texts) if t and needle in t.lower()]
+        return rows
 
     def _apply_filters(self) -> None:
-        shows = self._matcher()
-        if not self.filter.text():
-            self._haystacks = {}  # a copy of every row's text; only needed while there is a filter
+        if len(self._all_rows) < self.model.BIG:
+            for _ in self._filtering(None):
+                pass
+        else:
+            self._builds += 1
+            if self._waiting is None:
+                self._waiting = []
+            self._slices.start(self._filtering(self.model.STEP, self._builds), lambda: None)
+
+    def _filtering(self, step: int | None, builds: int | None = None):
+        """Show the rows the filters let through, going through ``step`` rows (or all of them) between two yields.
+        Typing on filters only the rows the last keystroke showed. Overtaken by another load or filtering, it
+        ends."""
+        if builds is None:
+            self._builds += 1
+            builds = self._builds
+        label, needle = self._wanted()
+        rows, last = self._all_rows, self._last
+        if label == "all labels" and not needle:
+            picked = rows
+        else:
+            if last is not None and last[0] == label and last[1] and last[1] in needle:
+                rows = last[2]  # a longer needle: only rows with the shorter one can have it
+            picked = []
+            for a in range(0, len(rows), step or len(rows) or 1):
+                picked += self._filtered(rows[a:a + (step or len(rows))], label, needle)
+                yield
+                if builds != self._builds:
+                    return
         chosen = self.view.selectionModel().selectedRows()
         selected = {self.model.row_at(i.row())["id"] for i in chosen}
         current = self.view.currentIndex()
         current_id = self.model.row_at(current.row())["id"] if current.isValid() else None
-        self.model.set_rows(self._all_rows if shows is None else list(filter(shows, self._all_rows)))
+        if step is None or step >= len(picked):
+            self.model.set_rows(picked)
+            order = list(column(self.model.rows, "id")) if current_id or selected else []
+        else:
+            order = yield from self.model.set_rows_steps(picked)
+            if order is None or builds != self._builds:
+                return
+        self._last = (label, needle, picked) if needle else None
         if current_id or 0 < len(selected) <= 1000:  # rows picked before still are, if the filters show them
-            for i, r in enumerate(self.model.rows):
-                if r["id"] == current_id:
+            wanted = selected | {current_id}
+            for i in (i for i, rid in enumerate(order) if rid in wanted):
+                rid = order[i]
+                if rid == current_id:
                     self.view.selectionModel().setCurrentIndex(
                         self.model.index(i, current.column()), QItemSelectionModel.SelectionFlag.NoUpdate)
-                if r["id"] in selected:
+                if rid in selected:
                     self.view.selectionModel().select(
                         self.model.index(i, 0),
                         QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
@@ -502,6 +692,16 @@ class TablePage(QWidget):
             if self.isVisible():  # a page out of sight sizes them when it next shows
                 self._fit_columns()
         self._update_count()
+        if self._ids is not None:  # (else the load underway takes them once it has the ids)
+            self._take_waiting()
+
+    def _take_waiting(self) -> None:
+        waiting, self._waiting = self._waiting or [], None
+        for added, again in waiting:  # rows a fetch saved meanwhile
+            if added is not None:
+                self.add_rows(added)
+            else:
+                self.update_rows(again)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
