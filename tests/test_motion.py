@@ -311,6 +311,8 @@ def test_a_fade_starts_exactly_on_the_window_it_covers_at_150_percent(make_windo
 
 
 def test_a_waiting_bar_throbs_on_one_clock_that_stops_with_it(make_window):
+    # Driven a frame at a time (a repaint, then the clock's tick) rather than by waiting: on a busy runner the
+    # clock's own ticks land anywhere in a wait, and a tick empties the list the bars' repaints fill.
     from subsentiment.gui.widgets import ShareBar
     make_window()
     bars = [ShareBar() for _ in range(3)]
@@ -318,21 +320,24 @@ def test_a_waiting_bar_throbs_on_one_clock_that_stops_with_it(make_window):
         bar.resize(120, 6)
         bar.set(None, waiting=True)
         bar.show()
-    pump(80)
-    clock = motion._throbbers
-    # One timer for every bar. Each tick empties the list and the bars' repaints fill it again, so look between.
-    end = time.monotonic() + 2
-    while set(clock._painted) != set(bars) and time.monotonic() < end:
-        QApplication.processEvents()
-    assert clock._timer.isActive() and set(clock._painted) == set(bars)
+    QApplication.processEvents()
+    clock = motion._throbbers or motion._Throbbers()
+    motion._throbbers = clock
+    for bar in bars:
+        bar.repaint()
+    assert clock._timer.isActive() and set(clock._painted) == set(bars)  # one timer for every bar
     for bar in bars:
         bar.set(0.5)  # the number is in: the bar shows it and stops asking for frames
-    pump(80)
-    assert not clock._timer.isActive()
+        bar.repaint()
+    clock._tick()  # the frame that repaints the bars as they were last asked for
+    for bar in bars:
+        bar.repaint()
+    clock._tick()  # nothing asked for one since: the clock stops
+    assert not clock._timer.isActive() and not clock._painted
     motion.set_enabled(False)
     try:
         bars[0].set(None, waiting=True)
-        pump(80)
-        assert not clock._timer.isActive()  # Reduce motion: a still tinted bar, no frames
+        bars[0].repaint()
+        assert not clock._timer.isActive() and not clock._painted  # Reduce motion: a still tinted bar, no frames
     finally:
         motion.set_enabled(True)
