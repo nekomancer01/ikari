@@ -41,6 +41,9 @@ THREADS_TIP = ("A post with no comments counts as complete, and so does one whos
                "before Arctic Shift counted its comments.")
 
 WHAT = {"posts": "Posts", "comments": "Comments", "both": "Both"}  # what Download N days fetches
+# A day's count is kept in the database once the archive has had this long after the day ended to take in its
+# last posts (ArcticShiftClient's ingest lag is an hour); one asked for sooner is used for this session only.
+COUNT_SETTLED = 2 * 3600
 
 
 def day_text(day: int) -> str:
@@ -309,7 +312,11 @@ class CoveragePage(VerticalScrollArea):
         # part way is kept in the settings, so Resume can start it again after a restart too.
         self._run: tuple | None = None
         try:
-            self._stopped: dict | None = json.loads(settings.value("coverage/stopped", "", str) or "null")
+            stopped = json.loads(settings.value("coverage/stopped", "", str) or "null")
+            self._stopped: dict | None = stopped if (
+                isinstance(stopped, dict) and isinstance(stopped.get("subreddit"), str)
+                and stopped.get("what") in WHAT and isinstance(stopped.get("at"), (int, float))
+                and stopped.get("days") and all(isinstance(d, int) for d in stopped["days"])) else None
         except ValueError:
             self._stopped = None
 
@@ -378,7 +385,7 @@ class CoveragePage(VerticalScrollArea):
                              small=True)
         self.filter.buttons["posts"].setToolTip("Only days with posts the archive has and ikari hasn't saved")
         self.filter.buttons["comments"].setToolTip("Only days with saved posts whose comments aren't all saved")
-        self.filter.changed.connect(lambda _: (self._apply_filter(), self._show_ticked()))
+        self.filter.changed.connect(self._on_filter)
         # Ticked days download together, one after another under one progress bar.
         self.tick_all = mark_flat(small_button("Select all"))
         self.tick_all.clicked.connect(self._tick_all)
@@ -612,9 +619,17 @@ class CoveragePage(VerticalScrollArea):
         whole, posts = self._threads_on(day)
         return posts - whole
 
+    def _on_filter(self, _key: str) -> None:
+        """Only the days shown stay ticked, so Download and Delete never act on days out of sight."""
+        self._apply_filter()
+        self.ticked &= set(self._shown_days())
+        self._show_ticked()
+
     def _apply_filter(self) -> None:
         """Hide the days the filter above the list leaves out."""
         key = self.filter.value()
+        if key == "comments" and self._threads_for[:1] != ((self.subreddit or "").lower(),):
+            key = "all"  # the whole threads aren't counted yet: nothing is hidden until they are
         for row, day in enumerate(self._day_rows):
             hide = (key == "posts" and not self._missing_posts(day)) or (key == "comments"
                                                                           and not self._missing_threads(day))
@@ -922,8 +937,10 @@ class CoveragePage(VerticalScrollArea):
         if self._count_stopped:
             return  # the app is closing, and the answer may be cut short
         self.totals.setdefault(sub.lower(), {}).update(counts)
-        # Kept, so they aren't asked for again today, here or after a restart. Today's own isn't: it's still growing.
-        self.window_.store.save_archive_counts(sub, {d: n for d, n in counts.items() if d < today()})
+        # Kept, so they aren't asked for again today, here or after a restart; not a day the archive may still be
+        # taking posts in for, whose count could still grow.
+        settled = time.time() - DAY - COUNT_SETTLED
+        self.window_.store.save_archive_counts(sub, {d: n for d, n in counts.items() if d <= settled})
         if not self._count_is_current():
             return  # for a subreddit no longer shown: not this one's error
         self.status.setText("")
@@ -988,22 +1005,21 @@ class CoveragePage(VerticalScrollArea):
         """A day's comments button: the threads not saved whole, or, when every one is, all of them again."""
         if not self.subreddit:
             return
-        ids = self.window_.store.open_threads(self.subreddit, [day])
-        if not ids:
-            ids = [r["id"] for r in self.window_.store.comment_coverage(self.subreddit, day, day + DAY)]
-        self._download_comments(ids)
+        store = self.window_.store
+        self._download_comments(store.open_threads(self.subreddit, [day])
+                                or store.open_threads(self.subreddit, [day], every=True))
 
     def _download_ticked(self) -> None:
         if not self.subreddit or not self.ticked:
             return
         self._start(self.subreddit, self.what.value(), tuple(sorted(self.ticked, reverse=True)))
 
-    def _start(self, sub: str, what: str, days: tuple[int, ...]) -> None:
-        """Download ``what`` from these days of r/sub, newest first."""
+    def _start(self, sub: str, what: str, days: tuple[int, ...]) -> bool:
+        """Download ``what`` from these days of r/sub, newest first; False if there's nothing to start."""
         if what == "comments":
             ids = self.window_.store.open_threads(sub, days)
             if not ids:
-                return
+                return False
             req = collect.FetchRequest(subreddit=sub, comment_posts=tuple(ids))
             message = f"Downloading the comments on {plural(len(ids), 'post')} from {plural(len(days), 'day')}…"
         else:
@@ -1013,8 +1029,10 @@ class CoveragePage(VerticalScrollArea):
             message = (f"Downloading every {'post and comment' if comments else 'post'} from "
                        f"{plural(len(days), 'day')} in r/{sub}…")
         # The ticks stay until it ends: unticked once it has read them all, kept (and offered to resume) if it's stopped.
-        if self.window_.start_request(req, message):
-            self._run = (req, sub, what, days)
+        if not self.window_.start_request(req, message):
+            return False
+        self._run = (req, sub, what, days)
+        return True
 
     def fetch_ended(self, req: collect.FetchRequest, stopped: bool) -> None:
         """A fetch ended: if it's this page's download of ticked days, untick them, or, stopped part way, offer
@@ -1024,12 +1042,17 @@ class CoveragePage(VerticalScrollArea):
         _, sub, what, days = self._run
         self._run = None
         if stopped:
-            self._stopped = {"subreddit": sub, "what": what, "days": list(days), "at": time.time()}
-        else:
-            self._stopped = None
-            if (self.subreddit or "").lower() == sub.lower():
-                self.untick(days)
-        self.settings.setValue("coverage/stopped", json.dumps(self._stopped) if self._stopped else "")
+            self._remember_stopped({"subreddit": sub, "what": what, "days": list(days), "at": time.time()})
+            return
+        s = self._stopped
+        if s and s["subreddit"].lower() == sub.lower() and set(s["days"]) <= set(days) and what in (s["what"], "both"):
+            self._remember_stopped(None)  # what was stopped is now read to the end
+        if (self.subreddit or "").lower() == sub.lower():
+            self.untick(days)
+
+    def _remember_stopped(self, stopped: dict | None) -> None:
+        self._stopped = stopped
+        self.settings.setValue("coverage/stopped", json.dumps(stopped) if stopped else "")
         self._show_resume()
 
     def _show_resume(self) -> None:
@@ -1039,7 +1062,8 @@ class CoveragePage(VerticalScrollArea):
         if not here:
             return
         days = s["days"]
-        when = datetime.fromtimestamp(s["at"]).strftime("%H:%M")
+        at = datetime.fromtimestamp(s["at"])
+        when = at.strftime("%H:%M" if at.date() == datetime.now().date() else "%a %d %b, %H:%M")
         what = {"posts": "posts", "comments": "comments", "both": "posts and comments"}[s["what"]]
         self.resume_text.setText(f"Stopped at {when}: {what} from {plural(len(days), 'day')}")
         self.resume_bar.setToolTip(f"{range_text(min(days), max(days))}. Resume carries on where it got to.")
@@ -1052,7 +1076,8 @@ class CoveragePage(VerticalScrollArea):
         days = tuple(sorted(s["days"], reverse=True))
         self.ticked = set(days) & set(self.days) if self.days else set()
         self._show_ticked()
-        self._start(s["subreddit"], s["what"], days)
+        if not self._start(s["subreddit"], s["what"], days) and s["what"] == "comments" and not self.busy:
+            self._remember_stopped(None)  # its threads were finished since: nothing is left to resume
 
     def _download_comments(self, ids: list[str]) -> None:
         if not self.subreddit or not ids:

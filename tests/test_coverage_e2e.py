@@ -458,22 +458,29 @@ def counts_asked():
     return [c for c in FakeArchive.calls if c[0] == "counts"]
 
 
+def reopen(w):
+    """The app closed and opened again on the same database, Python's coverage showing."""
+    path = w.db_path
+    w.close()
+    again = mw.MainWindow(path)
+    again.fetch_form.range.setCurrentIndex(again.fetch_form.range.findData("week"))
+    again.show()
+    select(again, "Python")
+    again.show_page("coverage")
+    settle(again)
+    return again
+
+
 def test_day_counts_are_kept_and_asked_for_again_only_the_next_day(window, monkeypatch):
+    monkeypatch.setattr(coverage, "COUNT_SETTLED", 0)  # yesterday's count is kept too, whatever the hour
     w = window
     select(w, "Python")
     w.show_page("coverage")
     c = w.coverage
     settle(w, lambda: c.totals.get("python"))
     assert len(counts_asked()) == 1
-    path = w.db_path
-    w.close()
-    again = mw.MainWindow(path)  # the app opened again the same day: the kept counts are shown, not asked for
-    again.fetch_form.range.setCurrentIndex(again.fetch_form.range.findData("week"))
-    again.show()
+    again = reopen(w)  # opened again the same day: the kept counts are shown, not asked for
     try:
-        select(again, "Python")
-        again.show_page("coverage")
-        settle(again)
         c = again.coverage
         assert len(counts_asked()) == 1
         row = c.days.index(TODAY - 2 * DAY)
@@ -490,6 +497,20 @@ def test_day_counts_are_kept_and_asked_for_again_only_the_next_day(window, monke
     assert downloads() == []
 
 
+def test_a_count_asked_for_before_the_archive_has_settled_its_day_isnt_kept(window, monkeypatch):
+    monkeypatch.setattr(coverage, "COUNT_SETTLED", 30 * DAY)  # every listed day still settling
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals.get("python"))
+    again = reopen(w)
+    try:
+        assert len(counts_asked()) == 2
+    finally:
+        again.close()
+
+
 def test_comments_download_fetches_only_the_ticked_days_threads_not_their_posts(window):
     w = window
     select(w, "Python")
@@ -500,7 +521,7 @@ def test_comments_download_fetches_only_the_ticked_days_threads_not_their_posts(
     assert not c.download_ticked.isEnabled()  # nothing ticked
     tick(c, TODAY - DAY)
     tick(c, TODAY - 3 * DAY)
-    assert "2 threads" in c.estimate.text() and c.download_ticked.isEnabled()
+    assert "2\u00a0threads" in c.estimate.text() and c.download_ticked.isEnabled()
     QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
     settle(w, lambda: not w.fetch_job.busy)
     assert sorted(downloads()) == [("all_comments", "p0"), ("all_comments", "p2")]  # p1, on the day between, isn't
@@ -529,8 +550,10 @@ def test_the_filter_shows_only_days_missing_something_and_select_all_ticks_those
     w.show_page("coverage")
     c = w.coverage
     settle(w, lambda: c.totals and c._threads)
+    tick(c, TODAY)  # nothing saved today
     QTest.mouseClick(c.filter.buttons["comments"], Qt.MouseButton.LeftButton)
     assert c._shown_days() == [TODAY - k * DAY for k in (1, 2, 3)]  # the days with saved posts
+    assert c.ticked == set()  # a day the filter hides is ticked no longer
     c.tick_all.click()
     assert c.ticked == {TODAY - k * DAY for k in (1, 2, 3)}
     QTest.mouseClick(c.filter.buttons["all"], Qt.MouseButton.LeftButton)
@@ -557,19 +580,12 @@ def test_a_stopped_download_offers_resume_even_after_a_restart(window, monkeypat
     tick(c, TODAY - 3 * DAY, shift=True)
     QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
     settle(w, lambda: not w.fetch_job.busy)
-    assert c.resume_bar.isVisible() and "3 days" in c.resume_text.text()
+    assert c.resume_bar.isVisible() and "3\u00a0days" in c.resume_text.text()
     monkeypatch.setattr(FakeArchive, "fetch_posts", reads)
-    path = w.db_path
-    w.close()
     FakeArchive.calls = []
-    again = mw.MainWindow(path)
-    again.fetch_form.range.setCurrentIndex(again.fetch_form.range.findData("week"))
-    again.show()
+    again = reopen(w)
     try:
-        select(again, "Python")
-        again.show_page("coverage")
         c = again.coverage
-        settle(again)
         assert c.resume_bar.isVisible()
         QTest.mouseClick(c.resume, Qt.MouseButton.LeftButton)
         settle(again, lambda: not again.fetch_job.busy)

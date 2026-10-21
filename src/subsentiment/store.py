@@ -615,16 +615,17 @@ class Store:
                                "AND counted_at >= ?", (subreddit.lower(), after, before, since))
         return {r["day"]: r["posts"] for r in rows}
 
-    def open_threads(self, subreddit: str, days) -> list[str]:
-        """Saved posts from these UTC days (their starts) whose comment threads aren't saved whole, newest first:
-        what Download coverage's comment downloads fetch."""
+    def open_threads(self, subreddit: str, days, every: bool = False) -> list[str]:
+        """Saved posts from these UTC days (their starts) whose comment threads aren't saved whole, or with
+        ``every`` all of them, newest first: what Download coverage's comment downloads fetch."""
         days = sorted(days)
         if not days:
             return []
         rows = self.db.execute(
             "SELECT p.id, CAST(p.created_utc / 86400 AS INTEGER) * 86400 d FROM posts p WHERE p.subreddit = ? "
-            f"COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? AND p.image = 0 AND NOT {WHOLE_THREAD} "
-            "ORDER BY p.created_utc DESC", (subreddit, days[0], days[-1] + 86400))
+            "COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? AND p.image = 0 "
+            + ("" if every else f"AND NOT {WHOLE_THREAD} ") + "ORDER BY p.created_utc DESC",
+            (subreddit, days[0], days[-1] + 86400))
         want = set(days)
         return [r["id"] for r in rows if r["d"] in want]
 
