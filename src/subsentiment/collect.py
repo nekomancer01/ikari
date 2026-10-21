@@ -9,7 +9,6 @@ from typing import Callable, Collection
 
 import requests
 
-from subsentiment import sentiment
 from subsentiment.arctic_shift import ArcticShiftClient, Stopped, in_parallel
 from subsentiment.reddit import FetchError, Post, normalize_subreddit
 from subsentiment.store import Store
@@ -84,6 +83,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         return _all_comments(client, store, req, progress, should_stop, saved)
 
     name = normalize_subreddit(req.subreddit)
+    score = lambda text: store.lexicon(name).score(text)  # noqa: E731 - by the subreddit's own words, as set now
     picked_days = set(req.days)
     stored = {r["id"]: r for r in store.posts_between(name, req.after, req.before)
               if not picked_days or (r["created_utc"] or 0) // DAY * DAY in picked_days}  # not days between picked ones
@@ -95,7 +95,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         note(f"Checking {len(stale):,} saved posts for updated scores…")
         for p in client.fetch_posts_by_ids(stale, should_stop=should_stop):
             if p.score is not None:
-                store.save_post(p, *sentiment.score(p.text))
+                store.save_post(p, *score(p.text))
                 updated.append(p)
         store.commit()
         saved()
@@ -108,7 +108,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
     def save_streamed(batch: list[Post]) -> None:
         for p in batch:
             if p.id not in stored and p.id not in streamed:
-                store.save_post(p, *sentiment.score(p.text))
+                store.save_post(p, *score(p.text))
                 store.commit()
                 streamed.add(p.id)
                 saved()
@@ -171,7 +171,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
                 comments, complete = got if everything else (got, False)
                 had = store.comment_ids(p.id)  # a thread asked for again: count only what's new
                 for c in comments:
-                    store.save_comment(c, *sentiment.score(c.body))
+                    store.save_comment(c, *score(c.body))
                     n_comments += c.id not in had
                 store.mark_comments(p.id, ok=True, settled=p.score is not None)
                 if complete:  # an unsettled thread may still be growing, so it's whole only "so far"
@@ -202,11 +202,11 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         new = [p for p in picked if p.id not in stored]
         for p in new:
             if p.id not in streamed:
-                store.save_post(p, *sentiment.score(p.text))
+                store.save_post(p, *score(p.text))
         settled = [p for p in picked if p.id in stored and p.id not in rechecked
                    and stored[p.id]["score"] is None and p.score is not None]
         for p in settled:
-            store.save_post(p, *sentiment.score(p.text))
+            store.save_post(p, *score(p.text))
         store.commit()
         saved()
         return new, settled
@@ -264,6 +264,7 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
     """Every comment on each post in req.comment_posts. Posts whose numbers hadn't settled are
     re-checked first, so their comment totals are real where the archive has them by now."""
     name = normalize_subreddit(req.subreddit)
+    score = lambda text: store.lexicon(name).score(text)  # noqa: E731
     posts = [_stored_post(r) for r in store.posts_by_ids(req.comment_posts)]
     stale = [p.id for p in posts if p.score is None]
     fresh: dict[str, Post] = {}
@@ -271,7 +272,7 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
         progress(0, 0, f"Checking {len(stale):,} saved posts for updated comment counts…")
         fresh = {p.id: p for p in client.fetch_posts_by_ids(stale, should_stop=should_stop) if p.score is not None}
         for p in fresh.values():
-            store.save_post(p, *sentiment.score(p.text))
+            store.save_post(p, *score(p.text))
         store.commit()
         posts = [fresh.get(p.id, p) for p in posts]
     n_comments = 0
@@ -281,7 +282,7 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
         comments, whole = got
         had = store.comment_ids(p.id)  # a thread fetched again: count only what's new
         for c in comments:
-            store.save_comment(c, *sentiment.score(c.body))
+            store.save_comment(c, *score(c.body))
             n_comments += c.id not in had
         store.mark_comments(p.id, ok=True, settled=p.score is not None)
         if whole:  # an unsettled thread may still be growing: it has every comment so far, not all

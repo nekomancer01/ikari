@@ -467,3 +467,12 @@ def test_the_progress_line_comes_back_once_a_wait_is_over(tmp_path):
     waited = c.told.index("Arctic Shift is slow right now. Waiting 4 s before the next request…")
     assert c.told[waited + 1] == c.told[waited - 1] and c.told[waited - 1].startswith("Day 1 of 1")
     assert c.seen == [c.told[waited - 1]]  # not the wait's line, while the search goes on
+
+
+def test_a_fetch_scores_by_the_subreddits_own_words(tmp_path):
+    s = Store(tmp_path / "x.db")
+    s.save_word("python", "lovely", -1.0)  # the fake archive's comments all say "lovely"
+    s.save_word("rust", "title", 1.0)  # another subreddit's words don't count here
+    collect.run(FakeClient(posts=[mk(1)]), s, collect.FetchRequest("python", limit=1))
+    assert [(r["body"], r["label"]) for r in s.comments("python")] == [("lovely", "negative")]
+    assert [r["label"] for r in s.posts("python")] == ["neutral"]

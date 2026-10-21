@@ -14,6 +14,7 @@ from pathlib import Path
 import zstandard
 
 from subsentiment.reddit import Comment, Post, is_image_post
+from subsentiment.sentiment import Lexicon
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS posts (
@@ -68,6 +69,12 @@ CREATE TABLE IF NOT EXISTS removed_posts (
 CREATE TABLE IF NOT EXISTS notes (
     subreddit TEXT NOT NULL, day INTEGER NOT NULL, label TEXT NOT NULL, text TEXT, saved_at REAL,  -- subreddit lowercased
     PRIMARY KEY (subreddit, day)
+) WITHOUT ROWID;
+-- What the user set a word or phrase to mean in one subreddit, from -1 (negative) through 0 (no sentiment) to +1
+-- (positive); scoring there reads it that way (sentiment.Lexicon). word: lowercased, single-spaced.
+CREATE TABLE IF NOT EXISTS words (
+    subreddit TEXT NOT NULL, word TEXT NOT NULL, weight REAL NOT NULL, saved_at REAL,  -- subreddit lowercased
+    PRIMARY KEY (subreddit, word)
 ) WITHOUT ROWID;
 -- (Lookups by subreddit alone use the *_fetched indexes below, which start with it.)
 CREATE INDEX IF NOT EXISTS comments_post ON comments(post_id);
@@ -160,6 +167,7 @@ class Store:
                 if is_image_post(r["url"], r["selftext"])])
             self.db.commit()
         self._stamp = 0.0
+        self._lexicons: dict[str, tuple] = {}  # subreddit lowercased -> (when read, its words, their Lexicon)
         backup = Path(str(self.path) + "-before-v1")
         if fresh:
             self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -538,6 +546,39 @@ class Store:
             self.db.execute("DELETE FROM notes WHERE subreddit = ? AND day = ?", (subreddit.lower(), int(day)))
         self.db.commit()
 
+    def words(self, subreddit: str) -> dict[str, float]:
+        """The words and phrases set to mean something of their own in a subreddit, as {word: weight}."""
+        return {r["word"]: r["weight"] for r in self.db.execute(
+            "SELECT word, weight FROM words WHERE subreddit = ? ORDER BY word", (subreddit.lower(),))}
+
+    def save_word(self, subreddit: str, word: str, weight: float | None) -> None:
+        """Set what a word or phrase means in a subreddit, or with None let it mean what it usually does again."""
+        word = Lexicon.key(word)
+        if weight is None:
+            self.db.execute("DELETE FROM words WHERE subreddit = ? AND word = ?", (subreddit.lower(), word))
+        else:
+            self.db.execute("INSERT OR REPLACE INTO words VALUES (?, ?, ?, ?)",
+                            (subreddit.lower(), _storable(word), max(-1.0, min(1.0, float(weight))), time.time()))
+        self.db.commit()
+        self._lexicons.pop(subreddit.lower(), None)
+
+    def lexicon(self, subreddit: str) -> Lexicon:
+        """A subreddit's words as they're set now, for scoring what's saved there. They're read again once a
+        second at most (or at once, set on this connection), so a fetch running on its own connection while the
+        user sets one scores by it from then on without a query for each item."""
+        hit = self._lexicons.get(subreddit.lower())
+        if hit is None or abs(time.time() - hit[0]) > 1.0:
+            words = self.words(subreddit)
+            made = hit[2] if hit is not None and hit[1] == words else Lexicon(words)
+            hit = self._lexicons[subreddit.lower()] = (time.time(), words, made)
+        return hit[2]
+
+    def rescore(self, kind: str, scores) -> None:
+        """Save new scores, [(id, sentiment, label)], on posts or comments (``kind``), leaving the rest as it is.
+        Like save_post, it's kept once committed."""
+        self.db.executemany(f"UPDATE {kind} SET sentiment = ?, label = ? WHERE id = ?",
+                            [(s, label, i) for i, s, label in scores])
+
     def delete_subreddit(self, subreddit: str) -> None:
         self.db.execute("DELETE FROM posts WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
         self.db.execute("DELETE FROM comments WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
@@ -545,6 +586,7 @@ class Store:
         self.db.execute("DELETE FROM complete WHERE subreddit = ?", (subreddit.lower(),))
         self.db.execute("DELETE FROM removed_posts WHERE subreddit = ?", (subreddit.lower(),))
         self.db.execute("DELETE FROM notes WHERE subreddit = ?", (subreddit.lower(),))
+        self.db.execute("DELETE FROM words WHERE subreddit = ?", (subreddit.lower(),))
         self.db.execute("DELETE FROM packs WHERE subreddit = ?", (subreddit.lower(),))
         self.db.commit()
         self._compact()
@@ -624,13 +666,14 @@ class Store:
         self.db.execute("DELETE FROM complete")
         self.db.execute("DELETE FROM removed_posts")
         self.db.execute("DELETE FROM notes")
+        self.db.execute("DELETE FROM words")
         self.db.execute("DELETE FROM packs")
         self.db.commit()
         self._compact()
 
     def import_from(self, path: str | Path) -> tuple[int, int]:
         """Merge another ikari database into this one: rows this one lacks are added, and a row both have
-        keeps the copy fetched (or, for a timeline note, saved) last. Nothing is removed from either file. Returns (new posts, new comments),
+        keeps the copy fetched (or, for a timeline note or a word's meaning, saved) last. Nothing is removed from either file. Returns (new posts, new comments),
         image posts and their comments left out as they are everywhere.
         Raises sqlite3.DatabaseError if path isn't an ikari database, ValueError if it is this one,
         FileNotFoundError if there's no file there."""
@@ -676,6 +719,13 @@ class Store:
                     "SELECT subreddit, day, label, text, saved_at FROM other.notes o WHERE NOT EXISTS (SELECT 1 FROM "
                     "main.notes m WHERE m.subreddit = o.subreddit AND m.day = o.day "
                     "AND COALESCE(m.saved_at, 0) >= COALESCE(o.saved_at, 0))")
+            if "words" in tables:  # likewise a word both have set in a subreddit
+                self.db.execute(
+                    "INSERT OR REPLACE INTO main.words (subreddit, word, weight, saved_at) "
+                    "SELECT subreddit, word, weight, saved_at FROM other.words o WHERE NOT EXISTS (SELECT 1 FROM "
+                    "main.words m WHERE m.subreddit = o.subreddit AND m.word = o.word "
+                    "AND COALESCE(m.saved_at, 0) >= COALESCE(o.saved_at, 0))")
+                self._lexicons.clear()
             for i in range(0, len(imported), 500):
                 ids = imported[i:i + 500]
                 self.db.executemany("UPDATE posts SET image = 1 WHERE id = ?", [
