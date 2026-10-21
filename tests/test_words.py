@@ -119,6 +119,23 @@ def test_a_narrow_cloud_shrinks_its_longest_most_used_words_rather_than_leaving_
     assert all(cloud.rect().toRectF().contains(b) for b, *_ in placed)
 
 
+def test_a_little_less_room_keeps_the_words_where_they_are_and_a_lot_lays_them_out_afresh():
+    # A fetch's strip appearing under the header makes the page a little shorter: that used to lay the whole
+    # cloud out again, a jump just as a fetch began.
+    QApplication.instance() or QApplication([])
+    cloud = WordCloud()
+    cloud.resize(700, 300)
+    cloud.set_words([(f"w{i}", 100 - 3 * i, 0.0) for i in range(25)])
+    was = {word: box.center().toTuple() for box, word, *_ in cloud.placed()}
+    cloud.resize(700, 280)
+    now = {word: box.center().toTuple() for box, word, *_ in cloud.placed()}
+    moved = sorted(math.dist(was[k], now[k]) for k in now if k in was)
+    assert len(moved) >= 20 and moved[len(moved) // 2] < 15  # each moved with the edge, and a small step at most
+    cloud.resize(1400, 600)
+    big = {word: box.center().toTuple() for box, word, *_ in cloud.placed()}
+    assert all(abs(big[k][0] - 700) < 700 for k in big) and len(big) == 25  # filled afresh, every word fits
+
+
 def test_a_big_recount_runs_on_a_thread_and_keeps_rows_added_meanwhile(monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(WordTally, "THREAD_FROM", 10)
