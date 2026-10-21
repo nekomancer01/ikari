@@ -12,6 +12,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QItemSelectionModel, QSettings, Qt  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QTableView  # noqa: E402
 
 from subsentiment.gui import main_window as mw  # noqa: E402
@@ -61,6 +62,15 @@ def window(tmp_path):
     yield w
     w.close()
     QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
+
+
+def filtered(tab) -> None:
+    """Wait for a saved subreddit's table to show what its filters let through: its search runs on a thread once
+    typing pauses."""
+    end = time.monotonic() + 10
+    while tab._typing.isActive() or tab._slices.running():
+        assert time.monotonic() < end
+        QTest.qWait(5)
 
 
 def count_calls(monkeypatch, cls, name) -> list:
@@ -142,10 +152,12 @@ def test_rows_a_fetch_adds_go_where_the_sort_order_puts_them():
 def test_the_text_filter_ignores_case_and_line_breaks_and_applies_to_rows_a_fetch_adds(window):
     tab = window.comments_tab
     tab.filter.setText("LOVE  it")
+    filtered(tab)
     loved = sum(1 for r in tab.all_rows if r["body"].startswith("Love it"))
     assert 0 < tab.model.rowCount() == loved < COMMENTS
     assert all("love it" in tab.model.row_at(i)["body"].lower() for i in range(tab.model.rowCount()))
     tab.label_filter.setCurrentText("Negative")
+    filtered(tab)
     both = sum(1 for r in tab.all_rows if r["body"].startswith("Love it") and r["label"] == "negative")
     assert tab.model.rowCount() == both
     new = {"id": "new1", "post_id": "p1", "subreddit": "Big", "body": "I\nlove\tIT", "label": "negative",
@@ -155,6 +167,7 @@ def test_the_text_filter_ignores_case_and_line_breaks_and_applies_to_rows_a_fetc
     assert tab.model.rowCount() == both + 1 and tab.count.text() == mw.plural(both + 1, "row")
     tab.filter.setText("")
     tab.label_filter.setCurrentText("All labels")
+    filtered(tab)
     assert tab.model.rowCount() == COMMENTS + 2
 
 
@@ -238,9 +251,11 @@ def test_typing_a_filter_keeps_the_selected_row_selected(window):
     picked = tab.model.row_at(pick)["id"]
     tab.view.selectRow(pick)
     tab.filter.setText("great")
+    filtered(tab)
     assert [tab.model.row_at(i.row())["id"] for i in tab.view.selectionModel().selectedRows()] == [picked]
     assert tab.model.row_at(tab.view.currentIndex().row())["id"] == picked
     tab.filter.setText("awful")  # it doesn't match: nothing is selected
+    filtered(tab)
     assert tab.view.selectionModel().selectedRows() == []
 
 

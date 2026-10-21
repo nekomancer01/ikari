@@ -8,7 +8,7 @@ order, read as a list: what the tables show and export writes.
 from __future__ import annotations
 
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -24,6 +24,13 @@ LABEL_AT = {lab: k for k, lab in enumerate(LABELS)}
 ARRAYS = {"sentiment": "sentiment", "score": "score", "created_utc": "created", "label": "label"}
 
 
+class Gone(dict):
+    """A row deleted since it was counted: its id, and None for the rest."""
+
+    def __missing__(self, key):
+        return None
+
+
 class RowSource:
     """Rows by position, with ``ids``, ``created``, ``score``, ``sentiment`` and ``label`` arrays (as RowIndex
     keeps them). `values` gives any column of every row, for sorting and filtering; a text column read once is
@@ -37,6 +44,7 @@ class RowSource:
         self._drawn: OrderedDict[int, object] = OrderedDict()  # position -> its row, read lately
         self._values: dict[str, list] = {}  # column -> every row's value, once read
         self.version = 0  # counts changes to its rows
+        self._changes: deque = deque(maxlen=64)  # (version, positions changed then), the latest
 
     def __len__(self) -> int:
         return len(self.ids)
@@ -74,6 +82,12 @@ class RowSource:
         while len(self._drawn) > self.KEEP:
             self._drawn.popitem(last=False)
 
+    def changed_since(self, version: int) -> set | None:
+        """The positions changed since ``version``; None when that's too long ago to tell."""
+        if not self._changes or self._changes[0][0] > version + 1:
+            return set() if version == self.version else None
+        return {p for v, at in self._changes if v > version for p in at}
+
     def values(self, key: str):
         """Every row's ``key``: an array for the numbers kept as arrays, else a list, or None when that column
         isn't read yet (`read_values`)."""
@@ -98,6 +112,7 @@ class RowSource:
         ``rows`` (them as they are now)."""
         positions = [int(p) for p in positions]
         self.version += 1
+        self._changes.append((self.version, positions))
         for p in positions:
             self._drawn.pop(p, None)
         if rows is not None:
@@ -190,7 +205,12 @@ class Saved(RowSource):
     label = property(lambda self: self.index.label)
 
     def _read(self, positions) -> list:
-        return self.index.rows(positions)
+        """The rows at ``positions``; one deleted since the index was read (its days deleted, the window about to
+        read them again) as a `Gone` row."""
+        positions = [int(p) for p in positions]
+        got = {r["id"]: r for r in self.index.rows(positions)}
+        ids = self.ids
+        return [got.get(i) or Gone(id=i) for i in (ids[p].decode() for p in positions)]
 
     def where(self, ids) -> np.ndarray:
         return self.index.where(ids)

@@ -941,8 +941,8 @@ class MainWindow(QMainWindow):
             self._loaded[name.lower()] = loaded  # the newest last
             while len(self._loaded) > 4:
                 del self._loaded[next(iter(self._loaded))]
-        self._saved = loaded[1]
-        if self.fetch_job.busy and self._showing_fetch():
+        kept, self._saved = loaded[1] is self._saved, loaded[1]
+        if self.fetch_job.busy and self._showing_fetch() and not kept:
             # What it saved after these were read: they read the database as it was when they were made.
             self._read_to = {k: max(self._since, getattr(self._saved[k], "made_at", 0.0) - 1.0) for k in KINDS}
         self._last_fetched = self._newest("posts")
@@ -995,7 +995,7 @@ class MainWindow(QMainWindow):
 
     def _on_load_failed(self, message: str) -> None:
         if self._wanted is not None:  # read it here instead, where an error shows as it always has
-            self._show_dataset(self._name_of(self._wanted[0]), wait=True)
+            self._show_dataset(self._name_of(self._wanted), wait=True)
 
     def _name_of(self, lowered: str) -> str:
         """A saved subreddit's name as the list writes it."""
@@ -1188,8 +1188,7 @@ class MainWindow(QMainWindow):
         """Download coverage deleted some days of ``subreddit``: if it's still shown, show it again from the store
         on every page. If nothing of it is left it stays shown, empty, so its days can be downloaded again from
         here. Another subreddit picked meanwhile stays shown."""
-        for key in [k for k in self._loaded if k[0] == subreddit.lower()]:
-            del self._loaded[key]
+        self._loaded.pop(subreddit.lower(), None)
         shown = (self.current or "").lower() == subreddit.lower()
         self._refresh_datasets(select=subreddit if shown else None, reload=False)
         if shown:

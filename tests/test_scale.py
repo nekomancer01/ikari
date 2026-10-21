@@ -349,3 +349,79 @@ def test_filtering_a_big_subreddit_looks_its_words_up_on_a_thread_once_typing_pa
     until(lambda: not tab._typing.isActive() and not tab._slices.running(), 30)
     assert {r["id"] for r in tab.model.rows} == {i for i in expected if saved.rows(saved.where([i]))[0]["label"] == "negative"}
     saved.close()
+
+
+def test_a_row_deleted_after_its_subreddit_was_read_draws_as_gone_and_the_rest_as_they_are(tmp_path):
+    db = str(tmp_path / "big.db")
+    fill(db)
+    saved = Saved(db, "comments", "Big")
+    gone, kept = saved.ids[5].decode(), saved.ids[6].decode()
+    store = Store(db)
+    store.db.execute("DELETE FROM comments WHERE id = ?", (gone,))
+    store.db.commit()
+    store.close()
+    first, second = saved.rows([5, 6])  # (the second came back as the first's)
+    assert first["id"] == gone and first["body"] is None and second["id"] == kept and second["body"]
+    saved.close()
+
+
+def test_rows_read_for_drawing_while_a_fetch_adds_others_are_kept(tmp_path, monkeypatch):
+    QApplication.instance() or QApplication([])
+    db = str(tmp_path / "big.db")
+    fill(db)
+    saved = Saved(db, "comments", "Big")
+    tab = TablePage(TABLE_COMMENTS, stretch_col=2)
+    tab.set_rows(saved, np.arange(len(saved)))
+    until(lambda: not tab.model._reads.running(), 30)  # the first and last rows, read as the table got them
+    real = Saved._read
+
+    reading = threading.Event()
+
+    def slow(self, at):
+        got = real(self, at)
+        if threading.current_thread() is not threading.main_thread():
+            reading.set()
+            time.sleep(0.2)
+        return got
+    added = dict(saved.rows([COMMENTS - 1])[0], id="new1")
+    saved._drawn.clear()
+    monkeypatch.setattr(Saved, "_read", slow)
+    model = tab.model
+    assert model.data(model.index(0, 2)) is None  # drawn blank, read on a thread
+    until(reading.is_set, 30)
+    saved.add([added])  # a fetch saves a comment while the rows are read
+    until(lambda: not model._reads.running(), 30)
+    assert model.data(model.index(0, 2)) == tables._one_line(saved.rows([int(model.order[0])])[0]["body"])
+    assert saved.kept(int(model.order[0])) is not None
+    saved.close()
+
+
+def test_rows_a_fetch_rescored_out_while_a_big_table_is_filtered_stay_out(monkeypatch):
+    tab, rows = big_table()
+    tab.filter.setText("rogue")
+    QApplication.processEvents()  # under way
+    assert tab._slices.running()
+    keep = np.flatnonzero(np.arange(len(rows)) % 2 == 0)  # the odd ones went below the score filter
+    tab.retain(keep)
+    until(lambda: not tab._slices.running(), 30)
+    assert {r["id"] for r in tab.model.rows} == {rows[i]["id"] for i in keep if "rogue" in rows[i]["body"].lower()}
+
+
+def test_a_big_subreddit_that_failed_to_read_on_a_thread_is_read_again_here(tmp_path, monkeypatch):
+    settings(tmp_path)
+    db = str(tmp_path / "big.db")
+    fill(db)
+    monkeypatch.setattr(mw.MainWindow, "wait_for_data", False)
+    w = mw.MainWindow(db)
+    try:
+        w.show()
+        until(lambda: w.current == "Big" and not w.load_job.busy, 30)
+        w._wanted = "big"
+        w._on_load_failed("disk I/O error")
+        assert w.current == "Big" and w._wanted is None and len(w._saved["comments"]) == COMMENTS
+        w._loaded["big"] = w._loaded.get("big")
+        w.days_deleted("Big", 1, 0, 0)
+        assert "big" not in w._loaded
+    finally:
+        w.close()
+        QSettings.setDefaultFormat(QSettings.Format.NativeFormat)

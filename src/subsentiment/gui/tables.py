@@ -22,7 +22,7 @@ from subsentiment.gui.widgets import label, mark, plural
 from subsentiment.gui.rows import ARRAYS, LABEL_AT, RowList, Rows, RowSource
 from subsentiment.gui.worker import Slices, finish, on_thread
 from subsentiment.analysis import LABELS
-from subsentiment.store import NO_SCORE, column
+from subsentiment.store import NO_SCORE, PACKED, Search, column
 
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1  # the value a column sorts by (the model sorts by it itself)
 NUMERIC = ("sentiment", "score", "num_comments")
@@ -611,8 +611,10 @@ class RowsModel(QAbstractTableModel):
             at = order[lo:hi].tolist() if hi - lo <= 4 * RowSource.READ else [int(order[i]) for i in asked if i < len(order)]
             version = source.version
             got = yield from on_thread(lambda: source._read(at))
-            if source is self.source and source.version == version:
-                source.keep(at, got)
+            since = source.changed_since(version)
+            if source is self.source and since is not None:  # (rows changed meanwhile are read again)
+                fresh = [k for k, p in enumerate(at) if p not in since]
+                source.keep([at[k] for k in fresh], [got[k] for k in fresh])
             if len(self.order):  # the view draws what it shows of it again
                 self.dataChanged.emit(self.index(0, 0), self.index(len(self.order) - 1, len(self.columns) - 1))
             self.read.emit()
@@ -642,20 +644,20 @@ class TablePage(QWidget):
         self._in_base = np.zeros(0, bool)  # by position: in _base
         self._text_key = columns[stretch_col][1]
         self._builds = 0  # counts loads and filterings, so one worked out between frames sees it's been overtaken
-        self._waiting: list | None = None  # while one is: [(rows added, or None), (rows saved again, or None)], in turn
+        self._waiting: list | None = None  # while one is: what a fetch brought meanwhile, to take in turn once it's done
         self._last: tuple | None = None  # (label, needle, the positions they let through), for the next keystroke
+        self._by_words = False  # whether the text filter was looked up in the search index
         self._slices = Slices(self)
 
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("Filter by text…")
         self.filter.setClearButtonEnabled(True)
-        # A big table with a search index is searched once typing pauses: a short word's search ran to half a second.
+        # A saved subreddit is searched once typing pauses: a short word's search took up to half a second.
         self._typing = QTimer(self)
         self._typing.setSingleShot(True)
         self._typing.setInterval(150)
         self._typing.timeout.connect(self._apply_filters)
-        self.filter.textChanged.connect(lambda _: self._typing.start() if self.source.lazy and len(self._base) >= self.model.BIG
-                                        else self._apply_filters())
+        self.filter.textChanged.connect(lambda _: self._typing.start() if self.source.lazy else self._apply_filters())
         self.label_filter = mark(QComboBox(), "pill", True)
         self.label_filter.addItems(["All labels", "Positive", "Neutral", "Negative"])
         self.label_filter.currentTextChanged.connect(lambda _: motion.crossfade(self.view))  # first: the old rows' look
@@ -763,7 +765,7 @@ class TablePage(QWidget):
         looked at, while a big table is being worked out)."""
         rows = list(rows)
         if self._waiting is not None:
-            self._waiting.append((rows, None))
+            self._waiting.append(lambda: self.add_rows(rows))
             return len(rows)
         new = [p for p in dict.fromkeys(self._positions(rows)) if not self._in(p)]
         if new:
@@ -777,7 +779,7 @@ class TablePage(QWidget):
         are added and fade in. Returns how many of the rows given were shown before."""
         rows = list(rows)
         if self._waiting is not None:
-            self._waiting.append((None, rows))
+            self._waiting.append(lambda: self.update_rows(rows))
             return 0
         return self.took(self._positions(rows))
 
@@ -785,7 +787,7 @@ class TablePage(QWidget):
         """The rows at positions ``at`` were saved (again, or scored again): rows shown change to how they are now,
         and the rest are added and fade in. Returns how many were in the table before."""
         if self._waiting is not None:
-            self._waiting.append((None, Rows(self.source, at)))
+            self._waiting.append(lambda: self.took(at))
             return 0
         at = list(dict.fromkeys(int(p) for p in at))
         old = [p for p in at if self._in(p)]
@@ -805,6 +807,9 @@ class TablePage(QWidget):
         """Show the rows at ``at`` now, keeping the view's place: rows that left go, new ones are added (a fetch
         rescored some below the score filter, say)."""
         at = np.asarray(at, np.int64)
+        if self._waiting is not None:
+            self._waiting.append(lambda: self.retain(at))
+            return
         keep = np.zeros(len(self.source), bool)
         keep[at] = True
         gone = self._base[~keep[self._base]]
@@ -820,10 +825,19 @@ class TablePage(QWidget):
         return self.label_filter.currentText().lower(), " ".join(self.filter.text().lower().split())
 
     def _picked(self, at: np.ndarray, label: str, needle: str) -> np.ndarray:
-        """The positions among ``at`` the label and text filters let through: the text on one line, ignoring case."""
+        """The positions among ``at`` the label and text filters let through: the text on one line, ignoring case
+        (or its words, when the search index found the rest)."""
         if label != "all labels" and len(at):
             at = at[self.source.label[at] == LABEL_AT[label]]
-        if needle and len(at):
+        if needle and len(at) and self._by_words:  # as the search index found the others (Search): rows added since
+            kind, words = self.source.kind, Search.WORD.findall(needle)
+            hits = []
+            for p, r in zip(at.tolist(), self.source.rows(at)):
+                has = set(Search.WORD.findall(Search.text(kind, [r.get(c) for c in PACKED[kind]]).lower()))
+                if all(w in has for w in words[:-1]) and any(h.startswith(words[-1]) for h in has):
+                    hits.append(p)
+            at = np.array(hits, np.int64)
+        elif needle and len(at):
             texts = self.source.values(self._text_key)
             if texts is None:  # a few rows a fetch added: read here
                 texts = dict(zip(at.tolist(), column(self.source.rows(at), self._text_key)))
@@ -834,7 +848,7 @@ class TablePage(QWidget):
         return at
 
     def _apply_filters(self) -> None:
-        if len(self._base) < self.model.BIG:
+        if len(self._base) < self.model.BIG and not self.source.lazy:  # (a lazy source's search runs on a thread)
             finish(self._filtering(None))
         else:
             self._builds += 1
@@ -857,6 +871,7 @@ class TablePage(QWidget):
             found = finish(work) if step is None else (yield from work)
             if builds != self._builds:
                 return
+        self._by_words = found is not None
         if label == "all labels" and not needle:
             picked = at
         elif found is not None:
@@ -914,11 +929,8 @@ class TablePage(QWidget):
 
     def _take_waiting(self) -> None:
         waiting, self._waiting = self._waiting or [], None
-        for added, again in waiting:  # rows a fetch saved meanwhile
-            if added is not None:
-                self.add_rows(added)
-            else:
-                self.update_rows(again)
+        for take in waiting:
+            take()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
