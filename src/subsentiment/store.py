@@ -1250,15 +1250,44 @@ class Store:
         return sorted(tuple(map(int, k.split(":"))) for k in self.complete_keys("posts_read", subreddit))
 
     def save_read_spans(self, subreddit: str, spans) -> None:
+        self._save_spans("posts_read", subreddit, self.read_spans(subreddit) + list(spans), 1)
+
+    def tried_days(self, subreddit: str) -> list[int]:
+        """UTC days (their starts, newest first) a fetch or download has asked for, whether or not anything was
+        saved from them: Download coverage lists these, to find what those fetches missed. Before any was
+        recorded, the days from the first saved post to the last stand in for them."""
+        spans = self._tried_spans(subreddit)
+        return sorted({d for a, b in spans for d in range(a, b + 1, 86400)}, reverse=True)
+
+    def save_tried(self, subreddit: str, days) -> None:
+        """Record these UTC days (their starts) as asked for, joined to the ones before."""
+        self._save_spans("posts_tried", subreddit, self._tried_spans(subreddit) + [(d, d) for d in days], 86400)
+        self.db.commit()
+
+    def _tried_spans(self, subreddit: str) -> list[tuple[int, int]]:
+        """(first day, last day) stretches of tried_days; from what's saved when none were recorded."""
+        keys = self.complete_keys("posts_tried", subreddit)
+        if keys:
+            return sorted(tuple(map(int, k.split(":"))) for k in keys)
+        seen = [t for row in self.db.execute(
+            "SELECT MIN(created_utc), MAX(created_utc) FROM posts WHERE subreddit = ? COLLATE NOCASE "
+            "UNION ALL SELECT MIN(created_utc), MAX(created_utc) FROM removed_posts WHERE subreddit = ?",
+            (subreddit, subreddit.lower())) for t in row if t is not None]
+        seen += [int(k) for k in self.complete_keys("posts", subreddit)]
+        seen += [t for span in self.read_spans(subreddit) for t in span]
+        return [(int(min(seen) // 86400 * 86400), int(max(seen) // 86400 * 86400))] if seen else []
+
+    def _save_spans(self, kind: str, subreddit: str, spans, touch: int) -> None:
+        """Keep (first, last) stretches under ``kind`` in ``complete``, joining ones less than ``touch`` apart."""
         merged: list[tuple[int, int]] = []
-        for a, b in sorted(self.read_spans(subreddit) + list(spans)):
-            if merged and a <= merged[-1][1] + 1:
+        for a, b in sorted(spans):
+            if merged and a <= merged[-1][1] + touch:
                 merged[-1] = (merged[-1][0], max(merged[-1][1], b))
             else:
                 merged.append((a, b))
-        self.db.execute("DELETE FROM complete WHERE kind = 'posts_read' AND subreddit = ?", (subreddit.lower(),))
+        self.db.execute("DELETE FROM complete WHERE kind = ? AND subreddit = ?", (kind, subreddit.lower()))
         for a, b in merged:
-            self.mark_complete("posts_read", subreddit, f"{a}:{b}")
+            self.mark_complete(kind, subreddit, f"{a}:{b}")
 
     def save_removed(self, subreddit: str, removed: dict[str, float]) -> None:
         self.db.executemany("INSERT OR REPLACE INTO removed_posts VALUES (?, ?, ?)",

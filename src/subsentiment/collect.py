@@ -89,6 +89,9 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
 
     name = normalize_subreddit(req.subreddit)
     score = lambda text: store.lexicon(name).score(text)  # noqa: E731 - by the subreddit's own words, as set now
+    # Asked for, whatever comes of it: Download coverage lists these days, to find what this fetch misses.
+    end = time.time() if req.before is None else req.before
+    store.save_tried(name, req.days or days_in(end - 7 * DAY if req.after is None else req.after, end))
     picked_days = set(req.days)
     stored = {r["id"]: r for r in store.posts_between(name, req.after, req.before)
               if not picked_days or (r["created_utc"] or 0) // DAY * DAY in picked_days}  # not days between picked ones

@@ -130,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     window = MainWindow(str(db))
     motion.set_enabled(False)  # stills of the finished state, not mid-fade
     window.resize(*SIZE)
-    window.fetch_form.range.setCurrentIndex(window.fetch_form.range.findData("month"))  # Coverage lists these days
+    window.fetch_form.range.setCurrentIndex(window.fetch_form.range.findData("month"))
     window.show()
     window._refresh_datasets(SUBREDDIT)
     window.fetch_form.subreddit.setText(SUBREDDIT)
