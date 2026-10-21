@@ -1,5 +1,6 @@
 """The word cloud: which words count, how they're tallied and placed, and the Words page on real saved data."""
 import math
+from collections import Counter
 import os
 import time
 
@@ -252,6 +253,7 @@ def test_setting_a_word_rescores_that_subreddit_only_and_every_page_follows(tmp_
         row = meanings.rows["grinding"]
         QTest.mouseClick(row.slider, Qt.MouseButton.LeftButton, pos=QPoint(row.slider.width() - 4, row.slider.height() // 2))
         assert w.store.words("town") == {"grinding": 1.0} and row.reads.text() == "Very positive"
+        assert row.result.full_text().startswith("Scoring saved items\u2026")  # Ame: a way to see it's working
         end = time.monotonic() + 10
         while w.rescore.running():
             assert time.monotonic() < end
@@ -265,7 +267,12 @@ def test_setting_a_word_rescores_that_subreddit_only_and_every_page_follows(tmp_
         assert {r["id"]: r["label"] for r in w.posts_tab.model.rows}["town2"] == "positive"  # the tables
         assert {r["id"]: r["label"] for r in w.posts}["town0"] == "positive"  # and what export writes
         assert dict((word, lean) for word, _, lean in w.word_tally.top(KINDS))["grinding"] == 1.0  # the cloud
-        assert meanings.status.text() == "Saved items scored again"
+        assert meanings.status.isHidden()  # only says something when scoring failed
+        moved = {(a, "positive"): sum(1 for i in ("town0", "town2", "townc") if before[i.replace("town", "city")] == a)
+                 for a in ("negative", "neutral")}
+        assert row.result.full_text() == "\u2713 3 of 3 saved items changed label"
+        assert row.result.toolTip() == "\n".join(
+            f"{n} {a} \u2192 {b}" for (a, b), n in sorted(moved.items(), key=lambda m: -m[1]) if n)
         w._refresh_datasets("city")
         assert meanings.subreddit == "city" and meanings.rows == {}
         w._refresh_datasets("town")  # back from memory, rescored
@@ -330,3 +337,52 @@ def test_moving_the_span_keeps_the_words_both_spans_share_where_they_are(window,
         assert time.monotonic() < end
         app.processEvents()
     assert not page.busy and page._dimming.target == 1.0 and "library" in {word for _, word, *_ in page.placed()}
+
+
+def test_the_result_counts_only_what_the_setting_changes_and_old_scores_apart(tmp_path):
+    """Ame set "dungeon" to neutral and read "130 neutral \u2192 positive, 50 negative \u2192 positive": most of that
+    was items scored by an older version getting today's score, not the setting."""
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("subsentiment-test")
+    app.setApplicationName(tmp_path.name)
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path / "cfg"))
+    QSettings().setValue("updates/auto", False)
+    s = Store(tmp_path / "w.db")
+    day = 1_700_000_000.0
+    texts = ["Grinding the boss all night", "Grinding again", "The grinding is awful and broken, I hate it",
+             "Library reopened today"]
+    for i, title in enumerate(texts):
+        score, label = sentiment.score(title)
+        if i == 2:
+            label = "positive"  # as an older version had it
+        s.save_post(Post(f"p{i}", "town", title, "", "a", 1, 0.9, 0, day - i * 86400, "https://r", ""), score, label)
+    s.commit()
+    s.close()
+    set_to = sentiment.Lexicon({"grinding": 1.0})
+    usual = {t: sentiment.score(t)[1] for t in texts[:3]}
+    now = {t: set_to.score(t)[1] for t in texts[:3]}
+    assert usual[texts[2]] == now[texts[2]] == "negative"  # what the setting doesn't change, but was out of date
+    changes = Counter((usual[t], now[t]) for t in texts[:2] if usual[t] != now[t])
+    assert changes
+    w = mw.MainWindow(str(tmp_path / "w.db"))
+    try:
+        w.show()
+        w._refresh_datasets("town")
+        meanings = w.words_page.meanings
+        meanings.pick("grinding")
+        meanings.rows["grinding"].slider.setValue(100)
+        meanings._save(meanings.rows["grinding"])
+        end = time.monotonic() + 10
+        while w.rescore.running():
+            assert time.monotonic() < end
+            app.processEvents()
+            time.sleep(0.01)
+        n = sum(changes.values())
+        result = meanings.rows["grinding"].result
+        assert result.full_text() == f"\u2713 {n} of 3 saved items changed label"
+        assert result.toolTip() == "\n".join([f"{k} {a} \u2192 {b}" for (a, b), k in changes.most_common()]
+                                             + ["Also updated 1 scored by an older version"])
+    finally:
+        w.close()
+        QSettings.setDefaultFormat(QSettings.Format.NativeFormat)

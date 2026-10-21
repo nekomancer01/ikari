@@ -2,18 +2,22 @@
 
 Run: python tools/make_icon.py (needs Pillow).
 """
+import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageColor, ImageDraw
 
-ASSETS = Path(__file__).resolve().parents[1] / "src" / "subsentiment" / "gui" / "assets"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from subsentiment.gui.theme import ASSETS, THEMES
+
 N = 1024  # draw large, downsample for smooth edges
 
-# Flat: solid fills only, no gradients, sheen or shadows. Colours match the theme
-# accent and the chart's sentiment colours.
-TILE = (78, 100, 255)  # the icon tile's blue-violet
+# Flat: solid fills only, no gradients, sheen or shadows. Colours come from the light theme (the bars sit on
+# a white bubble, as the charts do there): the tile is the accent, the bars the sentiment colours.
+T = {k: ImageColor.getrgb(v) for k, v in THEMES["light"].items() if isinstance(v, str)}
+TILE = T["accent"]
 WHITE = (255, 255, 255, 255)
-COLORS = [(227, 73, 72), (138, 137, 132), (42, 120, 214)]  # negative, neutral, positive
+COLORS = [T["negative"], T["neutral"], T["positive"]]
 
 icon = Image.new("RGBA", (N, N), (0, 0, 0, 0))
 d = ImageDraw.Draw(icon)
