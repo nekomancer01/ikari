@@ -1,12 +1,12 @@
 """The Overview page (four stat tiles, the timeline across the full width, the distribution under it) and
-the single-card pages beside it in the rail: Timeline and Words."""
+the pages beside it in the rail: Timeline, a single card, and Words."""
 from __future__ import annotations
 
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
 
 from subsentiment.analysis import Analysis
 from subsentiment.gui.charts import DistributionChart, TimelineChart
-from subsentiment.gui.words import WordCloud
+from subsentiment.gui.words import WordCloud, WordMeanings
 from subsentiment.gui.widgets import ElidedLabel, StatTile, VerticalScrollArea, label, panel
 
 
@@ -27,7 +27,7 @@ def card(title: str, body: QWidget, extra: QWidget | None = None) -> QFrame:
 
 
 class CardPage(QWidget):
-    """A page that is one titled card filling the content area, such as Timeline and Words."""
+    """A page that is one titled card filling the content area, such as Timeline."""
 
     def __init__(self, title: str, body: QWidget, extra: QWidget | None = None):
         super().__init__()
@@ -36,6 +36,22 @@ class CardPage(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(card(title, body, extra), 1)
         self.cards = [body.parentWidget()]
+
+
+class WordsPage(QWidget):
+    """The word cloud filling the page, and beside it what words mean in the subreddit shown (WordMeanings)."""
+
+    def __init__(self):
+        super().__init__()
+        self.body = WordCloud()
+        self.meanings = WordMeanings()
+        self.body.word_clicked.connect(self.meanings.pick)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(14)
+        lay.addWidget(card("Words used most", self.body), 1)
+        lay.addWidget(card("Word meanings", self.meanings))
+        self.cards = [self.body.parentWidget(), self.meanings.parentWidget()]
 
 
 class OverviewPage(VerticalScrollArea):
