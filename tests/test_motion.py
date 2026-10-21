@@ -308,3 +308,27 @@ def test_a_fade_starts_exactly_on_the_window_it_covers_at_150_percent(make_windo
     assert run.returncode == 0, run.stderr[-2000:]
     assert "dpr 1.5" in run.stdout, run.stdout
     assert "off 0" in run.stdout, run.stdout
+
+
+def test_a_waiting_bar_throbs_on_one_clock_that_stops_with_it(make_window):
+    from subsentiment.gui.widgets import ShareBar
+    make_window()
+    bars = [ShareBar() for _ in range(3)]
+    for bar in bars:
+        bar.resize(120, 6)
+        bar.set(None, waiting=True)
+        bar.show()
+    pump(80)
+    clock = motion._throbbers
+    assert clock._timer.isActive() and set(clock._painted) == set(bars)  # one timer for every bar
+    for bar in bars:
+        bar.set(0.5)  # the number is in: the bar shows it and stops asking for frames
+    pump(80)
+    assert not clock._timer.isActive()
+    motion.set_enabled(False)
+    try:
+        bars[0].set(None, waiting=True)
+        pump(80)
+        assert not clock._timer.isActive()  # Reduce motion: a still tinted bar, no frames
+    finally:
+        motion.set_enabled(True)

@@ -103,6 +103,7 @@ def test_the_comments_table_opens_sorted_by_sentiment_and_sorts_by_any_column(wi
 
 
 def test_sorting_keeps_the_selected_row_selected():
+    QApplication.instance() or QApplication([])  # the first test on an xdist worker has none yet, and Qt aborts
     m = RowsModel(POST_COLUMNS)
     view = QTableView()
     view.setModel(m)

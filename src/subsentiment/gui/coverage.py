@@ -134,14 +134,18 @@ class Cell(QWidget):
             f"Arctic Shift counted {total or 0:,} posts for this day, fewer than are already saved, so the "
             "count can't be right. Download all fetches everything posted that day.")
 
-    def set(self, saved: int, total: int | None, complete: bool, noun: str, removed: int = 0) -> None:
+    def set(self, saved: int, total: int | None, complete: bool, noun: str, removed: int = 0,
+            waiting: bool = False) -> None:
+        """``waiting``: the archive's count is still being asked for, which the bar shows with a throbber."""
         main, side, share, tip = share_text(saved, total, complete, noun, removed)
+        if waiting:
+            side, tip = "counting…", "Asking Arctic Shift how many posts this day has."
         self.bar.setVisible(True)
         self.note.setVisible(False)
         self._pad(open_day=False)
         self.main.setText(main)
         self.side.setText(side)
-        self.bar.set(share, complete)
+        self.bar.set(share, complete, waiting=waiting)
         self.setToolTip(tip if tip else (f"{main}, {side}" if side else main))
         self._fit()
 
@@ -205,6 +209,7 @@ class CoveragePage(VerticalScrollArea):
         self.window_ = window
         self.subreddit: str | None = None
         self.busy = False
+        self._waiting: set[int] = set()  # days whose Download waits for the archive's count of them
         self.days: list[int] = []
         self.totals: dict[str, dict[int, int]] = {}  # subreddit (lowercase) -> day -> archive count
         self.count_error = ""
@@ -423,9 +428,9 @@ class CoveragePage(VerticalScrollArea):
             self._day_rows = list(self.days)
             row = self.days.index(keep) if keep in self.days else 0
             t.selectRow(row)
-        self._show_ticked()
         counting = self.count_job.busy
         current = today()
+        self._waiting = set()
         for row, day in enumerate(self.days):
             n, total, done = saved.get(day, 0), totals.get(day), str(day) in complete
             cell: Cell = t.cellWidget(row, 1)
@@ -438,16 +443,22 @@ class CoveragePage(VerticalScrollArea):
                                   else f"Fetch every post from {day_text(day)}")
                 continue
             gone = removed.get(day, 0)
-            cell.set(n, total, done, "post", gone)
-            if total is None and counting and not done:
-                cell.side.setText("counting…")
+            # Until its count is in, a day can't be told apart from one that's done or empty, so it waits;
+            # a complete day needs no count to be checked again.
+            waiting = total is None and counting and not done
+            if waiting:
+                self._waiting.add(day)
+            cell.set(n, total, done, "post", gone, waiting)
             full = done or (total is not None and 0 < total <= n + gone)
             button.setText("Check again" if full else "Download all")
-            button.setEnabled(not self.busy and not (total == 0 and not done and day < self.days[0]))
+            button.setEnabled(not self.busy and not waiting
+                              and not (total == 0 and not done and day < self.days[0]))
             button.setToolTip(
+                "Waiting for Arctic Shift's count of this day" if waiting else
                 "Look for posts the archive has added since" if full else
                 f"Fetch every post from {day_text(day)}"
                 + (f" (up to {total - n - gone:,} more)" if total and total > n + gone else ""))
+        self._show_ticked()
 
     # -- ticked days ----------------------------------------------------------
 
@@ -481,10 +492,13 @@ class CoveragePage(VerticalScrollArea):
         self.tick_all.setEnabled(bool(self._day_rows))
         self.download_ticked.setText(f"Download {plural(n, 'day')}" if n else "Download selected")
         idle = not self.busy and not self.delete_job.busy
-        self.download_ticked.setEnabled(bool(n) and idle)
+        counting = self.ticked & self._waiting
+        self.download_ticked.setEnabled(bool(n) and idle and not counting)
         what = "every post and comment" if self.with_comments.isChecked() else "every post"
-        self.download_ticked.setToolTip(f"Download {what} from the ticked days, newest first" if n
-                                        else "Tick days on the left to download them together")
+        self.download_ticked.setToolTip(
+            "Waiting for Arctic Shift's count of the ticked days" if counting else
+            f"Download {what} from the ticked days, newest first" if n else
+            "Tick days on the left to download them together")
         self.delete_ticked.setText(f"Delete {plural(n, 'day')}…" if n else "Delete selected")
         self.delete_ticked.setEnabled(bool(n) and idle and bool(self.subreddit))
         self.delete_ticked.setToolTip("Delete the posts and comments saved from the ticked days, so they show as "
