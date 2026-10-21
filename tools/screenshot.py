@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SUBREDDIT = "riverton"  # a made-up city; see tools/sample_text.py
 USERS = ["tram_fan_88", "mill_st_local", "quietcommuter", "rivertonmum", "bikes_not_cars",
          "old_bridge_photos", "night_owl_42", "canal_road_res", "dumpling_hunter", "council_watcher"]
-PAGES = ["overview", "timeline", "words", "posts", "comments", "coverage"]
+PAGES = ["overview", "words", "posts", "comments", "coverage"]
 SHOTS = [(f"{page}-{mode}.png", mode, page) for page in PAGES for mode in ("light", "dark")]
 SIZE = (1280, 800)  # logical; at the 1.5 device pixel ratio set below that is 1920x1200 pixels
 
@@ -150,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
             cov.day_table.selectRow(3)
             cov.ticked = set(cov.days[2:4])
             cov._show_ticked()
-        settle(app, 1.5 if page in ("coverage", "words", "timeline") else 0.3)  # counts, tallies, charts
+        settle(app, 1.5 if page in ("coverage", "words") else 0.3)  # counts, tallies, charts
         path = out / name
         window.grab().save(str(path))
         print("wrote", path)

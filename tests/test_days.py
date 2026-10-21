@@ -141,18 +141,17 @@ def test_every_view_counts_the_days_the_timeline_shows(window, tmp_path, monkeyp
     assert len(w.posts) == 5
 
 
-def test_the_timeline_page_and_the_overview_share_one_span(window):
+def test_the_timeline_sets_the_span_every_page_counts(window):
     w = window()
-    w.show_page("timeline")
-    QApplication.processEvents()
-    page = w.timeline_page.body
+    page = w.overview.timeline
     drag(page, D2 + 0.5 * DAY, D3)
-    assert page.view is not None and w.overview.timeline.view == page.view == w.span
+    assert page.view is not None and page.view == w.span
     assert tiles(w) < 10
     page.zoom_preset("All")
-    assert w.overview.timeline.view is None and tiles(w) == 10
-    w.overview.timeline.set_view(D1, D1 + 3 * DAY)
-    w.show_page("timeline")
+    assert w.span is None and tiles(w) == 10
+    page.set_view(D1, D1 + 3 * DAY)
+    w.show_page("words")
+    w.show_page("overview")
     assert page.view == (D1, D1 + 3 * DAY)
 
 
