@@ -133,8 +133,11 @@ def when_text(ts: float | None) -> str:
 class MainWindow(QMainWindow):
     LOAD_THREAD_FROM = 10_000  # saved posts and comments; a subreddit this big is read on a thread
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, wait_for_data: bool = True):
+        """``wait_for_data``: a big saved subreddit to show at the start is read before this returns. The app
+        passes False, so the window shows at once and the subreddit fills in once it's read on a thread."""
         super().__init__()
+        self._wait_for_data = wait_for_data
         self.setWindowTitle("ikari")
         self.resize(fit_to_screen(QSize(1320, 860), QGuiApplication.primaryScreen()))
         self.db_path = db_path
@@ -758,7 +761,7 @@ class MainWindow(QMainWindow):
         new = [r for r in rows if r["id"] not in known and r["created_utc"] is not None]
         if new:
             known.update(r["id"] for r in new)
-            self._saved[kind].extend(new)
+            self._saved[kind].add(new)
             self._analysis[kind].add(new)
             self.word_tally.add(kind, days.keep(new, self._table_days))
             if not self._shown_live.isActive():
@@ -847,14 +850,19 @@ class MainWindow(QMainWindow):
             dropped |= {r["id"] for r in rows} - {r["id"] for r in scoring_at_least(rows, self.min_score)}
             owner = "id" if kind == "posts" else "post_id"
             rows = [r for r in rows if r["id"] not in dropped and r[owner] not in dropped]
-            saved = self._saved[kind] = [r for r in self._saved[kind] if r["id"] not in dropped and r[owner] not in dropped]
+            saved = self._saved[kind]
+            if dropped:
+                saved = self._saved[kind] = days.SavedRows(
+                    r for r in saved if r["id"] not in dropped and r[owner] not in dropped)
             where = {r["id"]: i for i, r in enumerate(saved)}
+            new = []
             for r in rows:
                 if r["id"] in where:
-                    saved[where[r["id"]]] = r
+                    saved[where[r["id"]]] = r  # (saved again: still created when it was)
                 else:
-                    saved.append(r)
-            self._analysis[kind] = Analysis(saved)  # a rescored row changes the totals
+                    new.append(r)
+            saved.add(new)
+            self._analysis[kind] = Analysis(reversed(saved))  # a rescored row changes the totals
             self.word_tally.add(kind, days.keep(rows, self._table_days))  # by id: rows saved again replace their words
             tab.update_rows(days.keep(rows, self._table_days))
         self._known = {}
@@ -931,8 +939,8 @@ class MainWindow(QMainWindow):
         loaded = self._loaded.pop(key, None)
         if loaded is not None and (loaded[0] != stats or fetching):
             loaded = None
-        if (loaded is None and not wait and not fetching and self.isVisible() and stats
-                and stats[0] + stats[1] >= self.LOAD_THREAD_FROM):  # (before the window shows, nothing waits)
+        if (loaded is None and not wait and not fetching and (self.isVisible() or not self._wait_for_data) and stats
+                and stats[0] + stats[1] >= self.LOAD_THREAD_FROM):
             self._wanted = key
             self.subheading.setText(f"Opening r/{name}…")
             self._load_wanted()
@@ -948,9 +956,9 @@ class MainWindow(QMainWindow):
         self.current = name or None
         if loaded is None:
             with self.store.snapshot():
-                saved = {"posts": scoring_at_least(self.store.posts(name) if name else [], self.min_score),
-                         "comments": scoring_at_least(self.store.comments(name) if name else [], self.min_score)}
-            loaded = (stats, saved, {k: Analysis(rows) for k, rows in saved.items()})
+                saved = {k: days.SavedRows(scoring_at_least(self.store.rows(k, name) if name else [], self.min_score))
+                         for k in KINDS}
+            loaded = (stats, saved, {k: Analysis(reversed(rows)) for k, rows in saved.items()})  # as LoadWorker does
         self._loaded[key] = loaded  # the newest last; a running fetch's rows go into these as they're counted
         while len(self._loaded) > 4:
             del self._loaded[next(iter(self._loaded))]
@@ -1045,10 +1053,10 @@ class MainWindow(QMainWindow):
         # Rows still queued are in _saved already, so the tables have them once reloaded.
         self._drip.stop()
         self._queued = {"posts": [], "comments": []}
-        self.posts = days.keep(self._saved["posts"], whole)
+        self.posts = self._saved["posts"].between(whole)
         self.posts_tab.load(self.posts)
         yield
-        self.comments = days.keep(self._saved["comments"], whole)
+        self.comments = self._saved["comments"].between(whole)
         self.comments_tab.load(self.comments)
         self._update_dataset_labels()
         yield
@@ -1182,7 +1190,7 @@ class MainWindow(QMainWindow):
             if i is not None:  # (None: left out by the score filter)
                 old.append(saved[i])
                 # As shown, with its new score: a fetch may have saved it again since it was read.
-                shown.append({**saved[i], "sentiment": r["sentiment"], "label": r["label"]})
+                shown.append(saved[i]._replace(sentiment=r["sentiment"], label=r["label"]))
                 saved[i] = shown[-1]
         if not old:
             return

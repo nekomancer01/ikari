@@ -45,7 +45,7 @@ class WordTally(QObject):
 
     THREAD_FROM = 2000  # rows to count (or take off) at once; more are counted a slice at a time
     SLICE = 100  # rows counted between two frames: a few milliseconds, even for rows not split into words yet
-    SEEN_MAX = 400_000  # rows whose words are remembered, across subreddits; about 250 bytes each
+    SEEN_MAX = 400_000  # rows whose words are remembered beyond those counted; about 250 bytes each
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
@@ -64,8 +64,11 @@ class WordTally(QObject):
         self._slices.stop()
         self._pending = {k: [] for k in KINDS}  # rows added for an earlier count's rows don't carry over
         rows = {"posts": list(posts), "comments": list(comments)}
-        if sum(map(len, self._seen.values())) > self.SEEN_MAX:
-            self._seen = {k: {} for k in KINDS}
+        if sum(map(len, self._seen.values())) > max(self.SEEN_MAX, 2 * sum(map(len, rows.values()))):
+            # Others' words go (another subreddit's), these rows' stay: a subreddit with more rows than the
+            # limit was split into words all over again at every count.
+            self._seen = {k: {r["id"]: hit for r in rows[k] if (hit := self._seen[k].get(r["id"])) is not None}
+                          for k in KINDS}
             for k in KINDS:
                 self.counts[k].seen = self._seen[k]
         if self.ready and not fresh:
@@ -604,7 +607,7 @@ class Rescore(QObject):
                 if uses(text):
                     s, label = lexicon.score(text)
                     if (s, label) != (r["sentiment"], r["label"]):
-                        self._batch[kind].append({**r, "sentiment": s, "label": label})
+                        self._batch[kind].append(r._replace(sentiment=s, label=label))
                         self.store.rescore(kind, [(r["id"], s, label)])
                 now = time.perf_counter()
                 if now - sent_at > self.BATCH:

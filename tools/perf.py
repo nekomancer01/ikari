@@ -15,8 +15,10 @@ import argparse
 import collections
 import cProfile
 import itertools
+import os
 import pstats
 import random
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -134,8 +136,20 @@ class Heartbeat:
         loop.exec()
         self.timer.stop()
         gaps = sorted(self.gaps)
+        self.worst_ms = gaps[-1] if gaps else 0.0
         return {"worst": gaps[-1] if gaps else 0.0, "over": sum(g > FRAME_MS for g in gaps),
                 "busy": sum(g - 1 for g in gaps if g > 2)}
+
+
+def rss_mb() -> float:
+    """The process's resident memory now (Linux), or its peak elsewhere."""
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20
+    except OSError:
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak / 2**20 if sys.platform == "darwin" else peak / 1024
 
 
 def mouse(widget, kind, pos: QPointF, buttons=Qt.MouseButton.LeftButton):
@@ -212,13 +226,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stalls", action="store_true", help="say where the GUI thread was in each long gap")
     parser.add_argument("--sort", default="cumulative", help="profile order: cumulative or tottime")
     parser.add_argument("--profile", help="print where the time goes in interactions whose name has this in it")
+    parser.add_argument("--db", help="a copy of this database instead of made-up data (the file isn't changed)")
     args = parser.parse_args(argv)
 
     tmp = Path(tempfile.mkdtemp(prefix="ikari-perf-"))
     db = str(tmp / "perf.db")
     t = time.perf_counter()
-    seed(db, "Deltarune", args.scale, 1)
-    seed(db, "linux_gaming", args.scale * 0.5, 2)
+    if args.db:
+        shutil.copyfile(args.db, db)
+    else:
+        seed(db, "Deltarune", args.scale, 1)
+        seed(db, "linux_gaming", args.scale * 0.5, 2)
+    store = Store(db)
+    biggest, second = (sorted(store.datasets(), key=lambda d: -d["posts"] - d["comments"]) * 2)[:2]
+    store.close()
     print(f"seeded in {time.perf_counter() - t:.1f}s")
 
     app = QApplication(sys.argv[:1])
@@ -231,15 +252,27 @@ def main(argv: list[str] | None = None) -> int:
     from subsentiment.gui.main_window import MainWindow
     theme.load_fonts(app)
     theme.apply(app, "light")  # as the app does before its window
-    w = MainWindow(db)
-    w.resize(1280, 760)
-    w.show()
-    w._refresh_datasets("Deltarune")
+    QSettings().setValue("ui/last_dataset", biggest["name"])
     beat = Heartbeat()
     if args.stalls:
         beat.sample()
-    beat.run([], 1500)
+    t = time.perf_counter()
+    w = MainWindow(db, wait_for_data=False)  # as the app opens it
+    w.resize(1280, 760)
+    w.show()
+    opened = time.perf_counter() - t
+    worst = 0.0
+    while True:  # until the subreddit is in and counted
+        beat.run([], 500)
+        worst = max(worst, beat.worst_ms)
+        if (w.current == biggest["name"] and not w._wanted and not w._span_slices.running() and w.word_tally.ready
+                and not w.upgrading.is_alive()):
+            break
+    ready = time.perf_counter() - t
+    beat.worst_ms = worst
     print(f"dpr {w.devicePixelRatioF()}, {len(w._saved['posts']):,} posts, {len(w._saved['comments']):,} comments")
+    print(f"window up in {opened * 1000:.0f} ms, ready in {ready * 1000:.0f} ms (worst gap {beat.worst_ms:.0f} ms); "
+          f"memory {rss_mb():.0f} MB")
     print(f"{'interaction':<34}{'worst ms':>9}{'>16.7ms':>9}{'busy ms':>9}")
 
     def report(name, steps):
@@ -280,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
     for page in ("overview", "words"):
         w.show_page(page)
         beat.run([], 800)
-        for name in ("linux_gaming", "Deltarune"):  # as a click in the Saved list does it
+        for name in (second["name"], biggest["name"]):  # as a click in the Saved list does it
             row = next(i for i in range(w.datasets.count()) if w.datasets.item(i).data(Qt.ItemDataRole.UserRole) == name)
             report(f"{page}: switch to {name}", [lambda r=row: w.datasets.setCurrentRow(r)])
     for page in ("overview", "words"):

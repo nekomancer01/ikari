@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     native.set_appearance(requested)
     theme.apply(app, requested,
                 settings.value("ui/reduce_transparency", False, bool))
-    window = MainWindow(default_db_path())
+    window = MainWindow(default_db_path(), wait_for_data=False)
     window.show()
     code = app.exec()
     if window.running_threads():
