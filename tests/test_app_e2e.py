@@ -769,8 +769,9 @@ def test_coverage_counts_a_busy_subreddit_without_downloading_anything(env, monk
     assert paths == {AGG}  # only counts; the month-long count timed out and was split, never refused
     assert [r for r in env.archive.rejected if r[2] == 422]
     totals = cov.totals["askreddit"]
+    # Every day but today, which has no usable count until it's over, so isn't asked for.
     assert sum(totals.values()) == len([p for p in env.archive.posts if p["subreddit"] == "AskReddit"
-                                        and p["created_utc"] >= w.fetch_form.bounds()[0]])
+                                        and w.fetch_form.bounds()[0] <= p["created_utc"] < coverage.today()])
     for row in range(min(5, cov.day_table.rowCount())):  # browsing days and posts
         cov.day_table.selectRow(row)
         pump(30)
@@ -883,7 +884,7 @@ def test_download_all_comments_on_new_posts_says_what_it_got_and_doesnt_offer_th
         pump(10)
         cell, button = cov.post_table.cellWidget(i, 1), cov.post_table.cellWidget(i, 2).findChild(type(w.fetch_btn))
         assert cell.side.text() == "all so far" and "36 hours" in cell.toolTip()
-        assert button.text() == "Check again" and button.isEnabled()
+        assert button.text() == coverage.CHECK and button.isEnabled()
     env.archive.clear()
     QTest.mouseClick(cov.post_table.cellWidget(0, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     wait_idle(w)
@@ -971,7 +972,7 @@ def test_coverage_counts_a_subreddit_picked_while_another_is_being_counted(env):
         pump(20)
     cov = w.coverage
     assert cov.subreddit.lower() == "rust" and cov.count_error == ""
-    assert all(d in cov.totals["rust"] for d in cov.days)
+    assert all(d in cov.totals["rust"] for d in cov.days if d < coverage.today())  # today isn't asked for
 
 
 def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
@@ -1098,7 +1099,7 @@ def test_coverage_left_and_opened_again_mid_count_counts_without_an_error(env):
         pump(20)
     pump(100)
     cov = w.coverage
-    assert cov.count_error == "" and all(d in cov.totals["python"] for d in cov.days)
+    assert cov.count_error == "" and all(d in cov.totals["python"] for d in cov.days if d < coverage.today())
 
 
 def test_choosing_a_span_on_the_timeline_never_downloads_and_a_fetch_only_adds_rows_from_it(env):

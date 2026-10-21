@@ -283,6 +283,9 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
             store.save_post(p, *score(p.text))
         store.commit()
         posts = [fresh.get(p.id, p) for p in posts]
+    cap = req.comments_per_post if req.fill_threads else 0  # Download coverage's cap; 0: every comment
+    if cap:  # a thread with its cap saved already is done for this cap
+        posts = [p for p in posts if len(store.comment_ids(p.id)) < cap]
     if len(posts) > 1:
         # A day's Download all comments offers posts whose comments weren't counted yet; once re-checked, the ones
         # with none, or with every one saved already, cost no request. They're done, so they aren't offered again.
@@ -311,7 +314,8 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
         store.commit()
         saved()
 
-    errors, tried, gave_up = _each_thread(posts, client.fetch_all_comments, save, "All comments for post",
+    errors, tried, gave_up = _each_thread(posts, lambda p: client.fetch_all_comments(p, cap, req.comment_pick), save,
+                                          "Comments for post" if cap else "All comments for post",
                                           store, getattr(client, "tree_workers", getattr(client, "workers", 1)),
                                           progress, should_stop)
     if gave_up:

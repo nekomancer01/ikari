@@ -756,3 +756,27 @@ def test_deleting_days_forgets_them_whole_and_leaves_other_days_and_subreddits_a
     assert s.pack_settled() == 1
     assert {r["id"]: r["title"] for r in s.posts("python")}["Python1"] == "downloaded again"
     s.close()
+
+
+def test_archive_counts_are_kept_with_when_they_were_asked(tmp_path):
+    s = Store(tmp_path / "s.db")
+    s.save_archive_counts("Python", {86400: 5, 2 * 86400: 7}, at=1000.0)
+    assert s.archive_counts("python", 0, 3 * 86400) == {86400: 5, 2 * 86400: 7}
+    assert s.archive_counts("Python", 0, 2 * 86400) == {86400: 5}
+    assert s.archive_counts("Python", 0, 3 * 86400, since=1001.0) == {}  # asked before then: not kept as fresh
+    s.save_archive_counts("Python", {86400: 6}, at=2000.0)
+    assert s.archive_counts("Python", 0, 3 * 86400, since=1001.0) == {86400: 6}
+    s.delete_all()
+    assert s.archive_counts("Python", 0, 3 * 86400) == {}
+
+
+def test_open_threads_are_the_days_posts_without_every_comment(tmp_path):
+    from subsentiment.reddit import Post
+    s = Store(tmp_path / "s.db")
+    day = 20 * 86400
+    for pid, created, n in (("a", day + 10, 2), ("b", day + 20, 0), ("c", day + 30, 1), ("d", day + 86400 + 5, 3)):
+        s.save_post(Post(pid, "Python", pid, "", "u", 1, 1.0, n, created, "", ""), 0.0, "neutral")
+    s.mark_complete("comments", "Python", "c")
+    assert s.open_threads("Python", [day]) == ["a"]  # b has no comments, c is saved whole
+    assert s.open_threads("Python", [day + 86400, day]) == ["d", "a"]
+    assert s.open_threads("Python", []) == []
