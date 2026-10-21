@@ -5,6 +5,7 @@ import copy
 import re
 from functools import lru_cache
 
+from vaderSentiment import vaderSentiment as vader_lib
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from subsentiment import sentiment_model
@@ -50,6 +51,16 @@ _COMPLAINT = re.compile(
 @lru_cache(maxsize=1)
 def _analyzer() -> SentimentIntensityAnalyzer:
     return SentimentIntensityAnalyzer()
+
+
+@lru_cache(maxsize=1)
+def _known_words() -> frozenset[str]:
+    """Every word VADER or the classifier (alone or in a pair) reads anything into."""
+    words = set(_analyzer().lexicon) | set(vader_lib.BOOSTER_DICT) | set(vader_lib.NEGATE)
+    model = sentiment_model.load()
+    if model is not None:
+        words.update(w for term in model.vocab for w in term.split())
+    return frozenset(words)
 
 
 def clean(text: str) -> str:
@@ -128,6 +139,7 @@ class Lexicon:
     VALENCE = 3.5  # VADER's valence of a word set to +1 (its lexicon runs about -4 to +4)
     NUDGE = 3.0  # how far the classifier's positive and negative logits move per unit the stand-ins moved VADER's
     MOST = 4.0  # the furthest they move
+    BLANK = "zqikari"  # stands for a set word with no meaning of its own (stand-ins add a letter or more)
 
     def __init__(self, weights: dict[str, float] | None = None):
         self.weights = {self.key(w): max(-1.0, min(1.0, float(v))) for w, v in (weights or {}).items() if self.key(w)}
@@ -137,12 +149,13 @@ class Lexicon:
             self._find = re.compile(r"(?<![\w'])(?:" + "|".join(
                 r"\s+".join(map(re.escape, w.split())) for w in words) + r")(?![\w'])", re.IGNORECASE)
             # Letters only, so VADER keeps them whole, and nothing anyone writes. By casefold, as the search
-            # ignores case the same way ("ſtuff" is found for "stuff").
-            self._stand_in = {w.casefold(): "zqikari" + "".join(chr(97 + int(d)) for d in str(i))
-                              for i, w in enumerate(words)}
+            # ignores case the same way ("ſtuff" is found for "stuff"). A word set to neutral is BLANK, which VADER
+            # doesn't know: a known word, even of valence 0, takes a lift from a "very" or "completely" before it.
+            self._stand_in = {w.casefold(): self.BLANK + "".join(chr(97 + int(d)) for d in str(i))
+                              if self.weights[w] else self.BLANK for i, w in enumerate(words)}
             self._analyzer = copy.copy(_analyzer())
             self._analyzer.lexicon = {**_analyzer().lexicon,
-                                      **{self._stand_in[w.casefold()]: v * self.VALENCE for w, v in self.weights.items()}}
+                                      **{self._stand_in[w.casefold()]: v * self.VALENCE for w, v in self.weights.items() if v}}
         else:
             self._analyzer = _analyzer()
 
@@ -150,6 +163,12 @@ class Lexicon:
     def key(word: str) -> str:
         """How a word or phrase is kept: lowercased, with single spaces."""
         return " ".join(word.lower().split())
+
+    @staticmethod
+    def known(word: str) -> bool:
+        """Whether either scorer reads anything into ``word`` (or a word of a phrase). One neither knows already
+        reads as neutral, so setting it to neutral changes no score."""
+        return any(w in _known_words() for w in sentiment_model.tokens(word) if " " not in w)
 
     def uses(self, text: str) -> bool:
         """Whether ``text`` may use any of the set words: it's searched as written, so one only in a quote or a
@@ -159,22 +178,30 @@ class Lexicon:
     def score(self, text: str, scorer: str = "model") -> tuple[float, str]:
         """Like ``score``, reading the set words as set here."""
         cleaned = clean(text)
-        marked = self._find.sub(self._swap, cleaned) if self._find else cleaned
-        if marked == cleaned:  # no set word in it
+        if not self.uses(cleaned):  # no set word in it
             return score(text, scorer)
-        p = self._analyzer.polarity_scores(marked)
-        model = sentiment_model.load() if scorer == "model" else None
-        if model is None:
+        p, probs = self._read(cleaned, scorer)
+        if probs is None:
             compound, label = p["compound"], label_for(p["compound"])
         else:
-            plain = " ".join(self._find.sub(" ", cleaned).split())
-            without = self._analyzer.polarity_scores(plain)["compound"] if plain else 0.0
-            shift = max(-self.MOST, min(self.MOST, self.NUDGE * (p["compound"] - without)))
-            probs = model.probabilities(plain, [p["neg"], p["neu"], p["pos"], p["compound"], abs(p["compound"])], shift)
             compound, label = probs["positive"] - probs["negative"], max(probs, key=probs.get)
         if label == "positive" and is_sarcastic(cleaned, self._negative):
             return -compound, "negative"
         return compound, label
+
+    def _read(self, cleaned: str, scorer: str = "model") -> tuple[dict, dict | None]:
+        """VADER's scores of cleaned text using a set word, and the classifier's odds (None without it)."""
+        p = self._analyzer.polarity_scores(self._find.sub(self._swap, cleaned))
+        model = sentiment_model.load() if scorer == "model" else None
+        if model is None:
+            return p, None
+        # The set words as no word at all: one neither scorer knows, so the classifier doesn't pair the
+        # words either side of one ("running dungeon content" isn't "running content") and VADER's
+        # "not" and "very" stay as far from what they reach.
+        plain = self._find.sub(lambda m: self._swap(m, blank=True), cleaned)
+        without = self._analyzer.polarity_scores(plain)["compound"]
+        shift = max(-self.MOST, min(self.MOST, self.NUDGE * (p["compound"] - without)))
+        return p, model.probabilities(plain, [p["neg"], p["neu"], p["pos"], p["compound"], abs(p["compound"])], shift)
 
     _made: dict = {}  # the last lexicons ``compare`` made, by their words, so each process makes them once
 
@@ -190,13 +217,21 @@ class Lexicon:
         lexicon, without = made
         return [(*lexicon.score(t), without.score(t)[1]) for t in texts]
 
-    def _swap(self, m: re.Match) -> str:
-        stand_in = self._stand_in.get(self.key(m.group()).casefold())
-        return m.group() if stand_in is None else f" {stand_in} "
+    def _swap(self, m: re.Match, blank: bool = False) -> str:
+        """A set word's stand-in (or BLANK), in capitals where it was written in them, as VADER weighs those."""
+        stand_in = self.BLANK if blank else self._stand_in.get(self.key(m.group()).casefold())
+        if stand_in is None:
+            return m.group()
+        return stand_in.upper() if m.group().isupper() else stand_in  # (whole words matched: no spaces needed)
 
     def _negative(self, rest: str) -> bool:
-        """Whether what a sarcastic frame is wrapped around reads negative, with the set words as set here."""
-        return self.score(rest)[1] == "negative" if self.uses(rest) else _negative(rest)
+        """Whether what a sarcastic frame is wrapped around reads negative, as ``_negative`` has it, with the set
+        words as set here."""
+        if not self.uses(rest) or _COMPLAINT.search(rest):
+            return _negative(rest)
+        p, probs = self._read(rest)
+        return p["compound"] <= NEGATIVE_THRESHOLD or (
+            probs is not None and probs["negative"] > max(probs["positive"], 0.4))
 
 
 def score(text: str, scorer: str = "model") -> tuple[float, str]:
