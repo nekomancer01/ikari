@@ -544,8 +544,6 @@ class CoveragePage(VerticalScrollArea):
         days = days_in(after, before)
         if days != self.days:
             self.days, rebuild = days, True
-        # The heading above names the subreddit.
-        self.subtitle.setText(f"{range_text(days[-1], days[0])} · {plural(len(days), 'day')} · the dates set in Fetch")
         totals = self._totals()
         missing = [d for d in days if d not in totals and d < today()]  # today has no usable count yet
         if missing and not self.count_job.busy and not self.count_error:
@@ -637,7 +635,20 @@ class CoveragePage(VerticalScrollArea):
                 + (f" (up to {total - n - gone:,} more)" if total and total > n + gone else ""))
         self._show_threads()
         self._apply_filter()
+        self.ticked &= set(self._shown_days())  # a day just found to have no posts drops out
+        shown = self._shown_days()
+        if shown and self._selected_day() not in shown:  # the picked day went: pick the first one listed
+            t.selectRow(self.days.index(shown[0]))
+        empty = sum(self._no_posts(d) for d in self.days)
+        # The heading above names the subreddit.
+        self.subtitle.setText(f"{range_text(self.days[-1], self.days[0])} · {plural(len(self.days), 'day')} · the "
+                              "dates set in Fetch" + (f" · {plural(empty, 'day')} with no posts left out" if empty else ""))
         self._show_ticked()
+
+    def _no_posts(self, day: int) -> bool:
+        """The archive counts no posts on the day and none are saved: it isn't listed, ticked or downloaded."""
+        n, total, gone, _ = self._day_state.get(day, (0, None, 0, False))
+        return total == 0 and n == 0 and gone == 0
 
     def _missing_posts(self, day: int) -> bool:
         """The day has posts to download: no count says it's all saved."""
@@ -660,8 +671,8 @@ class CoveragePage(VerticalScrollArea):
         if key == "comments" and self._threads_for[:1] != ((self.subreddit or "").lower(),):
             key = "all"  # the whole threads aren't counted yet: nothing is hidden until they are
         for row, day in enumerate(self._day_rows):
-            hide = (key == "posts" and not self._missing_posts(day)) or (key == "comments"
-                                                                          and not self._missing_threads(day))
+            hide = self._no_posts(day) or (key == "posts" and not self._missing_posts(day)) or (
+                key == "comments" and not self._missing_threads(day))
             self.day_table.setRowHidden(row, hide)
 
     def _shown_days(self) -> list[int]:
@@ -789,7 +800,8 @@ class CoveragePage(VerticalScrollArea):
         self.estimate.setText("" if not n else {
             "posts": f"≈ {plural(posts, 'post')} to fetch" if posts else "Checks for posts added since",
             "comments": f"{plural(threads, 'thread')} to fetch",
-            "both": f"≈ {plural(posts, 'post')} and their comments, plus {plural(threads, 'saved thread')}"}[what])
+            "both": (f"≈ {plural(posts, 'post')} and their comments" if posts else "Checks for posts added since")
+                    + (f", plus {plural(threads, 'saved thread')}" if threads else "")}[what])
         self.delete_ticked.setText(f"Delete {plural(n, 'day')}…" if n else "Delete selected")
         self.delete_ticked.setEnabled(bool(n) and idle and bool(self.subreddit))
         self.delete_ticked.setToolTip("Delete the posts and comments saved from the ticked days, so they show as "

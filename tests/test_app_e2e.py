@@ -937,7 +937,7 @@ def test_coverage_keeps_its_place_while_a_download_runs(env):
     fetch(w, comments=False)
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     cov = open_coverage(w)
-    last = cov.day_table.rowCount() - 1
+    last = cov.days.index(cov._shown_days()[-1])  # the oldest day listed (days with no posts at all aren't)
     cov.day_table.selectRow(last)
     cov.day_table.scrollToBottom()
     pump(50)
