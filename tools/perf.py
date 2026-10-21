@@ -168,7 +168,7 @@ def wheel(widget, pos: QPointF, dy: int):
 def gestures(w) -> dict:
     """Each interaction as a list of steps a frame apart."""
     def chart():
-        return w.timeline_page.body if w.page() == "timeline" else w.overview.timeline
+        return w.overview.timeline
 
     def plot():
         return chart()._areas()[0]
@@ -293,10 +293,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{name:<34}{r['worst']:>9.1f}{r['over']:>9}{r['busy']:>9.0f}")
 
     if args.repaints:
-        for page in ("overview", "timeline", "words"):
+        for page in ("overview", "words"):
             w.show_page(page)
             beat.run([], 800)
-            for widget in (w, w.overview.timeline, w.timeline_page.body, w.overview.tiles["count"], w.words_page.body,
+            for widget in (w, w.overview.timeline, w.overview.tiles["count"], w.words_page.body,
                            w.rail):
                 if widget.isVisible():
                     t = time.perf_counter()
@@ -304,12 +304,11 @@ def main(argv: list[str] | None = None) -> int:
                         widget.repaint()
                     print(f"{page}: repaint {type(widget).__name__:<14}{(time.perf_counter() - t) * 100:7.1f} ms")
         return 0
-    for page in ("overview", "timeline"):
-        w.show_page(page)
-        beat.run([], 800)
-        for name, make in gestures(w).items():
-            report(f"{page}: {name}", make())
-    for page in ("words", "posts", "overview", "timeline", "comments", "overview"):
+    w.show_page("overview")
+    beat.run([], 800)
+    for name, make in gestures(w).items():
+        report(f"overview: {name}", make())
+    for page in ("words", "posts", "overview", "comments", "overview"):
         report(f"open page {page}", [lambda p=page: w.show_page(p)])
     for page in ("overview", "words"):
         w.show_page(page)
