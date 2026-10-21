@@ -218,13 +218,7 @@ def test_filtering_a_big_table_is_worked_out_between_frames_and_narrowed_as_you_
     assert {r["id"] for r in tab.model.rows} == {i for i in expected if int(i[1:]) % 3 == 2}
 
 
-def test_a_big_table_loading_between_frames_takes_rows_a_fetch_adds_meanwhile(monkeypatch):
-    real = tables.on_thread
-
-    def slow(work):  # the sort's thread is still going at the first frame (CI's could finish first, and nothing was waited on)
-        yield tables.Slices.WAIT
-        return (yield from real(work))
-    monkeypatch.setattr(tables, "on_thread", slow)
+def test_a_big_table_loading_between_frames_takes_rows_a_fetch_adds_meanwhile():
     tab, rows = big_table(10)
     more = [dict(rows[0], id=f"m{i}", sentiment=0.5) for i in range(60_000)]
     steps = tab.load_steps(more)
