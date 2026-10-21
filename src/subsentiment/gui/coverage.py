@@ -763,7 +763,8 @@ class CoveragePage(VerticalScrollArea):
         sub, days, got = self._deleting
         self.window_.set_deleting(False)
         if isinstance(got, tuple):
-            self.ticked.difference_update(days)
+            if (self.subreddit or "").lower() == sub.lower():
+                self.untick(days)
             self.status.setText("")
             self.window_.days_deleted(sub, len(days), *got)
         else:

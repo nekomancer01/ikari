@@ -590,6 +590,8 @@ class Store:
                 if left:
                     blob = packer.compress(json.dumps({"columns": PACKED["comments"], "rows": left},
                                                       ensure_ascii=False).encode())
+                    if _unpack(blob) != {"columns": list(PACKED["comments"]), "rows": left}:  # as pack_settled checks
+                        raise sqlite3.DatabaseError(f"comments of r/{sub} on day {day} wouldn't read back the same")
                     self.db.execute("UPDATE packs SET data = ?, packed_at = ? WHERE kind = 'comments' AND subreddit = ? "
                                     "AND day = ?", (blob, time.time(), sub, day))
                 else:
@@ -612,10 +614,7 @@ class Store:
             raise
         finally:
             self.db.execute("DROP TABLE IF EXISTS temp.gone")
-        with Store._packs_lock:
-            for key in [k for k in Store._packs if k[0] == self.path and k[2] == sub]:
-                del Store._packs[key]
-        self._compact()
+        self._compact()  # (a cached pack is let go when it's next read: it was changed or removed since)
         return shown[0], shown[1]
 
     def delete_all(self) -> None:

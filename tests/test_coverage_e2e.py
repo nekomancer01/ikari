@@ -407,8 +407,13 @@ def test_nothing_else_writes_while_days_are_deleted(window, monkeypatch):
     assert not w.fetch_btn.isEnabled() and not c.download_ticked.isEnabled() and not w.delete_btn.isEnabled()
     assert not c.day_table.cellWidget(0, 2).findChild(QPushButton).isEnabled()
     assert not w.start_request(mw.collect.FetchRequest(subreddit="Python"), "x")
+    names = [w.datasets.item(i).data(Qt.ItemDataRole.UserRole) for i in range(w.datasets.count())]
+    w.datasets.setCurrentRow(names.index("rust"))  # another subreddit looked at meanwhile stays on screen
+    QApplication.processEvents()
     hold.set()
     settle(w, lambda: not c.delete_job.busy)
+    assert w.current == "rust" and c.subreddit == "rust"
     assert w.fetch_btn.isEnabled() and w.delete_btn.isEnabled()
     assert c.day_table.cellWidget(0, 2).findChild(QPushButton).isEnabled()
+    assert w.store.posts_per_day("Python", TODAY - DAY, TODAY) == {}
     assert downloads() == []

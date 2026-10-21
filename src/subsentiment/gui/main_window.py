@@ -1118,19 +1118,21 @@ class MainWindow(QMainWindow):
         self._show_notes()
 
     def days_deleted(self, subreddit: str, days: int, posts: int, comments: int) -> None:
-        """Download coverage deleted some days of ``subreddit``: show it again from the store on every page. If
-        nothing of it is left it stays shown, empty, so its days can be downloaded again from here."""
+        """Download coverage deleted some days of ``subreddit``: if it's still shown, show it again from the store
+        on every page. If nothing of it is left it stays shown, empty, so its days can be downloaded again from
+        here. Another subreddit picked meanwhile stays shown."""
         for key in [k for k in self._loaded if k[0] == subreddit.lower()]:
             del self._loaded[key]
-        self._refresh_datasets(select=subreddit, reload=False)
-        name = self._name_of(subreddit.lower())
-        if subreddit.lower() not in self._stats:
-            self.datasets.blockSignals(True)
-            self.datasets.setCurrentRow(-1)  # it has no row any more
-            self.datasets.blockSignals(False)
-        self._show_dataset(name)
+        shown = (self.current or "").lower() == subreddit.lower()
+        self._refresh_datasets(select=subreddit if shown else None, reload=False)
+        if shown:
+            if subreddit.lower() not in self._stats:
+                self.datasets.blockSignals(True)
+                self.datasets.setCurrentRow(-1)  # it has no row any more
+                self.datasets.blockSignals(False)
+            self._show_dataset(self.current)
         self.statusBar().showMessage(f"Deleted {plural(posts, 'post')} and {plural(comments, 'comment')} saved from "
-                                     f"{plural(days, 'day')} of r/{name}.", 8000)
+                                     f"{plural(days, 'day')} of r/{subreddit}.", 8000)
 
     def _delete_dataset(self) -> None:
         if not self.current or self.writing():
@@ -1245,6 +1247,7 @@ class MainWindow(QMainWindow):
         if deleting.busy:  # one transaction: let it end, rather than cut it short, but show nothing of it
             deleting.worker.finished.disconnect()
             deleting.worker.failed.disconnect()
+            deleting.ended.disconnect()
             deleting.qthread.quit()
             deleting.qthread.wait(10000)
         self._upgrade_stop.set()  # it stops after the day it's packing
