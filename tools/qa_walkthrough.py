@@ -607,16 +607,23 @@ def words_and_score(e):
         return
     from subsentiment.store import scoring_at_least
 
-    go("posts")
-    for text in ("Score 100+", "Any score"):
-        w.score_pick.setCurrentIndex(w.score_pick.findText(text))
-        pump(0.8)
-        want = len(scoring_at_least(w.store.posts(w.current), w.min_score))
-        shown = w.posts_tab.view.model().rowCount()
-        e["notes"].append(f"{text}: posts table {shown}, expected {want}{'' if shown == want else ' MISMATCH'}; "
-                          f"subtitle {w.subheading.text()!r}")
-        if text != "Any score":
-            e["shots"].append(shot(w, "score-100"))
+    def min_score(comments: bool):  # one filter (w.min_score) until #125, one each for posts and comments since
+        return w.min_scores[comments] if hasattr(w, "min_scores") else w.min_score
+
+    picks = [("posts", w.score_pick, w.store.posts, w.posts_tab)]
+    if hasattr(w, "comment_score_pick"):
+        picks.append(("comments", w.comment_score_pick, w.store.comments, w.comments_tab))
+    for kind, pick, rows, page in picks:
+        go(kind)
+        for text in ("Score 10+" if kind == "comments" else "Score 100+", "Any score"):
+            pick.setCurrentIndex(pick.findText(text))
+            pump(0.8)
+            want = len(scoring_at_least(rows(w.current), min_score(kind == "comments")))
+            shown = page.view.model().rowCount()
+            e["notes"].append(f"{kind} {text}: table {shown}, expected {want}{'' if shown == want else ' MISMATCH'}; "
+                              f"subtitle {w.subheading.text()!r}")
+            if text != "Any score":
+                e["shots"].append(shot(w, f"{kind}-score"))
 
 
 @step("look-around: every tab, scope, theme and View option")
