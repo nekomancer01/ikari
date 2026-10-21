@@ -593,3 +593,26 @@ def test_a_stopped_download_offers_resume_even_after_a_restart(window, monkeypat
         assert not c.resume_bar.isVisible() and c.ticked == set()
     finally:
         again.close()
+
+
+def test_a_day_with_no_posts_anywhere_isnt_listed_ticked_or_downloaded(window, monkeypatch):
+    empty, saved = TODAY - 5 * DAY, TODAY - 2 * DAY  # the archive counts 0 on both; p1 is saved on the second
+
+    def counts(self, subreddit, after, before, should_stop=None):
+        FakeArchive.calls.append(("counts", subreddit))
+        return {d: 0 if d in (empty, saved) else 10 for d in range(int(after // DAY * DAY), int(before), DAY)}
+    monkeypatch.setattr(FakeArchive, "day_counts", counts)
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals and c._threads)
+    assert empty not in c._shown_days() and saved in c._shown_days()
+    assert "1 day with no posts left out" in c.subtitle.full_text()
+    QTest.mouseClick(c.what.buttons["posts"], Qt.MouseButton.LeftButton)
+    c.tick_all.click()
+    assert empty not in c.ticked and c.download_ticked.text() == f"Download {len(c.days) - 1} days"
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    fetched = [d[2] for d in downloads() if d[0] == "posts"]
+    assert fetched and empty not in fetched and saved in fetched
