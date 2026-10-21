@@ -1161,10 +1161,12 @@ def test_the_word_cloud_keeps_its_words_in_place_while_a_fetch_adds_to_them(env)
     cloud, shown = w.words_page.body, []
     while w.fetch_job.busy:
         pump(120)
-        shown.append({word: box.center() for box, word, *_ in cloud.placed()})
-    moves = []  # how far the words shown both times moved between two looks: the median, for each pair
-    for a, b in zip(shown, shown[1:]):
-        if a and a != b and set(a) & set(b):
+        shown.append((cloud.size(), {word: box.center() for box, word, *_ in cloud.placed()}))
+    # How far the words shown both times moved between two looks: the median, for each pair. A new size (the
+    # fetch's strip appearing under the header) lays the cloud out afresh, so only looks at one size count.
+    moves = []
+    for (size_a, a), (size_b, b) in zip(shown, shown[1:]):
+        if size_a == size_b and a and a != b and set(a) & set(b):
             d = sorted((a[k] - b[k]).manhattanLength() for k in set(a) & set(b))
             moves.append(d[len(d) // 2])
     assert len(moves) >= 3  # the cloud changed during the fetch
