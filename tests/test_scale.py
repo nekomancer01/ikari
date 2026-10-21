@@ -438,6 +438,9 @@ def test_a_subreddit_opened_while_the_database_is_upgraded_has_its_words_counted
     settings(tmp_path)
     db = str(tmp_path / "big.db")
     fill(db)
+    old = sqlite3.connect(db)
+    old.execute("PRAGMA user_version = 2")  # saved by 0.4, before packs counted their words
+    old.close()
     QSettings().setValue("ui/last_dataset", "Big")
     done = threading.Event()
     monkeypatch.setattr(Store, "upgrade", classmethod(lambda cls, path, stop=None: done.wait(30)))

@@ -145,6 +145,8 @@ class MainWindow(QMainWindow):
         self.db_path = db_path
         self.store = Store(db_path)
         # Packs the text of data saved before day packs existed, without holding up the window (store.PACKED).
+        # A database from before packs counted their words (version 3) has every row's text split for them.
+        self._wordless = self.store.db.execute("PRAGMA user_version").fetchone()[0] < 3
         self._upgrade_stop = threading.Event()
         self.upgrading = threading.Thread(target=Store.upgrade, args=(db_path, self._upgrade_stop), daemon=True)
         self.upgrading.start()
@@ -937,7 +939,7 @@ class MainWindow(QMainWindow):
             return
         self._wanted = None
         if loaded is None:
-            words = not self.upgrading.is_alive()
+            words = not (self._wordless and self.upgrading.is_alive())
             loaded = (stats, {k: Saved(self.db_path, k, name, words) for k in KINDS} if name else
                       {k: RowList() for k in KINDS})
         self._open(name, loaded)
@@ -999,7 +1001,8 @@ class MainWindow(QMainWindow):
         if self._wanted is None or self.load_job.busy:
             return
         key = self._wanted
-        worker = LoadWorker(self.db_path, key, (key, self._stats.get(key)), words=not self.upgrading.is_alive())
+        worker = LoadWorker(self.db_path, key, (key, self._stats.get(key)),
+                            words=not (self._wordless and self.upgrading.is_alive()))
         worker.read.connect(self._on_loaded)
         worker.failed.connect(self._on_load_failed)
         self.load_job.start(worker)
