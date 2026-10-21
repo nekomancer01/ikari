@@ -401,13 +401,20 @@ def test_bundled_fonts_are_weights_of_the_families_the_theme_asks_for():
 
 def test_each_rail_button_opens_its_page_and_the_last_one_is_reopened(make_window):
     w = make_window()
-    for page in ("timeline", "words", "posts", "comments", "overview", "timeline"):
+    for page in ("words", "posts", "comments", "overview", "words"):
         w.rail.buttons[page].click()
         assert w.page() == page and w.pages.currentWidget() is w.page_widgets[page]
-        assert w.scope.isVisibleTo(w) == (page in ("overview", "timeline", "words"))  # what it counts shows there
-    assert w.timeline_page.body.points == w.overview.timeline.points != []  # the same days, on its own page
+        assert w.scope.isVisibleTo(w) == (page in ("overview", "words"))  # what it counts shows there
+    assert "timeline" not in w.rail.buttons  # the Overview's chart is the only timeline
     w.close()
-    assert make_window().page() == "timeline"
+    assert make_window().page() == "words"
+
+
+def test_a_remembered_timeline_page_opens_the_overview(make_window):
+    w = make_window()
+    w.settings.setValue("ui/page", "timeline")  # the page an earlier version had
+    w.close()
+    assert make_window().page() == "overview"
 
 
 def test_the_old_tab_setting_opens_the_same_page(make_window):
@@ -588,7 +595,7 @@ def test_score_filters_hide_low_posts_and_low_comments_everywhere_and_are_rememb
     w.comment_score_pick.setCurrentIndex(w.comment_score_pick.findText("Comments 10+"))
     assert sorted(r["id"] for r in w.comments) == ["c-high", "c-mid"]
     assert w.posts_tab.model.rowCount() == 2 and w.comments_tab.model.rowCount() == 2
-    assert w._counted.count == 4  # the Overview and Timeline count what the tables show
+    assert w._counted.count == 4  # the Overview counts what the tables show
     assert "2\xa0posts" in w.subheading.text()
     out = tmp_path / "p.csv"
     assert w.store.export_csv("Python", "comments", out, min_score=w.min_scores[1]) == 2
