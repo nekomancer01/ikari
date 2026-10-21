@@ -15,10 +15,10 @@ import time
 from datetime import datetime, timezone
 
 import shiboken6
-from PySide6.QtCore import QEvent, QSize, Qt, Slot
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QBoxLayout, QCheckBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton,
-    QTableWidget, QVBoxLayout, QWidget,
+    QSizePolicy, QTableWidget, QVBoxLayout, QWidget,
 )
 
 from subsentiment import collect
@@ -356,9 +356,15 @@ class CoveragePage(VerticalScrollArea):
         root.addLayout(header)
 
         # What the ticked days download, and the one button that does it.
-        bar, bar_lay = panel("solid", margins=8, spacing=10)
-        bar_lay.setDirection(QBoxLayout.Direction.LeftToRight)
-        bar_lay.setContentsMargins(14, 7, 7, 7)
+        bar, rows = panel("solid", margins=8, spacing=8)
+        rows.setContentsMargins(14, 7, 7, 7)
+        self.bar_row = bar_lay = QHBoxLayout()
+        bar_lay.setSpacing(10)
+        rows.addLayout(bar_lay)
+        # On a narrow window the comment cap takes a second line, under the choice it belongs to.
+        self.bar_row2 = QHBoxLayout()
+        self.bar_row2.setSpacing(10)
+        rows.addLayout(self.bar_row2)
         bar_lay.addWidget(QLabel("Download"))
         self.what = Choice(list(WHAT.items()), settings.value("coverage/what", "both", str))
         self.what.buttons["posts"].setToolTip("Every post from the ticked days")
@@ -373,13 +379,21 @@ class CoveragePage(VerticalScrollArea):
         self.comment_cap.count.setSingleStep(50)
         self.comment_cap.count.setSuffix(" per thread")
         self.comment_cap.count.setSpecialValueText("All comments")
-        # As wide as its widest text ("25000 per thread"), so typing a big cap doesn't run into the arrows.
-        self.comment_cap.count.setMinimumWidth(self.comment_cap.count.sizeHint().width())
+        # Just wide enough for its widest text and the arrows, leaving the bar's room to the estimate.
+        count = self.comment_cap.count
+        count.setFixedWidth(count.fontMetrics().horizontalAdvance("25000 per thread") + 48)
+        self.comment_cap.pick.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         for signal in (self.comment_cap.count.valueChanged, self.comment_cap.pick.currentIndexChanged):
             signal.connect(self.comment_cap.save)
             signal.connect(self._show_ticked)
-        bar_lay.addWidget(self.comment_cap.count)
-        bar_lay.addWidget(self.comment_cap.pick)
+        self.cap_box = QWidget()
+        cap_lay = QHBoxLayout(self.cap_box)
+        cap_lay.setContentsMargins(0, 0, 0, 0)
+        cap_lay.setSpacing(10)
+        cap_lay.addWidget(self.comment_cap.count)
+        cap_lay.addWidget(self.comment_cap.pick)
+        bar_lay.addWidget(self.cap_box)
+        self.bar_row2.addStretch(1)
         self.estimate = ElidedLabel("", "muted")
         bar_lay.addWidget(self.estimate, 1)
         self.download_ticked = theme.mark(small_button("Download selected"), "primary", True)
@@ -927,6 +941,18 @@ class CoveragePage(VerticalScrollArea):
         if self.body.direction() != direction:
             self.body.setDirection(direction)
         super().resizeEvent(event)
+        QTimer.singleShot(0, self._place_cap)  # after this resize: moving it within one upsets the layout
+
+    def _place_cap(self) -> None:
+        """The cap stays on the bar's line while the estimate beside it keeps room to say something."""
+        if not shiboken6.isValid(self.cap_box):
+            return
+        inline = self.bar_row.indexOf(self.cap_box) >= 0
+        line = self.bar_row.minimumSize().width() + (0 if inline else self.cap_box.sizeHint().width() + 10)
+        fits = line + 21 + 160 <= self.viewport().width()  # the bar's side margins, then the estimate's room
+        if fits != inline:
+            (self.bar_row.insertWidget(self.bar_row.indexOf(self.what) + 1, self.cap_box) if fits
+             else self.bar_row2.insertWidget(0, self.cap_box))
 
     def eventFilter(self, obj, event) -> bool:
         if (obj is self._post_viewport and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)
