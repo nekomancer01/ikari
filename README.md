@@ -52,7 +52,7 @@ for Windows and Linux (macOS runs from source, not released for now).</p>
         <source media="(prefers-color-scheme: dark)" srcset="docs/words-dark.png">
         <img alt="Words page: a word cloud coloured by sentiment" src="docs/words-light.png">
       </picture>
-      <p align="center"><sub><b>Words</b>: the most used words, blue for positive and orange for negative</sub></p>
+      <p align="center"><sub><b>Words</b>: the most used words, blue for positive and orange for negative; set what a word means in a subreddit</sub></p>
     </td>
   </tr>
   <tr>
