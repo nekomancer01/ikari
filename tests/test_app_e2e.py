@@ -1473,3 +1473,34 @@ def test_coverage_downloads_a_days_comments_many_threads_at_once(env, monkeypatc
     starts = 40 * arctic_shift.BASE_INTERVAL * arctic_shift.TREE_SHARE
     assert took < 40 * arctic_shift.BASE_INTERVAL  # on main, 4 at a time took 40 / 4 * 1.6 s = 16 s
     assert took >= starts  # still spaced out: at most one start every 0.2 s
+
+
+def test_download_all_comments_asks_nothing_for_posts_that_turn_out_to_have_none(env):
+    # Ame, 21 Oct: Coverage's Download all comments "checks posts with empty comments". Posts saved before the
+    # archive counted their comments are offered; re-checked, many have none, and each still cost a request.
+    def usable(day):
+        return [p for p in env.archive.posts if p["subreddit"] == "Python" and day <= p["created_utc"] < day + DAY
+                and not p.get("removed_by_category")]
+    # A settled day holding posts both with and without comments.
+    day = next(d for d in (int((NOW - k * DAY) // DAY * DAY) for k in range(2, 7))
+               if any(p["num_comments"] == 0 for p in usable(d)) and any(p["num_comments"] for p in usable(d)))
+    in_day = usable(day)
+    s = env.store()
+    for p in in_day:  # as saved within a day of being posted: score and comment count not in yet
+        s.save_post(arctic_shift._post(dict(p, score=1, num_comments=0, retrieved_on=p["created_utc"] + 60)), 0.0,
+                    "neutral")
+    s.commit()
+    w = env.window()
+    w._refresh_datasets(select="Python")
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    cov = open_coverage(w)
+    cov.day_table.selectRow(cov.days.index(day))
+    pump(50)
+    assert cov.all_comments.text() == f"Download all comments ({len(in_day)} posts)"
+    env.archive.clear()
+    QTest.mouseClick(cov.all_comments, Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    pump(100)
+    asked = {q["link_id"] for p, q in env.archive.requests if p == TREE}
+    assert asked == {p["id"] for p in in_day if p["num_comments"]}  # none for the posts with no comments
+    assert cov.all_comments.text() == "Download all comments" and not cov.all_comments.isEnabled()

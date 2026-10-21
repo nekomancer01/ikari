@@ -502,3 +502,22 @@ def test_a_fetch_scores_by_the_subreddits_own_words(tmp_path):
     collect.run(FakeClient(posts=[mk(1)]), s, collect.FetchRequest("python", limit=1))
     assert [(r["body"], r["label"]) for r in s.comments("python")] == [("lovely", "negative")]
     assert [r["label"] for r in s.posts("python")] == ["neutral"]
+
+
+def test_a_days_comments_skip_posts_whose_recheck_finds_nothing_to_download(tmp_path):
+    # Ame, 21 Oct: Download all comments "checks posts with empty comments". Posts saved before the archive had
+    # counted their comments are re-checked first; the ones that turn out to have none (or only ones already
+    # saved) were still asked for their thread, one request each.
+    s = store_with(tmp_path, [mk(i, score=None, num_comments=None) for i in (1, 2, 3)], comments_for=("p2",))
+    c = FullThreadClient(by_id=[mk(1, score=5, num_comments=0), mk(2, score=5, num_comments=1),
+                                mk(3, score=5, num_comments=3)])
+    said = []
+    collect.run(c, s, collect.FetchRequest("python", comment_posts=("p1", "p2", "p3")),
+                progress=lambda done, total, msg: said.append(msg))
+    assert [call[1] for call in c.calls if call[0] == "all"] == ["p3"]
+    assert "Skipping 2 of 3 posts: no comments to download" in said
+    assert {"p1", "p2"} <= s.complete_keys("comments", "python")  # not offered again
+    # Check again on one post still asks the archive: its count can lag behind its comments.
+    c.calls.clear()
+    collect.run(c, s, collect.FetchRequest("python", comment_posts=("p1",)))
+    assert [call[1] for call in c.calls if call[0] == "all"] == ["p1"]

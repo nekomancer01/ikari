@@ -283,6 +283,19 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
             store.save_post(p, *score(p.text))
         store.commit()
         posts = [fresh.get(p.id, p) for p in posts]
+    if len(posts) > 1:
+        # A day's Download all comments offers posts whose comments weren't counted yet; once re-checked, the ones
+        # with none, or with every one saved already, cost no request. They're done, so they aren't offered again.
+        # One post asked about on its own (its Check again) is asked whatever its count says: a count can lag.
+        empty = [p for p in posts if p.num_comments is not None and len(store.comment_ids(p.id)) >= p.num_comments]
+        for p in empty:
+            store.mark_comments(p.id, ok=True, settled=p.score is not None)
+            store.mark_complete("comments" if p.score is not None else "comments_so_far", name, p.id)
+        store.commit()
+        if empty:
+            progress(0, 0, f"Skipping {len(empty):,} of {len(posts):,} posts: no comments to download")
+        skip = {p.id for p in empty}
+        posts = [p for p in posts if p.id not in skip]
     n_comments = 0
 
     def save(p: Post, got) -> None:
