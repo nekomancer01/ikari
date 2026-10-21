@@ -1,4 +1,4 @@
-"""A big saved subreddit (Ame's has 650,000 comments) opens without holding up the window or filling memory. Work
+"""A big saved subreddit (the owner's has 650,000 comments) opens without holding up the window or filling memory. Work
 and memory are counted, not timed, so these hold on a slow runner too; tools/perf.py --db measures the frame times
 on a real database."""
 import os
@@ -43,7 +43,7 @@ def test_the_app_shows_its_window_before_reading_a_big_subreddit(tmp_path, monke
     monkeypatch.setattr(mw.MainWindow, "wait_for_data", False)  # as the app opens it
     w = mw.MainWindow(db)
     try:
-        # Reading Ame's 650,000 comments took 17 s before the window first showed.
+        # Reading the owner's 650,000 comments took 17 s before the window first showed.
         assert reads == [[], [], []] and w.subheading.text() == "Opening r/Big…"
         w.show()
         until(lambda: len(w._saved["comments"]) == COMMENTS and not w._span_slices.running(), 30)
@@ -94,7 +94,7 @@ def test_moving_the_span_over_a_big_subreddit_works_out_what_changed_between_fra
     until(lambda: tally.ready and not tally._slices.running(), 30)
     Counted.reads = 0
     tally.count([], rows[1_000:61_000])  # the span moved along a day or so
-    # Main went through every row of the span at once to see which were new (most of a second with Ame's
+    # Main went through every row of the span at once to see which were new (most of a second with the owner's
     # 650,000 comments); it's done between frames now, the counts shown meanwhile.
     assert Counted.reads == 0 and tally.ready
     until(lambda: tally.ready and not tally._slices.running(), 30)
@@ -152,7 +152,7 @@ def test_sorting_a_big_table_is_worked_out_between_frames(monkeypatch):
     monkeypatch.setattr(tables, "sorted", lambda items, **k: (sorts.append(len(items)), real(items, **k))[1],
                         raising=False)
     tab.view.sortByColumn(3, Qt.SortOrder.DescendingOrder)  # Score
-    # Sorting all of Ame's 650,000 comments at the click held the window a second and a half; now no frame
+    # Sorting all of the owner's 650,000 comments at the click held the window a second and a half; now no frame
     # sorts more than a step's rows, and the table shows them in their new order once it's worked out.
     assert max(sorts, default=0) <= tab.model.STEP
     until(lambda: not tab.model._slices.running(), 30)
@@ -183,7 +183,7 @@ def test_filtering_a_big_table_is_worked_out_between_frames_and_narrowed_as_you_
     monkeypatch.setattr(tables, "column", lambda rs, key: (texts.append(len(rs)) if key == "body" else None,
                                                            real(rs, key))[1])
     tab.filter.setText("rogue")
-    # Going through every comment's text at the keystroke held the window 6 seconds with Ame's comments.
+    # Going through every comment's text at the keystroke held the window 6 seconds with the owner's comments.
     assert max(texts, default=0) <= tab.model.STEP and tab.model.rowCount() == len(rows)
     until(lambda: not tab._slices.running(), 30)
     expected = {r["id"] for r in rows if "rogue" in r["body"].lower()}
@@ -214,7 +214,7 @@ def test_a_big_table_loading_between_frames_takes_rows_a_fetch_adds_meanwhile():
 
 def test_closing_the_window_while_a_big_subreddit_is_read_stops_the_read(tmp_path, monkeypatch):
     """Qt aborted the process on exit when the window closed with the read's thread still going (half a minute
-    for Ame's 650,000 comments)."""
+    for the owner's 650,000 comments)."""
     settings(tmp_path)
     db = str(tmp_path / "big.db")
     fill(db)
@@ -232,7 +232,7 @@ def test_closing_the_window_while_a_big_subreddit_is_read_stops_the_read(tmp_pat
 
 
 def test_a_big_subreddit_is_summed_up_by_the_store_before_its_rows_are_read_and_its_words_split_meanwhile(tmp_path):
-    """Opening Ame's r/classicwow showed nothing for half a minute: every row was read, and its words split, before
+    """Opening the owner's r/classicwow showed nothing for half a minute: every row was read, and its words split, before
     the overview had anything to count. Its days are now counted by the store first (a second), and the words
     split in other processes while the rows are read."""
     db = str(tmp_path / "big.db")
@@ -297,7 +297,7 @@ def test_a_stricter_score_filter_finds_its_rows_among_those_in_memory(tmp_path, 
         pick.setCurrentIndex(pick.findText("Comments 10+"))
         until(lambda: not w._narrow_slices.running() and not w._span_slices.running()
               and w.comments_tab.model.rowCount() < COMMENTS, 30)
-        # Ame's comments were read again from the database for each change: 40 seconds.
+        # The owner's comments were read again from the database for each change: 40 seconds.
         assert reads == [[], []]
         expected = [r for r in Store(db).comments("Big") if r["score"] is not None and r["score"] >= 10]
         assert sorted(r["id"] for r in w.comments) == sorted(r["id"] for r in expected)

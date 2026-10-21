@@ -179,7 +179,7 @@ def test_rows_saved_again_with_a_new_label_are_counted_again_when_the_span_reloa
 
 def test_a_theme_switch_restyles_only_the_window_and_fades_two_pictures(window, monkeypatch):
     # Restyling every widget the app has (a new app style sheet, or setting the style again) took ~0.4 s at
-    # Ame's size, and each frame of the fade then repainted the whole window under the old look's picture.
+    # the owner's size, and each frame of the fade then repainted the whole window under the old look's picture.
     w, app = window, QApplication.instance()
     monkeypatch.setattr(motion, "_os_allows", True)
     monkeypatch.setattr(motion, "_wanted", True)

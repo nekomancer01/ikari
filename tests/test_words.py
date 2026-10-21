@@ -253,7 +253,7 @@ def test_setting_a_word_rescores_that_subreddit_only_and_every_page_follows(tmp_
         row = meanings.rows["grinding"]
         QTest.mouseClick(row.slider, Qt.MouseButton.LeftButton, pos=QPoint(row.slider.width() - 4, row.slider.height() // 2))
         assert w.store.words("town") == {"grinding": 1.0} and row.reads.text() == "Very positive"
-        assert row.result.full_text().startswith("Scoring saved items\u2026")  # Ame: a way to see it's working
+        assert row.result.full_text().startswith("Scoring saved items\u2026")  # The owner: a way to see it's working
         end = time.monotonic() + 10
         while w.rescore.running():
             assert time.monotonic() < end
@@ -308,7 +308,7 @@ def test_a_word_set_while_its_subreddit_is_fetched_is_rescored_again_after(windo
 
 
 def test_moving_the_span_keeps_the_words_both_spans_share_where_they_are(window, monkeypatch):
-    """Ame: the cloud should move fluidly "not just when you scrape but when you move around the timeline"."""
+    """The owner: the cloud should move fluidly "not just when you scrape but when you move around the timeline"."""
     w, app = window, QApplication.instance()
     w.show()
     w.show_page("words")
@@ -340,7 +340,7 @@ def test_moving_the_span_keeps_the_words_both_spans_share_where_they_are(window,
 
 
 def test_the_result_counts_only_what_the_setting_changes_and_old_scores_apart(tmp_path):
-    """Ame set "dungeon" to neutral and read "130 neutral \u2192 positive, 50 negative \u2192 positive": most of that
+    """The owner set "dungeon" to neutral and read "130 neutral \u2192 positive, 50 negative \u2192 positive": most of that
     was items scored by an older version getting today's score, not the setting."""
     app = QApplication.instance() or QApplication([])
     app.setOrganizationName("subsentiment-test")
@@ -417,7 +417,7 @@ def test_a_word_set_where_the_window_doesnt_have_every_row_rescores_from_the_sav
 @pytest.mark.parametrize("processes, again", [(True, False), (False, False), (True, True)],
                          ids=["in other processes", "where they can't run", "set again while it runs"])
 def test_a_big_rescore_is_scored_a_chunk_at_a_time_in_other_processes(tmp_path, monkeypatch, processes, again):
-    """Ame's r/classicwow had 31,497 items using "dungeon", which took minutes to score on the window's own
+    """The owner's r/classicwow had 31,497 items using "dungeon", which took minutes to score on the window's own
     thread. Chunks go to worker processes instead; where those can't start, every item is still scored here.
     A word set while a rescore runs starts it again, with new processes: what the old ones were on is dropped."""
     from subsentiment.gui import worker, words
