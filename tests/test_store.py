@@ -71,6 +71,39 @@ def test_datasets_summarise_each_subreddit_and_delete_all_empties_the_store(tmp_
     assert s.datasets() == [] and s.comments("python") == []
 
 
+def test_whole_comment_threads_are_counted_per_day_the_way_the_downloader_leaves_them(tmp_path):
+    from subsentiment.reddit import Comment, Post
+    s = Store(tmp_path / "w.db")
+    day = 1_791_936_000
+    posts = {  # id: (num_comments, comments saved, complete mark): whole?
+        "none": (0, 0, None),  # no comments: nothing to download
+        "marked": (9, 2, "comments"),  # Download all read it to the end; the count includes removed ones
+        "early": (None, 1, "comments_so_far"),  # read to the end before the archive counted it
+        "counted": (4, 1, "comments_so_far"),  # counted since, and more than was saved
+        "all": (2, 2, None),  # every comment the archive counts is saved
+        "part": (3, 1, None),
+        "never": (None, 0, None),
+    }
+    for i, (pid, (n, saved, mark)) in enumerate(posts.items()):
+        s.save_post(Post(pid, "Python", "t", "", "a", 1, 0.9, n, day + 10 + i, "u", ""), 0.0, "neutral")
+        for j in range(saved):
+            s.save_comment(Comment(f"{pid}{j}", pid, "Python", "t3_" + pid, "b", "x", 1, day, 0, "u"), 0.0, "neutral")
+        if mark:
+            s.mark_complete(mark, "Python", pid)
+    s.save_post(Post("next", "Python", "t", "", "a", 1, 0.9, 0, day + 86400 + 5, "u", ""), 0.0, "neutral")
+    s.save_post(Post("pic", "Python", "t", "", "a", 1, 0.9, 0, day + 99, "u", "", image=True), None, None)  # hidden
+    s.save_post(Post("other", "rust", "t", "", "a", 1, 0.9, 5, day + 50, "u", ""), 0.0, "neutral")
+    s.mark_complete("comments", "Python", "other")  # a mark in another subreddit doesn't count
+    s.commit()
+    assert s.whole_threads_per_day("PYTHON", day, day + 2 * 86400) == {day: (4, 7), day + 86400: (1, 1)}
+    assert s.whole_threads_per_day("rust", day, day + 86400) == {day: (0, 1)}
+    s.save_post(Post("alone", "Go", "t", "", "a", 1, 0.9, None, day + 5, "u", ""), 0.0, "neutral")
+    assert s.whole_threads_per_day("go", day, day + 86400) == {day: (0, 1)}  # a day of uncounted posts only
+    # The Posts list offers comments for exactly the posts that aren't whole.
+    assert {r["id"]: r["whole"] for r in s.comment_coverage("python", day, day + 86400)} == \
+        {"none": 1, "marked": 1, "early": 1, "counted": 0, "all": 1, "part": 0, "never": 0}
+
+
 def test_coverage_counts_per_day_and_complete_marks_are_cleared_with_the_data(tmp_path):
     from subsentiment.reddit import Comment, Post
     s = Store(tmp_path / "c.db")
@@ -601,7 +634,7 @@ def test_a_database_from_an_older_ikari_gets_notes_and_imports_without_them(tmp_
     assert Store(path).notes("python") == {0: ("X", "kept")}
 
 
-def test_score_filter_goes_by_the_post_score(tmp_path):
+def test_score_filter_goes_by_the_rows_own_score(tmp_path):
     from subsentiment.store import scoring_at_least
     s = Store(tmp_path / "s.db")
     day = 1_700_006_400.0 // 86400 * 86400
@@ -609,12 +642,12 @@ def test_score_filter_goes_by_the_post_score(tmp_path):
     s.save_comment(Comment("c1", "p10", "Python", "t3_p10", "b", "hi", -4, day + 86400, 0, "u"), 0.2, "positive")
     s.commit()
     posts, comments = s.posts("python"), s.comments("python")
-    assert posts[0]["score"] == 10 and comments[0]["post_score"] == 10
+    assert posts[0]["score"] == 10 and comments[0]["score"] == -4
     assert len(scoring_at_least(posts, 10)) == 1 and scoring_at_least(posts, 11) == []
-    assert len(scoring_at_least(comments, 10)) == 1  # a comment goes by its post's score, not its own -4
-    assert scoring_at_least(comments, 11) == [] and len(scoring_at_least(comments, None)) == 1
+    assert scoring_at_least(comments, 10) == []  # a comment goes by its own -4, not its post's 10
+    assert len(scoring_at_least(comments, -5)) == 1 and len(scoring_at_least(comments, None)) == 1
     out = tmp_path / "c.csv"
-    assert s.export_csv("python", "comments", out, min_score=11) == 0
+    assert s.export_csv("python", "comments", out, min_score=0) == 0
     assert s.export_csv("python", "posts", out, days={int(day)}, min_score=10) == 1
 
 

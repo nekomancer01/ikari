@@ -35,7 +35,7 @@ from subsentiment.store import Store, scoring_at_least
 
 
 SCOPES = ["Posts and comments", "Posts only", "Comments only"]
-# The header's score filter: label -> the lowest post score shown (None for any). Comments follow their post.
+# The header's score filters: label -> the lowest score shown (None for any), for posts and for comments.
 MIN_SCORES = {"Any score": None, "Score 1+": 1, "Score 10+": 10, "Score 50+": 50, "Score 100+": 100,
               "Score 500+": 500, "Score 1,000+": 1000}
 DRAWER_WIDTH = 318
@@ -149,7 +149,7 @@ class MainWindow(QMainWindow):
         self.fetch_job.ended.connect(self._on_fetch_ended)
         self.load_job = BackgroundJob(self)  # reads a big saved subreddit
         self.load_job.ended.connect(self._load_wanted)
-        self._wanted: tuple | None = None  # (name, score filter) being read on load_job's thread, to show then
+        self._wanted: tuple | None = None  # (name, post score filter, comment score filter) being read on load_job's thread, to show then
         self._stopping = False  # Stop was pressed on the running fetch
         self.current: str | None = None
         self.request: collect.FetchRequest | None = None
@@ -406,13 +406,16 @@ class MainWindow(QMainWindow):
         saved = self.settings.value("ui/overview_scope", SCOPES[0], str)
         self.scope.setCurrentIndex(max(self.scope.findText(saved), 0))
         self.scope.currentTextChanged.connect(self._on_scope_changed)
-        # Which posts every page counts by score, and the comments on them. It only hides, never deletes.
+        # Which posts, and which comments, every page counts by their own score. It only hides, never deletes.
         self.score_pick = mark(ShrinkingComboBox(), "pill", True)
-        for text, value in MIN_SCORES.items():
-            self.score_pick.addItem(text, value)
-        self.score_pick.setToolTip("Count only posts scoring at least this much, and the comments on them")
-        self.score_pick.setCurrentIndex(max(self.score_pick.findText(self.settings.value("ui/min_score", "", str)), 0))
-        self.score_pick.currentIndexChanged.connect(self._on_min_score)
+        self.comment_score_pick = mark(ShrinkingComboBox(), "pill", True)
+        for pick, setting, noun in ((self.score_pick, "ui/min_score", "posts"),
+                                    (self.comment_score_pick, "ui/min_comment_score", "comments")):
+            for text, value in MIN_SCORES.items():
+                pick.addItem(text if noun == "posts" else text.replace("Any score", "Any comments").replace("Score", "Comments"), value)
+            pick.setToolTip(f"Count only {noun} scoring at least this much")
+            pick.setCurrentIndex(max(pick.findText(self.settings.value(setting, "", str)), 0))
+            pick.currentIndexChanged.connect(lambda _=0, p=pick, k=setting: self._on_min_score(p, k))
         self.heading.setMinimumWidth(QFontMetrics(theme.display_font(14, 600)).horizontalAdvance("r/subreddit"))
 
         # The fetch running, or what the last one did, on every page: the drawer it started from closes.
@@ -432,6 +435,7 @@ class MainWindow(QMainWindow):
         controls.setSpacing(12)
         controls.addWidget(self.scope)
         controls.addWidget(self.score_pick)
+        controls.addWidget(self.comment_score_pick)
         header.addLayout(controls, 0, 1, Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.subheading, 1, 0, 1, 2)
         header.addWidget(self.fetch_strip, 2, 0, 1, 2)
@@ -492,7 +496,8 @@ class MainWindow(QMainWindow):
         self.rail.set_page(key)
         self.pages.setCurrentWidget(self.page_widgets[key])
         self.scope.setVisible(key in ("overview", "timeline", "words"))
-        self.score_pick.setVisible(key != "coverage")  # Download coverage counts every saved post
+        self.score_pick.setVisible(key != "coverage")
+        self.comment_score_pick.setVisible(key != "coverage")  # Download coverage counts every saved post
         self.settings.setValue("ui/page", key)
         if key == "timeline":  # kept up only while it shows
             self._show_span(self.timeline_page.body)
@@ -739,7 +744,7 @@ class MainWindow(QMainWindow):
             rows = read(name, self._read_to[kind])
             if rows:  # rows saved in the same instant as the last one read come back too; the ids catch them
                 self._read_to[kind] = rows[-1]["fetched_at"]
-                rows = scoring_at_least(rows, self.min_score)
+                rows = scoring_at_least(rows, self.min_scores[kind == "comments"])
                 self._count_new(kind, rows)
             for r in days.keep(rows, self._table_days):
                 if r["id"] not in self._queued_ids:
@@ -839,15 +844,16 @@ class MainWindow(QMainWindow):
         from freezing the window for seconds as the fetch ends."""
         if self._span_slices.running():  # the tables are mid-way to a new span: finish it with the rows as they are
             self._apply_span()
-        dropped: set[str] = set()
+        dropped = False
         for kind, read, tab in (("posts", self.store.posts_since, self.posts_tab),
                                 ("comments", self.store.comments_since, self.comments_tab)):
             rows = read(self.current, self._since)
-            # A post rescored below the score filter leaves, with its comments (posts come first).
-            dropped |= {r["id"] for r in rows} - {r["id"] for r in scoring_at_least(rows, self.min_score)}
-            owner = "id" if kind == "posts" else "post_id"
-            rows = [r for r in rows if r["id"] not in dropped and r[owner] not in dropped]
-            saved = self._saved[kind] = [r for r in self._saved[kind] if r["id"] not in dropped and r[owner] not in dropped]
+            # A row rescored below its score filter leaves.
+            kept = {r["id"] for r in scoring_at_least(rows, self.min_scores[kind == "comments"])}
+            gone = {r["id"] for r in rows} - kept
+            dropped = dropped or bool(gone)
+            rows = [r for r in rows if r["id"] in kept]
+            saved = self._saved[kind] = [r for r in self._saved[kind] if r["id"] not in gone]
             where = {r["id"]: i for i, r in enumerate(saved)}
             for r in rows:
                 if r["id"] in where:
@@ -926,7 +932,7 @@ class MainWindow(QMainWindow):
     def _show_dataset(self, name: str, wait: bool = False) -> None:
         """Show a saved subreddit. One shown lately is shown from memory; a big one not in memory is read on a
         thread (unless ``wait``, or the window isn't up yet) and shown once it's in, the window carrying on."""
-        key, stats = (name.lower(), self.min_score), self._stats.get(name.lower())
+        key, stats = (name.lower(), *self.min_scores), self._stats.get(name.lower())
         fetching = bool(self.fetch_job.busy and self.request and name.lower() == self.request.subreddit.lower())
         loaded = self._loaded.pop(key, None)
         if loaded is not None and (loaded[0] != stats or fetching):
@@ -948,8 +954,8 @@ class MainWindow(QMainWindow):
         self.current = name or None
         if loaded is None:
             with self.store.snapshot():
-                saved = {"posts": scoring_at_least(self.store.posts(name) if name else [], self.min_score),
-                         "comments": scoring_at_least(self.store.comments(name) if name else [], self.min_score)}
+                saved = {"posts": scoring_at_least(self.store.posts(name) if name else [], self.min_scores[0]),
+                         "comments": scoring_at_least(self.store.comments(name) if name else [], self.min_scores[1])}
             loaded = (stats, saved, {k: Analysis(rows) for k, rows in saved.items()})
         self._loaded[key] = loaded  # the newest last; a running fetch's rows go into these as they're counted
         while len(self._loaded) > 4:
@@ -975,8 +981,8 @@ class MainWindow(QMainWindow):
         """Read the subreddit last asked for on load_job's thread, once the one before is in."""
         if self._wanted is None or self.load_job.busy:
             return
-        name, min_score = key = self._wanted
-        worker = LoadWorker(self.db_path, name, min_score, (key, self._stats.get(name)))
+        name, *min_scores = key = self._wanted
+        worker = LoadWorker(self.db_path, name, tuple(min_scores), (key, self._stats.get(name)))
         worker.finished.connect(self._on_loaded)
         worker.failed.connect(self._on_load_failed)
         self.load_job.start(worker)
@@ -1055,11 +1061,12 @@ class MainWindow(QMainWindow):
         self.word_tally.count(self.posts, self.comments, fresh=reload)
 
     @property
-    def min_score(self) -> int | None:
-        return self.score_pick.currentData()
+    def min_scores(self) -> tuple[int | None, int | None]:
+        """The lowest score shown for posts and for comments (None for any)."""
+        return self.score_pick.currentData(), self.comment_score_pick.currentData()
 
-    def _on_min_score(self) -> None:
-        self.settings.setValue("ui/min_score", self.score_pick.currentText())
+    def _on_min_score(self, pick, setting: str) -> None:
+        self.settings.setValue(setting, pick.currentText())
         if not self.current:
             return
         motion.crossfade(self.content)
@@ -1146,11 +1153,11 @@ class MainWindow(QMainWindow):
         sub = self.words_page.meanings.subreddit
         if sub:
             self.store.save_word(sub, word, weight)
-            # The rows on screen are all there is of it, unless the score filter or a running fetch leaves some out.
+            # The rows on screen are all there is of it, unless a score filter or a running fetch leaves some out.
             fetching = self.fetch_job.busy and self.request is not None and self.request.subreddit.lower() == sub.lower()
             if fetching:  # it may be saving items scored the old way as this runs
                 self._set_mid_fetch.add(word)
-            whole = self.min_score is None and not fetching
+            whole = self.min_scores == (None, None) and not fetching
             self.rescore.start(sub, {word}, self._saved if whole and self.current == sub else None)
 
     def _rescore_after_fetch(self) -> None:
@@ -1162,7 +1169,7 @@ class MainWindow(QMainWindow):
     def _on_rescored(self, sub: str, kind: str, rows: list) -> None:
         """Saved items scored again by a subreddit's words: the pages showing it follow, as with a fetch's rows."""
         mine = self.current and self.current.lower() == sub
-        here = (sub, self.min_score)
+        here = (sub, *self.min_scores)
         for key in [k for k in self._loaded if k[0] == sub and not (mine and k == here)]:
             del self._loaded[key]  # read again when next shown
         if not mine:
@@ -1262,7 +1269,7 @@ class MainWindow(QMainWindow):
             try:
                 chosen = None if self._table_days is None else {
                     d for d in range(*self._table_days, days.DAY)}
-                n = self.store.export_csv(self.current, kind, path, days=chosen, min_score=self.min_score)
+                n = self.store.export_csv(self.current, kind, path, days=chosen, min_score=self.min_scores[kind == "comments"])
             except OSError as e:  # on Windows, usually the file is still open in Excel
                 QMessageBox.warning(self, "Export failed",
                                     f"Couldn't save {path}.\n\n{e.strerror or e}\n\n"
@@ -1270,8 +1277,8 @@ class MainWindow(QMainWindow):
                 return
             on = "" if chosen is None else (f" from {days.short_date(self._table_days[0], True)} to "
                                             f"{days.short_date(self._table_days[1] - days.DAY, True)}")
-            if self.min_score is not None:
-                on += f" scoring {self.min_score:,}+" if kind == "posts" else f" on posts scoring {self.min_score:,}+"
+            if self.min_scores[kind == "comments"] is not None:
+                on += f" scoring {self.min_scores[kind == 'comments']:,}+"
             self.statusBar().showMessage(f"Exported {n:,} {kind}{on} to {path}", 8000)
 
     def _import_database(self) -> None:
@@ -1344,6 +1351,6 @@ class MainWindow(QMainWindow):
     def running_threads(self) -> list[QThread]:
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
-        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job, self.load_job,
-                                    self.rescore.job)
+        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job,
+                                    self.coverage.threads_job, self.load_job, self.rescore.job)
                 if j.running()]
