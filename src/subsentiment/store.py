@@ -637,17 +637,19 @@ class Store:
                                "AND counted_at >= ?", (subreddit.lower(), after, before, since))
         return {r["day"]: r["posts"] for r in rows}
 
-    def open_threads(self, subreddit: str, days, every: bool = False) -> list[str]:
-        """Saved posts from these UTC days (their starts) whose comment threads aren't saved whole, or with
-        ``every`` all of them, newest first: what Download coverage's comment downloads fetch."""
+    def open_threads(self, subreddit: str, days, every: bool = False, cap: int = 0) -> list[str]:
+        """Saved posts from these UTC days (their starts) whose comment threads aren't saved whole, nor, with a
+        ``cap``, have that many comments saved; with ``every`` all of them. Newest first: what Download
+        coverage's comment downloads fetch."""
         days = sorted(days)
         if not days:
             return []
         rows = self.db.execute(
             "SELECT p.id, CAST(p.created_utc / 86400 AS INTEGER) * 86400 d FROM posts p WHERE p.subreddit = ? "
             "COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? AND p.image = 0 "
-            + ("" if every else f"AND NOT {WHOLE_THREAD} ") + "ORDER BY p.created_utc DESC",
-            (subreddit, days[0], days[-1] + 86400))
+            + ("" if every else f"AND NOT {WHOLE_THREAD} ") + ("" if every or not cap else f"AND {SAVED_COMMENTS} < ? ")
+            + "ORDER BY p.created_utc DESC",
+            (subreddit, days[0], days[-1] + 86400) + (() if every or not cap else (cap,)))
         want = set(days)
         return [r["id"] for r in rows if r["d"] in want]
 
@@ -668,6 +670,14 @@ class Store:
             f"{SAVED_COMMENTS} AS saved_comments, {WHOLE_THREAD} AS whole "
             "FROM posts p WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? "
             "AND p.image = 0 ORDER BY p.created_utc DESC", (subreddit, after, before)))
+
+    def comment_counts(self, subreddit: str, after: float | None, before: float | None) -> dict[str, int]:
+        """How many comments are saved on each post created in [after, before) that has any."""
+        return dict(self.db.execute(
+            "SELECT c.post_id, COUNT(*) FROM comments c JOIN posts p ON p.id = c.post_id "
+            "WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? GROUP BY c.post_id",
+            (subreddit, after if after is not None else float("-inf"),
+             before if before is not None else float("inf"))).fetchall())
 
     def whole_threads_per_day(self, subreddit: str, after: float, before: float) -> dict[int, tuple[int, int]]:
         """Per UTC day in [after, before), {day start: (posts whose comment threads are saved whole, saved
