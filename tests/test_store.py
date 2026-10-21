@@ -345,6 +345,11 @@ def test_settled_days_are_packed_smaller_and_read_back_the_same(tmp_path):
     import random
     rng = random.Random(4)
     s = Store(tmp_path / "x.db")
+    # Measured without the search index: packing leaves it as it is, and these rows' 40-word vocabulary makes it
+    # a third of the file (on real comments it's about a quarter the size of their packed text).
+    s.search.ready = False
+    for kind in store.PACKED:
+        s.db.execute(f"DROP TABLE search_{kind}")
     day0 = 1_700_000_000 // 86400 * 86400
     for i in range(300):
         created = day0 + (i % 5) * 86400 + i
@@ -838,7 +843,7 @@ def test_a_database_packed_by_0_4_is_packed_again_in_frames_and_reads_back_the_s
     assert list(tmp_path.iterdir()) == [path]  # its backup is gone once it worked
     assert _contents(path) == before
     s = Store(path)
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
     assert {k: s.rows(k, "deltarune") for k in rows} == rows
     packs = s.db.execute("SELECT data, cols, words FROM packs").fetchall()
     assert len(packs) == 8 and all(c and w for d, c, w in packs)  # small days stay one frame of JSON
@@ -899,4 +904,36 @@ def test_a_subreddits_packs_share_a_dictionary_made_from_a_big_day(tmp_path):
     assert o.import_from(path) == (1, 1500)  # another file's packs read with its own dictionary
     assert [r["body"] for r in o.comments("deltarune")] == [r["body"] for r in before]
     o.close()
+    s.close()
+
+
+def test_search_keeps_up_with_deletes_and_imports_and_a_0_4_database_gets_its_index(tmp_path, monkeypatch):
+    import numpy as np
+    key = lambda ids: sorted(store.Search.key(i) for i in ids)  # noqa: E731
+    # Image posts and their comments are indexed too, though never shown: compared among the rows shown.
+    shown = lambda found, rows: sorted(set(found.tolist()) & set(key(r["id"] for r in rows)))  # noqa: E731
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(V2_DB, path)
+    s = Store(path)
+    assert s.search.matches("comments", "the") is None  # not indexed yet
+    s.close()
+    Store.upgrade(path)
+    s = Store(path)
+    comments = s.rows("comments", "deltarune")
+    with_boss = [r["id"] for r in comments if "boss" in (r["body"] or "").split()]
+    assert with_boss and shown(s.search.matches("comments", "boss"), comments) == key(with_boss)
+    day = int(min(r["created_utc"] for r in s.rows("posts", "deltarune"))) // 86400 * 86400
+    s.delete_days("deltarune", [day])
+    left = {r["id"] for r in s.rows("comments", "deltarune")}
+    assert shown(s.search.matches("comments", "boss"), comments) == key(i for i in with_boss if i in left)
+    other = tmp_path / "other.db"
+    o = Store(other)
+    assert o.import_from(path)[1] == len(left)
+    assert shown(o.search.matches("comments", "boss"), comments) == key(i for i in with_boss if i in left)
+    o.delete_subreddit("deltarune")
+    assert len(o.search.matches("comments", "boss")) == 0
+    o.close()
+    s.delete_all()
+    assert len(s.search.matches("posts", "the")) == 0
+    assert isinstance(s.search.matches("posts", "the"), np.ndarray)
     s.close()
