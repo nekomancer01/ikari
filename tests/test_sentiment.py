@@ -1,3 +1,5 @@
+import pytest
+
 from subsentiment import sentiment
 
 
@@ -94,3 +96,30 @@ def test_set_words_count_inside_sarcasm_and_odd_letters_too():
     assert lex.score("gotta love when you kill the process")[1] == "positive"  # not sarcasm: "kill" is good here
     assert lex.score("gotta love when the game crashes")[1] == "negative"  # still sarcasm
     assert lex.score("this ſtuff is here")[1] == "positive"  # the search's case folding finds "stuff"
+
+
+def test_a_word_neither_scorer_knows_set_to_neutral_changes_no_score():
+    """The owner set "dungeon" (which neither VADER nor the classifier knows) to Neutral in r/classicwow, and 347 of
+    31,497 labels changed: the classifier paired the words either side of it, a "completely" before it lifted
+    its stand-in, and its capitals and the sarcasm check were read differently."""
+    lex = sentiment.Lexicon({"dungeon": 0.0})
+    texts = [
+        "I'm so torn on dungeon finder because it makes running dungeon content so accessible at the cost of "
+        "ruining the social aspect of putting a group together.",
+        "Are we going to see completely different dungeon comps? Do you think Forever will have a new dungeon "
+        "meta, or will spell cleave still be king?",
+        "The only time I felt like the leveling was too quick was doing the quests for the new under city "
+        "dungeon. There are like 5 or 6 quests and it gives you a level and a half.",
+        "THEY'RE VERMIN\n\nTHEY'RE DISGUSTING\n\nI AM SO MUCH MORE VIRTUOUS BECAUSE I AM OUTSIDE OF THE DUNGEON "
+        "TOUCHING GRASS",
+        "Gotta love when the dungeon queue pops right as dinner is ready",
+    ]
+    for text in texts:
+        assert lex.score(text) == pytest.approx(sentiment.score(text), abs=1e-9), text
+        assert lex.score(text, "vader") == pytest.approx(sentiment.score(text, "vader"), abs=1e-9), text
+
+
+def test_a_set_word_keeps_its_meaning_next_to_punctuation_and_in_a_sarcastic_frame():
+    assert sentiment.Lexicon({"grind": 1.0}).score("the grind-heavy content", "vader")[1] == "positive"
+    assert sentiment.Lexicon({"crashes": 1.0}).score("gotta love when the game crashes")[1] == "positive"
+    assert sentiment.Lexicon.known(":)") and sentiment.Lexicon.known("wow") and not sentiment.Lexicon.known("zenless")

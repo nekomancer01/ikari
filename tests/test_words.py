@@ -18,7 +18,7 @@ from subsentiment.analysis import WordCounts, words_in  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import motion  # noqa: E402
 from subsentiment.gui.rows import Saved  # noqa: E402
-from subsentiment.gui.words import KINDS, WordCloud, WordTally  # noqa: E402
+from subsentiment.gui.words import KINDS, WordCloud, WordMeanings, WordTally  # noqa: E402
 from subsentiment.reddit import Comment, Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
@@ -268,7 +268,7 @@ def test_setting_a_word_rescores_that_subreddit_only_and_every_page_follows(tmp_
         row = meanings.rows["grinding"]
         QTest.mouseClick(row.slider, Qt.MouseButton.LeftButton, pos=QPoint(row.slider.width() - 4, row.slider.height() // 2))
         assert w.store.words("town") == {"grinding": 1.0} and row.reads.text() == "Very positive"
-        assert row.result.full_text().startswith("Scoring saved items\u2026")  # The owner: a way to see it's working
+        assert row.result.text().startswith("Scoring saved items\u2026")  # the owner: a way to see it's working
         end = time.monotonic() + 10
         while w.rescore.running():
             assert time.monotonic() < end
@@ -285,7 +285,7 @@ def test_setting_a_word_rescores_that_subreddit_only_and_every_page_follows(tmp_
         assert meanings.status.isHidden()  # only says something when scoring failed
         moved = {(a, "positive"): sum(1 for i in ("town0", "town2", "townc") if before[i.replace("town", "city")] == a)
                  for a in ("negative", "neutral")}
-        assert row.result.full_text() == "\u2713 3 of 3 saved items changed label"
+        assert row.result.text() == "\u2713 3 of 3 saved items changed label"
         assert row.result.toolTip() == "\n".join(
             f"{n} {a} \u2192 {b}" for (a, b), n in sorted(moved.items(), key=lambda m: -m[1]) if n)
         w._refresh_datasets("city")
@@ -395,7 +395,7 @@ def test_the_result_counts_only_what_the_setting_changes_and_old_scores_apart(tm
             time.sleep(0.01)
         n = sum(changes.values())
         result = meanings.rows["grinding"].result
-        assert result.full_text() == f"\u2713 {n} of 3 saved items changed label"
+        assert result.text() == f"\u2713 {n} of 3 saved items changed label"
         assert result.toolTip() == "\n".join([f"{k} {a} \u2192 {b}" for (a, b), k in changes.most_common()]
                                              + ["Also updated 1 scored by an older version"])
     finally:
@@ -493,7 +493,26 @@ def test_a_big_rescore_is_scored_a_chunk_at_a_time_in_other_processes(tmp_path, 
         w.rescore.pool._idle.timeout.emit()
         assert w.rescore.pool._pool is None
         changes = sum(1 for t in texts[:11 + again] if set_to.score(t)[1] != sentiment.score(t)[1])
-        assert meanings.rows["grinding"].result.full_text() == f"\u2713 {changes} of {11 + again} saved items changed label"
+        assert meanings.rows["grinding"].result.text() == f"\u2713 {changes} of {11 + again} saved items changed label"
     finally:
         w.close()
         QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
+
+
+def test_a_setting_that_changes_no_label_says_why():
+    """The owner set "zenless" to Neutral and read "None of 61 saved items changed label", which looked broken:
+    neither scorer knows the word, so it read as neutral already."""
+    app = QApplication.instance() or QApplication([])
+    meanings = WordMeanings()
+    meanings.set_subreddit("ZZZ", {"zenless": 0.0, "hoyo": 0.0, "wow": 0.0, "great": 0.3})
+    meanings.show_result("zzz", {"zenless"}, 61, Counter())
+    meanings.show_result("zzz", {"wow"}, 1, Counter())
+    meanings.show_result("zzz", {"great"}, 4, Counter({("neutral", "positive"): 2}))
+    app.processEvents()
+    assert meanings.rows["zenless"].result.text() == (
+        "✓ No labels changed. 61 saved items use “zenless”, but the scorer doesn't know the word, so "
+        "it already read as neutral.")
+    assert meanings.rows["wow"].result.text() == (
+        "✓ No labels changed. 1 saved item uses “wow”, but the setting wasn't enough to move any of "
+        "them to another label.")
+    assert meanings.rows["great"].result.text() == "✓ 2 of 4 saved items changed label"
