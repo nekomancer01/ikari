@@ -369,6 +369,7 @@ class CoveragePage(VerticalScrollArea):
         self.bar_lines.addLayout(bar_end, 1)
         self.bar_first.addLayout(bar_lay)
         self.bar_first.addLayout(bar_cap)
+        self.bar_first.addStretch(1)  # the cap follows the choice, not the line's far end
         bar_lay.addWidget(QLabel("Download"))
         self.what = Choice(list(WHAT.items()), settings.value("coverage/what", "both", str))
         self.what.buttons["posts"].setToolTip("Every post from the ticked days")
