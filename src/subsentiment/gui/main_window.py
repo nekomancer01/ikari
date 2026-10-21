@@ -20,8 +20,8 @@ from subsentiment.gui import days, motion, native, theme
 from subsentiment.gui.coverage import CoveragePage
 from subsentiment.gui.fetch_form import FetchForm
 from subsentiment.gui.charts import NoteDialog, TimelineChart
-from subsentiment.gui.overview import CardPage, OverviewPage
-from subsentiment.gui.words import KINDS, WordCloud, WordTally
+from subsentiment.gui.overview import CardPage, OverviewPage, WordsPage
+from subsentiment.gui.words import KINDS, Rescore, WordTally
 from subsentiment.gui.rail import DRAWERS, PAGES, NavRail
 from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
 from subsentiment.gui.theme import mark, paint_backdrop
@@ -448,9 +448,19 @@ class MainWindow(QMainWindow):
         for chart in self.timelines:
             chart.note_requested.connect(self._edit_note)
             chart.view_changed.connect(partial(self._on_view_changed, chart))
-        self.words_page = CardPage("Words used most", WordCloud())
+        self.words_page = WordsPage()
         self.word_tally = WordTally(self)
         self.word_tally.changed.connect(self._render_words)
+        # What a word means in a subreddit: set beside the cloud, and the saved items using it scored again.
+        self.rescore = Rescore(self.store, self.db_path, self)
+        self.rescore.rescored.connect(self._on_rescored)
+        self.rescore.progress.connect(self.words_page.meanings.show_progress)
+        self.rescore.finished.connect(self.words_page.meanings.show_progress)
+        self.rescore.finished.connect(self._on_rescore_finished)
+        self._rescored: dict[str, dict] = {k: {} for k in KINDS}  # rows rescored, for the tables once it's done
+        self._rescore_index: dict[str, tuple] = {}  # kind -> (the saved rows, {id: where it is in them})
+        self.words_page.meanings.changed.connect(self._set_word)
+        self.overview.words.word_clicked.connect(self._pick_word)
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
         self.comments_tab = TablePage(COMMENT_COLUMNS, stretch_col=2)
         # The post title would otherwise size to its text and squeeze the comment column.
@@ -941,6 +951,8 @@ class MainWindow(QMainWindow):
         else:
             self._apply_span(reload=True)
         self._show_notes()
+        if switching or self.words_page.meanings.subreddit is None:
+            self.words_page.meanings.set_subreddit(self.current, self.store.words(self.current) if self.current else {})
         self._update_delete_enabled()
         self.coverage.set_subreddit(self.current)
 
@@ -1107,6 +1119,61 @@ class MainWindow(QMainWindow):
         self.store.save_note(subreddit, day, tag, text)
         self._show_notes()
 
+    def _pick_word(self, word: str) -> None:
+        """A word clicked in the Overview's cloud: set what it means on the Words page."""
+        self.show_page("words")
+        self.words_page.meanings.pick(word)
+
+    def _set_word(self, word: str, weight: float | None) -> None:
+        sub = self.words_page.meanings.subreddit
+        if sub:
+            self.store.save_word(sub, word, weight)
+            # The rows on screen are all there is of it, unless the score filter or a running fetch leaves some out.
+            whole = self.min_score is None and not (self.fetch_job.busy and self._showing_fetch())
+            self.rescore.start(sub, {word}, self._saved if whole and self.current == sub else None)
+
+    def _on_rescored(self, sub: str, kind: str, rows: list) -> None:
+        """Saved items scored again by a subreddit's words: the pages showing it follow, as with a fetch's rows."""
+        mine = self.current and self.current.lower() == sub
+        here = (sub, self.min_score)
+        for key in [k for k in self._loaded if k[0] == sub and not (mine and k == here)]:
+            del self._loaded[key]  # read again when next shown
+        if not mine:
+            return
+        if self._span_slices.running():  # the tables are mid-way to a new span: finish it with the rows as they are
+            self._apply_span()
+        saved, old, shown = self._saved[kind], [], []
+        # Where each saved row is, kept across a rescore's batches; looked up again if the rows changed meanwhile.
+        index = self._rescore_index.get(kind)
+        if index is None or index[0] is not saved:
+            index = self._rescore_index[kind] = (saved, {r["id"]: i for i, r in enumerate(saved)})
+        for r in rows:
+            i = index[1].get(r["id"])
+            if i is not None and (i >= len(saved) or saved[i]["id"] != r["id"]):
+                index = self._rescore_index[kind] = (saved, {s["id"]: i for i, s in enumerate(saved)})
+                i = index[1].get(r["id"])
+            if i is not None:  # (None: left out by the score filter)
+                old.append(saved[i])
+                shown.append(r)
+                saved[i] = r
+        if not old:
+            return
+        self._analysis[kind].add(old, -1)
+        self._analysis[kind].add(shown)
+        shown = days.keep(shown, self._table_days)
+        self.word_tally.add(kind, shown)  # by id: each row's lean follows its new label
+        self._rescored[kind].update((r["id"], r) for r in shown)
+        self._render_overview()
+
+    def _on_rescore_finished(self, sub: str) -> None:
+        """The tables (and what export writes) take the rescored rows in one go: each update sorts a table again."""
+        rows, self._rescored = self._rescored, {k: {} for k in KINDS}
+        self._rescore_index = {}
+        if self.current and self.current.lower() == sub:
+            for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
+                if rows[kind]:
+                    tab.update_rows(days.keep(rows[kind].values(), self._table_days))
+
     def _delete_dataset(self) -> None:
         if not self.current or self.fetch_job.busy:
             return
@@ -1216,6 +1283,7 @@ class MainWindow(QMainWindow):
             self.load_job.worker.failed.disconnect()
             self.load_job.qthread.quit()
             self.load_job.qthread.wait(3000)
+        self.rescore.stop()
         self._upgrade_stop.set()  # it stops after the day it's packing
         self.upgrading.join()
         self.store.close()
@@ -1224,4 +1292,5 @@ class MainWindow(QMainWindow):
     def running_threads(self) -> list[QThread]:
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
-        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.load_job) if j.running()]
+        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.load_job, self.rescore.job)
+                if j.running()]

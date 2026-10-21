@@ -6,12 +6,15 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings  # noqa: E402
+from PySide6.QtCore import QPoint, QSettings, Qt  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
+
+from subsentiment import sentiment  # noqa: E402
 
 from subsentiment.analysis import WordCounts, words_in  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
-from subsentiment.gui.words import WordCloud, WordTally  # noqa: E402
+from subsentiment.gui.words import KINDS, WordCloud, WordTally  # noqa: E402
 from subsentiment.reddit import Comment, Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
@@ -135,3 +138,69 @@ def test_a_small_recount_drops_rows_added_for_a_big_one_still_running(monkeypatc
         app.processEvents()
         time.sleep(0.01)
     assert [w for w, *_ in tally.top(["comments"])] == ["lane", "quiet"]
+
+
+def test_setting_a_word_rescores_that_subreddit_only_and_every_page_follows(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("subsentiment-test")
+    app.setApplicationName(tmp_path.name)
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path / "cfg"))
+    QSettings().setValue("updates/auto", False)
+    s = Store(tmp_path / "w.db")
+    day = 1_700_000_000.0  # long settled: the text is packed (store.PACKED), and read back through the packs
+    for sub in ("town", "city"):
+        for i, title in enumerate(["Grinding the boss all night", "Library reopened today", "Grinding again"]):
+            s.save_post(Post(f"{sub}{i}", sub, title, "", "a", 1, 0.9, 0, day - i * 86400, "https://r", ""),
+                        *sentiment.score(title))
+        s.save_comment(Comment(f"{sub}c", f"{sub}0", sub, "t3_x", "b", "more grinding tonight", 1, day + 60, 0, "/r/x/"),
+                       *sentiment.score("more grinding tonight"))
+    s.commit()
+    assert s.pack_settled() > 0
+    before = {r["id"]: r["label"] for r in s.posts("city") + s.comments("city")}
+    assert "positive" not in before.values()
+    s.close()
+    w = mw.MainWindow(str(tmp_path / "w.db"))
+    try:
+        w.show()
+        w._refresh_datasets("town")
+        w.show_page("words")
+        QApplication.processEvents()
+        assert w.current == "town"
+        positive = w._counted.counts["positive"]
+        meanings = w.words_page.meanings
+        cloud = w.words_page.body
+        box = next(b for b, word, *_ in cloud.placed() if word == "grinding")
+        QTest.mouseClick(cloud, Qt.MouseButton.LeftButton, pos=box.center().toPoint())  # picks it, unset
+        assert meanings.rows["grinding"].reads.text() == "Not set" and w.store.words("town") == {}
+        row = meanings.rows["grinding"]
+        QTest.mouseClick(row.slider, Qt.MouseButton.LeftButton, pos=QPoint(row.slider.width() - 4, row.slider.height() // 2))
+        assert w.store.words("town") == {"grinding": 1.0} and row.reads.text() == "Very positive"
+        end = time.monotonic() + 10
+        while w.rescore.running():
+            assert time.monotonic() < end
+            app.processEvents()
+            time.sleep(0.01)
+        app.processEvents()
+        saved = {r["id"]: r["label"] for r in w.store.posts("town") + w.store.comments("town")}
+        assert saved == {"town0": "positive", "town1": before["city1"], "town2": "positive", "townc": "positive"}
+        assert {r["id"]: r["label"] for r in w.store.posts("city") + w.store.comments("city")} == before
+        assert w._counted.counts["positive"] == positive + 3  # the overview and timeline
+        assert {r["id"]: r["label"] for r in w.posts_tab.model.rows}["town2"] == "positive"  # the tables
+        assert {r["id"]: r["label"] for r in w.posts}["town0"] == "positive"  # and what export writes
+        assert dict((word, lean) for word, _, lean in w.word_tally.top(KINDS))["grinding"] == 1.0  # the cloud
+        assert meanings.status.text() == "Saved items scored again"
+        w._refresh_datasets("city")
+        assert meanings.subreddit == "city" and meanings.rows == {}
+        w._refresh_datasets("town")  # back from memory, rescored
+        assert set(meanings.rows) == {"grinding"} and w._counted.counts["positive"] == positive + 3
+        QTest.mouseClick(meanings.rows["grinding"].remove, Qt.MouseButton.LeftButton)
+        end = time.monotonic() + 10
+        while w.rescore.running():
+            assert time.monotonic() < end
+            app.processEvents()
+            time.sleep(0.01)
+        assert w.store.words("town") == {} and w._counted.counts["positive"] == positive
+    finally:
+        w.close()
+        QSettings.setDefaultFormat(QSettings.Format.NativeFormat)

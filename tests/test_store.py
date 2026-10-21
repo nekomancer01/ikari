@@ -627,3 +627,20 @@ def test_read_spans_merge_and_go_with_the_subreddit(tmp_path):
     s.delete_subreddit("Python")  # its posts are gone, so a download must read them again
     assert s.read_spans("python") == []
     s.close()
+
+
+def test_word_meanings_are_kept_per_subreddit(tmp_path):
+    s = Store(tmp_path / "w.db")
+    s.save_word("Linux", "  Kill ", 0.0)
+    s.save_word("linux", "big shot", 3)  # kept within -1..1
+    s.save_word("Deltarune", "kill", -1)
+    assert s.words("LINUX") == {"big shot": 1.0, "kill": 0.0}
+    assert s.lexicon("linux").score("kill the process")[1] == "neutral"
+    assert s.lexicon("deltarune").score("kill the process")[1] == "negative"
+    s.save_word("linux", "kill", None)
+    assert s.words("linux") == {"big shot": 1.0}
+    assert s.lexicon("linux").score("kill the process")[1] == "negative"  # read again once changed
+    s.delete_subreddit("Linux")
+    assert s.words("linux") == {} and s.words("deltarune") == {"kill": -1.0}
+    s.close()
+    assert Store(tmp_path / "w.db").words("deltarune") == {"kill": -1.0}
