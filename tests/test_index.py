@@ -300,3 +300,34 @@ def test_a_thread_can_count_words_and_read_a_column_while_the_window_adds_and_dr
     _same_rows(index, rows)
     assert index.top_words(n=20) == WordCounts.top(WordCounts("comments", rows), n=20)
     index.close()
+
+
+def test_rows_added_to_an_empty_index_out_of_time_order_are_sorted_by_reorder(tmp_path):
+    path = tmp_path / "x.db"
+    s = Store(path)
+    index = RowIndex(path, "comments", "deltarune")
+    since = clock.time()
+    clock.sleep(0.01)
+    _fill(s, random.Random(2), posts=2, per=2, day0=DAY0 + 5 * 86400)
+    _fill(s, random.Random(3), posts=2, per=2, day0=DAY0, prefix="older")  # saved last, posted first
+    index.add(s.rows("comments", "deltarune", since=since))
+    assert index.ordered == 0
+    day = (DAY0, DAY0 + 86400)
+    assert {i.decode() for i in index.ids[index.mask(day)]} == {
+        r["id"] for r in s.rows("comments", "deltarune") if day[0] <= r["created_utc"] < day[1]} != set()
+    index.reorder()
+    _same_rows(index, s.rows("comments", "deltarune"))
+    index.close()
+    with pytest.raises(ValueError):
+        index.column("body")
+
+
+def test_a_column_has_the_newer_text_of_a_row_saved_again_since_the_index_was_read(saved):
+    path, s = saved
+    index = RowIndex(path, "comments", "deltarune")
+    s.save_comment(Comment("c6_1", "p6", "Deltarune", "t3_p6", "v1", "edited since", 3, DAY0 + 86400 + 6 * 37 + 30, 0,
+                           None), 0.1, "positive")
+    s.commit()
+    at = int(index.where(["c6_1"])[0])
+    assert index.column("body", at, at + 1) == ["edited since"]
+    index.close()
