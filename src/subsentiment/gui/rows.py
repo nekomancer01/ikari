@@ -117,6 +117,10 @@ class RowSource:
     def where(self, ids) -> np.ndarray:
         raise NotImplementedError
 
+    def search(self, typed: str) -> np.ndarray | None:
+        """Which rows have the words typed, as a mask (RowIndex.search); None to look through their text instead."""
+        return None
+
     def _read(self, positions) -> list:
         raise NotImplementedError
 
@@ -190,6 +194,9 @@ class Saved(RowSource):
 
     def where(self, ids) -> np.ndarray:
         return self.index.where(ids)
+
+    def search(self, typed: str) -> np.ndarray | None:
+        return self.index.search(typed)
 
     def read_values(self, key: str, step: int = 2000):
         """As RowSource's; a text column the index keeps in its packs is read on a thread, a big step at a time."""

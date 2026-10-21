@@ -324,6 +324,10 @@ def main(argv: list[str] | None = None) -> int:
             report(f"{page}: {text}", [lambda i=i: w.comment_score_pick.setCurrentIndex(i)], 3000)
     for col, order, text in ((3, Qt.SortOrder.DescendingOrder, "by score"), (6, Qt.SortOrder.AscendingOrder, "by date")):
         report(f"comments: sort {text}", [lambda c=col, o=order: w.comments_tab.view.sortByColumn(c, o)], 3000)
+    for typed in ("raid", "the"):  # typed into the Comments table's filter, a key a frame, then cleared
+        report(f"comments: filter {typed}", [lambda t=typed[:k]: w.comments_tab.filter.setText(t)
+                                             for k in range(1, len(typed) + 1)], 3000)
+        report(f"comments: clear filter {typed}", [lambda: w.comments_tab.filter.setText("")], 3000)
     for page in ("overview", "words"):
         # A fetch saving comments, a request's 100 at a time (here its latest ones saved again): the window counts
         # them in and the overview and word clouds follow every 250 ms, for two seconds.

@@ -7,6 +7,9 @@ import time
 import tracemalloc
 from collections import Counter
 
+import numpy as np
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QItemSelectionModel, QSettings, Qt  # noqa: E402
@@ -317,3 +320,32 @@ def test_a_stricter_score_filter_finds_its_rows_among_those_in_memory(tmp_path, 
         assert w._analysis["comments"].counts == Analysis(expected).counts
     finally:
         w.close()
+
+
+def test_filtering_a_big_subreddit_looks_its_words_up_on_a_thread_once_typing_pauses(tmp_path, monkeypatch):
+    """Going through 650,000 comments' text took seconds; the search index finds a word's in a few milliseconds."""
+    QApplication.instance() or QApplication([])
+    db = str(tmp_path / "big.db")
+    fill(db)
+    monkeypatch.setattr(tables.RowsModel, "BIG", 10_000)  # (20,000 comments here)
+    saved = Saved(db, "comments", "Big")
+    tab = TablePage(TABLE_COMMENTS, stretch_col=2)
+    tab.set_rows(saved, np.arange(len(saved)))
+    searched = []
+    real = Saved.search
+    monkeypatch.setattr(Saved, "search", lambda self, typed: (searched.append((typed, threading.current_thread())),
+                                                              real(self, typed))[1])
+    monkeypatch.setattr(Saved, "read_values", lambda self, key, step=2000: pytest.fail("every row's text was read"))
+    for typed in ("g", "gr", "gre", "great"):
+        tab.filter.setText(typed)
+    until(lambda: searched and not tab._typing.isActive() and not tab._slices.running(), 30)
+    assert [typed for typed, _ in searched] == ["great"]  # once typing paused
+    assert threading.main_thread() not in [thread for _, thread in searched]
+    db_ = Store(db)
+    expected = {r["id"] for r in db_.comments("Big") if "great" in r["body"].lower()}
+    db_.close()
+    assert expected and {r["id"] for r in tab.model.rows} == expected
+    tab.label_filter.setCurrentText("Negative")
+    until(lambda: not tab._typing.isActive() and not tab._slices.running(), 30)
+    assert {r["id"] for r in tab.model.rows} == {i for i in expected if saved.rows(saved.where([i]))[0]["label"] == "negative"}
+    saved.close()

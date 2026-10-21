@@ -649,7 +649,13 @@ class TablePage(QWidget):
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("Filter by text…")
         self.filter.setClearButtonEnabled(True)
-        self.filter.textChanged.connect(lambda _: self._apply_filters())
+        # A big table with a search index is searched once typing pauses: a short word's search ran to half a second.
+        self._typing = QTimer(self)
+        self._typing.setSingleShot(True)
+        self._typing.setInterval(150)
+        self._typing.timeout.connect(self._apply_filters)
+        self.filter.textChanged.connect(lambda _: self._typing.start() if self.source.lazy and len(self._base) >= self.model.BIG
+                                        else self._apply_filters())
         self.label_filter = mark(QComboBox(), "pill", True)
         self.label_filter.addItems(["All labels", "Positive", "Neutral", "Negative"])
         self.label_filter.currentTextChanged.connect(lambda _: motion.crossfade(self.view))  # first: the old rows' look
@@ -845,8 +851,20 @@ class TablePage(QWidget):
             builds = self._builds
         label, needle = self._wanted()
         at, last, source = self._base, self._last, self.source
+        found = None
+        if needle and source.lazy:  # the search index's words (on a thread: a common word took 390 ms of Ame's comments)
+            work = on_thread(lambda: source.search(needle))
+            found = finish(work) if step is None else (yield from work)
+            if builds != self._builds:
+                return
         if label == "all labels" and not needle:
             picked = at
+        elif found is not None:
+            late = at[at >= len(found)]  # added since the search began: looked through as they are
+            picked = at[at < len(found)]
+            picked = self._picked(picked[found[picked]], label, "")
+            if len(late):
+                picked = np.concatenate([picked, self._picked(late, label, needle)])
         else:
             if needle and source.values(self._text_key) is None:  # every row's text, read once
                 if step is None:

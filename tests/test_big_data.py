@@ -42,6 +42,9 @@ def fill(path, sub="Big"):
     db.executemany(f"INSERT INTO comments ({','.join(COMMENT_COLUMNS)}) VALUES ({','.join('?' * 13)})", comments)
     db.commit()
     db.close()
+    store = Store(path)
+    store.index_text()  # as saving them would have
+    store.close()
 
 
 @pytest.fixture
