@@ -608,7 +608,7 @@ def test_a_day_with_no_posts_anywhere_isnt_listed_ticked_or_downloaded(window, m
     c = w.coverage
     settle(w, lambda: c.totals and c._threads)
     assert empty not in c._shown_days() and saved in c._shown_days()
-    assert "1 day with no posts left out" in c.subtitle.text()
+    assert "1 day with no posts left out" in c.subtitle.full_text()
     QTest.mouseClick(c.what.buttons["posts"], Qt.MouseButton.LeftButton)
     c.tick_all.click()
     assert empty not in c.ticked and c.download_ticked.text() == f"Download {len(c.days) - 1} days"
