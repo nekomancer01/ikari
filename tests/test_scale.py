@@ -50,7 +50,7 @@ def test_a_big_subreddit_takes_half_the_memory_it_did(tmp_path):
     db = str(tmp_path / "big.db")
     fill(db)
     got = []
-    worker = LoadWorker(db, "Big", None)
+    worker = LoadWorker(db, "Big", (None, None))
     worker.finished.connect(got.append)
     tracemalloc.start()
     try:

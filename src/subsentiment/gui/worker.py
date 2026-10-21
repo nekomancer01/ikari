@@ -109,9 +109,9 @@ class LoadWorker(QObject):
     finished = Signal(object)  # (tag, rows, analysis): the tag it was given, {kind: rows}, {kind: Analysis}
     failed = Signal(str)
 
-    def __init__(self, db_path: str, subreddit: str, min_score: int | None, tag=None):
+    def __init__(self, db_path: str, subreddit: str, min_scores: tuple, tag=None):
         super().__init__()
-        self.args = (db_path, subreddit, min_score)
+        self.args = (db_path, subreddit, min_scores)
         self.tag = tag
 
     def stop(self) -> None:
@@ -119,12 +119,13 @@ class LoadWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        db_path, subreddit, min_score = self.args
+        db_path, subreddit, (min_post, min_comment) = self.args
         store = None
         try:
             store = Store(db_path)
             with store.snapshot():
-                rows = {k: SavedRows(scoring_at_least(store.rows(k, subreddit), min_score)) for k in ("posts", "comments")}
+                rows = {k: SavedRows(scoring_at_least(store.rows(k, subreddit), least))
+                        for k, least in (("posts", min_post), ("comments", min_comment))}
             # Counted newest first, as Store.posts reads them: a total's last digits depend on the order it's added up in.
             self.finished.emit((self.tag, rows, {k: Analysis(reversed(v)) for k, v in rows.items()}))
         except Exception as e:
