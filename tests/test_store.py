@@ -689,6 +689,22 @@ def test_read_spans_merge_and_go_with_the_subreddit(tmp_path):
     s.close()
 
 
+def test_tried_days_join_and_fall_back_to_the_saved_days_before_any_were_kept(tmp_path):
+    s = Store(tmp_path / "t.db")
+    d = 86400 * 20000
+    assert s.tried_days("python") == []  # never fetched: nothing to list
+    s.save_post(Post("p1", "Python", "t", "", "a", 1, 0.9, 0, d + 2 * 86400 + 50, "u", ""), 0.0, "neutral")
+    s.save_removed("Python", {"gone": d + 10})
+    assert s.tried_days("PYTHON") == [d + 2 * 86400, d + 86400, d]  # an older database: first saved day to last
+    s.save_tried("python", [d + 5 * 86400, d + 4 * 86400])  # joined to those, and kept from now on
+    s.save_tried("Python", [d + 9 * 86400])
+    assert s.tried_days("python") == [d + k * 86400 for k in (9, 5, 4, 2, 1, 0)]
+    assert s.read_spans("python") == []  # a kind of its own
+    s.delete_subreddit("python")
+    assert s.tried_days("python") == []
+    s.close()
+
+
 def test_word_meanings_are_kept_per_subreddit(tmp_path):
     s = Store(tmp_path / "w.db")
     s.save_word("Linux", "  Kill ", 0.0)

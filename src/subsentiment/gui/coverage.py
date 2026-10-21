@@ -30,8 +30,7 @@ from subsentiment.gui.widgets import (
 from subsentiment.gui.worker import BackgroundJob, CountWorker, StoreWorker
 
 DAY = 86400
-MAX_DAY_POSTS = collect.MAX_DAY_POSTS
-days_in = collect.days_in  # cap on one day's "Download all"
+MAX_DAY_POSTS = collect.MAX_DAY_POSTS  # cap on one day's "Download all"
 
 NOTE = ("Totals come from Arctic Shift and include posts and comments later removed from Reddit, which ikari "
         "can't save. A day's share counts the removed posts and image posts ikari has seen as checked, and a thread can "
@@ -268,9 +267,10 @@ def centred(w: QWidget) -> QWidget:
 
 
 class CoveragePage(VerticalScrollArea):
-    """A page in the rail. It lists the days in the Fetch drawer's range, so a change there shows here; the
-    running fetch's progress and Stop are in the strip under the header, as on every page. On a short window it
-    scrolls, as the Overview does, rather than holding the window taller than the screen."""
+    """A page in the rail. It lists the days fetches and downloads of the subreddit have asked for, saved or not,
+    to find and fill what they missed (Store.tried_days); the running fetch's progress and Stop are in the strip
+    under the header, as on every page. On a short window it scrolls, as the Overview does, rather than holding
+    the window taller than the screen."""
 
     def __init__(self, window):
         super().__init__()
@@ -540,8 +540,14 @@ class CoveragePage(VerticalScrollArea):
             self._show_ticked()
             self._show_posts(None)
             return
-        after, before = self.window_.fetch_form.bounds()
-        days = days_in(after, before)
+        days = self.window_.store.tried_days(self.subreddit)
+        if not days:
+            self.subtitle.setText("Nothing fetched yet. Days a fetch asks for are listed here, to download what it missed.")
+            self.days = self._day_rows = []
+            self.day_table.setRowCount(0)
+            self._show_ticked()
+            self._show_posts(None)
+            return
         if days != self.days:
             self.days, rebuild = days, True
         totals = self._totals()
@@ -641,8 +647,8 @@ class CoveragePage(VerticalScrollArea):
             t.selectRow(self.days.index(shown[0]))
         empty = sum(self._no_posts(d) for d in self.days)
         # The heading above names the subreddit.
-        self.subtitle.setText(f"{range_text(self.days[-1], self.days[0])} · {plural(len(self.days), 'day')} · the "
-                              "dates set in Fetch" + (f" · {plural(empty, 'day')} with no posts left out" if empty else ""))
+        self.subtitle.setText(f"{range_text(self.days[-1], self.days[0])} · {plural(len(self.days), 'day')} "
+                              "fetched before" + (f" · {plural(empty, 'day')} with no posts left out" if empty else ""))
         self._show_ticked()
 
     def _no_posts(self, day: int) -> bool:
