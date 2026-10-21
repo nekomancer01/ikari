@@ -859,7 +859,8 @@ class _Meaning(QWidget):
         self.slider = MeaningSlider()
         self.slider.setToolTip(f"What \u201c{word}\u201d means here, from negative to positive")
         lay.addWidget(self.slider)
-        self.result = ElidedLabel("", "caption")  # what setting it did to the saved items (WordMeanings.show_result)
+        self.result = label("", "caption")  # what setting it did to the saved items (WordMeanings.show_result)
+        self.result.setWordWrap(True)
         self.result.hide()
         lay.addWidget(self.result)
         lay.addSpacing(6)
@@ -876,6 +877,7 @@ class _Meaning(QWidget):
     def set(self, weight: float | None) -> None:
         """Show ``weight``, or None for a word picked but not set yet."""
         self.saved = weight is not None
+        self.sent = weight  # as saved, and scored by (the slider may have moved on since)
         self.slider.blockSignals(True)
         self.slider.setValue(round((weight or 0) * 100))
         self.slider.blockSignals(False)
@@ -983,19 +985,29 @@ class WordMeanings(QWidget):
         mentioned apart."""
         if not (self.subreddit and subreddit == self.subreddit.lower()):
             return
-        if not using:
-            text, details = "No saved items use it yet", ""
-        else:
-            moved = sum(changed.values())
-            text = f"\u2713 {f'{moved:,}' if moved else 'None'} of {using:,} saved items changed label"
-            details = "\n".join(f"{n:,} {a} \u2192 {b}" for (a, b), n in changed.most_common())
-            if stale:  # out of date, not changed by the setting
-                details += f"{chr(10) if details else ''}Also updated {stale:,} scored by an older version"
+        moved = sum(changed.values())
+        details = "\n".join(f"{n:,} {a} \u2192 {b}" for (a, b), n in changed.most_common())
+        if stale:  # out of date, not changed by the setting
+            details += f"{chr(10) if details else ''}Also updated {stale:,} scored by an older version"
+        items = f"{using:,} saved {'item uses' if using == 1 else 'items use'}"
         for word in words:
             row = self.rows.get(word)
-            if row is not None:
-                row.scoring = False
-                row.show_result(text, details)
+            if row is None:
+                continue
+            it = "these words" if len(words) > 1 else f"\u201c{word}\u201d"
+            if not using:
+                text = f"No saved items use {it} yet"
+            elif moved:
+                text = f"\u2713 {moved:,} of {using:,} saved items changed label"
+            elif all(not self.rows[w].sent and not Lexicon.known(w) for w in words if w in self.rows):
+                # (The owner set "zenless" to Neutral, read "None of 61 changed" and took it for broken.)
+                text = (f"\u2713 No labels changed. {items} {it}, but the scorer doesn't know "
+                        f"{'them' if len(words) > 1 else 'the word'}, so it already read as neutral.")
+            else:
+                text = (f"\u2713 No labels changed. {items} {it}, but the setting wasn't enough to move any of "
+                        "them to another label.")
+            row.scoring = False
+            row.show_result(text, details)
 
     def show_progress(self, subreddit: str, done: int | None = None, total: int = 0) -> None:
         """How far scoring the saved items again has got, under the words being scored; done None once it's
