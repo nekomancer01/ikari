@@ -878,7 +878,7 @@ class TablePage(QWidget):
         label, needle = self._wanted()
         at, last, source = self._base, self._last, self.source
         found = None
-        if needle and source.lazy:  # the search index's words (on a thread: a common word took 390 ms of Ame's comments)
+        if needle and source.lazy:  # the search index's words (on a thread: a common word took 390 ms of the owner's comments)
             work = on_thread(lambda: source.search(needle))
             found = finish(work) if step is None else (yield from work)
             if builds != self._builds:

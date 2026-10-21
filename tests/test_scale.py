@@ -63,7 +63,7 @@ def test_the_app_shows_its_window_before_reading_a_big_subreddit(tmp_path, monke
 def test_a_big_subreddit_takes_a_tenth_of_the_memory_it_did(tmp_path):
     db = str(tmp_path / "big.db")
     fill(db)
-    Store(db).pack_settled()  # as Ame's are: days settle and are packed two days after they're fetched
+    Store(db).pack_settled()  # as the owner's are: days settle and are packed two days after they're fetched
     got = []
     worker = LoadWorker(db, "Big")
     worker.read.connect(got.append)
@@ -105,7 +105,7 @@ def test_the_words_of_a_big_span_are_counted_on_a_thread_from_its_days_counts(tm
     rows = Store(db).comments("Big")
     span = (int(min(r["created_utc"] for r in rows) // 86400 + 3) * 86400, int(time.time() // 86400 - 3) * 86400)
     tally.count(saved, span, (None, None))  # the span moved
-    # Main went through every row of the span to see which were new (most of a second with Ame's 650,000
+    # Main went through every row of the span to see which were new (most of a second with the owner's 650,000
     # comments); it adds up the counts of the span's days on a thread now, the words shown meanwhile.
     assert not tally.ready and tally._slices.running()
     until(lambda: tally.ready and not tally._slices.running(), 30)
@@ -169,7 +169,7 @@ def test_sorting_a_big_table_is_worked_out_between_frames(monkeypatch):
                         raising=False)
     threads = count_calls(monkeypatch, threading.Thread, "start")
     tab.view.sortByColumn(3, Qt.SortOrder.DescendingOrder)  # Score
-    # Sorting all of Ame's 650,000 comments at the click held the window a second and a half; now numbers are
+    # Sorting all of the owner's 650,000 comments at the click held the window a second and a half; now numbers are
     # sorted by numpy on a thread, no frame sorting anything, and the table shows the rows in their new order
     # once it's worked out.
     assert max(sorts, default=0) <= tab.model.STEP and tab.model._slices.running()
@@ -286,7 +286,7 @@ def test_opening_a_big_subreddit_shows_its_overview_rows_and_words(tmp_path, mon
         assert w._counted.count == POSTS + COMMENTS
         fresh = WordCounts.top(WordCounts("posts", Store(db).posts("Big")), WordCounts("comments", Store(db).comments("Big")), n=150)
         assert w.word_tally.top(["posts", "comments"], 150) == fresh
-        # Only the rows the table draws were read, on a thread: 128 comments took 400 ms to read from Ame's packs.
+        # Only the rows the table draws were read, on a thread: 128 comments took 400 ms to read from the owner's packs.
         reads = []
         real = Saved._read
         monkeypatch.setattr(Saved, "_read", lambda self, at: (reads.append(threading.current_thread()), real(self, at))[1])

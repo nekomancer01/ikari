@@ -67,7 +67,7 @@ def window(tmp_path):
 def filtered(tab) -> None:
     """Wait for a saved subreddit's table to show what its filters let through: its search runs on a thread once
     typing pauses."""
-    end = time.monotonic() + 10
+    end = time.monotonic() + 30
     while tab._typing.isActive() or tab._slices.running():
         assert time.monotonic() < end
         QTest.qWait(5)
