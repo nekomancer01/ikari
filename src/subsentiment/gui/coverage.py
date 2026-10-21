@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 
 import shiboken6
-from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Slot
+from PySide6.QtCore import QEvent, QSize, Qt, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QBoxLayout, QCheckBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton,
     QSizePolicy, QTableWidget, QVBoxLayout, QWidget,
@@ -358,13 +358,17 @@ class CoveragePage(VerticalScrollArea):
         # What the ticked days download, and the one button that does it.
         bar, rows = panel("solid", margins=8, spacing=8)
         rows.setContentsMargins(14, 7, 7, 7)
-        self.bar_row = bar_lay = QHBoxLayout()
-        bar_lay.setSpacing(10)
-        rows.addLayout(bar_lay)
-        # On a narrow window the comment cap takes a second line, under the choice it belongs to.
-        self.bar_row2 = QHBoxLayout()
-        self.bar_row2.setSpacing(10)
-        rows.addLayout(self.bar_row2)
+        # One line: what, the comment cap, then the estimate and the button. A narrower window puts the estimate and
+        # button on a second line, and a narrower one still the cap on its own line between them.
+        self.bar_lines, self.bar_first = (QBoxLayout(QBoxLayout.Direction.LeftToRight) for _ in range(2))
+        bar_lay, bar_cap, bar_end = QHBoxLayout(), QHBoxLayout(), QHBoxLayout()
+        for lay in (self.bar_lines, self.bar_first, bar_lay, bar_cap, bar_end):
+            lay.setSpacing(10)
+        rows.addLayout(self.bar_lines)
+        self.bar_lines.addLayout(self.bar_first)
+        self.bar_lines.addLayout(bar_end, 1)
+        self.bar_first.addLayout(bar_lay)
+        self.bar_first.addLayout(bar_cap)
         bar_lay.addWidget(QLabel("Download"))
         self.what = Choice(list(WHAT.items()), settings.value("coverage/what", "both", str))
         self.what.buttons["posts"].setToolTip("Every post from the ticked days")
@@ -386,19 +390,15 @@ class CoveragePage(VerticalScrollArea):
         for signal in (self.comment_cap.count.valueChanged, self.comment_cap.pick.currentIndexChanged):
             signal.connect(self.comment_cap.save)
             signal.connect(self._show_ticked)
-        self.cap_box = QWidget()
-        cap_lay = QHBoxLayout(self.cap_box)
-        cap_lay.setContentsMargins(0, 0, 0, 0)
-        cap_lay.setSpacing(10)
-        cap_lay.addWidget(self.comment_cap.count)
-        cap_lay.addWidget(self.comment_cap.pick)
-        bar_lay.addWidget(self.cap_box)
-        self.bar_row2.addStretch(1)
+        bar_cap.addWidget(self.comment_cap.count)
+        bar_cap.addWidget(self.comment_cap.pick)
+        for lay in (bar_lay, bar_cap):
+            lay.addStretch(1)  # on a line of its own, each part stays at the left
         self.estimate = ElidedLabel("", "muted")
-        bar_lay.addWidget(self.estimate, 1)
+        bar_end.addWidget(self.estimate, 1)
         self.download_ticked = theme.mark(small_button("Download selected"), "primary", True)
         self.download_ticked.clicked.connect(self._download_ticked)
-        bar_lay.addWidget(self.download_ticked)
+        bar_end.addWidget(self.download_ticked)
         root.addWidget(bar)
 
         self.day_table = table(["Day", "Posts", "", "Comment threads", ""])
@@ -940,19 +940,15 @@ class CoveragePage(VerticalScrollArea):
         direction = QBoxLayout.Direction.LeftToRight if wide else QBoxLayout.Direction.TopToBottom
         if self.body.direction() != direction:
             self.body.setDirection(direction)
+        # The bar on as few lines as fit, the estimate keeping room to say something.
+        what, cap = (self.bar_first.itemAt(k).layout().minimumSize().width() for k in (0, 1))
+        end = self.bar_lines.itemAt(1).layout().minimumSize().width()
+        room = self.viewport().width() - 21  # the bar's side margins
+        across, down = QBoxLayout.Direction.LeftToRight, QBoxLayout.Direction.TopToBottom
+        for lay, one in ((self.bar_lines, what + cap + end + 20 + 160 <= room), (self.bar_first, what + cap + 10 <= room)):
+            if lay.direction() != (across if one else down):
+                lay.setDirection(across if one else down)
         super().resizeEvent(event)
-        QTimer.singleShot(0, self, self._place_cap)  # after this resize: moving it within one upsets the layout
-
-    def _place_cap(self) -> None:
-        """The cap stays on the bar's line while the estimate beside it keeps room to say something."""
-        if not shiboken6.isValid(self.cap_box):
-            return
-        inline = self.bar_row.indexOf(self.cap_box) >= 0
-        line = self.bar_row.minimumSize().width() + (0 if inline else self.cap_box.sizeHint().width() + 10)
-        fits = line + 21 + 160 <= self.viewport().width()  # the bar's side margins, then the estimate's room
-        if fits != inline:
-            (self.bar_row.insertWidget(self.bar_row.indexOf(self.what) + 1, self.cap_box) if fits
-             else self.bar_row2.insertWidget(0, self.cap_box))
 
     def eventFilter(self, obj, event) -> bool:
         if (obj is self._post_viewport and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)
