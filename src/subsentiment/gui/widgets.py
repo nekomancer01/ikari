@@ -7,11 +7,11 @@ from __future__ import annotations
 import math
 from typing import Callable
 
-from PySide6.QtCore import QDate, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt
+from PySide6.QtCore import QDate, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath
 from PySide6.QtWidgets import (
-    QAbstractScrollArea, QCalendarWidget, QComboBox, QDateEdit, QFrame, QLabel, QScrollArea, QTableView,
-    QToolButton, QVBoxLayout, QWidget,
+    QAbstractScrollArea, QCalendarWidget, QComboBox, QDateEdit, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
+    QTableView, QToolButton, QVBoxLayout, QWidget,
 )
 
 from subsentiment.gui import motion, theme
@@ -133,6 +133,38 @@ class ShrinkingComboBox(QComboBox):
     def minimumSizeHint(self) -> QSize:
         full = super().minimumSizeHint()
         return QSize(min(full.width(), 120), full.height())
+
+
+class Choice(QFrame):
+    """A row of words in a soft track, one of them chosen (a raised pill): Download coverage's Posts / Comments /
+    Both and its list filters. ``options`` is [(key, text)]; ``changed`` sends the chosen key."""
+
+    changed = Signal(str)
+
+    def __init__(self, options: list[tuple[str, str]], current: str, small: bool = False):
+        super().__init__()
+        mark(self, "choice", True)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(2)
+        self.buttons: dict[str, QPushButton] = {}
+        for key, text in options:
+            b = mark(QPushButton(text), "flat", True)
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(f"padding: {'3px 10px' if small else '4px 12px'}; border-radius: 10px;")
+            b.clicked.connect(lambda _=False, k=key: self.changed.emit(k))
+            self.buttons[key] = b
+            lay.addWidget(b)
+        self.set_value(current if current in self.buttons else options[0][0])
+
+    def value(self) -> str:
+        return next(k for k, b in self.buttons.items() if b.isChecked())
+
+    def set_value(self, key: str) -> None:
+        self.buttons[key].setChecked(True)
 
 
 class QuietScrollBars(QObject):

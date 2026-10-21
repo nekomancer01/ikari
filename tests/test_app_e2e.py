@@ -750,8 +750,9 @@ def test_coverage_counts_a_busy_subreddit_without_downloading_anything(env, monk
     assert paths == {AGG}  # only counts; the month-long count timed out and was split, never refused
     assert [r for r in env.archive.rejected if r[2] == 422]
     totals = cov.totals["askreddit"]
+    # Every day but today, which has no usable count until it's over, so isn't asked for.
     assert sum(totals.values()) == len([p for p in env.archive.posts if p["subreddit"] == "AskReddit"
-                                        and p["created_utc"] >= w.fetch_form.bounds()[0]])
+                                        and w.fetch_form.bounds()[0] <= p["created_utc"] < coverage.today()])
     for row in range(min(5, cov.day_table.rowCount())):  # browsing days and posts
         cov.day_table.selectRow(row)
         pump(30)
@@ -864,7 +865,7 @@ def test_download_all_comments_on_new_posts_says_what_it_got_and_doesnt_offer_th
         pump(10)
         cell, button = cov.post_table.cellWidget(i, 1), cov.post_table.cellWidget(i, 2).findChild(type(w.fetch_btn))
         assert cell.side.text() == "all so far" and "36 hours" in cell.toolTip()
-        assert button.text() == "Check again" and button.isEnabled()
+        assert button.text() == coverage.CHECK and button.isEnabled()
     env.archive.clear()
     QTest.mouseClick(cov.post_table.cellWidget(0, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     wait_idle(w)
@@ -952,7 +953,7 @@ def test_coverage_counts_a_subreddit_picked_while_another_is_being_counted(env):
         pump(20)
     cov = w.coverage
     assert cov.subreddit.lower() == "rust" and cov.count_error == ""
-    assert all(d in cov.totals["rust"] for d in cov.days)
+    assert all(d in cov.totals["rust"] for d in cov.days if d < coverage.today())  # today isn't asked for
 
 
 def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
@@ -1079,7 +1080,7 @@ def test_coverage_left_and_opened_again_mid_count_counts_without_an_error(env):
         pump(20)
     pump(100)
     cov = w.coverage
-    assert cov.count_error == "" and all(d in cov.totals["python"] for d in cov.days)
+    assert cov.count_error == "" and all(d in cov.totals["python"] for d in cov.days if d < coverage.today())
 
 
 def test_choosing_a_span_on_the_timeline_never_downloads_and_a_fetch_only_adds_rows_from_it(env):
@@ -1454,3 +1455,34 @@ def test_coverage_downloads_a_days_comments_many_threads_at_once(env, monkeypatc
     starts = 40 * arctic_shift.BASE_INTERVAL * arctic_shift.TREE_SHARE
     assert took < 40 * arctic_shift.BASE_INTERVAL  # on main, 4 at a time took 40 / 4 * 1.6 s = 16 s
     assert took >= starts  # still spaced out: at most one start every 0.2 s
+
+
+def test_download_all_comments_asks_nothing_for_posts_that_turn_out_to_have_none(env):
+    # Ame, 21 Oct: Coverage's Download all comments "checks posts with empty comments". Posts saved before the
+    # archive counted their comments are offered; re-checked, many have none, and each still cost a request.
+    def usable(day):
+        return [p for p in env.archive.posts if p["subreddit"] == "Python" and day <= p["created_utc"] < day + DAY
+                and not p.get("removed_by_category")]
+    # A settled day holding posts both with and without comments.
+    day = next(d for d in (int((NOW - k * DAY) // DAY * DAY) for k in range(2, 7))
+               if any(p["num_comments"] == 0 for p in usable(d)) and any(p["num_comments"] for p in usable(d)))
+    in_day = usable(day)
+    s = env.store()
+    for p in in_day:  # as saved within a day of being posted: score and comment count not in yet
+        s.save_post(arctic_shift._post(dict(p, score=1, num_comments=0, retrieved_on=p["created_utc"] + 60)), 0.0,
+                    "neutral")
+    s.commit()
+    w = env.window()
+    w._refresh_datasets(select="Python")
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    cov = open_coverage(w)
+    cov.day_table.selectRow(cov.days.index(day))
+    pump(50)
+    assert cov.all_comments.text() == f"Download all comments ({len(in_day)} posts)"
+    env.archive.clear()
+    QTest.mouseClick(cov.all_comments, Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    pump(100)
+    asked = {q["link_id"] for p, q in env.archive.requests if p == TREE}
+    assert asked == {p["id"] for p in in_day if p["num_comments"]}  # none for the posts with no comments
+    assert cov.all_comments.text() == "Download all comments" and not cov.all_comments.isEnabled()
