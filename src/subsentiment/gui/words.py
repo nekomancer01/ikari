@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import Counter
 
 from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPointF, QRectF, QSize, QSizeF, Qt, QTimer,
                             QVariantAnimation, Signal)
@@ -166,6 +167,7 @@ class WordCloud(QWidget):
         self.empty = empty
         self.busy = False
         self._words: list[tuple[str, int, float]] = []
+        self.meant: dict[str, float] = {}  # the words shown by their set meaning (set_words)
         self._version = 0  # counts every change to the words
         self._placed: list[tuple[QRectF, str, int, float, float]] = []  # box, word, items, lean, pixel size
         self._shown: dict = {}  # every word drawn: those on their way out first (by id), then the rest (by word)
@@ -189,8 +191,11 @@ class WordCloud(QWidget):
         self._drawn_for = None
         self._next_drawn = (None, None)  # the same for the words being placed
 
-    def set_words(self, words: list[tuple[str, int, float]], busy: bool = False) -> None:
-        """Show these words: faded while ``busy`` (new counts are on their way)."""
+    def set_words(self, words: list[tuple[str, int, float]], busy: bool = False,
+                  meant: dict[str, float] | None = None) -> None:
+        """Show these words: faded while ``busy`` (new counts are on their way). ``meant`` ({word: -1..1}) are
+        the words the user set a meaning for here, which hovering one tells."""
+        self.meant = meant or {}
         words = list(words)
         if (words, busy) == (self._words, self.busy):
             return  # placed already
@@ -499,8 +504,12 @@ class WordCloud(QWidget):
             else:
                 _, word, n, lean, _ = hit
                 way = "leans positive" if lean > 0.1 else "leans negative" if lean < -0.1 else "mixed"
+                if word in self.meant:  # (its colour is still how the items using it were scored)
+                    way += f". You set it to {meaning(self.meant[word]).lower()} here; click to change it"
+                else:
+                    way += ". Click to set what it means here"
                 QToolTip.showText(e.globalPos(), f"{word}: in {n:,} {'post or comment' if n == 1 else 'posts and comments'}"
-                                                 f", {way}. Click to set what it means here", self)
+                                                 f", {way}", self)
             return True
         return super().event(e)
 
@@ -524,6 +533,9 @@ class Rescore(QObject):
     rescored = Signal(str, str, object)  # subreddit (lowercased), "posts" or "comments", the rows with new scores
     progress = Signal(str, int, int)  # subreddit, items gone through, of
     finished = Signal(str)  # subreddit: every item using the words is scored again and saved
+    # Just before finished: subreddit, the words, how many items use them, and how many changed label each way
+    # ({(old label, new label): items}).
+    scored = Signal(str, object, int, object)
     failed = Signal(str, str)  # subreddit, what went wrong reading its items
 
     BATCH = 0.25  # seconds between two batches sent out
@@ -540,6 +552,9 @@ class Rescore(QObject):
         self._rows: dict[str, dict | None] = {}  # what start was given to go through, by subreddit
         self._run = 0  # counts runs, so a read for one dropped since is ignored
         self._batch: dict[str, list] = {k: [] for k in KINDS}  # rescored, not saved yet
+        # By subreddit, the items its run found using the words, and those whose label it changed (from, to):
+        # kept when a run starts again with more words, so the end tells everything it did.
+        self._tally: dict[str, tuple[set, dict]] = {}
 
     def start(self, subreddit: str, words, rows: dict | None = None) -> None:
         """Rescore for ``words``; ``rows`` ({kind: rows}) are every saved post and comment of it, when the
@@ -587,7 +602,8 @@ class Rescore(QObject):
             return
         worker = LoadWorker(self.db_path, sub, None, self._run)
         worker.finished.connect(self._on_read)
-        worker.failed.connect(lambda message, sub=sub: (self._drop(), self.failed.emit(sub, message)))
+        worker.failed.connect(lambda message, sub=sub: (self._drop(), self._tally.pop(sub, None),
+                                                        self.failed.emit(sub, message)))
         self.job.start(worker)
 
     def _on_read(self, read: tuple) -> None:
@@ -598,6 +614,7 @@ class Rescore(QObject):
     def _steps(self, sub: str, words: set[str], rows: dict):
         """Score the items using ``words`` again, yielding after each; saved a batch at a time."""
         lexicon, uses = self.store.lexicon(sub), Lexicon(dict.fromkeys(words, 0.0)).uses
+        using, changed = self._tally.setdefault(sub, (set(), {}))
         total, done = sum(map(len, rows.values())), 0
         sent_at = committed_at = time.perf_counter()
         for kind in KINDS:
@@ -606,6 +623,13 @@ class Rescore(QObject):
                 done += 1
                 if uses(text):
                     s, label = lexicon.score(text)
+                    item = (kind, r["id"])
+                    using.add(item)
+                    was = changed.get(item, (r["label"],))[0]
+                    if label == was:
+                        changed.pop(item, None)
+                    else:
+                        changed[item] = (was, label)
                     if (s, label) != (r["sentiment"], r["label"]):
                         self._batch[kind].append({**r, "sentiment": s, "label": label})
                         self.store.rescore(kind, [(r["id"], s, label)])
@@ -627,9 +651,11 @@ class Rescore(QObject):
         self._batch = {k: [] for k in KINDS}
 
     def _finished(self) -> None:
-        sub = self._doing[0]
+        sub, words = self._doing
         self._save(sub)
         self._doing = None
+        using, changed = self._tally.pop(sub, (set(), {}))
+        self.scored.emit(sub, words, len(using), Counter(changed.values()))
         self.finished.emit(sub)
         self._next()
 
@@ -730,6 +756,10 @@ class _Meaning(QFrame):
         self.slider = MeaningSlider()
         self.slider.setToolTip(f"What \u201c{word}\u201d means here, from negative to positive")
         lay.addWidget(self.slider)
+        self.result = label("", "caption")  # what setting it did to the saved items (WordMeanings.show_result)
+        self.result.setWordWrap(True)
+        self.result.hide()
+        lay.addWidget(self.result)
         self.slider.valueChanged.connect(self._show)
         self.set(weight)
 
@@ -842,6 +872,25 @@ class WordMeanings(QWidget):
         if self.subreddit and subreddit == self.subreddit.lower():
             self.status.setText(f"Couldn't score saved items again: {message}")
 
+    def show_result(self, subreddit: str, words, using: int, changed: Counter) -> None:
+        """Under each of ``words``, what scoring the saved items again by them did: so it shows the setting is
+        at work, even where the cloud's colours barely move (a word is coloured by the items using it)."""
+        if not (self.subreddit and subreddit == self.subreddit.lower()):
+            return
+        several = len(words) > 1
+        if not using:
+            text = "No saved items use " + ("these words" if several else "it") + " yet"
+        else:
+            text = f"{using:,} saved {'item uses' if using == 1 else 'items use'} {'these words' if several else 'it'}"
+            moved = sum(changed.values())
+            text += ("; no label changed" if not moved else f"; {moved:,} changed: "
+                     + ", ".join(f"{n:,} {a} \u2192 {b}" for (a, b), n in changed.most_common(3)))
+        for word in words:
+            row = self.rows.get(word)
+            if row is not None:
+                row.result.setText(text)
+                row.result.show()
+
     def show_progress(self, subreddit: str, done: int | None = None, total: int = 0) -> None:
         """How far scoring the saved items again has got; done None once it's finished."""
         if self.subreddit and subreddit == self.subreddit.lower():
@@ -869,6 +918,8 @@ class WordMeanings(QWidget):
     def _save(self, row: _Meaning) -> None:
         weight = row.weight()
         row.set(weight)  # snapped, and set from now on
+        row.result.setText("Scoring the saved items that use it\u2026")
+        row.result.show()
         self.changed.emit(row.word, weight)
 
     def _remove(self, row: _Meaning) -> None:

@@ -252,6 +252,7 @@ def test_setting_a_word_rescores_that_subreddit_only_and_every_page_follows(tmp_
         row = meanings.rows["grinding"]
         QTest.mouseClick(row.slider, Qt.MouseButton.LeftButton, pos=QPoint(row.slider.width() - 4, row.slider.height() // 2))
         assert w.store.words("town") == {"grinding": 1.0} and row.reads.text() == "Very positive"
+        assert row.result.text() == "Scoring the saved items that use it\u2026"  # Ame: a way to see it's working
         end = time.monotonic() + 10
         while w.rescore.running():
             assert time.monotonic() < end
@@ -266,6 +267,10 @@ def test_setting_a_word_rescores_that_subreddit_only_and_every_page_follows(tmp_
         assert {r["id"]: r["label"] for r in w.posts}["town0"] == "positive"  # and what export writes
         assert dict((word, lean) for word, _, lean in w.word_tally.top(KINDS))["grinding"] == 1.0  # the cloud
         assert meanings.status.text() == "Saved items scored again"
+        moved = {(a, "positive"): sum(1 for i in ("town0", "town2", "townc") if before[i.replace("town", "city")] == a)
+                 for a in ("negative", "neutral")}
+        assert row.result.text() == "3 saved items use it; 3 changed: " + ", ".join(
+            f"{n} {a} \u2192 {b}" for (a, b), n in sorted(moved.items(), key=lambda m: -m[1]) if n)
         w._refresh_datasets("city")
         assert meanings.subreddit == "city" and meanings.rows == {}
         w._refresh_datasets("town")  # back from memory, rescored
