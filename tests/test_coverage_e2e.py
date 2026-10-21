@@ -38,7 +38,7 @@ class FakeArchive:
         return {d: 10 for d in range(int(after // DAY * DAY), int(before), DAY)}
 
     def fetch_posts(self, subreddit, after, before, limit, query="", top=False, skip=(), progress=None,
-                    should_stop=None, on_posts=None, exhaust=False):
+                    should_stop=None, on_posts=None, exhaust=False, read=()):
         self.exhausted = True
         FakeArchive.calls.append(("posts", subreddit, after, before))
         posts = [p for p in self.archive.get(subreddit, []) if after <= p.created_utc < before and p.id not in skip]

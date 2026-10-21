@@ -414,6 +414,22 @@ class Store:
         return {r["key"] for r in self.db.execute(
             "SELECT key FROM complete WHERE kind = ? AND subreddit = ?", (kind, subreddit.lower()))}
 
+    def read_spans(self, subreddit: str) -> list[tuple[int, int]]:
+        """Stretches of time (first, last second) fetches have read every post of (ArcticShiftClient.reached),
+        so a stopped download carries on from where it got to."""
+        return sorted(tuple(map(int, k.split(":"))) for k in self.complete_keys("posts_read", subreddit))
+
+    def save_read_spans(self, subreddit: str, spans) -> None:
+        merged: list[tuple[int, int]] = []
+        for a, b in sorted(self.read_spans(subreddit) + list(spans)):
+            if merged and a <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+            else:
+                merged.append((a, b))
+        self.db.execute("DELETE FROM complete WHERE kind = 'posts_read' AND subreddit = ?", (subreddit.lower(),))
+        for a, b in merged:
+            self.mark_complete("posts_read", subreddit, f"{a}:{b}")
+
     def save_removed(self, subreddit: str, removed: dict[str, float]) -> None:
         self.db.executemany("INSERT OR REPLACE INTO removed_posts VALUES (?, ?, ?)",
                             [(pid, subreddit.lower(), created) for pid, created in removed.items()])

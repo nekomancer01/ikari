@@ -115,10 +115,15 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
 
     def read(after, before, limit: int, everything: bool, say, whole_day: bool = True,
              skip: Collection[str] = stored.keys()) -> list[Post]:
+        # Where earlier fetches got to, so a stopped download goes on from there. Not for a day that's complete,
+        # where Check again looks through all of it for posts the archive has taken in since.
+        again = after is not None and str(int(after)) in store.complete_keys("posts", name)
         got = client.fetch_posts(name, after, before, limit, req.query, top=req.top,
                                  skip=() if req.top else skip,
                                  progress=say, should_stop=should_stop, on_posts=save_streamed,
-                                 exhaust=everything)
+                                 exhaust=everything, read=() if again else store.read_spans(name))
+        if reached := getattr(client, "reached", None):
+            store.save_read_spans(name, reached)
         # Taken, not read and cleared: after Stop, slice threads still running may be adding to it.
         take = getattr(client, "take_removed", None)
         removed = take() if take else {}

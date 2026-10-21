@@ -616,3 +616,14 @@ def test_score_filter_goes_by_the_post_score(tmp_path):
     out = tmp_path / "c.csv"
     assert s.export_csv("python", "comments", out, min_score=11) == 0
     assert s.export_csv("python", "posts", out, days={int(day)}, min_score=10) == 1
+
+
+def test_read_spans_merge_and_go_with_the_subreddit(tmp_path):
+    s = Store(tmp_path / "a.db")
+    s.save_read_spans("Python", [(100, 199), (300, 399)])
+    s.save_read_spans("python", [(200, 250), (500, 599)])  # touches the first: one stretch
+    assert s.read_spans("PYTHON") == [(100, 250), (300, 399), (500, 599)]
+    assert s.read_spans("rust") == []
+    s.delete_subreddit("Python")  # its posts are gone, so a download must read them again
+    assert s.read_spans("python") == []
+    s.close()
