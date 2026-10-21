@@ -33,7 +33,7 @@ for Windows and Linux (macOS runs from source, not released for now).</p>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/overview-dark.png">
-  <img alt="Overview tab: summary tiles, sentiment distribution, mean sentiment per day with a dip and recovery, and the most positive and negative posts" src="docs/overview-light.png" width="100%">
+  <img alt="Overview page: summary tiles, mean sentiment per day, the sentiment split and a word cloud" src="docs/overview-light.png" width="100%">
 </picture>
 
 </div>
@@ -42,23 +42,49 @@ for Windows and Linux (macOS runs from source, not released for now).</p>
   <tr>
     <td width="50%" valign="top">
       <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/timeline-dark.png">
+        <img alt="Timeline page: mean sentiment per day with post counts and a range slider" src="docs/timeline-light.png">
+      </picture>
+      <p align="center"><sub><b>Timeline</b>: mean sentiment per day; drag the slider to pick the range for every page</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/words-dark.png">
+        <img alt="Words page: a word cloud coloured by sentiment" src="docs/words-light.png">
+      </picture>
+      <p align="center"><sub><b>Words</b>: the most used words, blue for positive and orange for negative; set what a word means in a subreddit</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/posts-dark.png">
-        <img alt="Posts tab: a sortable, filterable table of posts with sentiment scores and labels" src="docs/posts-light.png">
+        <img alt="Posts page: a sortable, filterable table of posts with sentiment scores and labels" src="docs/posts-light.png">
       </picture>
       <p align="center"><sub><b>Posts</b>: sort, filter by text or label, double-click to open on Reddit</sub></p>
     </td>
     <td width="50%" valign="top">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/comments-dark.png">
-        <img alt="Comments tab: every comment with its score, label and the post it belongs to" src="docs/comments-light.png">
+        <img alt="Comments page: every comment with its score, label and the post it belongs to" src="docs/comments-light.png">
       </picture>
       <p align="center"><sub><b>Comments</b>: every reply, scored, with the post it belongs to</sub></p>
     </td>
   </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/coverage-dark.png">
+        <img alt="Coverage page: each day's saved posts against the archive's total, with batch download and delete" src="docs/coverage-light.png">
+      </picture>
+      <p align="center"><sub><b>Coverage</b>: see which days are saved, download what's missing, delete days to fetch again</sub></p>
+    </td>
+    <td></td>
+  </tr>
 </table>
 
 <p align="center"><sub>Screenshots follow your GitHub theme. They show invented sample data for a made-up city,
-r/riverton, whose new tram line breaks down for a week. Regenerate them with
+r/riverton, whose new tram line breaks down for a week, at 1920x1200 and 150% scaling. Regenerate them with
 <code>QT_QPA_PLATFORM=offscreen python tools/screenshot.py</code>.</sub></p>
 
 ## Features
