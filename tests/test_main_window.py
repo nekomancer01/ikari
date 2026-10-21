@@ -493,10 +493,12 @@ def test_the_distribution_shows_big_counts_whole(counts):
     app = QApplication.instance() or QApplication([])
     before = app.font()
     theme.load_fonts(app)
-    theme.apply(app, "light")
     motion.set_enabled(False)
     try:
         chart = DistributionChart()
+        # The sheet on the chart alone: on the app it restyles every widget the earlier tests left on this worker,
+        # and one Windows run crashed there (an access violation in setStyleSheet).
+        theme.apply(app, "light", window=chart)
         chart.resize(520, 330)
         chart.set_counts(dict(zip(DistributionChart.CATEGORIES, counts)))
         image = chart.grab().toImage()
@@ -643,9 +645,9 @@ def test_short_titles_leave_room_for_the_comments_column(make_window):
     before = app.font()
     make_window()
     theme.load_fonts(app)  # Inter, as the app draws with: its widths decide what fits
-    theme.apply(app, "light")
     try:
         page = TablePage(POST_COLUMNS, stretch_col=2)
+        theme.apply(app, "light", window=page)  # on the page alone, as in the test above
         page.resize(795, 600)  # the table's width there, in logical pixels
         page.show()
         row = {"id": "p1", "sentiment": -0.957, "label": "negative", "title": "terrible bug #188", "selftext": "",
