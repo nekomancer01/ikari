@@ -467,21 +467,24 @@ class Search:
     whole words and, as the last one is typed, words starting with it; not text in the middle of a word.
     Contentless deletes need SQLite 3.43 or later: without them there's no index and `matches` is None."""
 
-    WORD = re.compile(r"\w+")
+    WORD = re.compile(r"[^\W_]+")  # as FTS5 splits words: letters and digits
 
     def __init__(self, db: sqlite3.Connection, create: bool = True):
         """``create``: make the index's tables if they aren't there (a Store does; a reader only looks)."""
-        self.db = db
+        self.db, self.create = db, create
+        self.ready = self._probe()
+
+    def _probe(self) -> bool:
         try:
             for kind in PACKED:
-                if create:
-                    db.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS search_{kind} USING fts5(text, content='', "
-                               "contentless_delete=1, detail=none)")
+                if self.create:
+                    self.db.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS search_{kind} USING fts5(text, content='', "
+                                    "contentless_delete=1, detail=none)")
                 else:
-                    db.execute(f"SELECT 1 FROM search_{kind} LIMIT 0")
-            self.ready = True
+                    self.db.execute(f"SELECT 1 FROM search_{kind} LIMIT 0")
+            return True
         except sqlite3.OperationalError:  # an SQLite before 3.43, or one built without FTS5; or none made yet
-            self.ready = False
+            return False
 
     _DIGITS = np.full(256, -1, np.int64)
     _DIGITS[np.frombuffer(b"0123456789", np.uint8)] = np.arange(10)
@@ -509,6 +512,8 @@ class Search:
     def key(row_id: str) -> int:
         """A row's key in the index: its base-36 id as a number (below 2^57), or for any other id a hash of it
         (2^62 and up). Rowids can't be used, as VACUUM may number them again."""
+        if not row_id:
+            return 0  # as `keys` has it
         if len(row_id) <= 11 and row_id.isascii() and row_id.isalnum():
             return int(row_id, 36)
         return 2 ** 62 | int.from_bytes(hashlib.blake2b(row_id.encode(), digest_size=7).digest(), "little")
@@ -528,11 +533,15 @@ class Search:
         if self.ready:
             self.db.executemany(f"DELETE FROM search_{kind} WHERE rowid = ?", [(self.key(i),) for i in ids])
 
-    def optimize(self) -> None:
-        """Merge the index's pieces into one per kind: about 2% smaller, and quicker to search."""
+    def optimize(self, pages: int | None = None) -> None:
+        """Merge the index's pieces, the pieces each save adds, into one per kind: smaller, and quicker to search.
+        With ``pages``, only about that much of the work (FTS5's 'merge'), so it takes a bounded time."""
         if self.ready:
             for kind in PACKED:
-                self.db.execute(f"INSERT INTO search_{kind} (search_{kind}) VALUES ('optimize')")
+                if pages is None:
+                    self.db.execute(f"INSERT INTO search_{kind} (search_{kind}) VALUES ('optimize')")
+                else:
+                    self.db.execute(f"INSERT INTO search_{kind} (search_{kind}, rank) VALUES ('merge', ?)", (-pages,))  # negative: merge whatever's there
             self.db.commit()
 
     def clear(self) -> None:
@@ -547,13 +556,17 @@ class Search:
         return " ".join(f'"{w}"' for w in words) + "*" if words else None
 
     def matches(self, kind: str, typed: str) -> np.ndarray | None:
-        """The keys of the rows whose text has every word typed (the last as the start of one), sorted; None when
+        """The keys of the rows whose text has every word typed (the last as the start of one), in order; None when
         there's no index yet (a database being upgraded) or nothing was typed."""
         query = self.query(typed)
-        if not self.ready or query is None or self.db.execute("PRAGMA user_version").fetchone()[0] < 4:
+        if query is None or self.db.execute("PRAGMA user_version").fetchone()[0] < 4:
             return None
+        if not self.ready:  # a reader that looked before the upgrade made the index
+            self.ready = self._probe()
+            if not self.ready:
+                return None
         cur = self.db.execute(f"SELECT rowid FROM search_{kind} WHERE search_{kind} MATCH ?", (query,))
-        return np.sort(np.fromiter((r[0] for r in cur), np.int64))
+        return np.fromiter((r[0] for r in cur), np.int64)  # FTS5 gives them by rowid
 
 
 def _unpack(blob: bytes, db: sqlite3.Connection | None = None) -> dict:
@@ -581,7 +594,8 @@ def _pack_all(path: str, pack: bool = True) -> None:
             store.drop_rebuilt_links()
             if store._left_to_pack():
                 return
-        store.index_text()
+        if not store.index_text():
+            raise SystemExit(1)  # no search index here: Store.upgrade leaves the version as it was
     finally:
         if pool is not None:
             pool.shutdown(cancel_futures=True)
@@ -642,8 +656,10 @@ class Store:
         self._stamp = 0.0
         self._lexicons: dict[str, tuple] = {}  # subreddit lowercased -> (when read, its words, their Lexicon)
         backup = Path(str(self.path) + "-before-v1")
-        if fresh:
-            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        if fresh:  # an SQLite without the search index leaves it to Store.upgrade with one that has it
+            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION if self.search.ready else 3}")
+        elif not self.search.ready and self.db.execute("PRAGMA user_version").fetchone()[0] >= 4:
+            self.db.execute("PRAGMA user_version = 3")  # what's saved now isn't indexed: index it all again later
         elif (self.db.execute("PRAGMA user_version").fetchone()[0] < 1
               and self.path.resolve() not in Store._migration_tried):
             Store._migration_tried.add(self.path.resolve())  # a failed one waits for the next start, not each fetch
@@ -729,10 +745,10 @@ class Store:
             if not elsewhere and pack:
                 self.pack_settled(vacuum=False, stop=stop, old=True)
                 self.drop_rebuilt_links()
-            if self._left_to_pack():
+            if pack and self._left_to_pack():
                 return  # stopped, or some day couldn't be packed: carried on at the next start
             if not elsewhere and not self.index_text(stop) or elsewhere and (stop is not None and stop.is_set()):
-                return  # cut short: indexed again from the start next time
+                return  # cut short, or no search here: indexed again from the start next time
             self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self.db.commit()
             self._compact()
@@ -769,25 +785,38 @@ class Store:
     def index_text(self, stop: threading.Event | None = None) -> bool:
         """Index every saved row's text for search (Search), a day of a subreddit at a time, each its own
         transaction, so a fetch saving meanwhile waits no longer than one. False if ``stop`` cut it short (it
-        starts again next time: Store.upgrade marks it done)."""
+        starts again next time: Store.upgrade marks it done) or this SQLite has no search index."""
         if not self.search.ready:
-            return True
+            return False
         self.search.clear()
         self.db.commit()
+        start = time.time() - 1  # rows a fetch saves meanwhile are indexed as saved, then maybe here as they were
         for kind, cols in PACKED.items():
-            day_rows: list = []
-            last = None
-            cur = self.db.execute(f"SELECT id, lower(subreddit), CAST(created_utc / 86400 AS INTEGER), packed, "
-                                  f"{', '.join(cols)} FROM {kind} ORDER BY lower(subreddit), created_utc")
-            for r in cur.fetchall():
-                if (r[1], r[2]) != last:
-                    if stop is not None and stop.is_set():
-                        return False
-                    self._index_day(kind, last, day_rows)
-                    last, day_rows = (r[1], r[2]), []
-                day_rows.append(r)
-            self._index_day(kind, last, day_rows)
+            select = (f"SELECT id, lower(subreddit), CAST(created_utc / 86400 AS INTEGER), packed, {', '.join(cols)} "
+                      f"FROM {kind} WHERE subreddit = ? COLLATE NOCASE")
+            subs = [r[0] for r in self.db.execute(f"SELECT DISTINCT lower(subreddit) FROM {kind}")]
+            for sub in subs:  # a subreddit's rows at a time: only text not in packs is read here
+                if not self._index_rows(kind, self.db.execute(select + " ORDER BY created_utc", (sub,)).fetchall(), stop):
+                    return False
+            again = self.db.execute(select.replace("subreddit = ? COLLATE NOCASE", "fetched_at >= ?") +
+                                    " ORDER BY lower(subreddit), created_utc", (start,)).fetchall()
+            if not self._index_rows(kind, again, stop):  # so they're indexed as they are now
+                return False
         self.search.optimize()
+        return True
+
+    def _index_rows(self, kind: str, rows: list, stop: threading.Event | None) -> bool:
+        """Index rows (id, subreddit, day, packed, values of PACKED[kind]) in order of subreddit and day."""
+        day_rows: list = []
+        last = None
+        for r in rows:
+            if (r[1], r[2]) != last:
+                if stop is not None and stop.is_set():
+                    return False
+                self._index_day(kind, last, day_rows)
+                last, day_rows = (r[1], r[2]), []
+            day_rows.append(r)
+        self._index_day(kind, last, day_rows)
         return True
 
     def _index_day(self, kind: str, day: tuple | None, rows: list) -> None:
@@ -861,6 +890,7 @@ class Store:
             except Exception:  # noqa: BLE001 - busy, or text that can't be packed: leave the day as it is
                 continue
         if done and vacuum:  # the cleared text leaves its pages part empty, which only a VACUUM gives back
+            self.search.optimize(pages=2000)  # what the fetch's saves added to the search index, a few MB of it
             self._compact()
         return done
 

@@ -345,11 +345,6 @@ def test_settled_days_are_packed_smaller_and_read_back_the_same(tmp_path):
     import random
     rng = random.Random(4)
     s = Store(tmp_path / "x.db")
-    # Measured without the search index: packing leaves it as it is, and these rows' 40-word vocabulary makes it
-    # a third of the file (on real comments it's about a quarter the size of their packed text).
-    s.search.ready = False
-    for kind in store.PACKED:
-        s.db.execute(f"DROP TABLE search_{kind}")
     day0 = 1_700_000_000 // 86400 * 86400
     for i in range(300):
         created = day0 + (i % 5) * 86400 + i
@@ -936,4 +931,48 @@ def test_search_keeps_up_with_deletes_and_imports_and_a_0_4_database_gets_its_in
     s.delete_all()
     assert len(s.search.matches("posts", "the")) == 0
     assert isinstance(s.search.matches("posts", "the"), np.ndarray)
+    s.close()
+
+
+def test_search_words_and_keys_match_how_fts5_and_ids_are_split():
+    import numpy as np
+    assert store.Search.query("snake_case Boss's") == '"snake" "case" "boss" "s"*'
+    assert store.Search.query(" _ ") is None
+    ids = ["", "abc", "zzzzzzzzzzz", "abcdefghijkl", "t1_ab"]
+    assert store.Search.keys(np.array([i.encode() for i in ids])).tolist() == [store.Search.key(i) for i in ids]
+    assert store.Search.key("") == 0
+
+
+def test_a_version_3_database_with_unpacked_settled_rows_gets_its_index(tmp_path):
+    path = tmp_path / "subsentiment.db"
+    s = Store(path)
+    s.save_post(make_post(1, ts=1_600_000_000.0), 0.5, "positive")  # settled, not packed till the next fetch
+    s.search.clear()
+    s.db.execute("PRAGMA user_version = 3")
+    s.db.commit()
+    s.close()
+    Store.upgrade(path)
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert s.search.matches("posts", "t").tolist() == [store.Search.key("p1")]
+    s.close()
+
+
+def test_an_sqlite_without_search_leaves_the_index_for_one_with_it(tmp_path, monkeypatch):
+    path = tmp_path / "subsentiment.db"
+    probe = store.Search._probe
+    monkeypatch.setattr(store.Search, "_probe", lambda self: False)
+    s = Store(path)
+    s.save_post(make_post(1, ts=1_600_000_000.0), 0.5, "positive")
+    s.db.commit()
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == 3 and s.search.matches("posts", "t") is None
+    s.close()
+    Store.upgrade(path)
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == 3  # not marked indexed
+    s.close()
+    monkeypatch.setattr(store.Search, "_probe", probe)
+    Store.upgrade(path)
+    s = Store(path)
+    assert s.search.matches("posts", "t").tolist() == [store.Search.key("p1")]
     s.close()

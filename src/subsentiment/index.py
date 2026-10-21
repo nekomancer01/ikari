@@ -196,7 +196,7 @@ class RowIndex:
         """The words a row with this text (values of PACKED[kind]) counts."""
         if text is None:
             return ()
-        return tuple(words_in((text[2] or "") if self.kind == "comments" else f"{text[0] or ''} {text[1] or ''}"))
+        return tuple(words_in(Search.text(self.kind, text)))
 
     def _change(self, words, created, label, score, sign: int) -> None:
         """Count rows' words (lists of words or of word ids) in, or with ``sign`` -1 take them back out, as rows
@@ -324,13 +324,16 @@ class RowIndex:
         with self._lock:
             ids = self.ids
         with self._reader.lock:
-            hits = Search(self._reader.db, create=False).matches(self.kind, typed)
+            hits = self._reader.search.matches(self.kind, typed)
         if hits is None:
             return None
         with self._lock:
-            if self._keys is None or len(self._keys) != len(ids):
-                self._keys = Search.keys(ids)
             keys, order = self._keys, self._key_order
+        if keys is None or len(keys) != len(ids):
+            keys, order = Search.keys(ids), None
+            with self._lock:
+                if self.ids is ids:  # not grown meanwhile
+                    self._keys, self._key_order = keys, None
         if order is None or len(order) != len(keys):
             order = np.argsort(keys)
             with self._lock:
@@ -585,6 +588,7 @@ class PackReader:
         self._frames: OrderedDict = OrderedDict()  # (pack, frame) -> its columns (DayPack.frame_columns)
         self._whole: OrderedDict = OrderedDict()  # (kind, day) -> (packed_at, a whole pack's text), read lately
         self._posts: OrderedDict = OrderedDict()  # day -> (packed_at, {post id: (title, permalink)}), for comments
+        self.search = Search(self.db, create=False)
 
     def _packed_at(self, kind: str, day: int):
         row = self.db.execute("SELECT packed_at FROM packs WHERE kind = ? AND subreddit = ? AND day = ?",
