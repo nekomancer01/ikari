@@ -883,7 +883,7 @@ class WordMeanings(QWidget):
         else:
             text = f"{using:,} saved {'item uses' if using == 1 else 'items use'} {'these words' if several else 'it'}"
             moved = sum(changed.values())
-            text += ("; no label changed" if not moved else f"; {moved:,} changed: "
+            text += ("; no label changed" if not moved else f"; {moved:,} changed label: "
                      + ", ".join(f"{n:,} {a} \u2192 {b}" for (a, b), n in changed.most_common(3)))
         for word in words:
             row = self.rows.get(word)

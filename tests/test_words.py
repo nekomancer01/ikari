@@ -269,7 +269,7 @@ def test_setting_a_word_rescores_that_subreddit_only_and_every_page_follows(tmp_
         assert meanings.status.text() == "Saved items scored again"
         moved = {(a, "positive"): sum(1 for i in ("town0", "town2", "townc") if before[i.replace("town", "city")] == a)
                  for a in ("negative", "neutral")}
-        assert row.result.text() == "3 saved items use it; 3 changed: " + ", ".join(
+        assert row.result.text() == "3 saved items use it; 3 changed label: " + ", ".join(
             f"{n} {a} \u2192 {b}" for (a, b), n in sorted(moved.items(), key=lambda m: -m[1]) if n)
         w._refresh_datasets("city")
         assert meanings.subreddit == "city" and meanings.rows == {}
