@@ -176,6 +176,20 @@ class Lexicon:
             return -compound, "negative"
         return compound, label
 
+    _made: dict = {}  # the last lexicons ``compare`` made, by their words, so each process makes them once
+
+    @classmethod
+    def compare(cls, weights: dict[str, float], words: frozenset[str], texts: list[str]) -> list[tuple[float, str, str]]:
+        """Each of ``texts`` as (score, label) by ``weights``, and the label it gets with ``words`` meaning what
+        they usually do instead, to tell what setting them changed. Rescoring runs it in other processes."""
+        key = (tuple(sorted(weights.items())), words)
+        made = cls._made.get(key)
+        if made is None:
+            cls._made.clear()
+            made = cls._made[key] = (cls(weights), cls({w: v for w, v in weights.items() if w not in words}))
+        lexicon, without = made
+        return [(*lexicon.score(t), without.score(t)[1]) for t in texts]
+
     def _swap(self, m: re.Match) -> str:
         stand_in = self._stand_in.get(self.key(m.group()).casefold())
         return m.group() if stand_in is None else f" {stand_in} "
