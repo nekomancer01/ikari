@@ -1393,3 +1393,30 @@ def test_starting_a_saved_subreddit_after_another_switches_to_it_at_once(env):
     assert w.fetch_job.busy and w.current.lower() == "python" and w.posts_tab.model.rowCount() > 0
     env.archive.delay = 0
     wait_idle(w)
+
+
+def test_coverage_downloads_a_days_comments_many_threads_at_once(env, monkeypatch):
+    # Live on 21 Oct, Download all comments went through a day's posts about two a second: four threads in
+    # flight, each started 0.4 s after the last, while the archive took 1-2.5 s to answer each.
+    monkeypatch.setattr(worker.LIMITER, "base", arctic_shift.BASE_INTERVAL)  # the app's real pace
+    monkeypatch.setattr(worker.LIMITER, "interval", arctic_shift.BASE_INTERVAL)
+    day = busy_day(env, "bigday", 40)
+    env.archive.posts += [dict(env.archive.posts[-1], id="other", created_utc=NOW - 3600)]
+    w = env.window()
+    fetch(w, sub="bigday", comments=False, rng="week")
+    cov = open_coverage(w)
+    cov.day_table.selectRow(cov.days.index(day))
+    pump(50)
+    assert cov.all_comments.text() == "Download all comments (40 posts)"
+    env.archive.clear()
+    env.archive.peak = 0
+    env.archive.delays[TREE] = 1.6  # as long as the archive takes
+    started = time.monotonic()
+    QTest.mouseClick(cov.all_comments, Qt.MouseButton.LeftButton)
+    wait_idle(w, 60)
+    took = time.monotonic() - started
+    assert [p for p, _ in env.archive.requests].count(TREE) == 40
+    assert env.archive.peak == arctic_shift.TREE_WORKERS
+    starts = 40 * arctic_shift.BASE_INTERVAL * arctic_shift.TREE_SHARE
+    assert took < 40 * arctic_shift.BASE_INTERVAL  # on main, 4 at a time took 40 / 4 * 1.6 s = 16 s
+    assert took >= starts  # still spaced out: at most one start every 0.2 s
