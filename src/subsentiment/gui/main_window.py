@@ -1351,6 +1351,6 @@ class MainWindow(QMainWindow):
     def running_threads(self) -> list[QThread]:
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
-        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job, self.load_job,
-                                    self.rescore.job)
+        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job,
+                                    self.coverage.threads_job, self.load_job, self.rescore.job)
                 if j.running()]
