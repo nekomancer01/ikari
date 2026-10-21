@@ -838,7 +838,7 @@ def test_a_database_packed_by_0_4_is_packed_again_in_frames_and_reads_back_the_s
     assert list(tmp_path.iterdir()) == [path]  # its backup is gone once it worked
     assert _contents(path) == before
     s = Store(path)
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
     assert {k: s.rows(k, "deltarune") for k in rows} == rows
     packs = s.db.execute("SELECT data, cols, words FROM packs").fetchall()
     assert len(packs) == 8 and all(c and w for d, c, w in packs)  # small days stay one frame of JSON
@@ -899,4 +899,80 @@ def test_a_subreddits_packs_share_a_dictionary_made_from_a_big_day(tmp_path):
     assert o.import_from(path) == (1, 1500)  # another file's packs read with its own dictionary
     assert [r["body"] for r in o.comments("deltarune")] == [r["body"] for r in before]
     o.close()
+    s.close()
+
+
+def test_search_keeps_up_with_deletes_and_imports_and_a_0_4_database_gets_its_index(tmp_path, monkeypatch):
+    import numpy as np
+    key = lambda ids: sorted(store.Search.key(i) for i in ids)  # noqa: E731
+    # Image posts and their comments are indexed too, though never shown: compared among the rows shown.
+    shown = lambda found, rows: sorted(set(found.tolist()) & set(key(r["id"] for r in rows)))  # noqa: E731
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(V2_DB, path)
+    s = Store(path)
+    assert s.search.matches("comments", "the") is None  # not indexed yet
+    s.close()
+    Store.upgrade(path)
+    s = Store(path)
+    comments = s.rows("comments", "deltarune")
+    with_boss = [r["id"] for r in comments if "boss" in (r["body"] or "").split()]
+    assert with_boss and shown(s.search.matches("comments", "boss"), comments) == key(with_boss)
+    day = int(min(r["created_utc"] for r in s.rows("posts", "deltarune"))) // 86400 * 86400
+    s.delete_days("deltarune", [day])
+    left = {r["id"] for r in s.rows("comments", "deltarune")}
+    assert shown(s.search.matches("comments", "boss"), comments) == key(i for i in with_boss if i in left)
+    other = tmp_path / "other.db"
+    o = Store(other)
+    assert o.import_from(path)[1] == len(left)
+    assert shown(o.search.matches("comments", "boss"), comments) == key(i for i in with_boss if i in left)
+    o.delete_subreddit("deltarune")
+    assert len(o.search.matches("comments", "boss")) == 0
+    o.close()
+    s.delete_all()
+    assert len(s.search.matches("posts", "the")) == 0
+    assert isinstance(s.search.matches("posts", "the"), np.ndarray)
+    s.close()
+
+
+def test_search_words_and_keys_match_how_fts5_and_ids_are_split():
+    import numpy as np
+    assert store.Search.query("snake_case Boss's") == '"snake" "case" "boss" "s"*'
+    assert store.Search.query(" _ ") is None
+    ids = ["", "abc", "zzzzzzzzzzz", "abcdefghijkl", "t1_ab"]
+    assert store.Search.keys(np.array([i.encode() for i in ids])).tolist() == [store.Search.key(i) for i in ids]
+    assert store.Search.key("") == 0
+
+
+def test_a_version_3_database_with_unpacked_settled_rows_gets_its_index(tmp_path):
+    path = tmp_path / "subsentiment.db"
+    s = Store(path)
+    s.save_post(make_post(1, ts=1_600_000_000.0), 0.5, "positive")  # settled, not packed till the next fetch
+    s.search.clear()
+    s.db.execute("PRAGMA user_version = 3")
+    s.db.commit()
+    s.close()
+    Store.upgrade(path)
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert s.search.matches("posts", "t").tolist() == [store.Search.key("p1")]
+    s.close()
+
+
+def test_an_sqlite_without_search_leaves_the_index_for_one_with_it(tmp_path, monkeypatch):
+    path = tmp_path / "subsentiment.db"
+    probe = store.Search._probe
+    monkeypatch.setattr(store.Search, "_probe", lambda self: False)
+    s = Store(path)
+    s.save_post(make_post(1, ts=1_600_000_000.0), 0.5, "positive")
+    s.db.commit()
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == 3 and s.search.matches("posts", "t") is None
+    s.close()
+    Store.upgrade(path)
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == 3  # not marked indexed
+    s.close()
+    monkeypatch.setattr(store.Search, "_probe", probe)
+    Store.upgrade(path)
+    s = Store(path)
+    assert s.search.matches("posts", "t").tolist() == [store.Search.key("p1")]
     s.close()
