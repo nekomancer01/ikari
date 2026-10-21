@@ -1,7 +1,7 @@
 """How smooth the window feels with a big saved subreddit: frame times while the timeline is zoomed, dragged and
 panned, and the stalls when a page or a saved subreddit is switched.
 
-    QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.5 python tools/perf.py            # Ame's size: ~2,900 posts, ~48,000 comments
+    QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.5 python tools/perf.py            # The owner's size: ~2,900 posts, ~48,000 comments
     QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.5 python tools/perf.py --scale 4  # four times that
 
 Seeds throwaway databases (your own data and settings aren't touched), opens the real MainWindow at 1280x760
@@ -51,7 +51,7 @@ class Corpus:
 
 
 def seed(path: str, sub: str, scale: float, seed_no: int) -> None:
-    """``scale`` times Ame's subreddit, over two years of days, written straight to the database."""
+    """``scale`` times the owner's subreddit, over two years of days, written straight to the database."""
     Store(path).close()
     rng = random.Random(seed_no)
     corpus = Corpus(rng)
@@ -219,7 +219,7 @@ def gestures(w) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--scale", type=float, default=1.0, help="times Ame's subreddit size")
+    parser.add_argument("--scale", type=float, default=1.0, help="times the owner's subreddit size")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--only", default="", help="run only interactions whose name has this in it")
     parser.add_argument("--repaints", action="store_true", help="time repainting the window and its parts")

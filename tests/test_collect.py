@@ -505,7 +505,7 @@ def test_a_fetch_scores_by_the_subreddits_own_words(tmp_path):
 
 
 def test_a_days_comments_skip_posts_whose_recheck_finds_nothing_to_download(tmp_path):
-    # Ame, 21 Oct: Download all comments "checks posts with empty comments". Posts saved before the archive had
+    # The owner, 21 Oct: Download all comments "checks posts with empty comments". Posts saved before the archive had
     # counted their comments are re-checked first; the ones that turn out to have none (or only ones already
     # saved) were still asked for their thread, one request each.
     s = store_with(tmp_path, [mk(i, score=None, num_comments=None) for i in (1, 2, 3)], comments_for=("p2",))
