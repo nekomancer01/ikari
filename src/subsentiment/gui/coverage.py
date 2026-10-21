@@ -347,12 +347,16 @@ class CoveragePage(VerticalScrollArea):
         self._asking = False  # the question is showing
         for w in (self.delete_question, self.delete_cancel, self.delete_confirm):
             w.setVisible(False)
+        # The comment cap goes on its own row under the table, so the Days and Posts tables still start level.
+        cap_row = QHBoxLayout()
+        cap_row.setSpacing(10)
+        for w in (self.comment_cap.count, self.comment_cap.pick):
+            cap_row.addWidget(w)
+        cap_row.addStretch(1)
+        left_lay.addLayout(cap_row)
         left_lay.addWidget(self.delete_question)
-        # The comment cap goes under the table, so the Days and Posts tables still start level.
         days_foot = QHBoxLayout()
         days_foot.setSpacing(10)
-        for w in (self.comment_cap.count, self.comment_cap.pick):
-            days_foot.addWidget(w)
         # The days' comment threads added up: the ticked ones, or every day listed when none are.
         self.threads_total = ElidedLabel("", "muted")
         days_foot.addWidget(self.threads_total, 1)
