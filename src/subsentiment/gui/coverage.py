@@ -278,7 +278,8 @@ class CoveragePage(VerticalScrollArea):
         self.comment_cap.count.setSingleStep(50)
         self.comment_cap.count.setSuffix(" per thread")
         self.comment_cap.count.setSpecialValueText("All comments")
-        self.comment_cap.count.setMinimumWidth(self.comment_cap.count.sizeHint().width())  # "1,000 per thread" whole
+        # As wide as its widest text ("25000 per thread"), so typing a big cap doesn't run into the arrows.
+        self.comment_cap.count.setMinimumWidth(self.comment_cap.count.sizeHint().width())
         self.comment_cap.count.valueChanged.connect(self._show_ticked)
         self.comment_cap.count.valueChanged.connect(self.comment_cap.save)
         self.comment_cap.pick.currentIndexChanged.connect(self.comment_cap.save)
@@ -751,7 +752,7 @@ class CoveragePage(VerticalScrollArea):
                                    include_comments=comments, fill_threads=True, days=days,
                                    **self.comment_cap.request())
         cap = self.comment_cap.count.value()
-        what = "post" if not comments else "post and comment" if not cap else f"post, with up to {cap:,} comments each,"
+        what = "post" if not comments else "post and comment" if not cap else f"post, with up to {plural(cap, 'comment')} each,"
         # The ticks stay until it ends: unticked once it has read them all, kept if it's stopped.
         self.window_.start_request(req, f"Downloading every {what} from {plural(len(days), 'day')} in r/{self.subreddit}…")
 

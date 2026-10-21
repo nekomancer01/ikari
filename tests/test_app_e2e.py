@@ -324,6 +324,25 @@ def test_all_comments_fetches_each_whole_thread_and_is_remembered(env):
     assert env.window().fetch_form.comments_per_post.value() == 0  # remembered
 
 
+def test_the_fetch_drawer_keeps_a_random_sample_of_each_thread_and_remembers_it(env):
+    w = env.window()
+    w.fetch_form.comments_per_post.setValue(2)
+    pick = w.fetch_form.comment_cap.pick
+    pick.setCurrentIndex(pick.findData("random"))
+    fetch(w, comments=True)
+    s = env.store()
+    kept: dict[str, set] = {}
+    for c in s.comments("python"):
+        kept.setdefault(c["post_id"], set()).add(c["id"])
+    sizes = {r["id"]: max(r["num_comments"] or 0, 2) for r in s.posts("python")}  # the fake archive's tree sizes
+    assert kept and all(len(ids) == 2 for ids in kept.values())
+    top = {pid: {f"{pid}c{sizes[pid] - 1}", f"{pid}c{sizes[pid] - 2}"} for pid in kept}  # its scores rise with i
+    assert any(kept[pid] != top[pid] for pid in kept)  # not the top two: a sample
+    w.close()
+    again = env.window().fetch_form.comment_cap
+    assert (again.count.value(), again.pick.currentData()) == (2, "random")
+
+
 def test_comments_come_with_a_fetch_when_asked(env):
     w = env.window()
     fetch(w, comments=True)
