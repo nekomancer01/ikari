@@ -157,7 +157,7 @@ class Cell(QWidget):
         lay.addWidget(self.bar)
         # An open day has no bar, so its side text goes on its own line there: side by side,
         # "1,234 saved so far" and "No usable count" don't fit the column at 150%.
-        self.note = label("", "muted")
+        self.note = FitLabel()  # "No count" where "No usable count" doesn't fit, as the window narrows
         self.note.setVisible(False)
         lay.addWidget(self.note)
 
@@ -175,7 +175,7 @@ class Cell(QWidget):
         "today" (not over yet) or "wrong" (a day whose count is below what's saved)."""
         self.main.set(f"{saved:,} saved so far", f"{saved:,} so far")
         self.side.setText("")
-        self.note.setText("Today" if why == "today" else "No usable count")
+        self.note.set(*(("Today", "Today") if why == "today" else ("No usable count", "No count")))
         self.bar.setVisible(False)  # an empty bar would read as 0%
         self.note.setVisible(True)
         self._pad(open_day=True)

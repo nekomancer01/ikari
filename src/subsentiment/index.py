@@ -354,6 +354,8 @@ class RowIndex:
         how many of those are positive and negative: three arrays over ``vocab``. A sum of the days' counts."""
         if min_score is not None and min_score not in STEPS:
             raise ValueError(f"words are counted for the score filter's steps {STEPS}, not {min_score}")
+        if not self.with_words:  # read without them (the first start of an old database): no words to count yet
+            return tuple(np.zeros(len(self.vocab), np.int64) for _ in range(3))
         changes = self._merge_changes()
         first, last = (-2 ** 62, 2 ** 62) if days is None else (days[0] // 86400, -(-days[1] // 86400))
         a, b = np.searchsorted(np.array([d for d, _, _ in self._packs], np.int64), (first, last))
