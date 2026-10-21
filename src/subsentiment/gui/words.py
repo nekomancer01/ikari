@@ -52,13 +52,28 @@ class WordTally(QObject):
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
-        self.counts = {k: WordCounts(k) for k in KINDS}
+        self.known: dict[str, dict] = {k: {} for k in KINDS}  # id -> words of rows split elsewhere (learn)
+        self.counts = {k: WordCounts(k, known=self.known[k]) for k in KINDS}
         self.ready = True
         self._moving = False  # working out what a moved span gained and lost, a slice at a time
         self._pending: dict[str, list] = {k: [] for k in KINDS}  # rows added while a recount or a move runs
         self._slices = Slices(self)
         self._version = 0  # counts every change to the counts, for top()
         self._top, self._top_for = [], None
+
+    def learn(self, known: dict[str, dict]) -> None:
+        """The words of rows split elsewhere ({kind: {id: words}}), for rows read without theirs."""
+        self.known = {k: known.get(k) or {} for k in KINDS}
+        for k in KINDS:
+            self.counts[k].known = self.known[k]
+
+    def hold(self) -> None:
+        """Not ready until the next count: the rows to count are on their way (their words being split)."""
+        self._slices.stop()
+        self._moving, self.ready = False, False
+        self._pending = {k: [] for k in KINDS}
+        self._version += 1
+        self.changed.emit()
 
     def count(self, posts: list, comments: list, fresh: bool = False) -> None:
         """Count these rows' words instead. Rows the counts have already are kept, so moving the span a few days
@@ -112,7 +127,7 @@ class WordTally(QObject):
 
     def _recount(self, rows: dict) -> None:
         if sum(map(len, rows.values())) < self.THREAD_FROM:
-            counts = {k: WordCounts(k) for k in KINDS}
+            counts = {k: WordCounts(k, known=self.known[k]) for k in KINDS}
             for k in KINDS:
                 counts[k].add(rows[k])
             self._on_counted(counts)
@@ -121,7 +136,7 @@ class WordTally(QObject):
 
     def _recounting(self, rows: dict):
         """Not ready from now; the steps that count ``rows`` afresh, a slice each."""
-        counts = {k: WordCounts(k) for k in KINDS}
+        counts = {k: WordCounts(k, known=self.known[k]) for k in KINDS}
         self.ready = False
 
         def steps():
@@ -661,8 +676,8 @@ class Rescore(QObject):
         if rows is not None:
             self._on_read((self._run, rows, None))
             return
-        worker = LoadWorker(self.db_path, sub, (None, None), self._run)  # every row, whatever the window filters
-        worker.finished.connect(self._on_read)
+        worker = LoadWorker(self.db_path, sub, (None, None), self._run, words=False)  # every row, whatever the window filters
+        worker.read.connect(self._on_read)
         worker.failed.connect(lambda message, sub=sub: (self._drop(), self._tally.pop(sub, None),
                                                         self.failed.emit(sub, message)))
         self.job.start(worker)

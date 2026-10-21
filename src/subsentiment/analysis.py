@@ -43,6 +43,19 @@ class Analysis:
                 del days[day]
 
     @classmethod
+    def from_days(cls, totals) -> Analysis:
+        """An analysis of rows counted by the store a day and label at a time (Store.day_totals)."""
+        out = cls()
+        for day, label, n, total in totals:
+            bucket = out.days.setdefault(int(day), [0.0, 0, dict.fromkeys(LABELS, 0)])
+            bucket[0] += total
+            bucket[1] += n
+            bucket[2][label] += n
+            out.counts[label] += n
+            out.total += total
+        return out
+
+    @classmethod
     def combined(cls, *parts: Analysis, days: tuple[int, int] | None = None) -> Analysis:
         """One analysis of every row in ``parts``, as if their rows were added in that order; with ``days``
         ([first day's start, end)), of only the days in it."""
@@ -129,14 +142,17 @@ class WordCounts:
     for the word cloud brings its words along (store.Row.words), split once as it was read; any other row's text
     is split here."""
 
-    def __init__(self, kind: str, rows=()):
+    def __init__(self, kind: str, rows=(), known: dict | None = None):
         self.fields = _TEXT[kind]
         self.counts = {"all": Counter(), "positive": Counter(), "negative": Counter()}
         self._rows: dict[str, object] = {}  # id -> the row as counted (its label and words)
+        self.known = {} if known is None else known  # id -> the words of a row split elsewhere (LoadWorker)
         self.add(rows)
 
     def words(self, row) -> tuple[str, ...]:
         words = getattr(row, "words", None)
+        if words is None:
+            words = self.known.get(row["id"])
         if words is not None:
             return words
         fields = self.fields
@@ -154,14 +170,16 @@ class WordCounts:
                 rid, label, w = r["id"], r["label"], None
             old = kept.get(rid)
             if old is not None:
-                gone["all"].append(old.words)
+                was = words(old)
+                gone["all"].append(was)
                 if old.label in gone:
-                    gone[old.label].append(old.words)
-            if w is None:  # split here; what was counted is kept with it, as the row may change after
+                    gone[old.label].append(was)
+            if w is None:
                 w = words(r)
-                kept[rid] = _Counted(label, w)
-            else:  # a saved row doesn't change, so it's kept as it is
+            if isinstance(r, tuple):  # a saved row (store.Row) doesn't change, so it's kept as it is
                 kept[rid] = r
+            else:  # what was counted is kept with it, as the row may change after
+                kept[rid] = _Counted(label, w)
             added["all"].append(w)
             if label in added:
                 added[label].append(w)
@@ -175,9 +193,10 @@ class WordCounts:
         for i in ids:
             old = self._rows.pop(i, None)
             if old is not None:
-                gone["all"].append(old.words)
+                was = self.words(old)
+                gone["all"].append(was)
                 if old.label in gone:
-                    gone[old.label].append(old.words)
+                    gone[old.label].append(was)
         self._take(gone)
 
     def _take(self, gone: dict) -> None:
