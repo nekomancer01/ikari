@@ -146,7 +146,8 @@ Store.commit = timed_commit
 sentiment.score = timed_score
 import subsentiment.collect as collect  # noqa: E402
 
-collect.sentiment.score = timed_score
+if hasattr(collect, "sentiment"):  # collect stopped importing sentiment directly in #111
+    collect.sentiment.score = timed_score
 
 
 def snapshot_counters() -> dict:
