@@ -308,6 +308,13 @@ class DayPack:
         nulls, offsets, start, raw = column
         return None if nulls[k] else raw[start + offsets[k]:start + offsets[k + 1]].decode()
 
+    @staticmethod
+    def values(column: tuple) -> list[str | None]:
+        """Every value of a column (frame_columns), in order."""
+        nulls, offsets, start, raw = column
+        return [None if nulls[k] else raw[start + a:start + b].decode()
+                for k, (a, b) in enumerate(zip(offsets, offsets[1:]))]
+
     @classmethod
     def encode(cls, columns, ids: list[str], text: dict, zdict: zstandard.ZstdCompressionDict | None) -> bytes:
         """The data of a pack of ``ids`` in that order, their text being ``text[id]`` (values of ``columns``). A day of
@@ -374,8 +381,7 @@ class DayPack:
         unpacker = cls.decompressor(head["dict"], db, schema)
         names, prose = cls.split_columns(head["columns"])
         keys = cls.frame_columns(unpacker.decompress(blob[start:start + head["keys"]]), len(names) + 1)
-        n = head["rows"]
-        values = {c: [cls.value(col, k) for k in range(n)] for c, col in zip(["id"] + names, keys)}
+        values = {c: cls.values(col) for c, col in zip(["id"] + names, keys)}
         for c in prose:
             values[c] = []
         begin = start + head["keys"]
@@ -383,7 +389,7 @@ class DayPack:
             frame = cls.frame_columns(unpacker.decompress(blob[begin:start + end]), len(prose))
             begin = start + end
             for c, col in zip(prose, frame):
-                values[c] += [cls.value(col, k) for k in range(len(col[1]) - 1)]
+                values[c] += cls.values(col)
         return {"columns": head["columns"], "rows": dict(zip(values["id"], map(list, zip(*(values[c] for c in head["columns"])))))}
 
     @classmethod
