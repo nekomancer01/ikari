@@ -1,10 +1,9 @@
 """The word cloud: the words the shown posts and comments use most, sized by how many use them and coloured
 by which way those lean (the timeline's blue for positive, orange for negative).
 
-``WordTally`` keeps the counts for the rows on screen. Counting a big subreddit's words from scratch takes
-about a second per 100,000 comments, so that runs a slice at a time between frames while the window stays
-usable; each row's words are remembered, so moving the span only counts the days it gained or lost. Rows a
-fetch adds are counted in as they arrive, as the overview's numbers are.
+``WordTally`` has the words of the rows on screen, which their RowIndexes count from each day's word counts on
+a thread: moving the span or a score filter, or a fetch adding rows, counts them again in a few hundredths of a
+second, the window going on meanwhile.
 
 Clicking a word picks it in ``WordMeanings``, beside the cloud on the Words page, where a slider sets what it
 means in the subreddit shown, from negative through neutral to positive (sentiment.Lexicon). ``Rescore`` then
@@ -15,7 +14,6 @@ from __future__ import annotations
 import math
 import time
 from collections import Counter
-from itertools import islice
 
 from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPointF, QRectF, QSize, QSizeF, Qt, QTimer,
                             QVariantAnimation, Signal)
@@ -24,152 +22,92 @@ from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLineEdit, QSizePolicy, QSlider, QToolTip, QVBoxLayout, QWidget,
 )
 
-from subsentiment.analysis import WordCounts
 from subsentiment.gui import motion, theme
 from subsentiment.gui.charts import palette
 from subsentiment.gui.days import flat_button
 from subsentiment.gui.widgets import ElidedLabel, VerticalScrollArea, label
-from subsentiment.gui.worker import BackgroundJob, LoadWorker, ScorePool, Slices
+from subsentiment.analysis import LABELS
+from subsentiment.gui.rows import RowSource, Saved
+from subsentiment.gui.worker import BackgroundJob, LoadWorker, ScorePool, Slices, on_thread
+from subsentiment.index import top_words
 from subsentiment.sentiment import Lexicon
-from subsentiment.store import column
 
 KINDS = ("posts", "comments")
+_TEXT = {"posts": ("title", "selftext"), "comments": ("body",)}  # what Rescore searches
 _CELL = 2  # px; the word cloud's grid of taken space
 _FONTS: dict[int, object] = {}  # the cloud's font by pixel size
 
 
 class WordTally(QObject):
-    """The word counts of the posts and comments on screen. ``count`` starts over from a new set of rows;
-    ``add`` counts in rows a fetch saved (new, or saved again with a new score), and the window redraws the
-    cloud with the rest of the overview. ``ready`` is False while a big recount runs between frames, and
-    ``changed`` fires when one is done."""
+    """The words the posts and comments on screen use most, as their RowIndexes count them (index.top_words: each
+    day's counts added up: a few hundredths of a second for 650,000 comments, on a thread, where numpy lets go of the
+    interpreter lock). ``count`` asks for the words of a span and score filters; ``ready`` is False until the words
+    of a span or filter asked for the first time are in, and ``changed`` fires each time new ones are."""
 
     changed = Signal()
-
-    THREAD_FROM = 2000  # rows to count (or take off) at once; more are counted a slice at a time
-    SLICE = 100  # rows counted between two frames: a few milliseconds, even for rows not split into words yet
-    LOOK = 20_000  # rows gone through at once to find what a moved span gained and lost; more, a slice at a time
+    N = 150  # words worked out: the most a cloud shows
+    THREAD_FROM = 20_000  # posts and comments from which they're counted on a thread; fewer, at once
+    SCOPES = (KINDS, ("posts",), ("comments",))
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
-        self.known: dict[str, dict] = {k: {} for k in KINDS}  # id -> words of rows split elsewhere (learn)
-        self.counts = {k: WordCounts(k, known=self.known[k]) for k in KINDS}
         self.ready = True
-        self._moving = False  # working out what a moved span gained and lost, a slice at a time
-        self._pending: dict[str, list] = {k: [] for k in KINDS}  # rows added while a recount or a move runs
+        self._top: dict[tuple, list] = {}  # kinds -> their words, as last counted
+        self._want: tuple | None = None  # (saved, days, min_scores, their versions) to count next
+        self._shown: tuple | None = None  # what the words in _top are of, the same way
         self._slices = Slices(self)
-        self._version = 0  # counts every change to the counts, for top()
-        self._top, self._top_for = [], None
 
-    def learn(self, known: dict[str, dict]) -> None:
-        """The words of rows split elsewhere ({kind: {id: words}}), for rows read without theirs."""
-        self.known = {k: known.get(k) or {} for k in KINDS}
-        for k in KINDS:
-            self.counts[k].known = self.known[k]
+    def count(self, saved: dict, days: tuple[int, int] | None, min_scores: tuple) -> None:
+        """Count the words of ``saved``'s rows ({kind: rows.RowSource}) created in ``days`` that score at least
+        ``min_scores`` (posts', comments'), unless they're counted as they are now. The words shown meanwhile stay
+        up; another span's or filter's are only taken once they're in (``ready``)."""
+        want = (saved, days, tuple(min_scores), tuple(saved[k].version for k in KINDS))
+        if self._same(want, self._want if self._slices.running() else self._shown, versions=True):
+            return
+        if not self._same(want, self._shown):
+            self.ready = False
+        self._want = want
+        if sum(len(saved[k]) for k in KINDS) < self.THREAD_FROM:  # (a big count still running is let go)
+            self._slices.stop()
+            self._take(want, self._counted(want))
+        elif not self._slices.running():
+            self._slices.start(self._counting(), lambda: None)
+
+    @staticmethod
+    def _same(a: tuple | None, b: tuple | None, versions: bool = False) -> bool:
+        """Whether ``a`` and ``b`` are of the same rows, span and filters (and, with ``versions``, as they are)."""
+        return (a is not None and b is not None and a[0] is b[0] and a[1:3] == b[1:3]
+                and (not versions or a[3] == b[3]))
 
     def hold(self) -> None:
-        """Not ready until the next count: the rows to count are on their way (their words being split)."""
+        """Not ready until the next count: the rows to count are on their way."""
         self._slices.stop()
-        self._moving, self.ready = False, False
-        self._pending = {k: [] for k in KINDS}
-        self._version += 1
+        self._want, self._shown, self.ready = None, None, False
         self.changed.emit()
-
-    def count(self, posts: list, comments: list, fresh: bool = False) -> None:
-        """Count these rows' words instead. Rows the counts have already are kept, so moving the span a few days
-        only counts the days it gained and takes off the ones it left; ``fresh`` (rows that may have been saved
-        again with a new label or text) counts them all again. Working out what a moved span gained and lost
-        goes through every row of it, so with a big subreddit that's done a slice at a time too, the counts
-        shown meanwhile."""
-        self._slices.stop()
-        self._moving = False
-        self._pending = {k: [] for k in KINDS}  # rows added for an earlier count's rows don't carry over
-        rows = {"posts": list(posts), "comments": list(comments)}
-        if self.ready and not fresh:
-            if sum(map(len, rows.values())) < self.LOOK:
-                for _ in self._moved(rows, sliced=False):
-                    pass
-            else:
-                self._moving = True  # rows added meanwhile wait, so the counts and ids looked through hold still
-                self._slices.start(self._moved(rows, sliced=True), lambda: None)
-            return
-        self._recount(rows)
-
-    def _moved(self, rows: dict, sliced: bool):
-        """Count in the rows not counted yet and take off the ones counted that aren't in ``rows``, yielding as
-        it goes through them; a big change is counted afresh instead (in these slices, when ``sliced``)."""
-        gone, new = {}, {}
-        for k in KINDS:
-            counted, ids, look = self.counts[k].ids(), set(), self.LOOK
-            for i in range(0, len(rows[k]), look):
-                ids.update(column(rows[k][i:i + look], "id"))
-                yield
-            gone[k], was = [], iter(counted)
-            while chunk := list(islice(was, look)):
-                gone[k] += [rid for rid in chunk if rid not in ids]
-                yield
-            new[k] = []
-            for i in range(0, len(rows[k]), look):
-                new[k] += [r for r in rows[k][i:i + look] if r["id"] not in counted]
-                yield
-        self._moving = False
-        if sum(len(gone[k]) + len(new[k]) for k in KINDS) < self.THREAD_FROM:
-            for k in KINDS:
-                self.counts[k].remove(gone[k])
-                self.counts[k].add(new[k] + self._pending[k])
-                self._pending[k] = []
-            self._version += 1
-            self.changed.emit()
-        elif sliced:  # counted afresh a slice at a time: about as quick, and the counts shown stay whole meanwhile
-            yield from self._recounting(rows)
-        else:
-            self._recount(rows)
-
-    def _recount(self, rows: dict) -> None:
-        if sum(map(len, rows.values())) < self.THREAD_FROM:
-            counts = {k: WordCounts(k, known=self.known[k]) for k in KINDS}
-            for k in KINDS:
-                counts[k].add(rows[k])
-            self._on_counted(counts)
-        else:
-            self._slices.start(self._recounting(rows), lambda: None)
-
-    def _recounting(self, rows: dict):
-        """Not ready from now; the steps that count ``rows`` afresh, a slice each."""
-        counts = {k: WordCounts(k, known=self.known[k]) for k in KINDS}
-        self.ready = False
-
-        def steps():
-            for k in KINDS:
-                for i in range(0, len(rows[k]), self.SLICE):
-                    counts[k].add(rows[k][i:i + self.SLICE])
-                    yield
-            self._on_counted(counts)
-        return steps()
-
-    def _on_counted(self, counts: dict) -> None:
-        for k in KINDS:
-            counts[k].add(self._pending[k])
-            self._pending[k] = []
-        self.counts, self.ready = counts, True
-        self._version += 1
-        self.changed.emit()
-
-    def add(self, kind: str, rows: list) -> None:
-        if not rows:
-            return
-        if not self.ready or self._moving:
-            self._pending[kind].extend(rows)
-            return
-        self.counts[kind].add(rows)
-        self._version += 1
 
     def top(self, kinds, n: int = 100) -> list[tuple[str, int, float]]:
-        """The ``n`` words used most, worked out again only once the counts change."""
-        key = (tuple(kinds), n, self._version)
-        if key != self._top_for:
-            self._top, self._top_for = WordCounts.top(*[self.counts[k] for k in kinds], n=n), key
-        return self._top
+        """The ``n`` words used most among ``kinds``, as last counted."""
+        return self._top.get(tuple(kinds), [])[:n]
+
+    def _counted(self, want: tuple) -> dict:
+        saved, days, (min_post, min_comment), _ = want
+        parts = {k: (saved[k].index, least) for k, least in zip(KINDS, (min_post, min_comment))
+                 if isinstance(saved.get(k), Saved)}
+        return {kinds: top_words([parts[k] for k in kinds if k in parts], days, self.N) if parts else []
+                for kinds in self.SCOPES}
+
+    def _counting(self):
+        """Count what's wanted on a thread; once it's in, what was asked for meanwhile, if anything."""
+        while self._want is not None and not self._same(self._want, self._shown, versions=True):
+            want = self._want
+            got = yield from on_thread(lambda want=want: self._counted(want))
+            self._take(want, got)
+
+    def _take(self, want: tuple, got: dict) -> None:
+        self._top, self._shown = got, want
+        if self._same(self._want, want):
+            self.ready = True
+        self.changed.emit()
 
 
 class _Word:
@@ -581,14 +519,14 @@ def meaning(weight: float) -> str:
 
 class Rescore(QObject):
     """Scores a subreddit's saved posts and comments again by its words as they're set now, once some words'
-    meanings there changed: only the items using one of those words. They're the rows the window has of it, or
-    else read on a thread (the window's LoadWorker, which goes through the day packs). They're searched for the
+    meanings there changed: only the items using one of those words. They're the rows the window has of it (whose
+    text is read on a thread), or else read on a thread (the window's LoadWorker). They're searched for the
     words a slice at a time between frames, and what's found is scored by a ScorePool in other processes, a
     chunk at a time, or here between frames when there's little of it or the processes can't run. Each is saved
     as it's scored. Every quarter second what's done is committed and sent out with ``rescored``, so the pages
     follow as it goes. A change while one runs starts it again with every word it was doing."""
 
-    rescored = Signal(str, str, object)  # subreddit (lowercased), "posts" or "comments", the rows with new scores
+    rescored = Signal(str, str, object)  # subreddit (lowercased), "posts" or "comments", [{id, sentiment, label}]
     progress = Signal(str, int, int)  # subreddit, thousandths done, 1000
     finished = Signal(str)  # subreddit: every item using the words is scored again and saved
     # Just before finished: subreddit, the words, how many items use them, how many labels the words changed
@@ -628,15 +566,16 @@ class Rescore(QObject):
         self._sent_at = self._committed_at = 0.0
 
     def start(self, subreddit: str, words, rows: dict | None = None) -> None:
-        """Rescore for ``words``; ``rows`` ({kind: rows}) are every saved post and comment of it, when the
-        window has them all, so they needn't be read again."""
+        """Rescore for ``words``; ``rows`` ({kind: rows, or a rows.RowSource}) are every saved post and comment of
+        it, when the window has them all, so they needn't be read again."""
         sub = subreddit.lower()
         words = {Lexicon.key(w) for w in words}
         if self._doing is not None and self._doing[0] == sub:
             words |= self._doing[1]
             self._drop()
         self._todo[sub] = self._todo.get(sub, set()) | words
-        self._rows[sub] = None if rows is None else {k: list(v) for k, v in rows.items()}  # as they are now
+        self._rows[sub] = None if rows is None else {  # as they are now
+            k: v if isinstance(v, RowSource) else list(v) for k, v in rows.items()}
         self._next()
 
     def running(self, subreddit: str | None = None) -> bool:
@@ -674,16 +613,16 @@ class Rescore(QObject):
         self._run += 1
         rows = self._rows.pop(sub, None)
         if rows is not None:
-            self._on_read((self._run, rows, None))
+            self._on_read((self._run, rows))
             return
-        worker = LoadWorker(self.db_path, sub, (None, None), self._run, words=False)  # every row, whatever the window filters
+        worker = LoadWorker(self.db_path, sub, self._run, rows=True)  # every row, whatever the window filters
         worker.read.connect(self._on_read)
         worker.failed.connect(lambda message, sub=sub: (self._drop(), self._tally.pop(sub, None),
                                                         self.failed.emit(sub, message)))
         self.job.start(worker)
 
     def _on_read(self, read: tuple) -> None:
-        run, rows, _ = read
+        run, rows = read
         if run == self._run and self._doing is not None:
             self._slices.start(self._search(*self._doing, rows), self._settle)
 
@@ -691,16 +630,19 @@ class Rescore(QObject):
         """Find the items using ``words``, yielding after each, and send them to be scored a chunk at a time."""
         self._lexicon = (self.store.lexicon(sub).weights, frozenset(words))
         uses = Lexicon(dict.fromkeys(words, 0.0)).uses
+        for kind in KINDS:  # a source's text is read first: on a thread, a big step at a time
+            if isinstance(rows[kind], RowSource):
+                for key in _TEXT[kind]:
+                    yield from rows[kind].read_values(key)
         self._counts, self._shown = [sum(map(len, rows.values())), 0, 0, 0], 0
         self._sent_at = self._committed_at = time.perf_counter()
         chunk, sent = [], False
         for kind in KINDS:
-            for r in rows[kind]:
-                text = (r["body"] or "") if kind == "comments" else f"{r['title'] or ''}\n\n{r['selftext'] or ''}".strip()
+            for r, text in self._texts(kind, rows[kind]):
                 self._counts[1] += 1
                 if uses(text):
                     self._counts[2] += 1
-                    chunk.append((kind, r, text))
+                    chunk.append((kind, r(), text))
                     if len(chunk) == self.CHUNK:
                         self._submit(sub, chunk)
                         chunk, sent = [], True
@@ -710,6 +652,22 @@ class Rescore(QObject):
             self._submit(sub, chunk)
         elif chunk:
             yield from self._score_here(sub, [chunk])
+
+    @staticmethod
+    def _texts(kind: str, rows):
+        """(a call giving the row, its text) for each of ``rows`` (a list, or a rows.RowSource): what a source has
+        of a row found is its id, score and label."""
+        def text(*parts):
+            return (parts[0] or "") if kind == "comments" else f"{parts[0] or ''}\n\n{parts[1] or ''}".strip()
+        if not isinstance(rows, RowSource):
+            for r in rows:
+                yield (lambda r=r: r), text(*(r[k] for k in _TEXT[kind]))
+            return
+        ids, sentiment, label = rows.ids, rows.sentiment, rows.label
+        for i, parts in enumerate(zip(*(rows.values(k) for k in _TEXT[kind]))):
+            yield (lambda i=i: {"id": ids[i].decode() if isinstance(ids[i], bytes) else ids[i],
+                                "sentiment": float(sentiment[i]), "label": LABELS[label[i]] if label[i] >= 0 else None}
+                   ), text(*parts)
 
     def _submit(self, sub: str, chunk: list) -> None:
         self._out += 1
@@ -759,7 +717,7 @@ class Rescore(QObject):
                 if label != r["label"]:
                     stale.add(item)
             if (s, label) != (r["sentiment"], r["label"]):
-                self._batch[kind].append(r._replace(sentiment=s, label=label))
+                self._batch[kind].append({"id": r["id"], "sentiment": s, "label": label})
                 saves[kind].append((r["id"], s, label))
         for kind, scores in saves.items():
             if scores:

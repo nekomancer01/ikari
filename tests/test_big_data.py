@@ -220,7 +220,9 @@ def test_a_running_fetch_counts_its_rows_into_the_overview_without_reading_every
         assert recounts == [[], [], []]
         assert window._counted.count == before + 1  # the comment, not the post saved again
         whole = Analysis.combined(Analysis(window.store.posts("Big")), Analysis(window.store.comments("Big")))
-        assert window._counted.daily_means == whole.daily_means
+        # (Summed per day by the index in another order than row by row: the last digits differ.)
+        assert [(d, round(m, 9), n) for d, m, n in window._counted.daily_means] == [
+            (d, round(m, 9), n) for d, m, n in whole.daily_means]
         assert (new_day, 0.1, 1) in window.overview.timeline.points
     finally:
         window.fetch_job.qthread = None
