@@ -104,6 +104,7 @@ def on_thread(work: Callable):
             box.append((None, e))
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
+    yield Slices.WAIT  # at least once, however quick it is: work handed to a thread always lets a frame go by
     while not box:
         yield Slices.WAIT
     result, error = box[0]
@@ -247,9 +248,9 @@ class LoadWorker(QObject):
     finished = Signal(object)  # (tag,)
     failed = Signal(str)
 
-    def __init__(self, db_path: str, subreddit: str, tag=None, rows: bool = False):
+    def __init__(self, db_path: str, subreddit: str, tag=None, rows: bool = False, words: bool = True):
         super().__init__()
-        self.db_path, self.subreddit, self.tag, self.rows = db_path, subreddit, tag, rows
+        self.db_path, self.subreddit, self.tag, self.rows, self.words = db_path, subreddit, tag, rows, words
         self.store: Store | None = None
         self._stop = False
 
@@ -277,7 +278,7 @@ class LoadWorker(QObject):
                 for kind in ("posts", "comments"):
                     if self._stop:
                         raise sqlite3.OperationalError("interrupted")
-                    got[kind] = Saved(self.db_path, kind, self.subreddit)
+                    got[kind] = Saved(self.db_path, kind, self.subreddit, self.words)
             self.read.emit((self.tag, got))
             self.finished.emit((self.tag,))
         except Exception as e:

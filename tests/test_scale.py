@@ -287,11 +287,13 @@ def test_opening_a_big_subreddit_shows_its_overview_rows_and_words(tmp_path, mon
         fresh = WordCounts.top(WordCounts("posts", Store(db).posts("Big")), WordCounts("comments", Store(db).comments("Big")), n=150)
         assert w.word_tally.top(["posts", "comments"], 150) == fresh
         # Only the rows the table draws were read, on a thread: 128 comments took 400 ms to read from the owner's packs.
+        model = w.comments_tab.model
+        until(lambda: not model._reads.running(), 30)  # the first and last rows, read as the table got them
+        w._saved["comments"]._drawn.clear()
         reads = []
         real = Saved._read
         monkeypatch.setattr(Saved, "_read", lambda self, at: (reads.append(threading.current_thread()), real(self, at))[1])
         w.show_page("comments")
-        model = w.comments_tab.model
         until(lambda: model.data(model.index(0, 2)), 30)
         assert model.data(model.index(0, 2)) == tables._one_line(model.row_at(0)["body"])
         assert reads and threading.main_thread() not in reads
@@ -424,6 +426,34 @@ def test_a_big_subreddit_that_failed_to_read_on_a_thread_is_read_again_here(tmp_
         w._loaded["big"] = w._loaded.get("big")
         w.days_deleted("Big", 1, 0, 0)
         assert "big" not in w._loaded
+    finally:
+        w.close()
+        QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
+
+
+def test_a_subreddit_opened_while_the_database_is_upgraded_has_its_words_counted_once_that_is_done(tmp_path, monkeypatch):
+    """The first start on a 0.4 database read every comment's words out of its old packs while the upgrade
+    rewrote them: the owner's 650,000 comments showed after three minutes. They're shown at once now, their words
+    once the upgrade has counted them."""
+    settings(tmp_path)
+    db = str(tmp_path / "big.db")
+    fill(db)
+    old = sqlite3.connect(db)
+    old.execute("PRAGMA user_version = 2")  # saved by 0.4, before packs counted their words
+    old.close()
+    QSettings().setValue("ui/last_dataset", "Big")
+    done = threading.Event()
+    monkeypatch.setattr(Store, "upgrade", classmethod(lambda cls, path, stop=None: done.wait(30)))
+    monkeypatch.setattr(mw.MainWindow, "wait_for_data", False)
+    w = mw.MainWindow(db)
+    try:
+        w.show()
+        until(lambda: w.current == "Big" and w.comments_tab.model.rowCount() == COMMENTS and not w.load_job.busy, 30)
+        assert not w._saved["comments"].words and w.upgrading.is_alive()
+        done.set()
+        until(lambda: w._saved["comments"].words and not w.load_job.busy and w.word_tally.ready
+              and w.word_tally.top(["comments"]), 30)
+        assert w.comments_tab.model.rowCount() == COMMENTS
     finally:
         w.close()
         QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
