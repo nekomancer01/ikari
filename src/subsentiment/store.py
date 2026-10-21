@@ -565,8 +565,11 @@ class Search:
             self.ready = self._probe()
             if not self.ready:
                 return None
-        cur = self.db.execute(f"SELECT rowid FROM search_{kind} WHERE search_{kind} MATCH ?", (query,))
-        return np.fromiter((r[0] for r in cur), np.int64)  # FTS5 gives them by rowid
+        # As one row: read a row at a time, each step let go of the interpreter lock and waited for it back, so
+        # on a thread beside a busy window 5,000 matches took 1.5 s instead of 3 ms.
+        (hits,) = self.db.execute(f"SELECT group_concat(rowid) FROM search_{kind} WHERE search_{kind} MATCH ?",
+                                  (query,)).fetchone()
+        return np.sort(np.array(hits.split(","), np.int64)) if hits else np.zeros(0, np.int64)
 
 
 def _unpack(blob: bytes, db: sqlite3.Connection | None = None) -> dict:
@@ -578,9 +581,21 @@ def _split(texts: list[str]) -> list[tuple[str, ...]]:
     return [tuple(words_in(t)) for t in texts]
 
 
-def _pack_all(path: str, pack: bool = True) -> None:
+class _Stopping:
+    """A big Store.upgrade's ``stop`` as its process sees it: set by the window's thread, or that window gone."""
+
+    def __init__(self, event):
+        self.event = event
+
+    def is_set(self) -> bool:
+        parent = multiprocessing.parent_process()
+        return self.event.is_set() or parent is not None and not parent.is_alive()
+
+
+def _pack_all(path: str, pack: bool, stop) -> None:
     """A big Store.upgrade's packing (if ``pack``) and search index, in a process of its own, splitting words in a
-    few more."""
+    few more. ``stop`` (a multiprocessing Event) ends it between days, its word-splitting processes with it."""
+    stop = _Stopping(stop)
     store = Store(path)
     pool = None
     try:
@@ -590,11 +605,13 @@ def _pack_all(path: str, pack: bool = True) -> None:
         pool = None
     try:
         if pack:
-            store.pack_settled(vacuum=False, split=pool, old=True)
+            store.pack_settled(vacuum=False, stop=stop, split=pool, old=True)
+            if stop.is_set():
+                return
             store.drop_rebuilt_links()
             if store._left_to_pack():
                 return
-        store.index_text()
+        store.index_text(stop)
     finally:
         if pool is not None:
             pool.shutdown(cancel_futures=True)
@@ -831,16 +848,19 @@ class Store:
         """Pack in a process of its own (`_pack_all`), so a minute of it doesn't take the interpreter from the
         window this thread is in; ``stop`` ends it, between days or mid-day (its transaction is then rolled
         back). False if no process could be started here."""
+        context = multiprocessing.get_context("spawn")
         try:
-            worker = multiprocessing.get_context("spawn").Process(target=_pack_all, args=(str(self.path), pack), daemon=False)
+            stopping = context.Event()
+            worker = context.Process(target=_pack_all, args=(str(self.path), pack, stopping), daemon=False)
             worker.start()
         except Exception:  # noqa: BLE001
             return False
         while worker.is_alive():
             worker.join(0.2)
             if stop is not None and stop.is_set():
-                worker.terminate()
-                worker.join()
+                # It stops after the day it's packing, ending its word-splitting processes (ended from here, they'd
+                # be left running); the window closes meanwhile.
+                stopping.set()
                 return True
         return worker.exitcode == 0  # one that failed (a build missing a module, say): packed here instead
 

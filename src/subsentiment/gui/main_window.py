@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from functools import partial
 
+import numpy as np
 from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QFontMetrics, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
@@ -21,6 +22,7 @@ from subsentiment.gui.coverage import CoveragePage
 from subsentiment.gui.fetch_form import FetchForm
 from subsentiment.gui.charts import NoteDialog, TimelineChart
 from subsentiment.gui.overview import OverviewPage, WordsPage
+from subsentiment.gui.rows import RowList, Rows, Saved, chosen
 from subsentiment.gui.words import KINDS, Rescore, WordTally
 from subsentiment.gui.rail import DRAWERS, PAGES, NavRail
 from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
@@ -29,7 +31,7 @@ from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.widgets import (
     ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatusLabel, Throbber, fit_to_screen, label, panel, plural, section,
 )
-from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices, lasting
+from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices, finish
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, scoring_at_least
 
@@ -152,7 +154,7 @@ class MainWindow(QMainWindow):
         self.fetch_job.ended.connect(self._on_fetch_ended)
         self.load_job = BackgroundJob(self)  # reads a big saved subreddit
         self.load_job.ended.connect(self._load_wanted)
-        self._wanted: tuple | None = None  # (name, post score filter, comment score filter) being read on load_job's thread, to show then
+        self._wanted: str | None = None  # the subreddit (lowercased) being read on load_job's thread, to show then
         self._stopping = False  # Stop was pressed on the running fetch
         self.current: str | None = None
         self.request: collect.FetchRequest | None = None
@@ -179,32 +181,26 @@ class MainWindow(QMainWindow):
         self._span_settled.setInterval(300)
         self._span_settled.timeout.connect(self._span_settle)
         self._span_slices = Slices(self)
-        self._narrow_slices = Slices(self)  # a stricter score filter's rows found among those in memory
         self._queued: dict[str, list] = {"posts": [], "comments": []}
         self._queued_ids: set[str] = set()
         self._since = 0.0  # rows saved since this moment belong to the running fetch
         # How far each table has read the running fetch's rows, so each save reads only what's new.
         self._read_to = {"posts": 0.0, "comments": 0.0}
         self._follow = False  # show the subreddit being fetched, until the user picks another one
-        self.posts: list = []  # what the tables show and export writes: the saved rows from the days in the span
-        self.comments: list = []
-        # Every saved row of the subreddit shown, kept up as a running fetch saves more; the overview counts the
-        # days of it in the span.
+        # The overview's numbers of every saved day, of the rows that pass the score filters (from _saved).
         self._analysis = {"posts": Analysis(), "comments": Analysis()}
-        self._last_fetched: float | None = None  # newest fetched_at among self.posts
-        self._saved: dict[str, list] = {"posts": [], "comments": []}  # every saved row of the subreddit shown
+        self._last_fetched: float | None = None  # when the newest saved post of the subreddit shown was saved
+        # Every saved post and comment of the subreddit shown (a rows.Saved each), kept up as a running fetch saves more.
+        self._saved: dict = {"posts": RowList(), "comments": RowList()}
         # The span of days every page counts, as the timeline shows it: [lo, hi) in epoch seconds, None for
         # every day; and the timeline's range button it came from, if any.
         self.span: tuple[float, float] | None = None
         self._preset: str | None = "All"
         self._table_days: tuple[int, int] | None = None  # the whole days the tables were filtered to
         self._following = False  # the timeline is being given new days
-        self._known: dict[str, set[str]] = {}  # ids already in _saved and _analysis, once a running fetch is counted in
-        # The last few subreddits shown, (_saved, _analysis) by (name, score filter), with what the saved-data list
-        # said of each then (posts, comments, last fetched): switching back to one needn't read and count it again.
-        self._loaded: dict[tuple, tuple] = {}
-        self._unsplit: set[tuple] = set()  # loaded ones whose words are still being split (LoadWorker)
-        self._shown_key: tuple | None = None  # the _loaded key of what's shown
+        # The last few subreddits shown, (what the saved-data list said of it then (posts, comments, last fetched),
+        # _saved) by name lowercased: switching back to one needn't read it again.
+        self._loaded: dict[str, tuple] = {}
         self._stats: dict[str, tuple] = {}
         self.setWindowIcon(QIcon(str(theme.ASSETS / "app.png")))
         # A native material (Mica/Acrylic/vibrancy) needs a translucent window from the start,
@@ -470,8 +466,7 @@ class MainWindow(QMainWindow):
         self.rescore.finished.connect(self._on_rescore_finished)
         self.rescore.failed.connect(self.words_page.meanings.show_failed)
         self._set_mid_fetch: set[str] = set()  # words set in the subreddit a fetch is saving, scored again after it
-        self._rescored: dict[str, dict] = {k: {} for k in KINDS}  # rows rescored, for the tables once it's done
-        self._rescore_index: dict[str, tuple] = {}  # kind -> (the saved rows, {id: where it is in them})
+        self._rescored: dict[str, set] = {k: set() for k in KINDS}  # ids rescored, for the tables once it's done
         self.words_page.meanings.changed.connect(self._set_word)
         self.overview.words.word_clicked.connect(self._pick_word)
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
@@ -640,7 +635,7 @@ class MainWindow(QMainWindow):
         """What the window is waiting on, for the throbber: "" where the header already says (a subreddit being
         opened or filtered), None for nothing. While a fetch runs for the subreddit shown, the tables and words
         following it are its progress bar's to tell."""
-        if self._wanted is not None or self._narrow_slices.running():
+        if self._wanted is not None:
             return ""
         table = self.posts_tab.busy() or self.comments_tab.busy()
         if table:
@@ -652,7 +647,7 @@ class MainWindow(QMainWindow):
         if not (self.fetch_job.busy and self._showing_fetch()):
             if self._span_slices.running():
                 return "Filling the tables\u2026"
-            if self.word_tally.busy() or self._shown_key in self._unsplit:
+            if self.word_tally.busy():
                 return "Counting words\u2026"
         if self.upgrading.is_alive():
             return "Shrinking saved data\u2026"
@@ -755,9 +750,6 @@ class MainWindow(QMainWindow):
             self.datasets.setCurrentRow(-1)  # it has no row yet
             self.datasets.blockSignals(False)
             self._show_dataset(self.request.subreddit)
-        for kind, rows in self._saved.items():
-            # What was just loaded needn't be read again; rows sharing the last instant are caught by id.
-            self._read_to[kind] = max([self._read_to[kind]] + [r["fetched_at"] for r in rows])
 
     def _showing_fetch(self) -> bool:
         return bool(self.request and self.current and self.current.lower() == self.request.subreddit.lower())
@@ -770,8 +762,8 @@ class MainWindow(QMainWindow):
             rows = read(name, self._read_to[kind])
             if rows:  # rows saved in the same instant as the last one read come back too; the ids catch them
                 self._read_to[kind] = rows[-1]["fetched_at"]
-                rows = scoring_at_least(rows, self.min_scores[kind == "comments"])
                 self._count_new(kind, rows)
+                rows = scoring_at_least(rows, self.min_scores[kind == "comments"])
             for r in days.keep(rows, self._table_days):
                 if r["id"] not in self._queued_ids:
                     self._queued_ids.add(r["id"])
@@ -780,18 +772,12 @@ class MainWindow(QMainWindow):
             self._drip.start()  # comments saved every few ms would then hold every row back
 
     def _count_new(self, kind: str, rows) -> None:
-        """Count rows the running fetch saved into the overview, whatever their day: the timeline shows every
-        day, and the span can be moved onto them later. Rows saved before, saved again with new scores,
-        aren't counted twice (the finished fetch brings their new scores in)."""
-        known = self._known.get(kind)
-        if known is None:
-            known = self._known[kind] = {r["id"] for r in self._saved[kind]}
-        new = [r for r in rows if r["id"] not in known and r["created_utc"] is not None]
-        if new:
-            known.update(r["id"] for r in new)
-            self._saved[kind].add(new)
-            self._analysis[kind].add(new)
-            self.word_tally.add(kind, days.keep(new, self._table_days))
+        """Count rows the running fetch saved into the subreddit shown, whatever their day or score: the timeline
+        shows every day, and the span and score filters can be moved onto them later. Rows saved before, saved
+        again with new scores, take the place of what they were."""
+        rows = [r for r in rows if r["created_utc"] is not None]
+        if rows:
+            self._saved[kind].add(rows)
             if not self._shown_live.isActive():
                 self._shown_live.start()
 
@@ -863,38 +849,23 @@ class MainWindow(QMainWindow):
             self._refresh_datasets(reload=False)
 
     def _merge_fetched(self) -> None:
-        """Bring what the finished fetch saved into the dataset on screen: rows it saved again (new scores)
-        and any not dripped in yet. Reading back only these, not every saved row, keeps a big subreddit
-        from freezing the window for seconds as the fetch ends."""
+        """Bring what the finished fetch saved into the dataset on screen: rows it saved again (new scores) and
+        any not dripped in yet. Reading back only these, not every saved row, keeps a big subreddit from freezing
+        the window for seconds as the fetch ends."""
         if self._span_slices.running():  # the tables are mid-way to a new span: finish it with the rows as they are
             self._apply_span()
-        dropped = False
         for kind, read, tab in (("posts", self.store.posts_since, self.posts_tab),
                                 ("comments", self.store.comments_since, self.comments_tab)):
             rows = read(self.current, self._since)
-            # A row rescored below its score filter leaves.
-            kept = {r["id"] for r in scoring_at_least(rows, self.min_scores[kind == "comments"])}
-            gone = {r["id"] for r in rows} - kept
-            dropped = dropped or bool(gone)
-            rows = [r for r in rows if r["id"] in kept]
             saved = self._saved[kind]
-            if gone:
-                saved = self._saved[kind] = days.SavedRows(r for r in saved if r["id"] not in gone)
-            where = {r["id"]: i for i, r in enumerate(saved)}
-            new = []
-            for r in rows:
-                if r["id"] in where:
-                    saved[where[r["id"]]] = r  # (saved again: still created when it was)
-                else:
-                    new.append(r)
-            saved.add(new)
-            self._analysis[kind] = Analysis(reversed(saved))  # a rescored row changes the totals
-            self.word_tally.add(kind, days.keep(rows, self._table_days))  # by id: rows saved again replace their words
-            tab.update_rows(days.keep(rows, self._table_days))
-        self._known = {}
-        self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
-        if dropped:  # the tables only add and replace rows
-            self._apply_span(reload=True)
+            saved.add(rows)
+            # A row rescored below its score filter leaves the table; the rest show their new scores.
+            at = chosen(saved, self._table_days, self.min_scores[kind == "comments"])
+            tab.retain(at)
+            fetched = saved.where([r["id"] for r in rows])
+            tab.took(fetched[np.isin(fetched, at)])
+        self._loaded[self.current.lower()] = (self._stats.get(self.current.lower()), self._saved)
+        self._last_fetched = self._newest("posts")
         self._update_dataset_labels()
         self._render_overview()
 
@@ -961,31 +932,26 @@ class MainWindow(QMainWindow):
     def _show_dataset(self, name: str, wait: bool = False) -> None:
         """Show a saved subreddit. One shown lately is shown from memory; a big one not in memory is read on a
         thread (unless ``wait``, or the window isn't up yet) and shown once it's in, the window carrying on."""
-        key, stats = (name.lower(), *self.min_scores), self._stats.get(name.lower())
-        fetching = bool(self.fetch_job.busy and self.request and name.lower() == self.request.subreddit.lower())
-        self._narrow_slices.stop()
+        key, stats = name.lower(), self._stats.get(name.lower())
         loaded = self._loaded.pop(key, None)
-        if loaded is not None and (loaded[0] != stats or fetching):
+        # What a running fetch saves into the subreddit shown is counted in as it's saved: it's up to date.
+        kept = loaded is not None and loaded[1] is self._saved and self.fetch_job.busy and self._showing_fetch()
+        if loaded is not None and loaded[0] != stats and not kept:  # fetched or deleted since: read again
             loaded = None
-        wider = None if loaded is not None or fetching or wait else next((
-            got for (sub, *least), got in self._loaded.items() if sub == key[0] and got[0] == stats
-            and all(a is None or (b is not None and a <= b) for a, b in zip(least, key[1:]))), None)
-        if wider is not None and sum(map(len, wider[1].values())) >= self.LOAD_THREAD_FROM:
-            # A score filter made stricter: its rows are among those in memory, rather than read again (most of a
-            # minute with 650,000 comments).
-            self._wanted = None  # (nothing to read: a read ending meanwhile starts none)
-            self.subheading.setText(f"Filtering r/{name}…")
-            self._narrow_slices.start(self._narrowing(key, wider), lambda: self._show_dataset(name))
-            return
-        if wider is not None:
-            loaded = self._narrowed(key, wider)
-        if (loaded is None and not wait and not fetching and (self.isVisible() or not self.wait_for_data) and stats
+        if (loaded is None and not wait and (self.isVisible() or not self.wait_for_data) and stats
                 and stats[0] + stats[1] >= self.LOAD_THREAD_FROM):
             self._wanted = key
             self.subheading.setText(f"Opening r/{name}…")
             self._load_wanted()
             return
         self._wanted = None
+        if loaded is None:
+            loaded = (stats, {k: Saved(self.db_path, k, name) for k in KINDS} if name else
+                      {k: RowList() for k in KINDS})
+        self._open(name, loaded)
+
+    def _open(self, name: str, loaded: tuple) -> None:
+        """Show subreddit ``name``, read: ``loaded`` is (what the saved-data list said of it, its rows.Saved)."""
         # Rows still queued from a running fetch belong to whatever was shown before; the tables are
         # about to be reloaded from the store, which has them anyway.
         self._drip.stop()
@@ -993,26 +959,23 @@ class MainWindow(QMainWindow):
         switching = (name or None) != self.current
         if switching:  # the old subreddit fades out over the new one
             motion.crossfade(self.content)
+            if self.fetch_job.busy and self._showing_fetch():  # what the fetch saves from now on isn't counted in
+                self._loaded.pop(self.current.lower(), None)
         self.current = name or None
-        if loaded is None:
-            self._unsplit.discard(key)  # read here with their words
-            with self.store.snapshot(), lasting():
-                saved = {k: days.SavedRows(scoring_at_least(self.store.rows(k, name, words=True) if name else [], self.min_scores[i]))
-                         for i, k in enumerate(KINDS)}
-            loaded = (stats, saved, {k: Analysis(reversed(rows)) for k, rows in saved.items()})  # as LoadWorker does
-        self._loaded[key] = loaded  # the newest last; a running fetch's rows go into these as they're counted
-        while len(self._loaded) > 4:
-            del self._loaded[next(iter(self._loaded))]
-        _, self._saved, self._analysis = loaded
-        self._shown_key = key
-        self.word_tally.learn({k: self._saved[k].words for k in KINDS})  # (None: the rows have theirs, or soon will)
-        self._known = {}
-        self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
+        if name:
+            self._loaded[name.lower()] = loaded  # the newest last
+            while len(self._loaded) > 4:
+                del self._loaded[next(iter(self._loaded))]
+        kept, self._saved = loaded[1] is self._saved, loaded[1]
+        if self.fetch_job.busy and self._showing_fetch() and not kept:
+            # What it saved after these were read: they read the database as it was when they were made.
+            self._read_to = {k: max(self._since, getattr(self._saved[k], "made_at", 0.0) - 1.0) for k in KINDS}
+        self._last_fetched = self._newest("posts")
         # The span remembered for it, shown on the timeline once they have its days.
         self.span, self._preset = days.load_range(self.settings, name)
         self._render_overview(restore=True)
         if self.isVisible() and sum(map(len, self._saved.values())) >= self.LOAD_THREAD_FROM:
-            self._span_settled.stop()  # a big one's tables and words fill in over the next few frames
+            self._span_settled.stop()  # a big one's tables fill in over the next few frames
             self._span_slices.start(self._span_steps(reload=True), lambda: None)
         else:
             self._apply_span(reload=True)
@@ -1022,103 +985,42 @@ class MainWindow(QMainWindow):
         self._update_delete_enabled()
         self.coverage.set_subreddit(self.current)
 
-    def _narrowing(self, key: tuple, wider: tuple):
-        """Find the rows of ``key``'s score filters among ``wider``'s (a looser filter's, in memory), yielding
-        every few thousand rows, and keep them in _loaded."""
-        stats, rows, _ = wider
-        saved, analysis = {}, {}
-        for kind, least in zip(KINDS, key[1:]):
-            kept, every = [], rows[kind]
-            for a in range(0, len(every), 20_000):
-                kept += scoring_at_least(every[a:a + 20_000], least)
-                yield
-            saved[kind] = days.SavedRows(kept)
-            counted = analysis[kind] = Analysis()
-            for b in range(len(kept), 0, -5_000):  # newest first, as LoadWorker counts them
-                counted.add(reversed(kept[max(0, b - 5_000):b]))
-                yield
-        for kind in KINDS:  # (in the same step as the check: their words may have come in meanwhile)
-            saved[kind].words = rows[kind].words
-        if any(k[0] == key[0] for k in self._unsplit):  # their words are on their way: these get them too
-            self._unsplit.add(key)
-        self._loaded[key] = (stats, saved, analysis)
+    @property
+    def posts(self) -> Rows:
+        """What the Posts table shows and export writes: the saved posts from the days in the span that pass the
+        score filter (whatever the table's own filters show)."""
+        return self.posts_tab.all_rows
 
-    def _narrowed(self, key: tuple, wider: tuple) -> tuple:
-        for _ in self._narrowing(key, wider):
-            pass
-        return self._loaded.pop(key)
+    @property
+    def comments(self) -> Rows:
+        return self.comments_tab.all_rows
+
+    def _newest(self, kind: str) -> float | None:
+        """When the newest saved post or comment (``kind``) of the subreddit shown was saved."""
+        if not self.current:
+            return None
+        return self.store.db.execute(f"SELECT MAX(fetched_at) FROM {kind} WHERE subreddit = ? COLLATE NOCASE",
+                                     (self.current,)).fetchone()[0]
 
     def _load_wanted(self) -> None:
-        """Read the subreddit last asked for on load_job's thread, once the one before is in (or, if that one's
-        rows are in and only their words are being split, once that's cut short: its words are then split as
-        it's counted, should it be shown)."""
-        if self._wanted is None:
+        """Read the subreddit last asked for on load_job's thread, once the one before is in."""
+        if self._wanted is None or self.load_job.busy:
             return
-        if self.load_job.busy:
-            if self.load_job.worker.tag[0] in self._loaded:
-                self.load_job.worker.stop()
-            return
-        name, *min_scores = key = self._wanted
-        worker = LoadWorker(self.db_path, name, tuple(min_scores), (key, self._stats.get(name)))
-        worker.summed.connect(self._on_summed)
+        key = self._wanted
+        worker = LoadWorker(self.db_path, key, (key, self._stats.get(key)))
         worker.read.connect(self._on_loaded)
-        worker.finished.connect(self._on_split)
         worker.failed.connect(self._on_load_failed)
         self.load_job.start(worker)
 
-    def _on_summed(self, summed: tuple) -> None:
-        """A big subreddit's days counted by the store, a second in, while its rows are read: the overview shows
-        them meanwhile (the tables and words follow with the rows)."""
-        (key, stats), analysis = summed
-        if self._wanted != key:
-            return
-        name = self._name_of(key[0])
-        if name != self.current:  # the old subreddit fades out over the new one
-            motion.crossfade(self.content)
-        self._drip.stop()
-        self._queued = {"posts": [], "comments": []}
-        self._span_slices.stop()
-        self.current, self._shown_key = name, None
-        self._saved, self._analysis = {k: days.SavedRows() for k in KINDS}, analysis
-        self.posts, self.comments, self._table_days = [], [], None
-        self.posts_tab.load([])
-        self.comments_tab.load([])
-        self.word_tally.hold()
-        self.span, self._preset = days.load_range(self.settings, name)
-        self._render_overview(restore=True)
-        self._show_notes()
-        self.words_page.meanings.set_subreddit(name, self.store.words(name))
-        self._update_delete_enabled()
-        self.coverage.set_subreddit(name)
-        self.heading.setText(f"r/{name}")
-        self.subheading.setText(f"Reading r/{name}'s {plural(analysis['posts'].count, 'post')} and "
-                                f"{plural(analysis['comments'].count, 'comment')}…")
-
     def _on_loaded(self, read: tuple) -> None:
-        (key, stats), saved, analysis = read
-        self._loaded[key] = (stats, saved, analysis)
-        self._unsplit.add(key)  # its words are being split meanwhile
+        (key, stats), saved = read
         if self._wanted == key:
-            self._show_dataset(self._name_of(key[0]))
-
-    def _on_split(self, split: tuple) -> None:
-        """The words of a subreddit read without them: counted into the word clouds if it's shown."""
-        (key, _), words = split
-        waiting = self._shown_key in self._unsplit
-        for other in [k for k in self._unsplit if k[0] == key[0]]:  # (and the stricter score filters' found in it)
-            self._unsplit.discard(other)
-            loaded = self._loaded.get(other)
-            if loaded is not None and words is not None:
-                for k in KINDS:
-                    loaded[1][k].words = words[k]
-        if waiting and self._shown_key not in self._unsplit:
-            self.word_tally.learn(words or {})
-            if not self._span_slices.running():  # (else the span's last step counts them)
-                self.word_tally.count(self.posts, self.comments, fresh=True)
+            self._wanted = None
+            self._open(self._name_of(key), (stats, saved))
 
     def _on_load_failed(self, message: str) -> None:
         if self._wanted is not None:  # read it here instead, where an error shows as it always has
-            self._show_dataset(self._name_of(self._wanted[0]), wait=True)
+            self._show_dataset(self._name_of(self._wanted), wait=True)
 
     def _name_of(self, lowered: str) -> str:
         """A saved subreddit's name as the list writes it."""
@@ -1160,12 +1062,13 @@ class MainWindow(QMainWindow):
         self._span_settled.stop()
         reload = reload or self._span_slices.running()
         self._span_slices.stop()
-        for _ in self._span_steps(reload):
-            pass
+        finish(self._span_steps(reload))
+        self.word_tally.count(self._saved, self._table_days, self.min_scores)  # (unless counted as they are already)
 
     def _span_steps(self, reload: bool = False):
-        """_apply_span's work, yielding between the steps that take a while. Each table takes its rows from
-        _saved in its own step, so rows a running fetch adds in between are in them."""
+        """_apply_span's work, yielding between the steps that take a while (a big table's order is worked out away
+        from the frames). Each table takes its rows from _saved in its own step, so rows a running fetch adds in
+        between are in them."""
         whole = days.whole(self.span)
         if whole == self._table_days and not reload:
             return
@@ -1173,17 +1076,11 @@ class MainWindow(QMainWindow):
         # Rows still queued are in _saved already, so the tables have them once reloaded.
         self._drip.stop()
         self._queued = {"posts": [], "comments": []}
-        self.posts = self._saved["posts"].between(whole)
-        yield from self.posts_tab.load_steps(self.posts)  # a big table a step at a time
-        yield
-        self.comments = self._saved["comments"].between(whole)
-        yield from self.comments_tab.load_steps(self.comments)
+        for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
+            saved = self._saved[kind]
+            yield from tab.set_rows_steps(saved, chosen(saved, whole, self.min_scores[kind == "comments"]))
+            yield
         self._update_dataset_labels()
-        yield
-        if self._shown_key in self._unsplit:  # counted once they're split
-            self.word_tally.hold()
-        else:
-            self.word_tally.count(self.posts, self.comments, fresh=reload)
 
     @property
     def min_scores(self) -> tuple[int | None, int | None]:
@@ -1191,14 +1088,18 @@ class MainWindow(QMainWindow):
         return self.score_pick.currentData(), self.comment_score_pick.currentData()
 
     def _on_min_score(self, pick, setting: str) -> None:
+        """A score filter changed: every page counts the rows that pass it, from what's in memory."""
         self.settings.setValue(setting, pick.currentText())
         if not self.current:
             return
         motion.crossfade(self.content)
         self._flush_rows()
-        self._show_dataset(self.current)
-        if self.fetch_job.busy and self._showing_fetch():  # read the running fetch's rows from here on
-            self._read_to = {k: max([self._since] + [r["fetched_at"] for r in self._saved[k]]) for k in self._saved}
+        self._render_overview()
+        if self.isVisible() and sum(map(len, self._saved.values())) >= self.LOAD_THREAD_FROM:
+            self._span_settled.stop()
+            self._span_slices.start(self._span_steps(reload=True), lambda: None)
+        else:
+            self._apply_span(reload=True)
 
     def _on_scope_changed(self, text: str) -> None:
         self.settings.setValue("ui/overview_scope", text)
@@ -1210,6 +1111,7 @@ class MainWindow(QMainWindow):
         """Show every saved day on the timeline, and the span's days on the tiles and distribution. With
         restore, the timeline shows the span the window holds (another subreddit's, as remembered)."""
         scope = self.scope.currentText()
+        self._analysis = {k: self._saved[k].analysis(least) for k, least in zip(KINDS, self.min_scores)}
         self._counted = Analysis.combined(
             *[self._analysis[k] for k, skip in (("posts", "Comments only"), ("comments", "Posts only")) if scope != skip])
         chart = self.overview.timeline
@@ -1231,6 +1133,7 @@ class MainWindow(QMainWindow):
         self.overview.show_analysis(a)
         if not moving:
             self.mood.set_counts(a.counts["positive"], a.counts["negative"], a.count, ease)
+            self.word_tally.count(self._saved, days.whole(self.span), self.min_scores)
             self._render_words()
 
     def _render_words(self) -> None:
@@ -1278,8 +1181,8 @@ class MainWindow(QMainWindow):
             fetching = self.fetch_job.busy and self.request is not None and self.request.subreddit.lower() == sub.lower()
             if fetching:  # it may be saving items scored the old way as this runs
                 self._set_mid_fetch.add(word)
-            whole = self.min_scores == (None, None) and not fetching
-            self.rescore.start(sub, {word}, self._saved if whole and self.current == sub else None)
+            here = not fetching and self.current is not None and self.current.lower() == sub.lower()
+            self.rescore.start(sub, {word}, self._saved if here else None)
 
     def _rescore_after_fetch(self) -> None:
         """Items the fetch saved while words were being set were scored the old way: go through them again."""
@@ -1290,52 +1193,27 @@ class MainWindow(QMainWindow):
     def _on_rescored(self, sub: str, kind: str, rows: list) -> None:
         """Saved items scored again by a subreddit's words: the pages showing it follow, as with a fetch's rows."""
         mine = self.current and self.current.lower() == sub
-        here = (sub, *self.min_scores)
-        for key in [k for k in self._loaded if k[0] == sub and not (mine and k == here)]:
-            del self._loaded[key]  # read again when next shown
         if not mine:
+            self._loaded.pop(sub, None)  # read again when next shown
             return
-        if self._span_slices.running():  # the tables are mid-way to a new span: finish it with the rows as they are
-            self._apply_span()
-        saved, old, shown = self._saved[kind], [], []
-        # Where each saved row is, kept across a rescore's batches; looked up again if the rows changed meanwhile.
-        index = self._rescore_index.get(kind)
-        if index is None or index[0] is not saved:
-            index = self._rescore_index[kind] = (saved, {r["id"]: i for i, r in enumerate(saved)})
-        for r in rows:
-            i = index[1].get(r["id"])
-            if i is not None and (i >= len(saved) or saved[i]["id"] != r["id"]):
-                index = self._rescore_index[kind] = (saved, {s["id"]: i for i, s in enumerate(saved)})
-                i = index[1].get(r["id"])
-            if i is not None:  # (None: left out by the score filter)
-                old.append(saved[i])
-                # As shown, with its new score: a fetch may have saved it again since it was read.
-                shown.append(saved[i]._replace(sentiment=r["sentiment"], label=r["label"]))
-                saved[i] = shown[-1]
-        if not old:
-            return
-        self._analysis[kind].add(old, -1)
-        self._analysis[kind].add(shown)
-        shown = days.keep(shown, self._table_days)
-        self.word_tally.add(kind, shown)  # by id: each row's lean follows its new label
-        self._rescored[kind].update((r["id"], r) for r in shown)
+        self._saved[kind].rescore([(r["id"], r["sentiment"], r["label"]) for r in rows])
+        self._rescored[kind].update(r["id"] for r in rows)
         self._render_overview()
 
     def _on_rescore_finished(self, sub: str) -> None:
         """The tables (and what export writes) take the rescored rows in one go: each update sorts a table again."""
-        rows, self._rescored = self._rescored, {k: {} for k in KINDS}
-        self._rescore_index = {}
+        ids, self._rescored = self._rescored, {k: set() for k in KINDS}
         if self.current and self.current.lower() == sub:
             for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
-                if rows[kind]:
-                    tab.update_rows(days.keep(rows[kind].values(), self._table_days))
+                if ids[kind]:
+                    at = self._saved[kind].where(list(ids[kind]))
+                    tab.took(at[np.isin(at, tab.all_rows.at)])
 
     def days_deleted(self, subreddit: str, days: int, posts: int, comments: int) -> None:
         """Download coverage deleted some days of ``subreddit``: if it's still shown, show it again from the store
         on every page. If nothing of it is left it stays shown, empty, so its days can be downloaded again from
         here. Another subreddit picked meanwhile stays shown."""
-        for key in [k for k in self._loaded if k[0] == subreddit.lower()]:
-            del self._loaded[key]
+        self._loaded.pop(subreddit.lower(), None)
         shown = (self.current or "").lower() == subreddit.lower()
         self._refresh_datasets(select=subreddit if shown else None, reload=False)
         if shown:
@@ -1450,11 +1328,10 @@ class MainWindow(QMainWindow):
         self._shown_live.stop()
         self._span_settled.stop()
         self._span_slices.stop()
-        self._narrow_slices.stop()
+        self.word_tally.hold()
         self._wanted = None
         if self.load_job.busy:  # what it read is let go; its thread is waited for, as it uses the file
-            for sig in (self.load_job.worker.summed, self.load_job.worker.read, self.load_job.worker.finished,
-                        self.load_job.worker.failed):
+            for sig in (self.load_job.worker.read, self.load_job.worker.finished, self.load_job.worker.failed):
                 sig.disconnect()
             self.load_job.worker.stop()
             self.load_job.qthread.quit()
