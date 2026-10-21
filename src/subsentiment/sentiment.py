@@ -106,14 +106,15 @@ def _negative(cleaned: str) -> bool:
     return probs["negative"] > max(probs["positive"], 0.4)
 
 
-def is_sarcastic(cleaned: str) -> bool:
-    """True for obvious sarcasm in already-cleaned text (see the patterns above)."""
+def is_sarcastic(cleaned: str, negative=_negative) -> bool:
+    """True for obvious sarcasm in already-cleaned text (see the patterns above). ``negative`` says whether
+    what a positive frame is wrapped around reads negative."""
     if _SARCASM_MARKER.search(cleaned) or _EYEROLL.search(cleaned):
         return True
     if not _SARCASM_FRAME.search(cleaned):
         return False
     rest = _SARCASM_FRAME.sub(" ", cleaned).strip(" ,.!?")
-    return bool(rest) and _negative(rest)
+    return bool(rest) and negative(rest)
 
 
 class Lexicon:
@@ -135,11 +136,13 @@ class Lexicon:
             words = sorted(self.weights, key=len, reverse=True)
             self._find = re.compile(r"(?<![\w'])(?:" + "|".join(
                 r"\s+".join(map(re.escape, w.split())) for w in words) + r")(?![\w'])", re.IGNORECASE)
-            # Letters only, so VADER keeps them whole, and nothing anyone writes.
-            self._stand_in = {w: "zqikari" + "".join(chr(97 + int(d)) for d in str(i)) for i, w in enumerate(words)}
+            # Letters only, so VADER keeps them whole, and nothing anyone writes. By casefold, as the search
+            # ignores case the same way ("ſtuff" is found for "stuff").
+            self._stand_in = {w.casefold(): "zqikari" + "".join(chr(97 + int(d)) for d in str(i))
+                              for i, w in enumerate(words)}
             self._analyzer = copy.copy(_analyzer())
             self._analyzer.lexicon = {**_analyzer().lexicon,
-                                      **{s: self.weights[w] * self.VALENCE for w, s in self._stand_in.items()}}
+                                      **{self._stand_in[w.casefold()]: v * self.VALENCE for w, v in self.weights.items()}}
         else:
             self._analyzer = _analyzer()
 
@@ -156,7 +159,7 @@ class Lexicon:
     def score(self, text: str, scorer: str = "model") -> tuple[float, str]:
         """Like ``score``, reading the set words as set here."""
         cleaned = clean(text)
-        marked = self._find.sub(lambda m: " " + self._stand_in[self.key(m.group())] + " ", cleaned) if self._find else cleaned
+        marked = self._find.sub(self._swap, cleaned) if self._find else cleaned
         if marked == cleaned:  # no set word in it
             return score(text, scorer)
         p = self._analyzer.polarity_scores(marked)
@@ -169,9 +172,17 @@ class Lexicon:
             shift = max(-self.MOST, min(self.MOST, self.NUDGE * (p["compound"] - without)))
             probs = model.probabilities(plain, [p["neg"], p["neu"], p["pos"], p["compound"], abs(p["compound"])], shift)
             compound, label = probs["positive"] - probs["negative"], max(probs, key=probs.get)
-        if label == "positive" and is_sarcastic(cleaned):
+        if label == "positive" and is_sarcastic(cleaned, self._negative):
             return -compound, "negative"
         return compound, label
+
+    def _swap(self, m: re.Match) -> str:
+        stand_in = self._stand_in.get(self.key(m.group()).casefold())
+        return m.group() if stand_in is None else f" {stand_in} "
+
+    def _negative(self, rest: str) -> bool:
+        """Whether what a sarcastic frame is wrapped around reads negative, with the set words as set here."""
+        return self.score(rest)[1] == "negative" if self.uses(rest) else _negative(rest)
 
 
 def score(text: str, scorer: str = "model") -> tuple[float, str]:

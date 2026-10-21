@@ -297,8 +297,10 @@ class Rescore(QObject):
     rescored = Signal(str, str, object)  # subreddit (lowercased), "posts" or "comments", the rows with new scores
     progress = Signal(str, int, int)  # subreddit, items gone through, of
     finished = Signal(str)  # subreddit: every item using the words is scored again and saved
+    failed = Signal(str, str)  # subreddit, what went wrong reading its items
 
-    BATCH = 0.25  # seconds between two saves of what's been rescored
+    BATCH = 0.25  # seconds between two batches sent out
+    COMMIT = 0.05  # seconds between two commits: other connections (a fetch) wait while one is open
 
     def __init__(self, store, db_path: str, parent: QObject | None = None):
         super().__init__(parent)
@@ -358,7 +360,7 @@ class Rescore(QObject):
             return
         worker = LoadWorker(self.db_path, sub, None, self._run)
         worker.finished.connect(self._on_read)
-        worker.failed.connect(lambda _: self._drop())
+        worker.failed.connect(lambda message, sub=sub: (self._drop(), self.failed.emit(sub, message)))
         self.job.start(worker)
 
     def _on_read(self, read: tuple) -> None:
@@ -369,7 +371,8 @@ class Rescore(QObject):
     def _steps(self, sub: str, words: set[str], rows: dict):
         """Score the items using ``words`` again, yielding after each; saved a batch at a time."""
         lexicon, uses = self.store.lexicon(sub), Lexicon(dict.fromkeys(words, 0.0)).uses
-        total, done, saved_at = sum(map(len, rows.values())), 0, time.perf_counter()
+        total, done = sum(map(len, rows.values())), 0
+        sent_at = committed_at = time.perf_counter()
         for kind in KINDS:
             for r in rows[kind]:
                 text = (r["body"] or "") if kind == "comments" else f"{r['title'] or ''}\n\n{r['selftext'] or ''}".strip()
@@ -379,10 +382,14 @@ class Rescore(QObject):
                     if (s, label) != (r["sentiment"], r["label"]):
                         self._batch[kind].append({**r, "sentiment": s, "label": label})
                         self.store.rescore(kind, [(r["id"], s, label)])
-                if time.perf_counter() - saved_at > self.BATCH:
+                now = time.perf_counter()
+                if now - sent_at > self.BATCH:
                     self._save(sub)
                     self.progress.emit(sub, done, total)
-                    saved_at = time.perf_counter()
+                    sent_at = committed_at = time.perf_counter()
+                elif now - committed_at > self.COMMIT:
+                    self.store.commit()
+                    committed_at = now
                 yield
 
     def _save(self, sub: str) -> None:
@@ -572,7 +579,9 @@ class WordMeanings(QWidget):
 
     def set_subreddit(self, name: str | None, words: dict[str, float]) -> None:
         """Show the words set for ``name`` (None: nothing shown)."""
-        self._rest.stop()
+        if self._rest.isActive():  # a slider moved with the keys a moment ago
+            self._rest.stop()
+            self._save_resting()
         self.subreddit = name
         for row in self.rows.values():
             row.deleteLater()
@@ -602,6 +611,10 @@ class WordMeanings(QWidget):
         self.scroll.verticalScrollBar().setValue(0)
         row.slider.setFocus()
 
+    def show_failed(self, subreddit: str, message: str) -> None:
+        if self.subreddit and subreddit == self.subreddit.lower():
+            self.status.setText(f"Couldn't score saved items again: {message}")
+
     def show_progress(self, subreddit: str, done: int | None = None, total: int = 0) -> None:
         """How far scoring the saved items again has got; done None once it's finished."""
         if self.subreddit and subreddit == self.subreddit.lower():
@@ -622,8 +635,9 @@ class WordMeanings(QWidget):
             self._rest.start()
 
     def _save_resting(self) -> None:
-        if self._resting is not None and self._resting.word in self.rows:
+        if self._resting is not None and self.rows.get(self._resting.word) is self._resting:
             self._save(self._resting)
+        self._resting = None
 
     def _save(self, row: _Meaning) -> None:
         weight = row.weight()

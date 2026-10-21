@@ -167,7 +167,7 @@ class Store:
                 if is_image_post(r["url"], r["selftext"])])
             self.db.commit()
         self._stamp = 0.0
-        self._lexicons: dict[str, tuple[dict, Lexicon]] = {}  # subreddit lowercased -> (its words, their Lexicon)
+        self._lexicons: dict[str, tuple] = {}  # subreddit lowercased -> (when read, its words, their Lexicon)
         backup = Path(str(self.path) + "-before-v1")
         if fresh:
             self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -560,15 +560,18 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO words VALUES (?, ?, ?, ?)",
                             (subreddit.lower(), _storable(word), max(-1.0, min(1.0, float(weight))), time.time()))
         self.db.commit()
+        self._lexicons.pop(subreddit.lower(), None)
 
     def lexicon(self, subreddit: str) -> Lexicon:
-        """A subreddit's words as they're set now, for scoring what's saved there; read again on each call, so
-        a fetch running while the user sets one scores by it from then on."""
-        words = self.words(subreddit)
+        """A subreddit's words as they're set now, for scoring what's saved there. They're read again once a
+        second at most (or at once, set on this connection), so a fetch running on its own connection while the
+        user sets one scores by it from then on without a query for each item."""
         hit = self._lexicons.get(subreddit.lower())
-        if hit is None or hit[0] != words:
-            hit = self._lexicons[subreddit.lower()] = (words, Lexicon(words))
-        return hit[1]
+        if hit is None or abs(time.time() - hit[0]) > 1.0:
+            words = self.words(subreddit)
+            made = hit[2] if hit is not None and hit[1] == words else Lexicon(words)
+            hit = self._lexicons[subreddit.lower()] = (time.time(), words, made)
+        return hit[2]
 
     def rescore(self, kind: str, scores) -> None:
         """Save new scores, [(id, sentiment, label)], on posts or comments (``kind``), leaving the rest as it is.
@@ -602,7 +605,7 @@ class Store:
 
     def import_from(self, path: str | Path) -> tuple[int, int]:
         """Merge another ikari database into this one: rows this one lacks are added, and a row both have
-        keeps the copy fetched (or, for a timeline note, saved) last. Nothing is removed from either file. Returns (new posts, new comments),
+        keeps the copy fetched (or, for a timeline note or a word's meaning, saved) last. Nothing is removed from either file. Returns (new posts, new comments),
         image posts and their comments left out as they are everywhere.
         Raises sqlite3.DatabaseError if path isn't an ikari database, ValueError if it is this one,
         FileNotFoundError if there's no file there."""
@@ -648,6 +651,13 @@ class Store:
                     "SELECT subreddit, day, label, text, saved_at FROM other.notes o WHERE NOT EXISTS (SELECT 1 FROM "
                     "main.notes m WHERE m.subreddit = o.subreddit AND m.day = o.day "
                     "AND COALESCE(m.saved_at, 0) >= COALESCE(o.saved_at, 0))")
+            if "words" in tables:  # likewise a word both have set in a subreddit
+                self.db.execute(
+                    "INSERT OR REPLACE INTO main.words (subreddit, word, weight, saved_at) "
+                    "SELECT subreddit, word, weight, saved_at FROM other.words o WHERE NOT EXISTS (SELECT 1 FROM "
+                    "main.words m WHERE m.subreddit = o.subreddit AND m.word = o.word "
+                    "AND COALESCE(m.saved_at, 0) >= COALESCE(o.saved_at, 0))")
+                self._lexicons.clear()
             for i in range(0, len(imported), 500):
                 ids = imported[i:i + 500]
                 self.db.executemany("UPDATE posts SET image = 1 WHERE id = ?", [

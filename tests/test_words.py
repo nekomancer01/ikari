@@ -204,3 +204,21 @@ def test_setting_a_word_rescores_that_subreddit_only_and_every_page_follows(tmp_
     finally:
         w.close()
         QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
+
+
+def test_a_word_set_while_its_subreddit_is_fetched_is_rescored_again_after(window):
+    w = window
+    w.show()
+    app = QApplication.instance()
+    started = []
+    w.rescore.start = lambda sub, words, rows=None: started.append((sub, set(words), rows is None))
+    w.request, w.fetch_job.qthread = mw.collect.FetchRequest("town"), object()  # as if town were being fetched
+    w.words_page.meanings.pick("harbour")
+    w.words_page.meanings._save(w.words_page.meanings.rows["harbour"])
+    assert started == [("town", {"harbour"}, True)]  # read from disk: the window doesn't have every row yet
+    w.fetch_job.qthread = None
+    w._rescore_after_fetch()  # as the fetch ends: what it saved meanwhile was scored the old way
+    assert started[-1] == ("town", {"harbour"}, True)
+    w._rescore_after_fetch()
+    assert len(started) == 2
+    app.processEvents()

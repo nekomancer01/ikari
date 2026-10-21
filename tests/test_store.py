@@ -644,3 +644,19 @@ def test_word_meanings_are_kept_per_subreddit(tmp_path):
     assert s.words("linux") == {} and s.words("deltarune") == {"kill": -1.0}
     s.close()
     assert Store(tmp_path / "w.db").words("deltarune") == {"kill": -1.0}
+
+
+def test_import_brings_word_meanings_keeping_the_one_saved_last(tmp_path, monkeypatch):
+    from subsentiment import store as store_mod
+    when = iter([100.0, 200.0, 300.0])
+    monkeypatch.setattr(store_mod.time, "time", lambda: next(when))
+    mine, theirs = Store(tmp_path / "mine.db"), Store(tmp_path / "theirs.db")
+    mine.save_word("linux", "kill", -1.0)  # 100
+    theirs.save_word("linux", "kill", 0.0)  # 200
+    theirs.save_word("linux", "zombie", 0.5)  # 300
+    theirs.close()
+    monkeypatch.undo()
+    assert mine.lexicon("linux").score("kill the process")[1] == "negative"
+    mine.import_from(tmp_path / "theirs.db")
+    assert mine.words("linux") == {"kill": 0.0, "zombie": 0.5}
+    assert mine.lexicon("linux").score("kill the process")[1] == "neutral"

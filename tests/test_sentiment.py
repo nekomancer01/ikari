@@ -87,3 +87,10 @@ def test_text_without_a_set_word_scores_as_before():
         assert lex.score(text) == sentiment.score(text)
         assert lex.score(text, "vader") == sentiment.score(text, "vader")
     assert sentiment.Lexicon().score("kill it") == sentiment.score("kill it")
+
+
+def test_set_words_count_inside_sarcasm_and_odd_letters_too():
+    lex = sentiment.Lexicon({"kill": 1.0, "stuff": 1.0})
+    assert lex.score("gotta love when you kill the process")[1] == "positive"  # not sarcasm: "kill" is good here
+    assert lex.score("gotta love when the game crashes")[1] == "negative"  # still sarcasm
+    assert lex.score("this ſtuff is here")[1] == "positive"  # the search's case folding finds "stuff"

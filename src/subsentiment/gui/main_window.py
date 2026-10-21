@@ -457,6 +457,8 @@ class MainWindow(QMainWindow):
         self.rescore.progress.connect(self.words_page.meanings.show_progress)
         self.rescore.finished.connect(self.words_page.meanings.show_progress)
         self.rescore.finished.connect(self._on_rescore_finished)
+        self.rescore.failed.connect(self.words_page.meanings.show_failed)
+        self._set_mid_fetch: set[str] = set()  # words set in the subreddit a fetch is saving, scored again after it
         self._rescored: dict[str, dict] = {k: {} for k in KINDS}  # rows rescored, for the tables once it's done
         self._rescore_index: dict[str, tuple] = {}  # kind -> (the saved rows, {id: where it is in them})
         self.words_page.meanings.changed.connect(self._set_word)
@@ -806,6 +808,7 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, result: collect.FetchResult) -> None:
         self._loaded.clear()  # what it saved (scores too) is read again, not shown from memory
+        self._rescore_after_fetch()
         self.progress_msg.setText(finish_text(result, self.request))
         if self.request.days and not (result.stopped or result.timed_out):  # stopped: the ticks stay, to go on
             self.coverage.untick(self.request.days)
@@ -852,6 +855,7 @@ class MainWindow(QMainWindow):
 
     def _on_failed(self, message: str) -> None:
         self._loaded.clear()
+        self._rescore_after_fetch()
         self._live.stop()
         self._flush_rows()
         # Show anything stored before the error, unless the user went to look at another subreddit.
@@ -1129,8 +1133,17 @@ class MainWindow(QMainWindow):
         if sub:
             self.store.save_word(sub, word, weight)
             # The rows on screen are all there is of it, unless the score filter or a running fetch leaves some out.
-            whole = self.min_score is None and not (self.fetch_job.busy and self._showing_fetch())
+            fetching = self.fetch_job.busy and self.request is not None and self.request.subreddit.lower() == sub.lower()
+            if fetching:  # it may be saving items scored the old way as this runs
+                self._set_mid_fetch.add(word)
+            whole = self.min_score is None and not fetching
             self.rescore.start(sub, {word}, self._saved if whole and self.current == sub else None)
+
+    def _rescore_after_fetch(self) -> None:
+        """Items the fetch saved while words were being set were scored the old way: go through them again."""
+        if self._set_mid_fetch:
+            self.rescore.start(self.request.subreddit, self._set_mid_fetch)
+            self._set_mid_fetch = set()
 
     def _on_rescored(self, sub: str, kind: str, rows: list) -> None:
         """Saved items scored again by a subreddit's words: the pages showing it follow, as with a fetch's rows."""
@@ -1154,8 +1167,9 @@ class MainWindow(QMainWindow):
                 i = index[1].get(r["id"])
             if i is not None:  # (None: left out by the score filter)
                 old.append(saved[i])
-                shown.append(r)
-                saved[i] = r
+                # As shown, with its new score: a fetch may have saved it again since it was read.
+                shown.append({**saved[i], "sentiment": r["sentiment"], "label": r["label"]})
+                saved[i] = shown[-1]
         if not old:
             return
         self._analysis[kind].add(old, -1)
