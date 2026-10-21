@@ -1,4 +1,5 @@
 """The word cloud: which words count, how they're tallied and placed, and the Words page on real saved data."""
+import math
 import os
 import time
 
@@ -6,7 +7,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QSettings, Qt  # noqa: E402
+from PySide6.QtCore import QPoint, QSettings, Qt, QVariantAnimation  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -14,6 +15,7 @@ from subsentiment import sentiment  # noqa: E402
 
 from subsentiment.analysis import WordCounts, words_in  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
+from subsentiment.gui import motion  # noqa: E402
 from subsentiment.gui.words import KINDS, WordCloud, WordTally  # noqa: E402
 from subsentiment.reddit import Comment, Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
@@ -62,6 +64,59 @@ def test_the_cloud_fits_its_words_without_overlap_biggest_first():
     assert sizes == sorted(sizes, reverse=True) and sizes[0] > 2 * sizes[-1]
     cloud.set_words([])
     assert cloud.placed() == []
+
+
+def test_a_change_eases_in_from_the_words_on_screen_and_reduce_motion_lands_at_once(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(motion, "_os_allows", True)
+    words = [(f"word{i}", 1000 // (i + 1), 0.5) for i in range(30)]
+    for on in (True, False):
+        monkeypatch.setattr(motion, "_wanted", on)
+        cloud = WordCloud()
+        cloud.resize(700, 300)
+        cloud.show()
+        app.processEvents()
+        cloud.set_words(words)
+        was = {word: box.center() for box, word, *_ in cloud.placed()}
+        cloud._anim.setCurrentTime(cloud.MOVE_MS)  # the words have popped in
+        cloud.repaint()  # on screen: the next change eases in from here
+        assert cloud._painted
+        # Counts change, the least used word goes, a new one comes and the third most used turns negative.
+        cloud.set_words([(w, n + 5, -0.8 if i == 2 else lean) for i, (w, n, lean) in enumerate(words[:-1])]
+                        + [("newcomer", 36, 0.0)])
+        now = {word: box.center() for box, word, *_ in cloud.placed()}
+        assert "newcomer" in now and "word29" not in now
+        # Most stayed put, or took just the small step towards the middle that closes up gaps.
+        mid = cloud.rect().toRectF().center()
+        assert sum(math.dist(was[k].toTuple(), now[k].toTuple()) <= cloud.PULL * math.dist(was[k].toTuple(), mid.toTuple()) + 1
+                   for k in now if k in was) > 20
+        drawn = {w.word: w for w in cloud._shown.values()}
+        assert cloud._anim.state() == (QVariantAnimation.State.Running if on else QVariantAnimation.State.Stopped)
+        if on:  # the first frame: as before, the new word not there yet and the one going still fully there
+            assert drawn["newcomer"].alpha == 0 and drawn["word29"].alpha == 1 and drawn["word29"].shown == 0
+            assert drawn["word2"].was == 0.5 and drawn["word2"].lean == -0.8  # its colour fades across
+            cloud._anim.setCurrentTime(cloud.MOVE_MS // 2)
+            assert 0 < drawn["newcomer"].alpha < 1 and 0 < drawn["word29"].alpha < 1
+            cloud.repaint()  # a frame mid-way draws the pictures of the words
+            cloud._anim.setCurrentTime(cloud.MOVE_MS)
+            app.processEvents()
+        drawn = {w.word: w for w in cloud._shown.values()}
+        assert set(drawn) == set(now)  # the word that went is gone
+        assert all(abs(w.x - now[k].x()) < 1e-6 and abs(w.y - now[k].y()) < 1e-6 and w.alpha == 1
+                   and w.size == w.px for k, w in drawn.items())
+        cloud.close()
+
+
+def test_a_narrow_cloud_shrinks_its_longest_most_used_words_rather_than_leaving_them_out():
+    QApplication.instance() or QApplication([])
+    cloud = WordCloud()
+    cloud.resize(150, 560)  # the Words page beside its meanings card, on a small window
+    cloud.set_words([("festival", 2, 0.5), ("harbour", 2, 0.0), ("grinding", 2, -0.5)]
+                    + [(w, 1, 0.0) for w in ("tonight", "parking", "awful", "library")])
+    placed = cloud.placed()
+    assert {word for _, word, *_ in placed} == {"festival", "harbour", "grinding", "tonight", "parking", "awful",
+                                                 "library"}
+    assert all(cloud.rect().toRectF().contains(b) for b, *_ in placed)
 
 
 def test_a_big_recount_runs_on_a_thread_and_keeps_rows_added_meanwhile(monkeypatch):
@@ -222,3 +277,35 @@ def test_a_word_set_while_its_subreddit_is_fetched_is_rescored_again_after(windo
     w._rescore_after_fetch()
     assert len(started) == 2
     app.processEvents()
+
+
+def test_moving_the_span_keeps_the_words_both_spans_share_where_they_are(window, monkeypatch):
+    """Ame: the cloud should move fluidly "not just when you scrape but when you move around the timeline"."""
+    w, app = window, QApplication.instance()
+    w.show()
+    w.show_page("words")
+    app.processEvents()
+    page = w.words_page.body
+    was = {word: box.center().toTuple() for box, word, *_ in page.placed()}
+    page.repaint()
+    w.overview.timeline.presets["1w"].click()  # the newest week: the first post and its comment
+    w._apply_span()  # what the tables and the cloud do once the span settles
+    now = {word: box.center().toTuple() for box, word, *_ in page.placed()}
+    mid = page.rect().toRectF().center().toTuple()
+    assert set(now) == {"harbour", "festival", "tonight", "lights", "lovely"}
+    # Each stayed put, or took at most a small step towards the middle (closing up the gaps words left).
+    assert all(math.dist(was[k], now[k]) <= 0.15 * math.dist(was[k], mid) + 1 for k in now), (was, now)
+
+    # A recount too big to do at once, and the clouds shown again meanwhile (as a fetch's refresh does): the
+    # words stay up, faded, until it's done, rather than the cloud emptying and filling again from nothing.
+    monkeypatch.setattr(WordTally, "THREAD_FROM", 1)
+    w.overview.timeline.presets["All"].click()
+    w._apply_span()
+    w._render_words()
+    assert not w.word_tally.ready and page.busy
+    assert {word for _, word, *_ in page.placed()} == set(now) and page._dimming.target == page.BUSY_DIM
+    end = time.monotonic() + 10
+    while not w.word_tally.ready:
+        assert time.monotonic() < end
+        app.processEvents()
+    assert not page.busy and page._dimming.target == 1.0 and "library" in {word for _, word, *_ in page.placed()}
