@@ -1342,7 +1342,10 @@ def test_a_count_that_keeps_timing_out_doesnt_hold_up_a_download(env, monkeypatc
     cov = w.coverage
     row = next(r for r, d in enumerate(cov.days) if d < coverage.today() - DAY
                and any(d <= p["created_utc"] < d + DAY for p in env.archive.posts if p["subreddit"] == "Python"))
-    QTest.mouseClick(cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    # An uncounted day's Download all now waits for its count, so the same download is started as its button
+    # would once enabled: what's checked here is that the count's back-offs don't hold up a download.
+    assert not cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)).isEnabled()
+    cov._download_day(cov.days[row])
     wait_idle(w)
     paths = env.archive.paths()
     assert SEARCH in paths and paths.count(AGG) == 1  # done within the count's first 2 s pause, not after it
