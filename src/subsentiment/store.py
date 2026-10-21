@@ -5,14 +5,17 @@ import csv
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 from contextlib import contextmanager
+from operator import attrgetter, itemgetter
 from pathlib import Path
 
 import zstandard
 
+from subsentiment.analysis import words_in
 from subsentiment.reddit import Comment, Post, is_image_post
 from subsentiment.sentiment import Lexicon
 
@@ -105,6 +108,18 @@ SETTLE = 2 * 86400  # a day is packed once it's this old: scores have settled, s
 _ZSTD_LEVEL = 12
 
 
+# How many of post p's comments are saved, and whether its whole thread is (1 or 0): as the comment downloader
+# leaves it, so Download coverage offers no more for it. That's a post with no comments, one whose "Download all"
+# read its thread to the end (kind "comments" in the complete table), one read to the end before the archive
+# counted its comments ("comments_so_far", until it has), and one with as many saved as the archive counts.
+SAVED_COMMENTS = "(SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id)"
+WHOLE_THREAD = (  # IFNULL: an uncounted post (num_comments NULL) would make "= 0" and ">=" NULL
+    "IFNULL(p.num_comments = 0 "
+    "OR EXISTS (SELECT 1 FROM complete k WHERE k.kind = 'comments' AND k.subreddit = lower(p.subreddit) AND k.key = p.id) "
+    "OR (p.num_comments IS NULL AND EXISTS (SELECT 1 FROM complete k WHERE k.kind = 'comments_so_far' "
+    "AND k.subreddit = lower(p.subreddit) AND k.key = p.id)) "
+    f"OR (p.num_comments > 0 AND {SAVED_COMMENTS} >= p.num_comments), 0)")
+
 # Comments on image posts are hidden along with the posts (``c`` is the comments table).
 NOT_IMAGE = "c.post_id NOT IN (SELECT id FROM posts WHERE image = 1)"
 
@@ -117,6 +132,88 @@ def scoring_at_least(rows, min_score: int | None) -> list:
     if min_score is None:
         return rows
     return [r for r in rows if r["score"] is not None and r["score"] >= min_score]
+
+
+class Row(tuple):
+    """A saved post or comment as the window holds it: a tuple, read by column name (``r["body"]``) or, much
+    quicker, as an attribute (``r.body``). With hundreds of thousands of comments saved, a tuple each takes about
+    a third of the memory a dict each did. ``keys()`` and ``dict(r)`` give the columns the store reads."""
+    __slots__ = ()
+    COLUMNS: tuple[str, ...] = ()
+    _at: dict[str, int] = {}
+
+    def __getitem__(self, key):
+        if key.__class__ is str:
+            i = self._at.get(key)
+            if i is not None:
+                return tuple.__getitem__(self, i)
+            if key in self.COLUMNS:  # worked out when read (a comment's permalink)
+                return getattr(self, key)
+            raise KeyError(key)
+        return tuple.__getitem__(self, key)
+
+    # The rest of a mapping's ways, so a row stands in for the dicts the window held before.
+    def __iter__(self):
+        return iter(self.COLUMNS)
+
+    def __len__(self) -> int:
+        return len(self.COLUMNS)
+
+    def __contains__(self, key) -> bool:
+        return key in self.COLUMNS
+
+    def keys(self) -> tuple[str, ...]:
+        return self.COLUMNS
+
+    def items(self):
+        return ((c, self[c]) for c in self.COLUMNS)
+
+    def values(self):
+        return (self[c] for c in self.COLUMNS)
+
+    def _replace(self, **changes) -> Row:
+        """This row with some of its fields changed (a new score, say)."""
+        return tuple.__new__(type(self), [changes.pop(f, v) for f, v in zip(self._fields, tuple.__iter__(self))])
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def column(rows: list, key: str):
+    """Every row's ``key``, quickly: a saved row (`Row`) is read as an attribute and an sqlite3.Row by position,
+    both far quicker than by name."""
+    kinds = set(map(type, rows))
+    if len(kinds) == 1 and issubclass(next(iter(kinds)), Row):  # rows a fetch adds can be dicts
+        return map(attrgetter(key), rows)
+    if kinds == {sqlite3.Row}:
+        return map(itemgetter(rows[0].keys().index(key)), rows)
+    return map(itemgetter(key), rows)
+
+
+class PostRow(Row, namedtuple("_Post", POST_COLUMNS + ("words",))):
+    """``words``: the words its title and text use (analysis.words_in), when read for the word cloud; else None."""
+    __slots__ = ()
+    COLUMNS = POST_COLUMNS
+    _at = {c: i for i, c in enumerate(POST_COLUMNS)}
+
+
+class CommentRow(Row, namedtuple("_Comment", COMMENT_COLUMNS[:9] + ("link",) + COMMENT_COLUMNS[10:]
+                                 + ("post_title", "post_score", "post_link", "words"))):
+    """``link`` is the permalink as saved, mostly None: rebuilt then from its post's (``post_link``), as read.
+    ``words``: as a post's, of its body."""
+    __slots__ = ()
+    COLUMNS = COMMENT_COLUMNS + ("post_title", "post_score")
+    _at = {c: i for i, c in enumerate(COMMENT_COLUMNS[:9] + ("link",) + COMMENT_COLUMNS[10:]
+                                      + ("post_title", "post_score")) if c != "link"}
+
+    @property
+    def permalink(self) -> str | None:
+        if self.link is not None or self.post_link is None:
+            return self.link
+        return self.post_link + self.id + "/"
 
 
 def _unpack(blob: bytes) -> dict:
@@ -309,8 +406,9 @@ class Store:
             self._compact()
         return done
 
-    def _pack(self, kind: str, sub: str, day: int, cached: bool = True) -> dict[str, list]:
-        """One day's packed text, as {id: [values of PACKED[kind]]}; {} if there's no pack."""
+    def _pack(self, kind: str, sub: str, day: int, cached: bool = True, keep: bool = True) -> dict[str, list]:
+        """One day's packed text, as {id: [values of PACKED[kind]]}; {} if there's no pack. Unless ``keep``, a
+        pack read is not kept for the next read (a whole subreddit's, which would keep its text twice)."""
         key = (kind, sub, day)
         row = self.db.execute("SELECT packed_at FROM packs WHERE kind = ? AND subreddit = ? AND day = ?", key).fetchone()
         if row is None:
@@ -323,6 +421,8 @@ class Store:
         data = _unpack(self.db.execute("SELECT data FROM packs WHERE kind = ? AND subreddit = ? AND day = ?", key).fetchone()[0])
         rows = data["rows"] if data["columns"] == list(PACKED[kind]) else {  # packed with other columns
             i: [dict(zip(data["columns"], v)).get(c) for c in PACKED[kind]] for i, v in data["rows"].items()}
+        if not keep:
+            return rows
         with Store._packs_lock:
             Store._packs[self.path, *key] = (row[0], rows)
             while len(Store._packs) > 512:  # about a year of days of a subreddit or two
@@ -354,6 +454,74 @@ class Store:
                     r["permalink"] = post["permalink"] + r["id"] + "/"
             for k in ("post_packed", "post_sub", "post_created"):
                 r.pop(k, None)
+        return out
+
+    def rows(self, kind: str, subreddit: str, since: float | None = None, words: bool = False) -> list[Row]:
+        """Every saved post or comment (``kind``) of a subreddit as `Row`s, oldest first; or with ``since``, those
+        saved at or after it, in the order they were saved (what a running fetch has added). Strings many rows
+        share (a comment's post id and title, its author) are kept once. With ``words``, each row's text is split
+        into the words the word cloud counts (``Row.words``), once, here: the window reads a big subreddit on a
+        thread, and splitting 650,000 comments took longer than reading them."""
+        if kind == "posts":
+            cols = ", ".join(POST_COLUMNS)
+            sql = (f"SELECT {cols}, packed, NULL, NULL, NULL, NULL, NULL, NULL FROM posts "
+                   "WHERE subreddit = ? COLLATE NOCASE AND image = 0")
+        else:
+            cols = ", ".join("c." + c for c in COMMENT_COLUMNS)
+            sql = (f"SELECT {cols}, c.packed, p.id, p.title, p.score, p.permalink, p.packed, "
+                   "CAST(p.created_utc / 86400 AS INTEGER) FROM comments c LEFT JOIN posts p ON p.id = c.post_id "
+                   "WHERE c.subreddit = ? COLLATE NOCASE AND " + NOT_IMAGE)
+        sql += " AND fetched_at >= ? ORDER BY fetched_at" if since is not None else " ORDER BY created_utc"
+        if kind == "comments":
+            sql = sql.replace(" fetched_at", " c.fetched_at").replace(" created_utc", " c.created_utc")
+        cur = self.db.cursor()
+        cur.row_factory = None
+        columns = POST_COLUMNS if kind == "posts" else COMMENT_COLUMNS
+        n, text_at = len(columns), [columns.index(c) for c in PACKED[kind]]
+        created_at, author_at, sub_at = columns.index("created_utc"), columns.index("author"), columns.index("subreddit")
+        lower, bulk = subreddit.lower(), since is None
+        shared: dict = {}  # each string many rows share, once
+        packs: dict[str, dict] = {"posts": {}, "comments": {}}  # by kind, the days' packs read so far
+        posts: dict[str, tuple] = {}  # a comment's post: (its id, title, permalink), once each
+
+        def pack(k: str, day: int) -> dict:
+            got = packs[k].get(day)
+            if got is None:
+                if bulk and k == kind and len(packs[k]) > 4:  # rows come a day at a time: done with the others
+                    packs[k].clear()
+                got = packs[k][day] = self._pack(k, lower, day, keep=not bulk)
+            return got
+
+        out = []
+        make, cls, share, intern = tuple.__new__, PostRow if kind == "posts" else CommentRow, shared.setdefault, sys.intern
+        # Read as it goes rather than all at once, so what each row is read into is let go of meanwhile.
+        for r in cur.execute(sql, (subreddit, *([since] if since is not None else []))):
+            values = list(r[:n])
+            if r[n]:  # its text is in its day's pack
+                text = pack(kind, int(r[created_at] // 86400)).get(r[0])
+                if text:
+                    for i, v in zip(text_at, text):
+                        values[i] = v
+            values[author_at], values[sub_at], values[-2] = (  # -2: the label
+                share(values[author_at], values[author_at]), share(values[sub_at], values[sub_at]),
+                share(values[-2], values[-2]))
+            if kind == "comments":
+                post = posts.get(values[1])
+                if post is None:
+                    title, link = r[n + 2], r[n + 4]
+                    if r[n + 5]:  # the post's text is in its own day's pack: title, selftext, author, permalink
+                        title, _, _, link = (pack("posts", r[n + 6]).get(r[n + 1]) or (title, None, None, link))[:4]
+                    post = posts[values[1]] = (values[1], title, link)
+                values[1] = post[0]
+                if post[2] is not None and values[9] == post[2] + values[0] + "/":  # rebuilt as read instead
+                    values[9] = None
+                values += (post[1], r[n + 3], post[2])
+            if words:
+                text = values[5] if kind == "comments" else f"{values[2] or ''} {values[3] or ''}"
+                values.append(tuple(map(intern, words_in(text or ""))))
+            else:
+                values.append(None)
+            out.append(make(cls, values))
         return out
 
     def _saved_at(self) -> float:
@@ -462,10 +630,10 @@ class Store:
 
     def comment_coverage(self, subreddit: str, after: float, before: float) -> list[sqlite3.Row]:
         """Saved posts created in [after, before), newest first, each with saved_comments (how many of
-        its comments are saved) beside the post's own num_comments."""
+        its comments are saved) beside the post's own num_comments, and whole (see WHOLE_THREAD)."""
         return self._unpacked("posts", self.db.execute(
             "SELECT p.id, p.subreddit, p.title, p.num_comments, p.score, p.created_utc, p.permalink, p.packed, "
-            "(SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS saved_comments "
+            f"{SAVED_COMMENTS} AS saved_comments, {WHOLE_THREAD} AS whole "
             "FROM posts p WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? "
             "AND p.image = 0 ORDER BY p.created_utc DESC", (subreddit, after, before)))
 
@@ -476,6 +644,15 @@ class Store:
             "WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? GROUP BY c.post_id",
             (subreddit, after if after is not None else float("-inf"),
              before if before is not None else float("inf"))).fetchall())
+
+    def whole_threads_per_day(self, subreddit: str, after: float, before: float) -> dict[int, tuple[int, int]]:
+        """Per UTC day in [after, before), {day start: (posts whose comment threads are saved whole, saved
+        posts)}, image posts left out as in posts_per_day. Counted in SQL: no post is read."""
+        rows = self.db.execute(
+            f"SELECT CAST(p.created_utc / 86400 AS INTEGER) * 86400 d, COUNT(*) n, SUM({WHOLE_THREAD}) whole "
+            "FROM posts p WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? "
+            "AND p.image = 0 GROUP BY d", (subreddit, after, before))
+        return {r["d"]: (r["whole"], r["n"]) for r in rows}
 
     def posts_by_ids(self, ids) -> list[sqlite3.Row]:
         ids = list(ids)
@@ -517,27 +694,19 @@ class Store:
         return sum(p.stat().st_size for p in (self.path, self.path.with_name(self.path.name + "-wal"))
                    if p.exists())
 
-    def posts(self, subreddit: str) -> list[sqlite3.Row]:
-        return self._unpacked("posts", self.db.execute(
-            "SELECT * FROM posts WHERE subreddit = ? COLLATE NOCASE AND image = 0 ORDER BY created_utc DESC",
-            (subreddit,)))
+    def posts(self, subreddit: str) -> list[Row]:
+        """A subreddit's saved posts, newest first."""
+        return self.rows("posts", subreddit)[::-1]
 
-    def posts_since(self, subreddit: str, ts: float) -> list[sqlite3.Row]:
-        """Posts saved at or after ``ts``, oldest first: what a running fetch has added."""
-        return self._unpacked("posts", self.db.execute(
-            "SELECT * FROM posts WHERE subreddit = ? COLLATE NOCASE AND fetched_at >= ? AND image = 0 "
-            "ORDER BY fetched_at",
-            (subreddit, ts)))
+    def posts_since(self, subreddit: str, ts: float) -> list[Row]:
+        """Posts saved at or after ``ts``, in the order they were saved: what a running fetch has added."""
+        return self.rows("posts", subreddit, ts, words=True)
 
-    def comments_since(self, subreddit: str, ts: float) -> list[sqlite3.Row]:
-        return self._unpacked("comments", self.db.execute(
-            _COMMENT_SELECT + " WHERE c.subreddit = ? COLLATE NOCASE AND c.fetched_at >= ? AND " + NOT_IMAGE + " ORDER BY c.fetched_at",
-            (subreddit, ts)))
+    def comments_since(self, subreddit: str, ts: float) -> list[Row]:
+        return self.rows("comments", subreddit, ts, words=True)
 
-    def comments(self, subreddit: str) -> list[sqlite3.Row]:
-        return self._unpacked("comments", self.db.execute(
-            _COMMENT_SELECT + " WHERE c.subreddit = ? COLLATE NOCASE AND " + NOT_IMAGE + " ORDER BY c.created_utc DESC",
-            (subreddit,)))
+    def comments(self, subreddit: str) -> list[Row]:
+        return self.rows("comments", subreddit)[::-1]
 
     def notes(self, subreddit: str) -> dict[int, tuple[str, str]]:
         """A subreddit's timeline notes, as {day start: (label, description)}."""
