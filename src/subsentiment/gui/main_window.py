@@ -464,6 +464,7 @@ class MainWindow(QMainWindow):
         self.rescore.rescored.connect(self._on_rescored)
         self.rescore.progress.connect(self.words_page.meanings.show_progress)
         self.rescore.finished.connect(self.words_page.meanings.show_progress)
+        self.rescore.scored.connect(self.words_page.meanings.show_result)
         self.rescore.finished.connect(self._on_rescore_finished)
         self.rescore.failed.connect(self.words_page.meanings.show_failed)
         self._set_mid_fetch: set[str] = set()  # words set in the subreddit a fetch is saving, scored again after it
@@ -1131,8 +1132,9 @@ class MainWindow(QMainWindow):
         words = [] if busy and self._words_for != self.current else self.word_tally.top(kinds, 150)
         if not busy:
             self._words_for = self.current
-        self.overview.words.set_words(words[:50], busy)
-        self.words_page.body.set_words(words, busy)  # placed only once it shows
+        meant = self.store.lexicon(self.current).weights if self.current else {}
+        self.overview.words.set_words(words[:50], busy, meant)
+        self.words_page.body.set_words(words, busy, meant)  # placed only once it shows
 
     def _show_notes(self) -> None:
         notes = self.store.notes(self.current) if self.current else {}
@@ -1160,6 +1162,7 @@ class MainWindow(QMainWindow):
         sub = self.words_page.meanings.subreddit
         if sub:
             self.store.save_word(sub, word, weight)
+            self._render_words()  # hovering it in the clouds tells what it's set to
             # The rows on screen are all there is of it, unless a score filter or a running fetch leaves some out.
             fetching = self.fetch_job.busy and self.request is not None and self.request.subreddit.lower() == sub.lower()
             if fetching:  # it may be saving items scored the old way as this runs
