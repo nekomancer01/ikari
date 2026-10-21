@@ -386,3 +386,56 @@ def test_the_result_counts_only_what_the_setting_changes_and_old_scores_apart(tm
     finally:
         w.close()
         QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
+
+
+@pytest.mark.parametrize("processes", [True, False], ids=["in other processes", "where they can't run"])
+def test_a_big_rescore_is_scored_a_chunk_at_a_time_in_other_processes(tmp_path, monkeypatch, processes):
+    """Ame's r/classicwow had 31,497 items using "dungeon", which took minutes to score on the window's own
+    thread. Chunks go to worker processes instead; where those can't start, every item is still scored here."""
+    from subsentiment.gui import worker, words
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("subsentiment-test")
+    app.setApplicationName(tmp_path.name)
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path / "cfg"))
+    QSettings().setValue("updates/auto", False)
+    monkeypatch.setattr(words.Rescore, "CHUNK", 4)
+    if not processes:
+        def refuse(*a, **k):
+            raise OSError("no processes here")
+        monkeypatch.setattr(worker, "ProcessPoolExecutor", refuse)
+    s = Store(tmp_path / "w.db")
+    day = 1_700_000_000.0
+    texts = [f"Grinding {what} today" for what in ("is fun", "again", "is awful", "for hours", "the boss", "sucks",
+                                                    "with friends", "is broken", "forever", "is great", "alone")]
+    texts += ["Library reopened today", "The weather is lovely"]
+    for i, title in enumerate(texts):
+        s.save_post(Post(f"p{i}", "town", title, "", "a", 1, 0.9, 0, day - i * 3600, "https://r", ""), *sentiment.score(title))
+    s.commit()
+    s.close()
+    w = mw.MainWindow(str(tmp_path / "w.db"))
+    pooled = []
+    w.rescore.pool.scored.connect(lambda tag, results: pooled.append(len(results)))
+    try:
+        w.show()
+        w._refresh_datasets("town")
+        meanings = w.words_page.meanings
+        meanings.pick("grinding")
+        meanings.rows["grinding"].set(-1.0)  # as if dragged there: no wait for a slider moved with the keys
+        meanings._save(meanings.rows["grinding"])
+        end = time.monotonic() + 60
+        while w.rescore.running():
+            assert time.monotonic() < end
+            app.processEvents()
+            time.sleep(0.01)
+        set_to = sentiment.Lexicon({"grinding": -1.0})
+        assert {r["id"]: r["label"] for r in w.store.posts("town")} == {
+            f"p{i}": set_to.score(t)[1] for i, t in enumerate(texts)}
+        assert sorted(pooled) == ([3, 4, 4] if processes else [])  # back in any order
+        assert w.rescore.pool._pool is None  # its processes end once it's done
+        changes = sum(1 for t in texts[:11] if set_to.score(t)[1] != sentiment.score(t)[1])
+        assert meanings.rows["grinding"].result.full_text() == f"✓ {changes} of 11 saved items changed label"
+    finally:
+        w.close()
+        QSettings.setDefaultFormat(QSettings.Format.NativeFormat)

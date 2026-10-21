@@ -2,7 +2,10 @@
 the network, and long Python work on the GUI thread a slice at a time (`Slices`)."""
 from __future__ import annotations
 
+import multiprocessing
+import os
 import time
+from concurrent.futures import CancelledError, Future, ProcessPoolExecutor
 from typing import Callable, Iterator
 
 import requests
@@ -11,6 +14,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from subsentiment import collect
 from subsentiment.arctic_shift import ArcticShiftClient, RateLimiter
 from subsentiment.reddit import FetchError
+from subsentiment.sentiment import Lexicon
 from subsentiment.analysis import Analysis
 from subsentiment.store import Store, scoring_at_least
 
@@ -64,6 +68,56 @@ class Slices(QObject):
         done = self._done
         self.stop()
         done()
+
+
+class ScorePool(QObject):
+    """Scores texts by a subreddit's words in other processes, one per spare core: long scoring then neither
+    holds up the window (a thread would, by the interpreter lock) nor waits for room between its frames. The
+    processes start at the first ``submit`` and end at ``close``. ``scored`` brings (tag, [(score, label,
+    label without the words)]) back on the GUI thread, or ``failed`` the tag of texts they couldn't score."""
+
+    scored = Signal(object, object)
+    failed = Signal(object)
+    _done = Signal(object, object)  # from the pool's own thread: tag, future
+
+    WORKERS = max(1, min(8, (os.cpu_count() or 2) - 1))
+
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+        self._pool: ProcessPoolExecutor | None = None
+        self._done.connect(self._settle)
+
+    def submit(self, tag, weights: dict[str, float], words: frozenset[str], texts: list[str]) -> None:
+        try:
+            if self._pool is None:
+                self._pool = ProcessPoolExecutor(self.WORKERS, mp_context=multiprocessing.get_context("spawn"))
+            future = self._pool.submit(Lexicon.compare, weights, words, texts)
+        except Exception:  # no processes here (a broken pool, or none allowed): the caller scores them itself
+            self.close()
+            QTimer.singleShot(0, lambda: self.failed.emit(tag))
+            return
+        future.add_done_callback(lambda f: self._send(tag, f))
+
+    def close(self) -> None:
+        """End the processes, dropping what they haven't started on."""
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pool = None
+
+    def _send(self, tag, future: Future) -> None:
+        try:
+            self._done.emit(tag, future)
+        except RuntimeError:  # the window has closed
+            pass
+
+    def _settle(self, tag, future: Future) -> None:
+        try:
+            results = future.result()
+        except (Exception, CancelledError):  # cancelled too: one failing ends the others, which are then scored apart
+            self.close()
+            self.failed.emit(tag)
+        else:
+            self.scored.emit(tag, results)
 
 
 class FetchWorker(QObject):
