@@ -231,19 +231,19 @@ class RowsModel(QAbstractTableModel):
         in. The view keeps its place."""
         where = {r["id"]: i for i, r in enumerate(self.rows)} if rows else {}
         key_of = self._key_of(self._sort[0]) if self._sort is not None else None
-        added, changed = [], False
+        added, changed, moved = [], False, False
         for r in rows:
             i = where.get(r["id"])
             if i is None:
                 added.append(r)
             elif self.rows[i] != r:
                 self.rows[i] = r
-                if key_of is not None:
-                    self._keys[i] = key_of(r)
+                if key_of is not None and (k := key_of(r)) != self._keys[i]:
+                    self._keys[i], moved = k, True
                 changed = True
         if changed:
             self.dataChanged.emit(self.index(0, 0), self.index(len(self.rows) - 1, len(self.columns) - 1))
-        self._insert(added, resort=changed)  # an updated score can move a row
+        self._insert(added, resort=moved)  # an updated score can move a row; a new label alone, sorted by date, can't
 
     def append_rows(self, rows: list) -> int:
         """Add rows not shown yet, each fading in from now; returns how many were new."""

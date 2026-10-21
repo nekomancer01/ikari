@@ -28,7 +28,9 @@ class Model:
         self.vader_w: list[list[float]] = data["vader_weights"]  # per class, one weight per vader feature
         self.bias: list[float] = data["bias"]
 
-    def probabilities(self, cleaned: str, vader: list[float]) -> dict[str, float]:
+    def probabilities(self, cleaned: str, vader: list[float], shift: float = 0.0) -> dict[str, float]:
+        """P(class) for cleaned text; ``shift`` raises the positive logit and lowers the negative one by that
+        much (a subreddit's own word meanings, sentiment.Lexicon)."""
         counts: dict[str, int] = {}
         for t in tokens(cleaned):
             if t in self.vocab:
@@ -39,6 +41,7 @@ class Model:
         for k in range(len(self.classes)):
             z = self.bias[k] + sum(w * f for w, f in zip(self.vader_w[k], vader))
             z += sum(w / norm * self.vocab[t][1 + k] for t, w in weights.items())
+            z += shift * {"positive": 1, "negative": -1}.get(self.classes[k], 0)
             logits.append(z)
         m = max(logits)
         exps = [math.exp(z - m) for z in logits]

@@ -629,6 +629,39 @@ def test_read_spans_merge_and_go_with_the_subreddit(tmp_path):
     s.close()
 
 
+def test_word_meanings_are_kept_per_subreddit(tmp_path):
+    s = Store(tmp_path / "w.db")
+    s.save_word("Linux", "  Kill ", 0.0)
+    s.save_word("linux", "big shot", 3)  # kept within -1..1
+    s.save_word("Deltarune", "kill", -1)
+    assert s.words("LINUX") == {"big shot": 1.0, "kill": 0.0}
+    assert s.lexicon("linux").score("kill the process")[1] == "neutral"
+    assert s.lexicon("deltarune").score("kill the process")[1] == "negative"
+    s.save_word("linux", "kill", None)
+    assert s.words("linux") == {"big shot": 1.0}
+    assert s.lexicon("linux").score("kill the process")[1] == "negative"  # read again once changed
+    s.delete_subreddit("Linux")
+    assert s.words("linux") == {} and s.words("deltarune") == {"kill": -1.0}
+    s.close()
+    assert Store(tmp_path / "w.db").words("deltarune") == {"kill": -1.0}
+
+
+def test_import_brings_word_meanings_keeping_the_one_saved_last(tmp_path, monkeypatch):
+    from subsentiment import store as store_mod
+    when = iter([100.0, 200.0, 300.0])
+    monkeypatch.setattr(store_mod.time, "time", lambda: next(when))
+    mine, theirs = Store(tmp_path / "mine.db"), Store(tmp_path / "theirs.db")
+    mine.save_word("linux", "kill", -1.0)  # 100
+    theirs.save_word("linux", "kill", 0.0)  # 200
+    theirs.save_word("linux", "zombie", 0.5)  # 300
+    theirs.close()
+    monkeypatch.undo()
+    assert mine.lexicon("linux").score("kill the process")[1] == "negative"
+    mine.import_from(tmp_path / "theirs.db")
+    assert mine.words("linux") == {"kill": 0.0, "zombie": 0.5}
+    assert mine.lexicon("linux").score("kill the process")[1] == "neutral"
+
+
 def test_deleting_days_forgets_them_whole_and_leaves_other_days_and_subreddits_as_they_were(tmp_path):
     s = Store(tmp_path / "x.db")
     d0 = 1_700_000_000 // 86400 * 86400
