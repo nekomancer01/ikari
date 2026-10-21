@@ -474,6 +474,9 @@ def test_fetching_another_subreddit_shows_it_as_it_downloads(env, saved_before):
     assert w.fetch_job.busy, "the fetch should still be running"
     assert w.current.lower() == "python"
     assert w.posts_tab.model.rowCount() > 2 * saved_before
+    # Stopped, as the delay above is for: the rest of the month at half a second a request took 24 s of
+    # wait_idle's 30 on Linux, and longer on a Windows runner.
+    QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
     wait_idle(w)
 
 
