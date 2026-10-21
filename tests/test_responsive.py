@@ -183,8 +183,8 @@ def test_a_theme_switch_restyles_only_the_window_and_fades_two_pictures(window, 
     w, app = window, QApplication.instance()
     monkeypatch.setattr(motion, "_os_allows", True)
     monkeypatch.setattr(motion, "_wanted", True)
-    w.show_page("timeline")
-    until(lambda: w.timeline_page.isVisible())
+    w.show_page("overview")
+    until(lambda: w.overview.timeline.isVisible())
     w._set_theme("dark")  # the first switch in a run sets the app's style; the app has done so at start
     until(lambda: not motion.fading(w))
     sheet, style = app.styleSheet(), app.style()

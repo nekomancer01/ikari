@@ -324,12 +324,11 @@ def test_clicking_a_week_zooms_in_to_its_days_and_shows_its_notes(window, monkey
     assert tl.view == (week[0], week[1])
 
 
-def test_the_timeline_page_shows_the_same_notes_and_adds_them_too(window):
+def test_the_overview_timeline_shows_saved_notes_and_adds_them(window):
     w = window()
     w._save_note("Python", SAVED[10], "OV", "from the overview")
-    w.show_page("timeline")
     pump(50)
-    tl = w.timeline_page.body
+    tl = w.overview.timeline
     assert tl.notes == {SAVED[10]: ("OV", "from the overview")}
     QTest.mouseClick(tl.presets["1m"], Qt.MouseButton.LeftButton)
     QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=dot(tl, SAVED[-3]))
@@ -337,7 +336,7 @@ def test_the_timeline_page_shows_the_same_notes_and_adds_them_too(window):
     QTest.keyClicks(dialog.tag, "TL")
     QTest.mouseClick(dialog.save, Qt.MouseButton.LeftButton)
     pump(50)
-    assert w.overview.timeline.notes == tl.notes == {SAVED[10]: ("OV", "from the overview"), SAVED[-3]: ("TL", "")}
+    assert tl.notes == {SAVED[10]: ("OV", "from the overview"), SAVED[-3]: ("TL", "")}
 
 
 def test_a_range_button_keeps_the_latest_days_when_the_days_shown_change(window):
