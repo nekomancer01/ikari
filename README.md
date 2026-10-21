@@ -42,13 +42,6 @@ for Windows and Linux (macOS runs from source, not released for now).</p>
   <tr>
     <td width="50%" valign="top">
       <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/timeline-dark.png">
-        <img alt="Timeline page: mean sentiment per day with post counts and a range slider" src="docs/timeline-light.png">
-      </picture>
-      <p align="center"><sub><b>Timeline</b>: mean sentiment per day; drag the slider to pick the range for every page</sub></p>
-    </td>
-    <td width="50%" valign="top">
-      <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/words-dark.png">
         <img alt="Words page: a word cloud coloured by sentiment" src="docs/words-light.png">
       </picture>

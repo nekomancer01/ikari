@@ -20,7 +20,7 @@ from subsentiment.gui import days, motion, native, theme
 from subsentiment.gui.coverage import CoveragePage
 from subsentiment.gui.fetch_form import FetchForm
 from subsentiment.gui.charts import NoteDialog, TimelineChart
-from subsentiment.gui.overview import CardPage, OverviewPage, WordsPage
+from subsentiment.gui.overview import OverviewPage, WordsPage
 from subsentiment.gui.words import KINDS, Rescore, WordTally
 from subsentiment.gui.rail import DRAWERS, PAGES, NavRail
 from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
@@ -197,7 +197,7 @@ class MainWindow(QMainWindow):
         self.span: tuple[float, float] | None = None
         self._preset: str | None = "All"
         self._table_days: tuple[int, int] | None = None  # the whole days the tables were filtered to
-        self._following = False  # the timelines are being given new days
+        self._following = False  # the timeline is being given new days
         self._known: dict[str, set[str]] = {}  # ids already in _saved and _analysis, once a running fetch is counted in
         # The last few subreddits shown, (_saved, _analysis) by (name, score filter), with what the saved-data list
         # said of each then (posts, comments, last fetched): switching back to one needn't read and count it again.
@@ -208,7 +208,7 @@ class MainWindow(QMainWindow):
         # so a change applies on next launch.
         self._native_backdrop = native.prepare_window(self, self.settings.value("ui/backdrop", "gradient", str))
         self._shown = False
-        self._counted = Analysis()  # what the Overview and Timeline show
+        self._counted = Analysis()  # what the Overview shows
         self.mood = theme.MoodTint(self, self.settings.value("ui/mood_tint", True, bool))
         motion.set_enabled(not self.settings.value("ui/reduce_motion", False, bool))
 
@@ -402,10 +402,10 @@ class MainWindow(QMainWindow):
 
         self.heading = ElidedLabel("No data yet", "heading")
         self.subheading = ElidedLabel(NO_DATA, "subtitle")
-        # What the Overview and Timeline count.
+        # What the Overview counts.
         self.scope = mark(ShrinkingComboBox(), "pill", True)
         self.scope.addItems(SCOPES)
-        self.scope.setToolTip("Count posts, comments or both on the Overview and Timeline")
+        self.scope.setToolTip("Count posts, comments or both on the Overview and Words")
         saved = self.settings.value("ui/overview_scope", SCOPES[0], str)
         self.scope.setCurrentIndex(max(self.scope.findText(saved), 0))
         self.scope.currentTextChanged.connect(self._on_scope_changed)
@@ -432,7 +432,7 @@ class MainWindow(QMainWindow):
         header.setHorizontalSpacing(12)
         header.setVerticalSpacing(2)
         header.addWidget(self.heading, 0, 0, Qt.AlignmentFlag.AlignVCenter)
-        # The scope shows on the Overview and Timeline only; a row keeps the score filter at the right edge
+        # The scope shows on the Overview and Words only; a row keeps the score filter at the right edge
         # without a hidden column's spacing.
         controls = QHBoxLayout()
         controls.setSpacing(12)
@@ -449,12 +449,8 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.content = content
         self.overview = OverviewPage()
-        timeline = TimelineChart()
-        self.timeline_page = CardPage("Mean sentiment per day (UTC)", timeline, timeline.toolbar)
-        self.timelines = (self.overview.timeline, timeline)
-        for chart in self.timelines:
-            chart.note_requested.connect(self._edit_note)
-            chart.view_changed.connect(partial(self._on_view_changed, chart))
+        self.overview.timeline.note_requested.connect(self._edit_note)
+        self.overview.timeline.view_changed.connect(self._on_view_changed)
         self.words_page = WordsPage()
         self.word_tally = WordTally(self)
         self._words_for = None  # the subreddit whose words the clouds show
@@ -479,7 +475,7 @@ class MainWindow(QMainWindow):
         post_col.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
         post_col.resizeSection(4, 180)
         self.coverage = CoveragePage(self)
-        self.page_widgets = {"overview": self.overview, "timeline": self.timeline_page, "words": self.words_page,
+        self.page_widgets = {"overview": self.overview, "words": self.words_page,
                              "posts": self.posts_tab, "comments": self.comments_tab, "coverage": self.coverage}
         for key in PAGES:
             self.pages.addWidget(self.page_widgets[key])
@@ -499,13 +495,11 @@ class MainWindow(QMainWindow):
             motion.crossfade(self.content)  # first: the old page's look
         self.rail.set_page(key)
         self.pages.setCurrentWidget(self.page_widgets[key])
-        self.scope.setVisible(key in ("overview", "timeline", "words"))
+        self.scope.setVisible(key in ("overview", "words"))
         self.score_pick.setVisible(key != "coverage")
         self.comment_score_pick.setVisible(key != "coverage")  # Download coverage counts every saved post
         self.settings.setValue("ui/page", key)
-        if key == "timeline":  # kept up only while it shows
-            self._show_span(self.timeline_page.body)
-        elif key == "words":
+        if key == "words":
             self._render_words()
 
     def set_drawer(self, key: str) -> None:
@@ -972,7 +966,7 @@ class MainWindow(QMainWindow):
         _, self._saved, self._analysis = loaded
         self._known = {}
         self._last_fetched = max((r["fetched_at"] for r in self._saved["posts"]), default=None)
-        # The span remembered for it, shown on the timelines once they have its days.
+        # The span remembered for it, shown on the timeline once they have its days.
         self.span, self._preset = days.load_range(self.settings, name)
         self._render_overview(restore=True)
         if self.isVisible() and sum(map(len, self._saved.values())) >= self.LOAD_THREAD_FROM:
@@ -1014,11 +1008,9 @@ class MainWindow(QMainWindow):
                 return name
         return lowered
 
-    def _on_view_changed(self, chart: TimelineChart) -> None:
-        """A timeline was zoomed, dragged or set to a range button: every page now counts its span."""
-        for other in self._kept_up():
-            if other is not chart:
-                self._show_span(other, chart)
+    def _on_view_changed(self) -> None:
+        """The timeline was zoomed, dragged or set to a range button: every page now counts its span."""
+        chart = self.overview.timeline
         if (chart.view, chart.preset) == (self.span, self._preset):
             return
         self.span, self._preset = chart.view, chart.preset
@@ -1027,12 +1019,13 @@ class MainWindow(QMainWindow):
         self._render_span(moving=True)
         self._span_settled.start()
 
-    def _show_span(self, chart: TimelineChart, like: TimelineChart | None = None) -> None:
-        """Show the counted days on ``chart`` and the span ``like`` shows, else the span every page counts,
-        without telling the window of it again."""
+    def _show_span(self) -> None:
+        """Show the counted days on the timeline and the span every page counts, without telling the window
+        of it again."""
+        chart = self.overview.timeline
         chart.blockSignals(True)
         chart.set_points(self._counted.daily_means)
-        chart.show_span(*((like.view, like.preset) if like else (self.span, self._preset)))
+        chart.show_span(self.span, self._preset)
         chart.blockSignals(False)
 
     def _span_settle(self) -> None:
@@ -1091,27 +1084,22 @@ class MainWindow(QMainWindow):
         self._render_words()
 
     def _render_overview(self, restore: bool = False) -> None:
-        """Show every saved day on the timelines, and the span's days on the tiles and distribution. With
-        restore, the timelines show the span the window holds (another subreddit's, as remembered)."""
+        """Show every saved day on the timeline, and the span's days on the tiles and distribution. With
+        restore, the timeline shows the span the window holds (another subreddit's, as remembered)."""
         scope = self.scope.currentText()
         self._counted = Analysis.combined(
             *[self._analysis[k] for k, skip in (("posts", "Comments only"), ("comments", "Posts only")) if scope != skip])
-        for chart in self._kept_up():
-            if restore:
-                self._show_span(chart)
-            else:  # a fetch adding days can move a span that ends on the latest day: _on_view_changed follows it
-                self._following = True
-                try:
-                    chart.set_points(self._counted.daily_means)
-                finally:
-                    self._following = False
+        chart = self.overview.timeline
         if restore:
-            self.span, self._preset = self.overview.timeline.view, self.overview.timeline.preset
+            self._show_span()
+            self.span, self._preset = chart.view, chart.preset
+        else:  # a fetch adding days can move a span that ends on the latest day: _on_view_changed follows it
+            self._following = True
+            try:
+                chart.set_points(self._counted.daily_means)
+            finally:
+                self._following = False
         self._render_span(ease=restore)
-
-    def _kept_up(self) -> list[TimelineChart]:
-        """The Overview's timeline, and the Timeline page's while it shows."""
-        return [c for c in self.timelines if c is self.overview.timeline or c.isVisible()]
 
     def _render_span(self, moving: bool = False, ease: bool = False) -> None:
         """The tiles and distribution for the span's days. The background's tint (eased to another subreddit's)
@@ -1139,8 +1127,7 @@ class MainWindow(QMainWindow):
 
     def _show_notes(self) -> None:
         notes = self.store.notes(self.current) if self.current else {}
-        for chart in self.timelines:
-            chart.set_notes(notes)
+        self.overview.timeline.set_notes(notes)
 
     def _edit_note(self, day: int) -> None:
         """Add, change or remove the note on a day the timeline's dot was clicked on."""
