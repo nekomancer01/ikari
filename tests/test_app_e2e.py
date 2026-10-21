@@ -18,7 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QSettings, QSize, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QLabel, QMessageBox  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton  # noqa: E402
 
 from subsentiment import arctic_shift  # noqa: E402
 from subsentiment.gui import coverage, days  # noqa: E402
@@ -950,6 +950,51 @@ def test_coverage_counts_a_subreddit_picked_while_another_is_being_counted(env):
     assert all(d in cov.totals["rust"] for d in cov.days)
 
 
+def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
+    # A day still being counted read "0 saved" with Download all live, as if there were nothing to fetch or
+    # it could be fetched blind. Until its count is in it shows a throbber and can't be downloaded, alone or
+    # ticked; today (never counted) and complete days (no count needed) stay usable throughout.
+    w = env.window()
+    fetch(w, comments=False)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
+    complete = env.store().complete_keys("posts", "python")
+    env.archive.clear()
+    env.archive.delays[AGG] = 1.5
+    w.coverage_act.trigger()
+    pump(200)
+    cov = w.coverage
+    assert cov.count_job.busy
+
+    def rows():
+        for row, day in enumerate(cov.days):
+            yield day, cov.day_table.cellWidget(row, 1), cov.day_table.cellWidget(row, 2).findChild(QPushButton)
+
+    waiting = []
+    for day, cell, button in rows():
+        if day >= coverage.today() or str(day) in complete:
+            assert button.isEnabled() and not cell.bar.waiting, day
+        else:
+            assert cell.bar.waiting and cell.side.text() == "counting…" and not button.isEnabled(), day
+            waiting.append(day)
+    done = [d for d in cov.days if str(d) in complete]
+    assert waiting and done
+    cov._tick(done[0], True)
+    assert cov.download_ticked.isEnabled()  # a complete day can be checked again at once
+    cov._tick(waiting[0], True)
+    assert not cov.download_ticked.isEnabled()
+    end = time.monotonic() + 15
+    while cov.count_job.busy and time.monotonic() < end:
+        pump(20)
+    pump(50)
+    totals = cov.totals["python"]
+    assert not any(cell.bar.waiting for _, cell, _ in rows())
+    # Every day with posts to look for can be downloaded now; only past days the archive has none for can't.
+    assert all(button.isEnabled() == (totals.get(day) != 0 or str(day) in complete or day == cov.days[0])
+               for day, _, button in rows())
+    assert cov.download_ticked.isEnabled()
+    assert set(env.archive.paths()) == {AGG}  # waiting downloaded nothing
+
+
 def test_coverage_follows_a_change_of_date_range_in_the_sidebar(env):
     w = env.window()
     fetch(w, comments=False)
@@ -1297,7 +1342,10 @@ def test_a_count_that_keeps_timing_out_doesnt_hold_up_a_download(env, monkeypatc
     cov = w.coverage
     row = next(r for r, d in enumerate(cov.days) if d < coverage.today() - DAY
                and any(d <= p["created_utc"] < d + DAY for p in env.archive.posts if p["subreddit"] == "Python"))
-    QTest.mouseClick(cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    # An uncounted day's Download all now waits for its count, so the same download is started as its button
+    # would once enabled: what's checked here is that the count's back-offs don't hold up a download.
+    assert not cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)).isEnabled()
+    cov._download_day(cov.days[row])
     wait_idle(w)
     paths = env.archive.paths()
     assert SEARCH in paths and paths.count(AGG) == 1  # done within the count's first 2 s pause, not after it
