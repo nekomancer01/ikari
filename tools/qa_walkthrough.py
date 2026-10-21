@@ -134,9 +134,9 @@ def timed_commit(self):
     local["commit_secs"] += time.perf_counter() - t
 
 
-def timed_score(text):
+def timed_score(*a, **k):  # score(text, scorer) passes the scorer along
     t = time.perf_counter()
-    out = _score(text)
+    out = _score(*a, **k)
     local["scores"] += 1
     local["score_secs"] += time.perf_counter() - t
     return out
