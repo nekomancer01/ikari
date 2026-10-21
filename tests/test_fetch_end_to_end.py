@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from subsentiment import arctic_shift  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
+from subsentiment.gui import tables  # noqa: E402
 from subsentiment.gui import worker  # noqa: E402
 from subsentiment.reddit import Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
@@ -117,6 +118,12 @@ def test_rows_arrive_one_by_one_fading_in_and_only_for_the_fetched_posts(tmp_pat
         assert fading >= 1  # rows were mid-fade while they arrived
         comment_requests = [q["link_id"] for path, q in server if path == "/api/comments/tree"]
         assert len(comment_requests) == 30 and not any(i.startswith("old") for i in comment_requests)
+        # Once the last rows have faded in (FADE_SECONDS from when they came), nothing keeps running. Comments now
+        # finish soon after the posts, so the posts' fade can still be going when the fetch ends.
+        settle = time.time() + tables.FADE_SECONDS + 1
+        while (w._live.isActive() or w._drip.isActive() or w.posts_tab.model._fade.isActive()) and time.time() < settle:
+            app.processEvents()
+            time.sleep(0.01)
         assert not (w._live.isActive() or w._drip.isActive() or w.posts_tab.model._fade.isActive())
         assert len(w.store.posts("Python")) == 40 and len(w.store.comments("Python")) == 90  # every post in range
     finally:

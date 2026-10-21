@@ -642,13 +642,13 @@ def test_requests_still_start_no_faster_than_the_limiter_allows():
     limiter = RateLimiter(0.02)
     real_wait, grab = limiter.wait, threading.Lock()
 
-    def wait(should_stop=None):
+    def wait(should_stop=None, share=1.0):
         # When the limiter let each request go, by its own clock. Timing anything after that also counts how
         # late the OS ran each worker thread, which on a busy machine (the suite runs in parallel) bunches
         # two together. The lock keeps another grant from moving _next before it's read.
         with grab:
-            real_wait(should_stop)
-            starts.append(limiter._next - limiter.interval)
+            real_wait(should_stop, share)
+            starts.append(limiter._next - limiter.interval * share)
 
     limiter.wait = wait
     ArcticShiftClient(session=SlowServer(items, delay=0.05), limiter=limiter, workers=4).fetch_posts(
