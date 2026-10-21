@@ -805,7 +805,7 @@ class CoveragePage(VerticalScrollArea):
             rows.sort(key=lambda r: -max(r["num_comments"] or 0, r["saved_comments"]))
         complete = store.complete_keys("comments", self.subreddit)
         so_far = store.complete_keys("comments_so_far", self.subreddit)
-        self.posts_title.setText(f"Posts on {day_text(day)} · {len(rows):,}")
+        self.posts_title.setText(f"Posts on {short_day(day)} · {len(rows):,}")
         ids = [r["id"] for r in rows]
         if ids != self._post_ids:
             # A busy day has thousands of posts, and three widgets a row took seconds to build; rows get
