@@ -26,6 +26,6 @@ if __name__ == "__main__":
     loop.exec()
     print(f"frozen={getattr(sys, 'frozen', False)} took {time.perf_counter() - t:.1f}s; chunks from processes: {len(pooled)} "
           f"({sum(pooled)} items); broken={w.rescore.pool.broken}; windows open: {len(QApplication.topLevelWidgets())}; "
-          f"{m.rows[word].result.full_text()}", flush=True)
+          f"{ascii(m.rows[word].result.full_text())}", flush=True)  # (the Windows console is cp1252)
     w.close()
     raise SystemExit(0 if pooled and not w.rescore.pool.broken else 1)
