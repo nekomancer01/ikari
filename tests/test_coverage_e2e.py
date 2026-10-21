@@ -79,6 +79,8 @@ def window(tmp_path, monkeypatch):
     for i in range(3):
         s.save_post(post(f"p{i}", "Python", TODAY - (i + 1) * DAY + 500), 0.0, "neutral")
     s.save_post(post("r0", "rust", TODAY - DAY + 500), 0.0, "neutral")
+    for sub in ("Python", "rust"):  # each fetched for the past week before: the days the page lists
+        s.save_tried(sub, range(TODAY - 7 * DAY, TODAY + DAY, DAY))
     s.commit()
     s.close()
     FakeArchive.calls = []

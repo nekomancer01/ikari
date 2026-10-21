@@ -42,11 +42,9 @@ def date_edit() -> DateEdit:
 
 
 class FetchForm(QObject):
-    """The fields and their ``layout``, which the sidebar shows. Enter in a text field sends ``submitted``;
-    a change of range, a preset or a typed date, sends ``range_moved``."""
+    """The fields and their ``layout``, which the sidebar shows. Enter in a text field sends ``submitted``."""
 
     submitted = Signal()
-    range_moved = Signal()
 
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)
@@ -170,14 +168,12 @@ class FetchForm(QObject):
                 edit.setMaximumDate(today)
                 edit.setDate(date)
                 edit.blockSignals(False)
-        self.range_moved.emit()
 
     def _on_date_edited(self) -> None:
         """Typing or picking a date means a custom range."""
         self.range.blockSignals(True)
         self.range.setCurrentIndex(self.range.findData("custom"))
         self.range.blockSignals(False)
-        self.range_moved.emit()
 
     def _update_comments_enabled(self) -> None:
         self.comment_cap.set_enabled(not self._busy and self.include_comments.isChecked())

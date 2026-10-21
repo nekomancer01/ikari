@@ -20,7 +20,7 @@ from PySide6.QtCore import QPoint, QSettings, QSize, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton  # noqa: E402
 
-from subsentiment import arctic_shift  # noqa: E402
+from subsentiment import arctic_shift, collect  # noqa: E402
 from subsentiment.gui import coverage, days  # noqa: E402
 from subsentiment.gui import tables  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
@@ -106,6 +106,13 @@ def in_range(env, w, sub="Python") -> int:
     after, before = w.fetch_form.bounds()
     return len([p for p in env.archive.posts if p["subreddit"] == sub and after <= p["created_utc"] < before
                 and not p.get("removed_by_category")])
+
+
+def fetched_before(env, w, sub="python", rng="month") -> None:
+    """Record ``rng`` as asked for by an earlier fetch of ``sub``, which Download coverage then lists, without
+    downloading it all again here."""
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData(rng))
+    env.store().save_tried(sub, collect.days_in(*w.fetch_form.bounds()))
 
 
 def fetch(w, sub="python", comments=True, rng="week", timeout: float = 30, **extra):
@@ -763,7 +770,7 @@ def test_coverage_counts_a_busy_subreddit_without_downloading_anything(env, monk
     w = env.window()
     fetch(w, sub="askreddit", comments=False, rng="day")
     env.archive.clear()
-    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
+    fetched_before(env, w, "askreddit")
     cov = open_coverage(w)
     paths = set(env.archive.paths())
     assert paths == {AGG}  # only counts; the month-long count timed out and was split, never refused
@@ -935,7 +942,7 @@ def test_coverage_downloads_do_only_what_they_say(env):
 def test_coverage_keeps_its_place_while_a_download_runs(env):
     w = env.window()
     fetch(w, comments=False)
-    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
+    fetched_before(env, w)
     cov = open_coverage(w)
     last = cov.days.index(cov._shown_days()[-1])  # the oldest day listed (days with no posts at all aren't)
     cov.day_table.selectRow(last)
@@ -1020,17 +1027,51 @@ def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
     assert set(env.archive.paths()) == {AGG}  # waiting downloaded nothing
 
 
-def test_coverage_follows_a_change_of_date_range_in_the_sidebar(env):
+def test_coverage_lists_the_days_fetches_asked_for_not_the_sidebars_dates(env):
+    # It listed the Fetch drawer's dates, so it showed whatever range was typed there next, not the days the
+    # fetches before had tried and might have missed posts on.
+    w = env.window()
+    fetch(w, sub="rust", comments=False, rng="day")
+    rust_days = collect.days_in(*w.fetch_form.bounds())
+    fetch(w, comments=False)  # a week of python
+    cov = open_coverage(w)
+    week = collect.days_in(*w.fetch_form.bounds())
+    assert cov.days == week and cov.day_table.rowCount() == len(week)
+    assert "8\u00a0days fetched before" in cov.subtitle.text()
+    env.archive.clear()
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))  # dates set, nothing fetched
+    w.fetch_form.date_from.setDate(w.fetch_form.date_to.date().addDays(-2))
+    pump(500)
+    cov.refresh_saved()
+    assert cov.days == week and env.archive.paths() == []
+    # A fetch that's stopped or saves nothing still tried its days: they're listed, to download what it missed.
+    env.archive.fail(SEARCH, *[SLOW_DOWN] * 200)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    pump(300)
+    w.stop_btn.click()
+    wait_idle(w)
+    cov.refresh_saved()
+    assert cov.days == collect.days_in(*w.fetch_form.bounds()) and len(cov.days) == 31
+    rust = next(i for i in range(w.datasets.count())
+                if w.datasets.item(i).data(Qt.ItemDataRole.UserRole).lower() == "rust")
+    w.datasets.setCurrentRow(rust)  # each subreddit lists its own
+    pump(200)
+    assert cov.days == rust_days
+
+
+def test_coverage_of_data_saved_before_tried_days_were_kept_spans_the_saved_days(env):
+    # Databases from before ikari kept the days each fetch asked for: the first saved post's day to the last's.
     w = env.window()
     fetch(w, comments=False)
+    s = env.store()
+    s.db.execute("DELETE FROM complete WHERE kind IN ('posts_tried', 'posts', 'posts_read')")
+    for table in ("posts", "removed_posts"):
+        s.db.execute(f"DELETE FROM {table} WHERE created_utc >= ?", (NOW - 2 * DAY,))
+    s.commit()
+    first, last = s.db.execute("SELECT MIN(created_utc), MAX(created_utc) FROM posts").fetchone()
     cov = open_coverage(w)
-    assert len(cov.days) == 8
-    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
-    pump(500)
-    assert len(cov.days) == 31 and cov.day_table.rowCount() == 31
-    w.fetch_form.date_from.setDate(w.fetch_form.date_to.date().addDays(-2))  # typing a date: a custom range
-    pump(500)
-    assert len(cov.days) == 3
+    assert cov.days == collect.days_in(first, last + 1)
 
 
 def test_closing_the_app_while_a_coverage_count_is_out_doesnt_freeze_it(env):
@@ -1347,7 +1388,7 @@ def test_a_stopped_download_all_goes_on_from_where_it_got_to(env, monkeypatch):
     env.archive.posts += [dict(env.archive.posts[-1], id="other", created_utc=NOW - 3600)]
     w = env.window()
     fetch(w, sub="bigday", comments=False, rng="day")  # a post from today, so r/bigday is saved
-    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    fetched_before(env, w, "bigday", "week")
     cov = open_coverage(w)
     row = cov.days.index(day)
     button = lambda: cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn))  # noqa: E731
@@ -1384,7 +1425,7 @@ def test_a_count_that_keeps_timing_out_doesnt_hold_up_a_download(env, monkeypatc
     monkeypatch.setattr(arctic_shift, "MAX_WAIT", 120.0)  # the app's real back-offs
     w = env.window()
     fetch(w, comments=False, rng="day")
-    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
+    fetched_before(env, w)
     env.archive.clear()
     env.archive.fail(AGG, *[SLOW_DOWN] * 100)
     w.coverage_act.trigger()
