@@ -1145,6 +1145,30 @@ def test_a_second_fetch_into_a_shown_subreddit_ends_without_reading_it_all_back(
     assert w.overview.tiles["count"].value.text() == f"{len(store.posts('python')) + len(store.comments('python')):,}"
 
 
+def test_the_word_cloud_keeps_its_words_in_place_while_a_fetch_adds_to_them(env):
+    """Ame: the cloud "should update dynamically while you scrape instead of constantly resetting". Each refresh
+    used to lay every word out again from the middle, so all of them jumped about; now a word stays where it is
+    and only grows or shrinks, unless something bigger needs its place."""
+    w = env.window()
+    w.show_page("words")
+    env.archive.delay = 0.03  # a few refreshes of the cloud while it runs
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(True)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    cloud, shown = w.words_page.body, []
+    while w.fetch_job.busy:
+        pump(120)
+        shown.append({word: box.center() for box, word, *_ in cloud.placed()})
+    moves = []  # how far the words shown both times moved between two looks: the median, for each pair
+    for a, b in zip(shown, shown[1:]):
+        if a and a != b and set(a) & set(b):
+            d = sorted((a[k] - b[k]).manhattanLength() for k in set(a) & set(b))
+            moves.append(d[len(d) // 2])
+    assert len(moves) >= 3  # the cloud changed during the fetch
+    assert max(moves) < 15, moves  # on main the median word moved 50-200 px each time
+
+
 def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
     """Ame: "basically I just want everything to update live". The overview used to be redrawn only a second
     after a save, from the rows dripped into the tables by then, so while the fetch waited on a slow request
