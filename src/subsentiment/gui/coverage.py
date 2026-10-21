@@ -165,6 +165,34 @@ class Cell(QWidget):
         self.side.setVisible(bool(self.side.text()) and need <= room)
 
 
+class FitLabel(QLabel):
+    """A muted line that shows its short form where the long one doesn't fit: a day of thousands of posts
+    drops the word "threads" rather than run past the date's column."""
+
+    def __init__(self):
+        super().__init__()
+        theme.mark(self, "role", "muted")
+        self.forms = ("", "")
+
+    def set(self, full: str, short: str) -> None:
+        self.forms = (full, short)
+        self._fit()
+
+    def full_text(self) -> str:
+        return self.forms[0]
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, super().minimumSizeHint().height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit()
+
+    def _fit(self) -> None:
+        full, short = self.forms
+        self.setText(full if self.fontMetrics().horizontalAdvance(full) <= self.width() else short)
+
+
 def small_button(text: str) -> QPushButton:
     b = QPushButton(text)
     b.setStyleSheet("padding: 5px 12px;")
@@ -438,7 +466,7 @@ class CoveragePage(VerticalScrollArea):
                 when = QVBoxLayout()
                 when.setSpacing(0)
                 when.addWidget(QLabel(day_text(day)))
-                when.addWidget(label("", "muted"))
+                when.addWidget(FitLabel())
                 lay.addLayout(when, 1)
                 t.setCellWidget(row, 0, box)
                 t.setCellWidget(row, 1, Cell())
@@ -519,18 +547,11 @@ class CoveragePage(VerticalScrollArea):
     def _show_threads(self) -> None:
         """Each day's line under its date: how many of its saved posts have every comment saved."""
         for row, day in enumerate(self._day_rows):
-            box = self.day_table.cellWidget(row, 0)
-            line = box.findChildren(QLabel)[1]
+            line: FitLabel = self.day_table.cellWidget(row, 0).findChild(FitLabel)
             whole, posts = self._threads_on(day)
             line.setVisible(bool(posts))
-            text = f"✓ {plural(posts, 'thread')}" if whole == posts else f"{whole:,} of {plural(posts, 'thread')}"
-            # A day of thousands of posts drops the word rather than run past the date's column.
-            m = box.layout().contentsMargins()
-            room = (self.day_table.columnWidth(0) - m.left() - box.layout().spacing()
-                    - box.findChild(QCheckBox).sizeHint().width())
-            if line.fontMetrics().horizontalAdvance(text) > room:
-                text = f"✓ {posts:,}" if whole == posts else f"{whole:,} of {posts:,}"
-            line.setText(text)
+            line.set(f"✓ {plural(posts, 'thread')}" if whole == posts else f"{whole:,} of {plural(posts, 'thread')}",
+                     f"✓ {posts:,}" if whole == posts else f"{whole:,} of {posts:,}")
             line.setToolTip(f"Every comment is saved on {whole:,} of the {plural(posts, 'post')} saved from this "
                             "day. " + THREADS_TIP)
 
