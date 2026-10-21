@@ -124,7 +124,7 @@ class LoadWorker(QObject):
         try:
             store = Store(db_path)
             with store.snapshot():
-                rows = {k: SavedRows(scoring_at_least(store.rows(k, subreddit), least))
+                rows = {k: SavedRows(scoring_at_least(store.rows(k, subreddit, words=True), least))
                         for k, least in (("posts", min_post), ("comments", min_comment))}
             # Counted newest first, as Store.posts reads them: a total's last digits depend on the order it's added up in.
             self.finished.emit((self.tag, rows, {k: Analysis(reversed(v)) for k, v in rows.items()}))
