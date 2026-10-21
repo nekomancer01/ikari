@@ -533,9 +533,10 @@ class Rescore(QObject):
     rescored = Signal(str, str, object)  # subreddit (lowercased), "posts" or "comments", the rows with new scores
     progress = Signal(str, int, int)  # subreddit, items gone through, of
     finished = Signal(str)  # subreddit: every item using the words is scored again and saved
-    # Just before finished: subreddit, the words, how many items use them, and how many changed label each way
-    # ({(old label, new label): items}).
-    scored = Signal(str, object, int, object)
+    # Just before finished: subreddit, the words, how many items use them, how many labels the words changed
+    # each way ({(label without them, label with them): items}), and how many others' scores were only out of
+    # date (scored by an older version).
+    scored = Signal(str, object, int, object, int)
     failed = Signal(str, str)  # subreddit, what went wrong reading its items
 
     BATCH = 0.25  # seconds between two batches sent out
@@ -552,9 +553,10 @@ class Rescore(QObject):
         self._rows: dict[str, dict | None] = {}  # what start was given to go through, by subreddit
         self._run = 0  # counts runs, so a read for one dropped since is ignored
         self._batch: dict[str, list] = {k: [] for k in KINDS}  # rescored, not saved yet
-        # By subreddit, the items its run found using the words, and those whose label it changed (from, to):
-        # kept when a run starts again with more words, so the end tells everything it did.
-        self._tally: dict[str, tuple[set, dict]] = {}
+        # By subreddit, the items its run found using the words, those whose label the words change (without
+        # them, with them), and those it gave a new label for another reason (scored by an older version): kept
+        # when a run starts again with more words, so the end tells everything it did.
+        self._tally: dict[str, tuple[set, dict, set]] = {}
 
     def start(self, subreddit: str, words, rows: dict | None = None) -> None:
         """Rescore for ``words``; ``rows`` ({kind: rows}) are every saved post and comment of it, when the
@@ -614,7 +616,8 @@ class Rescore(QObject):
     def _steps(self, sub: str, words: set[str], rows: dict):
         """Score the items using ``words`` again, yielding after each; saved a batch at a time."""
         lexicon, uses = self.store.lexicon(sub), Lexicon(dict.fromkeys(words, 0.0)).uses
-        using, changed = self._tally.setdefault(sub, (set(), {}))
+        without = Lexicon({w: v for w, v in lexicon.weights.items() if w not in words})  # the words as usual
+        using, changed, stale = self._tally.setdefault(sub, (set(), {}, set()))
         total, done = sum(map(len, rows.values())), 0
         sent_at = committed_at = time.perf_counter()
         for kind in KINDS:
@@ -623,13 +626,15 @@ class Rescore(QObject):
                 done += 1
                 if uses(text):
                     s, label = lexicon.score(text)
+                    usual = without.score(text)[1]
                     item = (kind, r["id"])
                     using.add(item)
-                    was = changed.get(item, (r["label"],))[0]
-                    if label == was:
-                        changed.pop(item, None)
+                    if label != usual:
+                        changed[item] = (usual, label)
                     else:
-                        changed[item] = (was, label)
+                        changed.pop(item, None)
+                        if label != r["label"]:
+                            stale.add(item)
                     if (s, label) != (r["sentiment"], r["label"]):
                         self._batch[kind].append({**r, "sentiment": s, "label": label})
                         self.store.rescore(kind, [(r["id"], s, label)])
@@ -654,8 +659,8 @@ class Rescore(QObject):
         sub, words = self._doing
         self._save(sub)
         self._doing = None
-        using, changed = self._tally.pop(sub, (set(), {}))
-        self.scored.emit(sub, words, len(using), Counter(changed.values()))
+        using, changed, stale = self._tally.pop(sub, (set(), {}, set()))
+        self.scored.emit(sub, words, len(using), Counter(changed.values()), len(stale - changed.keys()))
         self.finished.emit(sub)
         self._next()
 
@@ -872,19 +877,24 @@ class WordMeanings(QWidget):
         if self.subreddit and subreddit == self.subreddit.lower():
             self.status.setText(f"Couldn't score saved items again: {message}")
 
-    def show_result(self, subreddit: str, words, using: int, changed: Counter) -> None:
+    def show_result(self, subreddit: str, words, using: int, changed: Counter, stale: int = 0) -> None:
         """Under each of ``words``, what scoring the saved items again by them did: so it shows the setting is
-        at work, even where the cloud's colours barely move (a word is coloured by the items using it)."""
+        at work, even where the cloud's colours barely move (a word is coloured by the items using it). Only
+        the labels the setting itself changes count; ``stale`` items whose label was only out of date are
+        mentioned apart."""
         if not (self.subreddit and subreddit == self.subreddit.lower()):
             return
-        several = len(words) > 1
+        it = "these words" if len(words) > 1 else "it"
         if not using:
-            text = "No saved items use " + ("these words" if several else "it") + " yet"
+            text = f"No saved items use {it} yet"
         else:
-            text = f"{using:,} saved {'item uses' if using == 1 else 'items use'} {'these words' if several else 'it'}"
             moved = sum(changed.values())
-            text += ("; no label changed" if not moved else f"; {moved:,} changed label: "
+            text = f"{using:,} saved {'item uses' if using == 1 else 'items use'} {it}. "
+            text += (f"Setting {it} changes no labels" if not moved else f"Setting {it} changes {moved:,} "
+                     + ("label" if moved == 1 else "labels") + ": "
                      + ", ".join(f"{n:,} {a} \u2192 {b}" for (a, b), n in changed.most_common(3)))
+            if stale:
+                text += f". Also updated {stale:,} scored by an older version"
         for word in words:
             row = self.rows.get(word)
             if row is not None:
