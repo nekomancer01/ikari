@@ -877,6 +877,7 @@ class _Meaning(QWidget):
     def set(self, weight: float | None) -> None:
         """Show ``weight``, or None for a word picked but not set yet."""
         self.saved = weight is not None
+        self.sent = weight  # as saved, and scored by (the slider may have moved on since)
         self.slider.blockSignals(True)
         self.slider.setValue(round((weight or 0) * 100))
         self.slider.blockSignals(False)
@@ -998,10 +999,10 @@ class WordMeanings(QWidget):
                 text = f"No saved items use {it} yet"
             elif moved:
                 text = f"\u2713 {moved:,} of {using:,} saved items changed label"
-            elif len(words) == 1 and not row.weight() and not Lexicon.known(word):
+            elif all(not self.rows[w].sent and not Lexicon.known(w) for w in words if w in self.rows):
                 # (The owner set "zenless" to Neutral, read "None of 61 changed" and took it for broken.)
-                text = (f"\u2713 No labels changed. {items} {it}, but the scorer doesn't know the word, so it "
-                        "already read as neutral.")
+                text = (f"\u2713 No labels changed. {items} {it}, but the scorer doesn't know "
+                        f"{'them' if len(words) > 1 else 'the word'}, so it already read as neutral.")
             else:
                 text = (f"\u2713 No labels changed. {items} {it}, but the setting wasn't enough to move any of "
                         "them to another label.")

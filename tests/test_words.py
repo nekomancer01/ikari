@@ -504,7 +504,7 @@ def test_a_setting_that_changes_no_label_says_why():
     neither scorer knows the word, so it read as neutral already."""
     app = QApplication.instance() or QApplication([])
     meanings = WordMeanings()
-    meanings.set_subreddit("ZZZ", {"zenless": 0.0, "wow": 0.0, "great": 0.3})
+    meanings.set_subreddit("ZZZ", {"zenless": 0.0, "hoyo": 0.0, "wow": 0.0, "great": 0.3})
     meanings.show_result("zzz", {"zenless"}, 61, Counter())
     meanings.show_result("zzz", {"wow"}, 1, Counter())
     meanings.show_result("zzz", {"great"}, 4, Counter({("neutral", "positive"): 2}))

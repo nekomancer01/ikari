@@ -117,3 +117,9 @@ def test_a_word_neither_scorer_knows_set_to_neutral_changes_no_score():
     for text in texts:
         assert lex.score(text) == pytest.approx(sentiment.score(text), abs=1e-9), text
         assert lex.score(text, "vader") == pytest.approx(sentiment.score(text, "vader"), abs=1e-9), text
+
+
+def test_a_set_word_keeps_its_meaning_next_to_punctuation_and_in_a_sarcastic_frame():
+    assert sentiment.Lexicon({"grind": 1.0}).score("the grind-heavy content", "vader")[1] == "positive"
+    assert sentiment.Lexicon({"crashes": 1.0}).score("gotta love when the game crashes")[1] == "positive"
+    assert sentiment.Lexicon.known(":)") and sentiment.Lexicon.known("wow") and not sentiment.Lexicon.known("zenless")
