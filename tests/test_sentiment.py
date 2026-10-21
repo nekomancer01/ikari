@@ -69,3 +69,28 @@ def test_a_post_of_many_short_lines_scores_quickly():
     sentiment.score(" \n" * 20000)  # 40,000 characters, the most a Reddit post holds
     assert time.perf_counter() - start < 0.5  # over a second before
     assert sentiment.score("great point\n> this is awful and terrible\n")[0] > 0  # quotes still ignored
+
+
+def test_a_subreddits_own_word_meanings_change_its_labels():
+    linux = sentiment.Lexicon({"kill": 0.0, "Big  Shot": 1.0})
+    assert sentiment.score("kill the process and restart it")[1] == "negative"  # its usual meaning
+    assert linux.score("kill the process and restart it")[1] == "neutral"  # means nothing here
+    assert sentiment.Lexicon({"kill": 0.6}).score("kill the process and restart it")[1] == "positive"
+    assert linux.score("Spamton is a BIG SHOT!")[1] == "positive"  # phrases, any case and spacing
+    assert linux.score("he is not a big shot")[1] == "negative"  # "not" still turns it round
+    assert linux.score("he is not a big shot", "vader")[1] == "negative"
+
+
+def test_text_without_a_set_word_scores_as_before():
+    lex = sentiment.Lexicon({"kill": 1.0, "shot": -1.0})
+    for text in ("I love this, it's amazing!", "This is terrible and I hate it.", "killer app", "big shots", ""):
+        assert lex.score(text) == sentiment.score(text)
+        assert lex.score(text, "vader") == sentiment.score(text, "vader")
+    assert sentiment.Lexicon().score("kill it") == sentiment.score("kill it")
+
+
+def test_set_words_count_inside_sarcasm_and_odd_letters_too():
+    lex = sentiment.Lexicon({"kill": 1.0, "stuff": 1.0})
+    assert lex.score("gotta love when you kill the process")[1] == "positive"  # not sarcasm: "kill" is good here
+    assert lex.score("gotta love when the game crashes")[1] == "negative"  # still sarcasm
+    assert lex.score("this ſtuff is here")[1] == "positive"  # the search's case folding finds "stuff"

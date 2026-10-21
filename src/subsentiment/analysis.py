@@ -22,20 +22,24 @@ class Analysis:
         self.days: dict[int, list] = {}  # day start (UTC) -> [sum of scores, count, {label: count}]
         self.add(rows)
 
-    def add(self, rows) -> None:
+    def add(self, rows, sign: int = 1) -> None:
+        """Count ``rows`` in, or with ``sign`` -1 take rows counted before back out (a rescored row is taken out
+        as it was and counted in as it is)."""
         counts, days = self.counts, self.days
         for r in rows:
             if r["created_utc"] is None:  # no day to count it on
                 continue
-            s = r["sentiment"]
-            counts[r["label"]] += 1
+            s = r["sentiment"] * sign
+            counts[r["label"]] += sign
             self.total += s
             bucket = days.get(day := int(r["created_utc"] // 86400 * 86400))
             if bucket is None:
                 bucket = days[day] = [0.0, 0, dict.fromkeys(LABELS, 0)]
             bucket[0] += s
-            bucket[1] += 1
-            bucket[2][r["label"]] += 1
+            bucket[1] += sign
+            bucket[2][r["label"]] += sign
+            if not bucket[1]:  # every row of the day taken out
+                del days[day]
 
     @classmethod
     def combined(cls, *parts: Analysis, days: tuple[int, int] | None = None) -> Analysis:
