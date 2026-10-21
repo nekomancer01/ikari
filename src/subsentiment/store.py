@@ -471,7 +471,7 @@ def _pack_all(path: str) -> None:
     except Exception:  # noqa: BLE001 - split them here
         pool = None
     try:
-        store.pack_settled(vacuum=False, split=pool)
+        store.pack_settled(vacuum=False, split=pool, old=True)
         store.drop_rebuilt_links()
     finally:
         if pool is not None:
@@ -513,9 +513,8 @@ class Store:
             if "packed" not in {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN packed INTEGER NOT NULL DEFAULT 0")
                 self.db.commit()
-            # The rows a RowIndex reads one by one: those whose numbers aren't in their day's pack.
-            self.db.execute(f"CREATE INDEX IF NOT EXISTS {table}_unpacked ON {table}(subreddit COLLATE NOCASE, "
-                            "created_utc) WHERE packed != 1")
+            if fresh:  # an older database gets it from Store.upgrade, on its thread
+                self._index_unpacked(table)
         for column in {"cols", "words"} - {r["name"] for r in self.db.execute("PRAGMA table_info(packs)")}:
             self.db.execute(f"ALTER TABLE packs ADD COLUMN {column} BLOB")
         self.db.commit()
@@ -599,6 +598,8 @@ class Store:
         and packed next time."""
         self = cls(path)
         try:
+            for table in PACKED:
+                self._index_unpacked(table)
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
             if version not in (1, 2):
                 return
@@ -613,7 +614,7 @@ class Store:
                 os.replace(part, backup)
             rows = self.db.execute("SELECT (SELECT COUNT(*) FROM posts) + (SELECT COUNT(*) FROM comments)").fetchone()[0]
             if rows < 50_000 or not self._pack_elsewhere(stop):
-                self.pack_settled(vacuum=False, stop=stop)
+                self.pack_settled(vacuum=False, stop=stop, old=True)
                 self.drop_rebuilt_links()
             if self._left_to_pack():
                 return  # stopped, or some day couldn't be packed: carried on at the next start
@@ -625,6 +626,12 @@ class Store:
             pass
         finally:
             self.close()
+
+    def _index_unpacked(self, table: str) -> None:
+        """The rows a RowIndex reads one by one: those whose numbers aren't in their day's pack."""
+        self.db.execute(f"CREATE INDEX IF NOT EXISTS {table}_unpacked ON {table}(subreddit COLLATE NOCASE, "
+                        "created_utc) WHERE packed != 1")
+        self.db.commit()
 
     def drop_rebuilt_links(self) -> None:
         """Clear the permalinks comments were saved with that are their post's plus their id, as they're rebuilt
@@ -657,7 +664,8 @@ class Store:
             if stop is not None and stop.is_set():
                 worker.terminate()
                 worker.join()
-        return True
+                return True
+        return worker.exitcode == 0  # one that failed (a build missing a module, say): packed here instead
 
     def _left_to_pack(self) -> int:
         """Settled rows not packed yet, and packs saved before packs had their rows' numbers."""
@@ -671,12 +679,12 @@ class Store:
         return ((now if now is not None else time.time()) - SETTLE) // 86400 * 86400
 
     def pack_settled(self, now: float | None = None, vacuum: bool = True, stop: threading.Event | None = None,
-                     split: ProcessPoolExecutor | None = None) -> int:
+                     split: ProcessPoolExecutor | None = None, old: bool = False) -> int:
         """Pack every settled day that has rows not packed yet (ones saved since the day was last packed, or
         never packed), rows whose scores were set since (packed 2), or a pack saved in the format before
-        frames. Each day is one transaction: the new pack is checked to read back exactly the text it replaces
-        before the rows' copies are cleared. ``split``: worker processes to split the words in. Returns how
-        many days were packed."""
+        frames when ``old`` (Store.upgrade's, which runs it in a process of its own). Each day is one transaction:
+        the new pack is checked to read back exactly the text it replaces before the rows' copies are cleared.
+        ``split``: worker processes to split the words in. Returns how many days were packed."""
         self.db.commit()
         before = self._settled_before(now)
         days: dict[tuple, set[str]] = {}  # (kind, subreddit, day) -> ids of its rows not packed yet
@@ -685,7 +693,7 @@ class Store:
                     f"SELECT id, lower(subreddit), CAST(created_utc / 86400 AS INTEGER) FROM {kind} "
                     "WHERE packed != 1 AND created_utc < ?", (before,)):
                 days.setdefault((kind, sub, day), set()).add(i)
-            for sub, day in self.db.execute("SELECT subreddit, day FROM packs WHERE kind = ? AND cols IS NULL", (kind,)):
+            for sub, day in self.db.execute("SELECT subreddit, day FROM packs WHERE kind = ? AND cols IS NULL", (kind,)) if old else ():
                 days.setdefault((kind, sub, day), set())
         done = 0
         for (kind, sub, day), ids in sorted(days.items()):
@@ -755,8 +763,10 @@ class Store:
         self.db.execute("INSERT OR REPLACE INTO packs (kind, subreddit, day, packed_at, data, cols, words) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?)", (kind, sub, day, time.time(), blob,
                                                          DayPack.encode_cols(ids, packed_numbers), DayPack.encode_counts(*counts)))
+        # A row saved again since that isn't in ``fresh`` keeps its newer text in its row (packed 0).
         self.db.executemany(f"UPDATE {kind} SET packed = 1, {', '.join(c + ' = NULL' for c in cols)} "
-                            "WHERE id = ? AND packed != 1", [(i,) for i in ids])
+                            "WHERE id = ? AND packed = 0", [(i,) for i in new_text])
+        self.db.executemany(f"UPDATE {kind} SET packed = 1 WHERE id = ? AND packed = 2", [(i,) for i in ids])
 
     def _word_counts(self, kind, sub, ids, text, numbers, packed, new_text, old, split) -> tuple[np.ndarray, np.ndarray]:
         """A day's word counts (DayPack.word_keys) for its new pack: its old pack's, less what the rows that changed
@@ -810,7 +820,7 @@ class Store:
         """A subreddit's vocab table as {word: id}, kept while packing."""
         vocab = self._vocab.get(sub)
         if vocab is None or len(vocab) != self.db.execute(
-                "SELECT COUNT(*) FROM vocab WHERE subreddit = ?", (sub,)).fetchone()[0]:  # another connection added some
+                "SELECT COALESCE(MAX(id) + 1, 0) FROM vocab WHERE subreddit = ?", (sub,)).fetchone()[0]:  # another connection added some
             vocab = self._vocab[sub] = {w: i for i, w in self.db.execute(
                 "SELECT id, word FROM vocab WHERE subreddit = ? ORDER BY id", (sub,))}
         return vocab

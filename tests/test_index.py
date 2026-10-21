@@ -143,7 +143,8 @@ def test_a_pack_from_before_frames_is_read_until_it_is_packed_again(tmp_path):
     _same_rows(index, rows)
     assert Analysis(rows).counts == index.analysis().counts
     index.close()
-    assert s.pack_settled() == 10  # packed again in frames, with its column block
+    assert s.pack_settled() == 0  # a fetch leaves them to Store.upgrade
+    assert s.pack_settled(old=True) == 10  # packed again, with its column block
     assert s.db.execute("SELECT COUNT(*) FROM packs WHERE cols IS NULL").fetchone()[0] == 0
     _same_rows(RowIndex(path, "comments", "deltarune"), rows)
 
@@ -178,4 +179,29 @@ def test_days_packed_again_count_only_what_changed_and_still_match(saved, kind):
         assert index.top_words(None, min_score, n=40) == WordCounts.top(WordCounts(kind, chosen), n=40)
     words = {w: n for w, n, _ in index.top_words(n=10_000)}
     assert ("zebra" in words) == (kind == "comments")
+    index.close()
+
+
+def test_an_id_longer_than_every_saved_one_is_not_mistaken_for_one_it_starts_with(saved):
+    path, s = saved
+    index = RowIndex(path, "posts", "deltarune")
+    p1 = int(index.where(["p1"])[0])
+    assert p1 >= 0 and list(index.where(["p1", "p1xyzzyq", b"p1"])) == [p1, -1, p1]
+    index.close()
+
+
+def test_rows_read_after_their_day_was_packed_still_have_their_text(saved):
+    path, s = saved
+    import time as clock
+    since = clock.time()
+    s.save_comment(Comment("c6_1", "p6", "Deltarune", "t3_p6", "v1", "saved again during a fetch", 3,
+                           DAY0 + 86400 + 6 * 37 + 30, 0, "https://www.reddit.com/r/Deltarune/comments/p6/x/c6_1/"), 0.1, "positive")
+    s.commit()
+    index = RowIndex(path, "comments", "deltarune")
+    index.add(s.rows("comments", "deltarune", since=since))
+    assert index._pack_of[index.where(["c6_1"])[0]] < 0
+    s.pack_settled()  # as the fetch ends: the rows read one by one are packed now
+    expected = s.rows("comments", "deltarune")
+    assert [tuple(r)[:-1] for r in index.rows(range(len(index)))] == [tuple(r)[:-1] for r in expected]
+    assert {r.id: r.body for r in index.rows(index.where(["c6_1"]))} == {"c6_1": "saved again during a fetch"}
     index.close()

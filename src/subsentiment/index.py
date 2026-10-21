@@ -46,9 +46,8 @@ class RowIndex:
         self._wkeys = self._wn = np.zeros(0, np.int64)
         self._changes: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         self._loose: dict[bytes, np.ndarray] = {}
-        with self._snapshot():
-            parts = self._read_packs() + [self._read_rows()]
-        self._join(parts)
+        with self._snapshot():  # the vocab table and the packs' text read in _join too
+            self._join(self._read_packs() + [self._read_rows()])
         self._merge_changes()
         self._count_all()
 
@@ -287,12 +286,14 @@ class RowIndex:
         """The positions of rows with these ids (str or bytes), -1 for one not here."""
         if self._sorted_ids is None:
             self._sorted_ids = np.argsort(self.ids, kind="stable")
-        want = np.array([i.encode() if isinstance(i, str) else i for i in ids], dtype=self.ids.dtype if len(self.ids) else "S1")
-        if not len(self.ids):
+        want = [i.encode() if isinstance(i, str) else bytes(i) for i in ids]
+        if not len(self.ids) or not want:
             return np.full(len(want), -1)
-        found = np.minimum(np.searchsorted(self.ids, want, sorter=self._sorted_ids), len(self.ids) - 1)
+        fits = np.array([len(i) <= self.ids.itemsize for i in want])  # a longer one isn't here (and would be cut short)
+        cut = np.array([i if f else b"" for i, f in zip(want, fits)], dtype=self.ids.dtype)
+        found = np.minimum(np.searchsorted(self.ids, cut, sorter=self._sorted_ids), len(self.ids) - 1)
         at = self._sorted_ids[found]
-        return np.where(self.ids[at] == want, at, -1)
+        return np.where(fits & (self.ids[at] == cut), at, -1)
 
     # Words ---------------------------------------------------------------------------------------------------
 
@@ -334,17 +335,18 @@ class RowIndex:
     def _whole_pack(self, kind: str, created: float) -> dict[str, list]:
         """A whole day's pack, {id: [values of PACKED[kind]]}: for a row whose place in it isn't known."""
         key = (kind, int(created // 86400))
+        now = self.db.execute("SELECT packed_at FROM packs WHERE kind = ? AND subreddit = ? AND day = ?",
+                              (kind, self.subreddit, key[1])).fetchone()
         hit = self._whole.get(key)
-        if hit is None:
+        if hit is None or now is None or hit[0] != now[0]:  # not read yet, or packed again since
             row = self.db.execute("SELECT data FROM packs WHERE kind = ? AND subreddit = ? AND day = ?",
                                   (kind, self.subreddit, key[1])).fetchone()
-            hit = DayPack.read(row[0], self.db)["rows"] if row else {}
-            self._whole[key] = hit
+            hit = self._whole[key] = (now[0] if now else None, DayPack.read(row[0], self.db)["rows"] if row else {})
             while len(self._whole) > 8:
                 self._whole.popitem(last=False)
         else:
             self._whole.move_to_end(key)
-        return hit
+        return hit[1]
 
     def _block(self, pack: int, block: int) -> list | None:
         """A pack's keys (block -1) or one of its frames (block 0 on), as DayPack.frame_columns, read from disk the
@@ -359,9 +361,12 @@ class RowIndex:
                               (self.kind, self.subreddit, day)).fetchone()
         if row is None or row[1] != packed_at:
             return None
+        if self._heads.get(pack, ()) is None:
+            return None
         if pack not in self._heads:
             head = self._read(row[0], 0, 8)
-            if not head.startswith(DayPack.MAGIC):  # one frame of JSON: read whole
+            self._heads[pack] = None  # one frame of JSON: read whole (_whole_pack)
+            if not head.startswith(DayPack.MAGIC):
                 return None
             self._heads[pack] = DayPack.header(head + self._read(row[0], 8, int.from_bytes(head[4:8], "little")))
         head, start = self._heads[pack]
@@ -405,11 +410,11 @@ class RowIndex:
         marks = ", ".join("?" * len(ids))
         if self.kind == "posts":
             got = {r[0]: r for r in self.db.execute(
-                f"SELECT {', '.join(POST_COLUMNS)} FROM posts WHERE id IN ({marks})", ids)}
+                f"SELECT {', '.join(POST_COLUMNS)}, packed FROM posts WHERE id IN ({marks})", ids)}
         else:
             cols = ", ".join("c." + c for c in COMMENT_COLUMNS)
             got = {r[0]: r for r in self.db.execute(
-                f"SELECT {cols}, p.title, p.score, p.permalink, p.packed, p.created_utc FROM comments c "
+                f"SELECT {cols}, c.packed, p.title, p.score, p.permalink, p.packed, p.created_utc FROM comments c "
                 f"LEFT JOIN posts p ON p.id = c.post_id WHERE c.id IN ({marks})", ids)}
         columns = POST_COLUMNS if self.kind == "posts" else COMMENT_COLUMNS
         text_at = [columns.index(c) for c in PACKED[self.kind]]
@@ -419,12 +424,14 @@ class RowIndex:
             if r is None:  # deleted since
                 continue
             values = list(r[:len(columns)])
-            text = self.text(p)
-            if text is not None:
-                for k, v in zip(text_at, text):
+            if r[len(columns)]:  # its text is in its pack (packed since this index was read, if it was loose then)
+                text = self.text(p) if self._pack_of[p] != LOOSE else None
+                if text is None:
+                    text = self._whole_pack(self.kind, float(self.created[p])).get(rid)
+                for k, v in zip(text_at, text or ()):
                     values[k] = v
             if self.kind == "comments":
-                title, post_score, link, post_packed, post_created = r[len(columns):]
+                title, post_score, link, post_packed, post_created = r[len(columns) + 1:]
                 if post_packed and post_created is not None:
                     post = self._whole_pack("posts", post_created).get(values[1])
                     if post is not None:

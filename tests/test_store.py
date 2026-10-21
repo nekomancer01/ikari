@@ -780,6 +780,23 @@ def test_deleting_days_forgets_them_whole_and_leaves_other_days_and_subreddits_a
     s.close()
 
 
+def test_deleting_a_day_keeps_the_newer_text_of_a_comment_saved_again_on_a_day_it_shares(tmp_path):
+    s = Store(tmp_path / "x.db")
+    day = 1_700_000_000 // 86400 * 86400
+    s.save_post(Post("pA", "Python", "t", "", "a", 1, 0.9, 2, day - 3600, POST_LINK, ""), 0.0, "neutral")  # the day before
+    s.save_post(Post("pB", "Python", "t", "", "a", 1, 0.9, 2, day + 60, POST_LINK, ""), 0.0, "neutral")
+    for post in ("pA", "pB"):  # both comments on pB's day
+        s.save_comment(Comment("c" + post, post, "Python", f"t3_{post}", "b", "first", 1, day + 100, 0, None), 0.0, "neutral")
+    s.commit()
+    s.pack_settled()
+    s.save_comment(Comment("cpB", "pB", "Python", "t3_pB", "b", "edited", 1, day + 100, 0, None), 0.0, "neutral")
+    s.commit()
+    s.delete_days("python", [day - 86400])  # takes pA and its comment out of the comments' pack of pB's day
+    assert {r["id"]: r["body"] for r in s.comments("python")} == {"cpB": "edited"}
+    s.pack_settled()
+    assert {r["id"]: r["body"] for r in s.comments("python")} == {"cpB": "edited"}
+
+
 def test_archive_counts_are_kept_with_when_they_were_asked(tmp_path):
     s = Store(tmp_path / "s.db")
     s.save_archive_counts("Python", {86400: 5, 2 * 86400: 7}, at=1000.0)
