@@ -897,3 +897,13 @@ def test_a_narrowed_window_full_of_one_seconds_posts_isnt_called_read_to_its_end
     c._page = page
     c.fetch_posts("python", after=T0, before=T0 + 3600, limit=100, exhaust=True)
     assert not c.exhausted and c.reached == []
+
+
+def test_comment_threads_go_out_at_half_the_spacing_of_searches():
+    c = client([ok([]) for _ in range(5)])
+    for _ in range(3):
+        c.get("/api/comments/tree", {"link_id": "p1", "limit": 100}, share=arctic_shift.TREE_SHARE)
+    c.get("/api/posts/search", {"limit": 100})
+    c.get("/api/posts/search", {"limit": 100})
+    assert c.clock.sleeps == [0.5, 0.5, 0.5, 1.0]  # the first goes at once; a search after a thread waits its share
+    assert ArcticShiftClient().tree_workers == arctic_shift.TREE_WORKERS > arctic_shift.WORKERS

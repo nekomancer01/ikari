@@ -129,6 +129,7 @@ class FakeArchive:
         self.faults: dict[str, list[tuple[int, dict]]] = {}  # path -> responses to give before real ones
         self.delay = 0.0  # seconds each request takes, so a test can stop a fetch midway
         self.delays: dict[str, float] = {}  # the same for one endpoint only
+        self.in_flight = self.peak = 0  # requests being answered now, and the most at once
         self._lock = threading.Lock()
         archive = self
 
@@ -169,6 +170,16 @@ class FakeArchive:
         self.faults.setdefault(path, []).extend(responses)
 
     def answer(self, path: str, q: dict) -> tuple[int, dict, dict]:
+        with self._lock:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+        try:
+            return self._answer(path, q)
+        finally:
+            with self._lock:
+                self.in_flight -= 1
+
+    def _answer(self, path: str, q: dict) -> tuple[int, dict, dict]:
         with self._lock:
             self.requests.append((path, q))
             headers = self._spend()
