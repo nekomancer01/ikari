@@ -334,6 +334,14 @@ def test_a_download_into_a_big_subreddit_hands_its_rows_to_the_window(window, mo
         real = getattr(w.store, name)
         monkeypatch.setattr(w.store, name, lambda *a, real=real: (rows := real(*a), read.append(len(rows)))[0])
     scored_here = count_calls(monkeypatch, worker.Lexicon, "score")
+    start = worker.ThreadScorer.start
+
+    def start_and_wait(scorer):  # as on a download long enough for them to come up (seconds, on Windows)
+        start(scorer)
+        end = time.monotonic() + 60
+        while not scorer.ready and not scorer.broken and time.monotonic() < end:
+            time.sleep(0.01)
+    monkeypatch.setattr(worker.ThreadScorer, "start", start_and_wait)
     w.show_page("overview")
     shown = w.comments_tab.model.rowCount()
     try:

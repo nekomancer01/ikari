@@ -191,24 +191,42 @@ class ScorePool(QObject):
 class ThreadScorer:
     """Scores a fetch's comments, a thread at a time, in other processes, while the fetch's own thread waits without
     the interpreter lock: scored on that thread, a big thread's comments held it for most of each second, and every
-    frame of the window waited on it. A few comments are scored here, as handing them over costs more; and all of
-    them once processes can't run here, or don't answer in time. Stopped while it waits, it gives back None and the
-    thread isn't saved."""
+    frame of the window waited on it. ``start`` starts the processes as the fetch begins; until they're all up (a
+    few seconds on Windows), and for a thread of a few comments (handing them over costs more), comments are scored
+    here, so a thread never waits on them. Here too from then on once they can't run, fail or don't answer in time.
+    Stopped while it waits, it gives back None and the thread isn't saved."""
 
     LEAST = 100  # comments in a thread for it to go to the processes
     WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
-    WAIT = 30.0  # seconds the processes get to start and answer, and a millisecond more for each comment
+    WAIT = 30.0  # seconds the processes get to answer, and a millisecond more for each comment
 
     def __init__(self, should_stop=lambda: False):
         self._pool: ProcessPoolExecutor | None = None
+        self._up: list[Future] = []  # one no-op each, done once the processes have started
         self.broken = False
         self.should_stop = should_stop
 
+    def start(self) -> None:
+        try:
+            self._pool = ProcessPoolExecutor(self.WORKERS, mp_context=multiprocessing.get_context("spawn"))
+            self._up = [self._pool.submit(int) for _ in range(self.WORKERS)]
+        except Exception:  # none allowed here
+            self.broken = True
+            self.close()
+
+    @property
+    def ready(self) -> bool:
+        if self.broken or not self._up or not all(f.done() for f in self._up):
+            return False
+        if any(f.exception() for f in self._up):
+            self.broken = True
+            self.close()
+            return False
+        return True
+
     def __call__(self, lexicon: Lexicon, texts: list[str]) -> list[tuple[float, str]] | None:
-        if len(texts) >= self.LEAST and not self.broken:
+        if len(texts) >= self.LEAST and self.ready:
             try:
-                if self._pool is None:
-                    self._pool = ProcessPoolExecutor(self.WORKERS, mp_context=multiprocessing.get_context("spawn"))
                 step = -(-len(texts) // self.WORKERS)
                 parts = [self._pool.submit(Lexicon.compare, lexicon.weights, frozenset(), texts[a:a + step])
                          for a in range(0, len(texts), step)]
@@ -220,13 +238,13 @@ class ThreadScorer:
                     if time.monotonic() > give_up:
                         raise TimeoutError("the scoring processes didn't answer")
                 return [got[:2] for part in parts for got in part.result()]
-            except Exception:  # none allowed, they died or hung: scored here from now on
+            except Exception:  # they died or hung: scored here from now on
                 self.broken = True
                 self.close()
         return [lexicon.score(t) for t in texts]
 
     def close(self) -> None:
-        pool, self._pool = self._pool, None
+        pool, self._pool, self._up = self._pool, None, []
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
             for process in list((pool._processes or {}).values()):
@@ -275,6 +293,7 @@ class FetchWorker(Worker):
         self._read_to = {"posts": self.since, "comments": self.since}
         self._last: dict[str, str] = {}  # the id of the last row of each kind sent
         self._closing = threading.Event()  # the window is closing: what's left of packing waits for the next fetch
+        self._scorer = ThreadScorer(lambda: self.stopping)
 
     def _send_saved(self, store: Store) -> None:
         got = {}
@@ -294,12 +313,15 @@ class FetchWorker(Worker):
 
     def stop(self, closing: bool = False) -> None:
         super().stop()
+        self._scorer.close()  # (from any thread) its processes, left idle, would keep the app from exiting
         if closing:
             self._closing.set()
 
     def work(self) -> None:
         store = None
-        scorer = ThreadScorer(lambda: self.stopping)
+        scorer = self._scorer
+        if self.request.include_comments:
+            scorer.start()  # up by the time the posts are in
         try:
             store = Store(self.db_path)  # sqlite connections can't cross threads; opening can fail too
             result = collect.run(ArcticShiftClient(limiter=LIMITER), store, self.request,
@@ -312,7 +334,7 @@ class FetchWorker(Worker):
             LIMITER.on_wait = None  # collect.run pointed it at this worker, which is about to go
             if store is not None:
                 try:
-                    store.pack_fetched(self._closing)  # days that have settled since get their text compressed (store.PACKED)
+                    store.pack_settled(stop=self._closing)  # days that have settled since get their text compressed
                 except Exception:  # never worth failing a fetch for: the rows stay as they are, packed next time
                     pass
                 store.close()

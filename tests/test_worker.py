@@ -132,26 +132,53 @@ def test_a_background_job_runs_its_worker_off_the_gui_thread_and_tidies_up():
     assert Worker.ran_on is not threading.main_thread()
 
 
+def started(scorer):
+    scorer.start()
+    end = time.monotonic() + 60
+    while not scorer.ready:
+        assert time.monotonic() < end and not scorer.broken
+        time.sleep(0.01)
+    return scorer
+
+
 def test_a_big_threads_comments_are_scored_in_other_processes_as_they_are_here():
     from subsentiment.sentiment import Lexicon
     lexicon = Lexicon({"raid": 0.8, "nerf": -0.6})
     moods = ["was great", "is so annoying", "needs a nerf", "ok I guess", "what a raid", "not bad at all"]
     texts = [f"the raid tonight {moods[i % len(moods)]} #{i}" for i in range(worker_mod.ThreadScorer.LEAST + 50)]
-    scorer = worker_mod.ThreadScorer()
+    scorer = started(worker_mod.ThreadScorer())
     try:
-        assert scorer(lexicon, texts[:5]) == [lexicon.score(t) for t in texts[:5]] and scorer._pool is None  # here
+        handed = count_calls_on(scorer._pool, "submit")
+        assert scorer(lexicon, texts[:5]) == [lexicon.score(t) for t in texts[:5]] and not handed  # here
         got = scorer(lexicon, texts)
-        assert scorer._pool is not None and not scorer.broken
+        assert handed and not scorer.broken
     finally:
         scorer.close()
     assert got == [lexicon.score(t) for t in texts]
+
+
+def test_a_big_thread_is_scored_here_while_the_processes_are_still_starting():
+    # Waiting on them, each thread of a download waited seconds on Windows (a test download took twice as long).
+    from subsentiment.sentiment import Lexicon
+    lexicon = Lexicon({"raid": 0.8})
+    texts = [f"the raid tonight #{i}" for i in range(worker_mod.ThreadScorer.LEAST)]
+    scorer = worker_mod.ThreadScorer()
+    scorer.start()
+    try:
+        scorer._up.append(worker_mod.Future())  # one never comes up
+        handed = count_calls_on(scorer._pool, "submit")
+        assert scorer(lexicon, texts) == [lexicon.score(t) for t in texts] and not handed and not scorer.broken
+    finally:
+        scorer.close()
 
 
 def test_stop_while_a_threads_comments_are_scored_elsewhere_leaves_the_thread_unsaved():
     # Waiting on the processes, Stop (or quitting) used to wait for the whole thread's scores first.
     from subsentiment.sentiment import Lexicon
     texts = ["the raid tonight was great"] * (worker_mod.ThreadScorer.LEAST * 50)
-    scorer = worker_mod.ThreadScorer(lambda: True)
+    stop = []
+    scorer = started(worker_mod.ThreadScorer(lambda: bool(stop)))
+    stop.append(True)
     start = time.monotonic()
     try:
         assert scorer(Lexicon({"raid": 0.8}), texts) is None
@@ -159,18 +186,26 @@ def test_stop_while_a_threads_comments_are_scored_elsewhere_leaves_the_thread_un
         scorer.close()
     assert time.monotonic() - start < 10 and scorer._pool is None and not scorer.broken
 
+
 def test_scoring_processes_that_dont_answer_in_time_are_given_up_for_scoring_here(monkeypatch):
     # A pool that never answered would have held the fetch forever.
     from subsentiment.sentiment import Lexicon
     lexicon = Lexicon({"raid": 0.8})
     texts = [f"the raid tonight #{i}" for i in range(worker_mod.ThreadScorer.LEAST)]
     monkeypatch.setattr(worker_mod.ThreadScorer, "WAIT", -1.0)  # out of time at once
-    scorer = worker_mod.ThreadScorer()
+    scorer = started(worker_mod.ThreadScorer())
     try:
         assert scorer(lexicon, texts) == [lexicon.score(t) for t in texts]
     finally:
         scorer.close()
     assert scorer.broken and scorer._pool is None
+
+
+def count_calls_on(obj, name):
+    calls, real = [], getattr(obj, name)
+    setattr(obj, name, lambda *a, **k: calls.append(a) or real(*a, **k))
+    return calls
+
 
 def test_a_fetch_reads_back_what_it_saved_and_sends_it_to_the_window(monkeypatch, tmp_path):
     # The window used to read them itself: a read a row at a time, each waiting on this thread for the interpreter.

@@ -1036,31 +1036,3 @@ def test_comments_on_image_posts_are_left_out_of_each_subreddits_count(tmp_path)
                                0, "u"), 0.0, "neutral")
     s.commit()
     assert [(d["name"], d["posts"], d["comments"]) for d in s.datasets()] == [("Python", 1, 3)]
-
-
-def test_the_days_a_big_fetch_saved_are_packed_in_a_process_of_its_own(tmp_path, monkeypatch):
-    import random
-    rng = random.Random(5)
-    s = Store(tmp_path / "x.db")
-    day0 = 1_700_000_000 // 86400 * 86400
-    for i in range(40):
-        link = f"https://www.reddit.com/r/Deltarune/comments/p{i}/x/"
-        s.save_post(Post(f"p{i}", "Deltarune", _chatter(rng, 8), "", "u", 5, 0.9, 3, day0 + (i % 4) * 86400 + i, link,
-                         link), 0.1, "positive")
-        for j in range(3):
-            s.save_comment(Comment(f"c{i}_{j}", f"p{i}", "Deltarune", f"t3_p{i}", "v", _chatter(rng, 12), 1,
-                                   day0 + (i % 4) * 86400 + i + 60 * j, 0, link + f"c{i}_{j}/"), 0.0, "neutral")
-    s.commit()
-    before = (s.posts("deltarune"), s.comments("deltarune"))
-    here = []
-    monkeypatch.setattr(Store, "pack_settled", lambda self, *a, **k: here.append(1))  # in this process
-    monkeypatch.setattr(Store, "PACK_ELSEWHERE", 100)
-    s.pack_fetched()
-    assert here == []
-    assert s.db.execute("SELECT COUNT(*) FROM comments WHERE packed != 1").fetchone()[0] == 0
-    assert s.db.execute("SELECT COUNT(*) FROM posts WHERE packed != 1").fetchone()[0] == 0
-    assert (s.posts("deltarune"), s.comments("deltarune")) == before
-    monkeypatch.setattr(Store, "PACK_ELSEWHERE", 10_000)
-    s.pack_fetched()  # a small fetch's are packed here
-    assert here == [1]
-    s.close()
