@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import zstandard
 
-from subsentiment.analysis import LABELS, words_in
+from subsentiment.analysis import LABEL_AT, words_in
 from subsentiment.reddit import Comment, Post, is_image_post
 from subsentiment.sentiment import Lexicon
 
@@ -969,11 +969,10 @@ class Store:
         blob = DayPack.encode(cols, ids, text, zdict)
         if DayPack.read(blob, self.db) != {"columns": list(cols), "rows": {i: text[i] for i in ids}}:
             raise sqlite3.DatabaseError(f"{kind} of r/{sub} on day {day} wouldn't read back the same")
-        label = {lab: k for k, lab in enumerate(LABELS)}
         packed_numbers = {"created": [numbers[i][1] for i in ids],
                           "score": [NO_SCORE if numbers[i][2] is None else numbers[i][2] for i in ids],
                           "sentiment": [numbers[i][3] if numbers[i][3] is not None else 0.0 for i in ids],
-                          "label": [label.get(numbers[i][4], -1) for i in ids],
+                          "label": [LABEL_AT.get(numbers[i][4], -1) for i in ids],
                           "hidden": [int(bool(numbers[i][5])) for i in ids]}
         counts = self._word_counts(kind, sub, ids, text, packed_numbers, packed, new_text, old, split)
         self.db.execute("INSERT OR REPLACE INTO packs (kind, subreddit, day, packed_at, data, cols, words) "
@@ -1104,20 +1103,6 @@ class Store:
             for k in ("post_packed", "post_sub", "post_created"):
                 r.pop(k, None)
         return out
-
-    def day_totals(self, kind: str, subreddit: str, min_score: int | None = None) -> list[tuple]:
-        """How many of a subreddit's posts or comments (``kind``) scoring at least ``min_score`` each day has with
-        each label, and their sentiment added up: [(day start, label, items, sum)]. Counted here, where reading
-        the rows of a big subreddit to count them takes seconds (analysis.Analysis.from_days)."""
-        if kind == "posts":
-            sql = "SELECT created_utc, label, sentiment, score FROM posts WHERE subreddit = ? COLLATE NOCASE AND image = 0"
-        else:
-            sql = ("SELECT c.created_utc, c.label, c.sentiment, c.score FROM comments c "
-                   "WHERE c.subreddit = ? COLLATE NOCASE AND " + NOT_IMAGE)
-        where = "created_utc IS NOT NULL" + ("" if min_score is None else " AND score IS NOT NULL AND score >= ?")
-        return self.db.execute(
-            f"SELECT CAST(created_utc / 86400 AS INTEGER) * 86400, label, COUNT(*), SUM(sentiment) FROM ({sql}) "
-            f"WHERE {where} GROUP BY 1, 2", (subreddit, *([] if min_score is None else [min_score]))).fetchall()
 
     def rows(self, kind: str, subreddit: str, since: float | None = None, words: bool = False,
              days: tuple[float, float] | None = None) -> list[Row]:

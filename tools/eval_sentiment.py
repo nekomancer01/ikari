@@ -30,11 +30,11 @@ from sklearn.metrics import classification_report, confusion_matrix, f1_score
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from subsentiment import sentiment  # noqa: E402
+from subsentiment.analysis import LABELS  # noqa: E402
 
 BASE = "https://raw.githubusercontent.com/google-research/google-research/master/goemotions/data/"
 CACHE = Path(__file__).resolve().parent / ".cache" / "goemotions"
 ISARCASM = "https://raw.githubusercontent.com/iabufarha/iSarcasmEval/main/train/train.En.csv"
-LABELS = sentiment.LABELS
 NEUTRAL_ID = 27  # emotions.txt lists 27 emotions; id 27 is "neutral"
 
 
