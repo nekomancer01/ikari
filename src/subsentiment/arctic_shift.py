@@ -96,13 +96,13 @@ class QueryTimeout(FetchError):
 
 class _Flight:
     """A request the limiter let out, until its answer comes. ``probe``: the archive is down, and this thread is to
-    ask it the cheapest question (PROBE) instead of its own; ``outage_start`` is when the request first found the
-    archive down (None if it hasn't)."""
+    ask it the cheapest question (PROBE) instead of its own. ``since``: when the request was first asked for, which
+    its later tries pass back to RateLimiter.wait."""
 
-    def __init__(self, should_stop: StopFn | None, probe: bool = False, outage_start: float | None = None):
+    def __init__(self, should_stop: StopFn | None, since: float, probe: bool = False):
         self.should_stop = should_stop
+        self.since = since
         self.probe = probe
-        self.outage_start = outage_start
 
     def abandoned(self) -> bool:
         """The job that sent it was stopped, so nobody is waiting for its answer."""
@@ -123,9 +123,10 @@ class RateLimiter:
     ``X-RateLimit-Remaining`` on any response. Each 429 doubles the spacing (up to MAX_INTERVAL);
     successful requests ease it back to the base interval.
 
-    Down: after OUTAGE_AFTER failures in a row (5xx, no answer, one that can't be read) with nothing answered
-    between, nothing more goes out but one PROBE at a time, PROBE_WAITS apart; the first answer, to a probe or to
-    a request already out, ends it. A request that has waited OUTAGE_PATIENCE for it raises ArchiveDown. (Live, 22
+    Down: after OUTAGE_AFTER failures in a row (5xx, or no answer) with nothing answered between, nothing more
+    goes out but one PROBE at a time, PROBE_WAITS apart; the first answer, to a probe or to a request already out,
+    ends it. Once it has been down OUTAGE_PATIENCE, a request waiting raises ArchiveDown as soon as a probe sent
+    since it began has failed: so every job ends together, and one started later asks once first. (Live, 22
     Oct 03:14 UTC: every request, even the smallest, answered HTTP 500 for over ten minutes; each request used to
     hold everything back 5 s, 10 s, ... 120 s, eight times, before failing.)
 
@@ -153,9 +154,10 @@ class RateLimiter:
         self._budget_known = False  # the server has sent X-RateLimit-Remaining at least once
         self._answered = False  # any answer has arrived yet
         self._failures = 0  # requests failed in a row, across every job
-        self._down: tuple[float, str] | None = None  # (wall time, what came back) since the archive is down
+        self._down: tuple[float, str, float] | None = None  # since it's down: (wall time, what came back, clock time)
         self._probes = 0  # probes that failed since
         self._probe_at = 0.0  # when the next may go
+        self._probe_failed = float("-inf")  # when the last one failed
         self._probing = False  # one is out
 
     @property
@@ -163,36 +165,35 @@ class RateLimiter:
         return self._down is not None
 
     def down_text(self) -> str:
-        since, what = self._down or (self._wall(), "")
+        since, what, _ = self._down or (self._wall(), "", 0.0)
         return f"Arctic Shift isn't answering ({what} since {time.strftime('%H:%M', time.localtime(since))})"
 
-    def wait(self, should_stop: StopFn | None = None, share: float = 1.0, outage_start: float | None = None) -> _Flight:
+    def wait(self, should_stop: StopFn | None = None, share: float = 1.0, since: float | None = None) -> _Flight:
         """Block until a request may go out, and count it as in flight until ``observe`` or ``done``
         (given what this returns). Raises Stopped, sending nothing, if ``should_stop`` turns true meanwhile.
         ``share`` is how much of the spacing the request takes up: less for a light one (see TREE_SHARE).
-        While the archive is down, the flight returned may be a probe (see the class); ``outage_start`` is when
-        this request first found it down, and once it has waited OUTAGE_PATIENCE since, ArchiveDown is raised."""
-        announced = None  # the (until, why) last announced
+        While the archive is down, the flight returned may be a probe (see the class), and ArchiveDown is raised
+        once it has been down too long (see the class): ``since`` is when this request was first asked for."""
+        announced = False
         with self._lock:
+            since = self._clock() if since is None else since
             while True:
                 if should_stop and should_stop():
                     raise Stopped
                 now = self._clock()
                 if self._down is not None:
-                    outage_start = now if outage_start is None else outage_start
-                    if now - outage_start >= OUTAGE_PATIENCE:
-                        if announced and self.on_wait:
-                            self.on_wait(0.0, "")
+                    long = now - self._down[2] >= OUTAGE_PATIENCE
+                    if long and self._probe_failed >= since:
                         raise ArchiveDown(f"{self.down_text()}. What was downloaded is kept; try again once "
                                           "it's back.")
-                    if not self._probing and now >= self._probe_at:
+                    due = max(self._next, now if long and self._probe_failed < since else self._probe_at)
+                    if not self._probing and now >= due:
                         self._probing = True
-                        return _Flight(should_stop, probe=True, outage_start=outage_start)
-                    left = max(self._probe_at - now, STOP_POLL)
-                    if self.on_wait and announced != (self._probe_at, self._down):
-                        self.on_wait(left, self.down_text())
-                        announced = (self._probe_at, self._down)
-                    self._rest(min(left, STOP_POLL if should_stop else 1.0))
+                        return _Flight(should_stop, since, probe=True)
+                    if not self._probing and self.on_wait and self._announced != due:  # once for each probe
+                        self._announced = due
+                        self.on_wait(due - now, self.down_text())
+                    self._rest(STOP_POLL if should_stop else 1.0)
                     continue
                 if self._budget is not None and now >= self._budget_until:
                     self._budget = None  # the window reset; the next answer gives the new budget
@@ -207,9 +208,9 @@ class RateLimiter:
                     self._budget = None
                 delay = self._next - now
                 if delay > 0:
-                    if delay >= 3 and self.on_wait and announced is None:
+                    if delay >= 3 and self.on_wait and not announced:
                         self.on_wait(delay, self._reason)
-                        announced = (self._next, None)
+                        announced = True
                     chunk, slot = (min(delay, STOP_POLL) if should_stop else delay), self._next
                     self._rest(chunk)
                     if should_stop and should_stop():  # pressed during that last short wait
@@ -222,7 +223,7 @@ class RateLimiter:
                 self._next = self._clock() + self.interval * share
                 if announced and self.on_wait:
                     self.on_wait(0.0, "")  # over: the UI goes back to what the job is doing
-                flight = _Flight(should_stop, outage_start=outage_start)
+                flight = _Flight(should_stop, since)
                 self._in_flight.append(flight)
                 if self._budget is not None:
                     self._budget -= 1
@@ -288,7 +289,7 @@ class RateLimiter:
         with self._lock:
             self._failures += 1
             if self._down is None and self._failures >= OUTAGE_AFTER:
-                self._down, self._probes, self._probing = (self._wall(), what), 0, False
+                self._down, self._probes, self._probing = (self._wall(), what, self._clock()), 0, False
                 self._probe_at = self._clock() + PROBE_WAITS[0]
             return self._down is not None
 
@@ -301,7 +302,8 @@ class RateLimiter:
             self._probing = False
             if self._down is not None:
                 self._probes += 1
-                self._probe_at = self._clock() + PROBE_WAITS[min(self._probes, len(PROBE_WAITS) - 1)]
+                self._probe_failed = self._clock()
+                self._probe_at = self._probe_failed + PROBE_WAITS[min(self._probes, len(PROBE_WAITS) - 1)]
             self._lock.notify_all()
 
     def reset_after(self, headers, default: float) -> float:
@@ -328,6 +330,7 @@ class RateLimiter:
             self._lock.notify_all()
 
     _reason = "Arctic Shift is busy"
+    _announced = None  # when the probe last announced is due
 
 
 def _number(value, default):
@@ -439,23 +442,28 @@ class ArcticShiftClient:
         * A query timeout: this request alone pauses 2 s, then 4 s, asking for smaller pages (unless ``shrink`` is
           False, for requests whose ``limit`` isn't a page size), then raises QueryTimeout for the caller to ask
           for less.
-        * A 5xx, no answer, or one that isn't the archive's JSON: this request alone tries again, 1, 2, 4 and 8 s
-          later, RETRIES times in all, then raises (the network error itself, if that's what it was). Failures
-          in a row across every request mean the archive is down: this request then waits for it to come back
-          rather than using up its tries, and raises ArchiveDown if it doesn't within OUTAGE_PATIENCE.
+        * A 5xx, or no answer: this request alone tries again, 1, 2, 4 and 8 s later, RETRIES times in all, then
+          raises (the network error itself, if that's what it was). Failures in a row across every request mean the
+          archive is down: this request then waits for it to come back rather than using up its tries, and raises
+          ArchiveDown if it doesn't within OUTAGE_PATIENCE.
+        * An answer that isn't the archive's JSON: this request alone tries again, GARBLED_TRIES times in all.
         * Any other error is raised at once: the request is wrong, and asking again won't help.
 
         ``share`` is RateLimiter.wait's."""
         params = dict(params)
         self._local.last_params = params  # what was finally sent, after any shrinking
-        timeouts = tries = garbled = 0
-        outage_start = None
+        timeouts = tries = limited = garbled = 0
+        since = None
         stop = None if getattr(self._local, "finishing", False) else self.should_stop
         while True:
-            flight = self.limiter.wait(stop, share, outage_start)
-            outage_start = flight.outage_start
+            flight = self.limiter.wait(stop, share, since)
+            since = flight.since
             if flight.probe:
-                self.limiter.probed(self._probe(flight))
+                up = False
+                try:
+                    up = self._probe(flight)
+                finally:  # whatever happened, the next probe can go
+                    self.limiter.probed(up)
                 continue
             try:
                 resp = self.session.get(BASE_URL + path, params=params, timeout=TIMEOUT)
@@ -504,31 +512,31 @@ class ArcticShiftClient:
                 if resp.status_code == 429:
                     self.limiter.ok(ease=False)  # answering, if not to this
                     self.limiter.slow_down()
-                    self.limiter.hold(self.limiter.reset_after(resp.headers, 5.0 * 2 ** min(tries, 4)),
+                    self.limiter.hold(self.limiter.reset_after(resp.headers, 5.0 * 2 ** min(limited, 4)),
                                       "Arctic Shift asked ikari to slow down")
-                    tries += 1
-                    if tries >= 2 * RETRIES:
+                    limited += 1
+                    if limited >= 2 * RETRIES:
                         raise FetchError("Arctic Shift is rate limiting. Try again in a few minutes.")
                     continue
-                if resp.status_code < 500 and isinstance(payload, dict):
+                if resp.status_code == 200 and isinstance(payload, dict):
                     self.limiter.ok(ease=False)
-                    if resp.status_code == 200:
-                        raise FetchError(f"Arctic Shift: {error}")
-                    raise FetchError(f"Arctic Shift returned HTTP {resp.status_code}" + (f": {error}" if error else "."))
-                # A 5xx, or an answer that isn't the archive's JSON: a proxy's or CDN's error page, or a body cut
-                # short. Either may be this request's own trouble, or the archive's.
-                if resp.status_code >= 500:
-                    failure, what = FetchError(f"Arctic Shift couldn't answer (HTTP {resp.status_code}). Try again "
-                                               "in a few minutes."), f"HTTP {resp.status_code}"
-                else:
+                    raise FetchError(f"Arctic Shift: {error}")
+                if resp.status_code == 200:
+                    # Not the archive's JSON: a proxy's or CDN's error page, or a body cut short. A few are retried,
+                    # then it's said what came back; it isn't the archive answering, so waiting for that won't help.
                     garbled += 1
-                    failure, what = FetchError("Arctic Shift's answers couldn't be read (something between this "
-                                               "computer and the archive may be answering instead). Try again in "
-                                               "a few minutes."), "an unreadable answer"
-            if garbled >= GARBLED_TRIES:  # what keeps answering isn't the archive: waiting won't bring it
-                raise failure
+                    if garbled >= GARBLED_TRIES:
+                        raise FetchError("Arctic Shift's answers couldn't be read (something between this computer "
+                                         "and the archive may be answering instead). Try again in a few minutes.")
+                    self.limiter.pause(2.0 * garbled, stop)
+                    continue
+                if resp.status_code < 500:  # the request is wrong: asking again won't help
+                    self.limiter.ok(ease=False)
+                    raise FetchError(f"Arctic Shift returned HTTP {resp.status_code}" + (f": {error}" if error else "."))
+                failure, what = FetchError(f"Arctic Shift couldn't answer (HTTP {resp.status_code}). Try again in a "
+                                           "few minutes."), f"HTTP {resp.status_code}"
+            # A 5xx, or no answer: this request's own trouble, or the archive's.
             if self.limiter.failed(what):
-                outage_start = self.limiter._clock() if outage_start is None else outage_start
                 continue  # waited for at the limiter, which probes until it's back
             tries += 1
             if tries >= RETRIES:

@@ -327,8 +327,6 @@ def _each_thread(posts: list[Post], get: Callable, client: ArcticShiftClient, st
             got = get(p)
         except Stopped:
             return None  # not tried
-        except ArchiveDown:
-            raise
         except (FetchError, requests.RequestException):
             with lock:
                 streak[0] += 1

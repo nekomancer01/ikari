@@ -440,6 +440,44 @@ def test_a_network_error_on_the_last_try_is_raised():
         c.get(*SEARCH)
 
 
+def test_a_refusal_that_isnt_the_archives_json_is_reported_at_once_with_its_status():
+    c = down_client([FakeResponse(403, None)])
+    with pytest.raises(FetchError, match="HTTP 403"):
+        c.get(*SEARCH)
+    assert len(c.session.calls) == 1 and not c.limiter.down
+
+
+def test_answers_that_cant_be_read_dont_make_the_archive_count_as_down():
+    # Something between this computer and the archive answering instead (a proxy's page) isn't an outage to wait out.
+    c = down_client([FakeResponse(200, None)] * arctic_shift.GARBLED_TRIES)
+    with pytest.raises(FetchError, match="couldn't be read"):
+        c.get(*SEARCH)
+    assert "probe" not in [u for u, _ in c.session.calls] and not c.limiter.down
+
+
+def test_rate_limits_dont_use_up_a_requests_tries_at_server_errors():
+    c = down_client([FakeResponse(429, headers={"X-RateLimit-Reset": "1"})] * 4 + [FakeResponse(503), ok([post(1)])])
+    assert len(c.get(*SEARCH)) == 1
+
+
+def test_a_probe_that_raises_lets_the_next_one_go():
+    c = down_client([FakeResponse(500)] * arctic_shift.OUTAGE_AFTER + [ok([])], probes=[ValueError("odd"), ok([])])
+    with pytest.raises(ValueError):
+        c.get(*SEARCH)
+    assert c.limiter.down and not c.limiter._probing
+    assert c.get(*SEARCH) == [] and not c.limiter.down
+
+
+def test_a_second_outage_gets_its_own_patience():
+    c = down_client([FakeResponse(500)] * arctic_shift.OUTAGE_AFTER + [ok([])]
+                    + [FakeResponse(500)] * arctic_shift.OUTAGE_AFTER + [ok([])],
+                    probes=[FakeResponse(500)] * 9 + [ok([])] + [FakeResponse(500)] * 9 + [ok([])])
+    c.get(*SEARCH)  # down for about 8 minutes, then back
+    c.clock.t += 300
+    c.get(*SEARCH)  # down again: waited out too, not ended at once for the first one's time
+    assert not c.limiter.down
+
+
 def test_a_failure_while_the_archive_answers_others_doesnt_make_it_down():
     c = down_client([FakeResponse(503), ok([]), FakeResponse(503), ok([]), FakeResponse(503), ok([])])
     for _ in range(3):
