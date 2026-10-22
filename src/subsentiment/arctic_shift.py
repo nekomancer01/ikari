@@ -244,10 +244,10 @@ def _meta(d: dict) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
-def _int(value) -> int:
-    """A count from the archive as an int; 0 for anything that isn't a finite number ("1.5" is 1)."""
-    n = _number(value, 0)
-    return int(n) if math.isfinite(n) else 0
+def _finite(value, kind=float):
+    """A number from the archive as ``kind`` (int for a count: "1.5" is 1); 0 for anything that isn't a finite number."""
+    n = _number(value, 0.0)
+    return kind(n) if math.isfinite(n) else kind(0)
 
 
 def _settled(d: dict) -> bool:
@@ -274,26 +274,14 @@ def _post(d: dict) -> Post:
         title=_text(d.get("title")),
         selftext=selftext,
         author=_text(d.get("author")) or "[deleted]",
-        score=_int(d.get("score")) if settled else None,
-        upvote_ratio=_ratio(d.get("upvote_ratio")) if settled else None,
-        num_comments=_int(d.get("num_comments")) if settled else None,
+        score=_finite(d.get("score"), int) if settled else None,
+        upvote_ratio=_finite(d.get("upvote_ratio")) if settled else None,
+        num_comments=_finite(d.get("num_comments"), int) if settled else None,
         created_utc=_number(d.get("created_utc"), 0),
         permalink="https://www.reddit.com" + permalink,
         url=_text(d.get("url")),
         image=is_image_post(d.get("url"), selftext, d.get("post_hint") or "", d.get("is_gallery")),
     )
-
-
-def _ratio(value) -> float:
-    n = _number(value, 0.0)
-    return n if math.isfinite(n) else 0.0
-
-
-def _with_text_id(d: dict) -> dict:
-    """``d`` with its id as text, as ids are compared with saved ones (a numeric one never matched)."""
-    if d.get("id") is not None and not isinstance(d["id"], str):
-        d = dict(d, id=str(d["id"]))
-    return d
 
 
 def _text(value) -> str:
@@ -318,12 +306,6 @@ def slot_count(after: float, before: float, limit: int, top: bool) -> int:
     if top:
         return max(1, min(limit, days, TOP_SLOTS))
     return max(1, min(limit, days * SLOTS_PER_DAY, max(days, MIN_SLOTS)))
-
-
-def _light_rank(d: dict) -> tuple:
-    """Sort key for top mode's light copies. Posts the archive hasn't re-checked still carry placeholder
-    scores (usually 1), so they sink below real ones."""
-    return (_number(d.get("score"), 0), _number(d.get("num_comments"), 0))
 
 
 class ArcticShiftClient:
@@ -377,13 +359,22 @@ class ArcticShiftClient:
                 self.limiter.done(flight)
                 raise
             self.limiter.observe(resp.headers, flight)
-            payload = _json(resp)  # parsed once: a big comment tree takes a while to parse
-            error = _error_text(payload)
+            try:
+                payload = resp.json()  # parsed once: a big comment tree takes a while to parse
+            except Exception:  # not JSON
+                payload = None
+            error = str(payload.get("error") or "") if isinstance(payload, dict) else ""
             if resp.status_code == 200 and not error and isinstance(payload, dict):
                 self.limiter.ok()
                 data = payload.get("data")
-                # Anything that isn't an object is a malformed record; skipping it keeps the rest.
-                return [_with_text_id(d) for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+                records = []
+                for d in data if isinstance(data, list) else ():
+                    if not isinstance(d, dict):  # a malformed record: skipping it keeps the rest
+                        continue
+                    if d.get("id") is not None and not isinstance(d["id"], str):  # compared with saved ids as text
+                        d = dict(d, id=str(d["id"]))
+                    records.append(d)
+                return records
             if resp.status_code == 200 and not isinstance(payload, dict):
                 # Not the archive's JSON: a proxy's or CDN's error page, or a body cut short. It used to fail
                 # the whole fetch on the first one; a few are retried, then it's said what came back.
@@ -393,7 +384,8 @@ class ArcticShiftClient:
                                      "and the archive may be answering instead). Try again in a few minutes.")
                 self.limiter.hold(2.0 * garbled, "Arctic Shift's answer couldn't be read")
                 continue
-            if _is_timeout(resp.status_code, error):
+            lowered = error.lower()
+            if "timed out" in lowered or "timeout" in lowered or (resp.status_code == 422 and "slow down" in lowered):
                 # The archive answers slow queries with "Query timed out" (HTTP 200) or "Timeout. Maybe
                 # slow down a bit" (HTTP 422). Wait, then try a smaller page.
                 timeouts += 1
@@ -505,7 +497,10 @@ class ArcticShiftClient:
             if should_stop and should_stop():
                 return None
             if top:
-                ranked = sorted(self._top_pool(base, lo, hi, should_stop), key=_light_rank, reverse=True)
+                # Posts the archive hasn't re-checked still carry placeholder scores (usually 1): they sink below
+                # real ones.
+                ranked = sorted(self._top_pool(base, lo, hi, should_stop), reverse=True,
+                                key=lambda d: (_number(d.get("score"), 0), _number(d.get("num_comments"), 0)))
                 return self._take_top(ranked, want)
             if not more[i]:  # read to its end before
                 return [], hi, False
@@ -638,16 +633,10 @@ class ArcticShiftClient:
                 self._page_cap = sent
             size = sent  # a page shrunk after a timeout is full at this size, not at the size asked for
             new = [d for d in page if d.get("id") and d["id"] not in seen]
-            fresh: list[Post] = []
             for d in new:
                 seen.add(d["id"])
-                if _removed(d):
-                    self._note_removed(d)
-                elif d["id"] not in skip and (post := _post(d)).image:
-                    self._note_image(post)
-                elif d["id"] not in skip and len(out) < want:
+                if (post := self._usable(d, skip)) is not None and len(out) < want:
                     out.append(post)
-                    fresh.append(out[-1])
                     cursor = max(cursor, int(_number(d.get("created_utc"), 0)) - 1)
             if len(out) >= want or (should_stop and should_stop()):
                 return out, cursor, True
@@ -721,26 +710,27 @@ class ArcticShiftClient:
                 page = self.get("/api/posts/ids", {"ids": ",".join(ids[i:i + IDS_BATCH])})
             except Stopped:
                 break
-            for d in page:
-                if not d.get("id"):
-                    continue
-                if _removed(d):
-                    self._note_removed(d)
-                elif (post := _post(d)).image:
-                    self._note_image(post)
-                else:
-                    out.append(post)
+            out += [post for d in page if d.get("id") and (post := self._usable(d)) is not None]
         return out
 
-    def _note_removed(self, d: dict) -> None:
-        created = _number(d.get("created_utc"), None)
-        if created is not None:
-            with self._removed_lock:  # slice threads Stop left running may still be adding
-                self.removed[d["id"]] = float(created)
-
-    def _note_image(self, post: Post) -> None:
-        with self._removed_lock:
-            self.images[post.id] = post
+    def _usable(self, d: dict, skip: Collection[str] = ()) -> Post | None:
+        """The post ``d`` is, if it's one to keep and not in ``skip``. A removed one is noted in ``removed`` (the
+        archive's daily counts include it) and an image post not in ``skip`` in ``images`` (kept as a hidden row),
+        under a lock: slice threads Stop left running may still be adding."""
+        if _removed(d):
+            created = _number(d.get("created_utc"), None)
+            if created is not None:
+                with self._removed_lock:
+                    self.removed[d["id"]] = float(created)
+            return None
+        if d["id"] in skip:
+            return None
+        post = _post(d)
+        if post.image:
+            with self._removed_lock:
+                self.images[post.id] = post
+            return None
+        return post
 
     def take_images(self) -> list[Post]:
         """The image posts skipped so far, which are then forgotten: kept as hidden rows, so they count as
@@ -855,7 +845,7 @@ class ArcticShiftClient:
                 parent_id=_text(d.get("parent_id")),
                 author=_text(d.get("author")) or "[deleted]",
                 body=body,
-                score=_int(d.get("score")) if _settled(d) else None,
+                score=_finite(d.get("score"), int) if _settled(d) else None,
                 created_utc=_number(d.get("created_utc"), 0),
                 depth=int(d["depth"]) if isinstance(d.get("depth"), int) else 0,
                 permalink="https://www.reddit.com" + permalink,
@@ -975,19 +965,3 @@ def _bucket_time(b) -> float | None:
         return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)).timestamp()
     return None
 
-
-def _is_timeout(status: int, error: str) -> bool:
-    text = error.lower()
-    return "timed out" in text or "timeout" in text or (status == 422 and "slow down" in text)
-
-
-def _json(resp):
-    """The response's JSON, or None when it isn't JSON."""
-    try:
-        return resp.json()
-    except Exception:
-        return None
-
-
-def _error_text(payload) -> str:
-    return str(payload.get("error") or "") if isinstance(payload, dict) else ""
