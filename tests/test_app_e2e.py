@@ -1636,6 +1636,31 @@ def test_a_days_comments_downloaded_once_read_complete_even_where_the_archive_co
     assert env.store().open_threads("bigthreads", [day]) == []  # nothing left to offer again
 
 
+def test_a_huge_thread_whose_tree_comes_back_collapsed_is_read_whole_from_the_comment_search(env):
+    # A tree the archive collapses whatever the limit came back the same way on every download, so its day never
+    # read complete and Coverage offered it again and again.
+    day = busy_day(env, "hugethread", 5)
+    big = next(p for p in env.archive.posts if p["id"] == "bd00002")
+    big.update(num_comments=1500, tree=1500, collapsed=True, same_second=150,  # a burst sharing one second too
+               retrieved_on=big["created_utc"] + 40 * 3600)
+    w = env.window()
+    fetch(w, sub="hugethread", comments=False, rng="week")
+    cov = open_coverage(w)
+    row = cov.days.index(day)
+    QTest.mouseClick(cov.day_table.cellWidget(row, 4).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    wait_idle(w, 60)
+    end = time.monotonic() + 10
+    while cov.threads_job.busy and time.monotonic() < end:
+        pump(20)
+    pump(100)
+    assert cov.day_table.cellWidget(row, 3).main.full_text() == "✓ 5\u00a0threads"
+    saved = env.store().comments("hugethread")
+    assert len([c for c in saved if c["post_id"] == "bd00002"]) == 1500
+    depth = {c["id"]: c["depth"] for c in saved}
+    assert depth["bd00002c3"] == 1 and depth["bd00002c1000"] == 0 and depth["bd00002c1003"] == 1  # from the parents
+    assert env.store().open_threads("hugethread", [day]) == []
+
+
 def test_download_all_comments_asks_nothing_for_posts_that_turn_out_to_have_none(env):
     # The owner, 21 Oct: Coverage's Download all comments "checks posts with empty comments". Posts saved before the
     # archive counted their comments are offered; re-checked, many have none, and each still cost a request.
