@@ -527,6 +527,24 @@ def test_all_comments_ask_for_the_whole_thread_and_say_whether_it_is_complete():
     assert client([ok(full)]).fetch_all_comments(small)[1] is False  # a full page may have been cut short
 
 
+def test_a_capped_thread_is_read_whole_then_picked_top_scoring_or_at_random_the_same_way_each_time():
+    # The archive cuts a tree short in posting order and can't sort it (live, 21 Oct: limit=100 on a 1,065-comment
+    # thread held 22 of its top 100; sort and sort_type got 400), so a cap reads the whole thread and picks here.
+    p = Post("p1", "Python", "t", "", "a", 10, 0.9, 40, 1.0, "u", "")
+    tree = [node(comment(f"c{i}", "t3_p1", i, score=i % 7, depth=0)) for i in range(40)]
+    c = client([ok(tree)] * 4)
+    top, whole = c.fetch_all_comments(p, 5, "top")
+    assert c.session.calls[0][1] == {"link_id": "p1", "limit": 100}  # the whole thread, not 5
+    assert [x.score for x in top] == [6] * 5 and not whole
+    some, whole = c.fetch_all_comments(p, 5, "random")
+    assert len(some) == 5 and not whole
+    assert [x.id for x in c.fetch_all_comments(p, 5, "random")[0]] == [x.id for x in some]  # the same five again
+    more = {x.id for x in c.fetch_all_comments(p, 12, "random")[0]}
+    assert len(more) == 12 and {x.id for x in some} < more  # a bigger cap keeps the ones already picked
+    everything, whole = client([ok(tree)]).fetch_all_comments(p, 50, "random")
+    assert len(everything) == 40 and whole  # the cap left nothing out
+
+
 class BusyArchive(ArchiveSession):
     """Times out on any page bigger than ``max_limit``, so the client retries with smaller pages."""
 

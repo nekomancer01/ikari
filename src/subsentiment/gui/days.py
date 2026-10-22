@@ -12,6 +12,7 @@ last of them.
 from __future__ import annotations
 
 import math
+from bisect import bisect_left, insort
 from datetime import date, datetime, timezone
 
 from PySide6.QtCore import Qt
@@ -53,6 +54,33 @@ def keep(rows, days: tuple[int, int] | None) -> list:
         return list(rows)
     first, end = days
     return [r for r in rows if r["created_utc"] is not None and first <= r["created_utc"] < end]
+
+
+class SavedRows(list):
+    """Saved rows kept oldest first, so the rows of a span of days are found by halving the list rather than by
+    going through every row (hundreds of thousands, with a big subreddit's comments). Rows without a time come
+    first. Give it rows in that order; ``add`` puts more where they belong."""
+
+    words: dict | None = None  # {id: words} of rows read without theirs (LoadWorker), once they're split
+
+    @staticmethod
+    def when(row) -> float:
+        t = row["created_utc"]
+        return float("-inf") if t is None else t
+
+    def add(self, rows) -> None:
+        when = self.when
+        for r in sorted(rows, key=when):
+            if not self or when(r) >= when(self[-1]):  # a fetch's rows are mostly the newest
+                self.append(r)
+            else:
+                insort(self, r, key=when)
+
+    def between(self, days: tuple[int, int] | None) -> list:
+        """As `keep` does: a new list of the rows created in ``days``, all of them for None."""
+        if days is None:
+            return list(self)
+        return self[bisect_left(self, days[0], key=self.when):bisect_left(self, days[1], key=self.when)]
 
 
 def settings_keys(subreddit: str) -> tuple[str, str]:

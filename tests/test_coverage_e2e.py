@@ -12,7 +12,8 @@ from PySide6.QtCore import QSettings, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QCheckBox, QPushButton  # noqa: E402
 
-from subsentiment.gui import worker  # noqa: E402
+from subsentiment.arctic_shift import keep  # noqa: E402
+from subsentiment.gui import coverage, worker  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.reddit import Comment, Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
@@ -28,6 +29,7 @@ def post(pid, sub, created, num_comments=5):
 class FakeArchive:
     """Stands in for ArcticShiftClient; every call is logged on the class."""
     calls: list = []
+    caps: list = []  # (cap, pick) of each thread asked for
     archive = {"Python": [post(f"new{i}", "Python", TODAY - 3 * DAY + 100 + i) for i in range(4)]}
 
     def __init__(self, limiter=None, **kw):
@@ -50,14 +52,17 @@ class FakeArchive:
         FakeArchive.calls.append(("ids", list(ids)))
         return []
 
-    def fetch_comments(self, p, limit=100):
+    def fetch_comments(self, p, limit=100, pick="top"):
         FakeArchive.calls.append(("comments", p.id))
         return []
 
-    def fetch_all_comments(self, p):
+    def fetch_all_comments(self, p, cap=0, pick="top"):
         FakeArchive.calls.append(("all_comments", p.id))
-        return [Comment(f"c{p.id}{j}", p.id, p.subreddit, "t3_" + p.id, "b", "ok", 1, p.created_utc, 0, "u")
-                for j in range(5)], True
+        FakeArchive.caps.append((cap, pick))
+        thread = [Comment(f"c{p.id}{j}", p.id, p.subreddit, "t3_" + p.id, "b", "ok", j, p.created_utc, 0, "u")
+                  for j in range(5)]
+        kept = keep(thread, cap, pick, p.id)
+        return kept, len(kept) == len(thread)
 
 
 @pytest.fixture
@@ -74,9 +79,12 @@ def window(tmp_path, monkeypatch):
     for i in range(3):
         s.save_post(post(f"p{i}", "Python", TODAY - (i + 1) * DAY + 500), 0.0, "neutral")
     s.save_post(post("r0", "rust", TODAY - DAY + 500), 0.0, "neutral")
+    for sub in ("Python", "rust"):  # each fetched for the past week before: the days the page lists
+        s.save_tried(sub, range(TODAY - 7 * DAY, TODAY + DAY, DAY))
     s.commit()
     s.close()
     FakeArchive.calls = []
+    FakeArchive.caps = []
     monkeypatch.setattr(worker, "ArcticShiftClient", FakeArchive)
     # A failed fetch would open a modal box and hang the test; fail fast instead.
     monkeypatch.setattr(mw.QMessageBox, "warning", lambda *a: pytest.fail(f"fetch failed: {a[-1]}"))
@@ -94,7 +102,8 @@ def settle(w, until=lambda: True, timeout=5.0):
     while time.time() < end:
         QApplication.processEvents()
         cov = w.coverage
-        idle = not w.fetch_job.busy and (cov is None or not (cov.count_job.busy or cov.delete_job.busy))
+        idle = not w.fetch_job.busy and (cov is None or not (cov.count_job.busy or cov.delete_job.busy
+                                                             or cov.threads_job.busy))
         if idle and until():
             break
         time.sleep(0.01)
@@ -185,6 +194,40 @@ def test_a_posts_download_all_fetches_only_that_posts_comments(window):
     assert cell.main.text() == "5 saved" and "Complete" in cell.side.text()
 
 
+def test_each_day_says_how_many_comment_threads_are_saved_whole_and_follows_downloads(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+
+    def line(day):  # the day's Comment threads column
+        return c.day_table.cellWidget(c.days.index(day), 3).main
+    day = TODAY - DAY  # p0 is on this day; p1 and p2 on the two before, each with 5 comments to get
+    assert [line(TODAY - k * DAY).full_text() for k in (1, 2, 3)] == ["0 of 1\u00a0thread"] * 3
+    assert line(TODAY).full_text() == "No posts saved"  # nothing saved today: no threads to count
+    assert not c.day_table.cellWidget(c.days.index(TODAY), 4).findChild(QPushButton).isEnabled()
+    assert c.threads_total.text() == "Comments complete on 0 of 3\u00a0posts"
+    c.day_table.selectRow(c.days.index(day))
+    settle(w)
+    click(c.post_table, 0)  # p0's comments, read to the end
+    settle(w, lambda: not w.fetch_job.busy and line(day).full_text().startswith("\u2713"))
+    assert line(day).full_text() == "\u2713 1\u00a0thread"
+    assert c.threads_total.text() == "Comments complete on 1 of 3\u00a0posts"
+    tick(c, TODAY - 2 * DAY)  # the total covers the ticked days once any are
+    assert c.threads_total.text() == "Comments complete on 0 of 1\u00a0post"
+    assert downloads() == [("all_comments", "p0")]
+    narrow = coverage.FitLabel()  # a day of thousands of posts, in a column too narrow for the word
+    narrow.resize(narrow.fontMetrics().horizontalAdvance("1,234 of 5,678\u00a0threads") - 1, 20)
+    narrow.set("1,234 of 5,678\u00a0threads", "1,234 of 5,678")
+    assert narrow.text() == "1,234 of 5,678"
+    narrow.show()
+    narrow.resize(narrow.width() + 2, 20)  # widened: the word comes back
+    QApplication.processEvents()
+    assert narrow.text() == "1,234 of 5,678\u00a0threads"
+    narrow.close()
+
+
 def tick(c, day, shift=False):
     """A real click on a day's tick box, with Shift held for a run of days."""
     box = c.day_table.cellWidget(c.days.index(day), 0).findChild(QCheckBox)
@@ -228,7 +271,7 @@ def test_download_selected_fetches_only_the_ticked_days(window):
     w.show_page("coverage")
     c = w.coverage
     settle(w, lambda: c.totals)
-    c.with_comments.setChecked(False)
+    QTest.mouseClick(c.what.buttons["posts"], Qt.MouseButton.LeftButton)
     tick(c, TODAY - 3 * DAY)
     tick(c, TODAY - DAY)  # not a run: the day between stays out
     QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
@@ -278,7 +321,7 @@ def test_download_selected_with_comments_fetches_every_comment_on_those_days_onl
     w.show_page("coverage")
     c = w.coverage
     settle(w, lambda: c.totals)
-    assert c.with_comments.isChecked()
+    assert c.what.value() == "both"  # the default
     tick(c, TODAY - 3 * DAY)
     tick(c, TODAY - DAY)
     QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
@@ -290,6 +333,101 @@ def test_download_selected_with_comments_fetches_every_comment_on_those_days_onl
     assert threads == sorted(["p0", "p2", "new0", "new1", "new2", "new3"])  # p1, on the day between, isn't
     assert not [d for d in got if d[0] == "comments"]
     assert "p1" not in w.store.complete_keys("comments", "Python")
+
+
+def test_download_selected_keeps_the_picked_number_of_comments_per_thread_and_tops_up_later(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    assert c.comment_cap.count.text() == "All comments" and not c.comment_cap.pick.isEnabled()  # nothing left out to pick
+    c.comment_cap.count.setValue(2)
+    c.comment_cap.pick.setCurrentIndex(c.comment_cap.pick.findData("random"))
+    tick(c, TODAY - DAY)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert FakeArchive.caps == [(2, "random")]
+    picked = {x["id"] for x in w.store.comments("Python")}
+    assert len(picked) == 2
+    assert "p0" not in w.store.complete_keys("comments", "Python")  # 2 of its 5: not whole
+
+    FakeArchive.calls, FakeArchive.caps = [], []
+    tick(c, TODAY - DAY)  # the same day again at the same cap: its thread has its 2 already
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert not [d for d in downloads() if d[0] == "all_comments"]
+
+    c.comment_cap.count.setValue(4)  # a bigger cap tops the thread up, keeping the random ones it had
+    tick(c, TODAY - DAY)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert FakeArchive.caps == [(4, "random")]
+    now = {x["id"] for x in w.store.comments("Python")}
+    assert len(now) == 4 and picked < now
+    assert "2 comments" in w.progress_msg.text().replace("\u00a0", " ")  # only the new ones count
+
+    c.comment_cap.count.setValue(0)  # All: the rest of the thread, which is then whole
+    tick(c, TODAY - DAY)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert len(w.store.comments("Python")) == 5 and "p0" in w.store.complete_keys("comments", "Python")
+    settings = QSettings()
+    assert (settings.value("coverage/comments_per_post", type=int), settings.value("coverage/comment_pick")) == (0, "random")
+
+
+def test_a_cap_that_holds_a_whole_thread_marks_it_complete(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    c.comment_cap.count.setValue(50)
+    tick(c, TODAY - DAY)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert FakeArchive.caps == [(50, "top")]
+    assert "p0" in w.store.complete_keys("comments", "Python")  # all 5 fit under 50
+
+
+def test_comments_only_downloads_follow_the_cap_too(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    QTest.mouseClick(c.what.buttons["comments"], Qt.MouseButton.LeftButton)
+    c.comment_cap.count.setValue(3)
+    tick(c, TODAY - DAY)  # p0 is saved there, its thread not
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert FakeArchive.caps == [(3, "top")] and len(w.store.comments("Python")) == 3
+    FakeArchive.calls, FakeArchive.caps = [], []
+    tick(c, TODAY - DAY)  # it has its 3: nothing to ask
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert not [d for d in downloads() if d[0] == "all_comments"]
+    c.comment_cap.count.setValue(0)  # All: the day's comments button finishes it
+    c._download_day_threads(TODAY - DAY)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert FakeArchive.caps == [(0, "top")] and "p0" in w.store.complete_keys("comments", "Python")
+
+
+def test_the_comment_cap_is_remembered(tmp_path, window):
+    w = window
+    c = w.coverage
+    QTest.mouseClick(c.what.buttons["posts"], Qt.MouseButton.LeftButton)
+    assert not c.comment_cap.count.isEnabled()  # posts only: no comments to cap
+    c.comment_cap.count.setValue(300)
+    c.comment_cap.pick.setCurrentIndex(c.comment_cap.pick.findData("random"))
+    again = mw.MainWindow(w.db_path)
+    try:
+        cap = again.coverage.comment_cap
+        assert again.coverage.what.value() == "posts"
+        assert (cap.count.value(), cap.pick.currentData()) == (300, "random")
+        assert again.fetch_form.comments_per_post.value() == 50  # the Fetch drawer keeps its own
+    finally:
+        again.close()
 
 
 def answer(c, yes, wait=True):
@@ -351,7 +489,7 @@ def test_delete_selected_asks_then_forgets_only_the_ticked_days_and_they_downloa
     row = c.days.index(TODAY - 3 * DAY)
     assert c.day_table.cellWidget(row, 1).main.text() == "0 of 10"
     button = c.day_table.cellWidget(row, 2).findChild(QPushButton)
-    assert button.text() == "Download all" and button.isEnabled()
+    assert button.text() == coverage.DOWNLOAD and button.isEnabled()
     assert "2 days" in w.statusBar().currentMessage().replace("\u00a0", " ")
 
     # Deleted, it stays deleted: not back when the subreddit is opened again, and a download reads it in full.
@@ -417,3 +555,167 @@ def test_nothing_else_writes_while_days_are_deleted(window, monkeypatch):
     assert c.day_table.cellWidget(0, 2).findChild(QPushButton).isEnabled()
     assert w.store.posts_per_day("Python", TODAY - DAY, TODAY) == {}
     assert downloads() == []
+
+
+def counts_asked():
+    return [c for c in FakeArchive.calls if c[0] == "counts"]
+
+
+def reopen(w):
+    """The app closed and opened again on the same database, Python's coverage showing."""
+    path = w.db_path
+    w.close()
+    again = mw.MainWindow(path)
+    again.fetch_form.range.setCurrentIndex(again.fetch_form.range.findData("week"))
+    again.show()
+    select(again, "Python")
+    again.show_page("coverage")
+    settle(again)
+    return again
+
+
+def test_day_counts_are_kept_and_asked_for_again_only_the_next_day(window, monkeypatch):
+    monkeypatch.setattr(coverage, "COUNT_SETTLED", 0)  # yesterday's count is kept too, whatever the hour
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals.get("python"))
+    assert len(counts_asked()) == 1
+    again = reopen(w)  # opened again the same day: the kept counts are shown, not asked for
+    try:
+        c = again.coverage
+        assert len(counts_asked()) == 1
+        row = c.days.index(TODAY - 2 * DAY)
+        assert c.day_table.cellWidget(row, 1).main.text() == "1 of 10"
+        c.recount.click()  # Recount asks anyway
+        settle(again)
+        assert len(counts_asked()) == 2
+        monkeypatch.setattr(coverage, "today", lambda: TODAY + DAY)  # the next UTC day
+        c.refresh_saved()
+        settle(again)
+        assert len(counts_asked()) == 3
+    finally:
+        again.close()
+    assert downloads() == []
+
+
+def test_a_count_asked_for_before_the_archive_has_settled_its_day_isnt_kept(window, monkeypatch):
+    monkeypatch.setattr(coverage, "COUNT_SETTLED", 30 * DAY)  # every listed day still settling
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals.get("python"))
+    again = reopen(w)
+    try:
+        assert len(counts_asked()) == 2
+    finally:
+        again.close()
+
+
+def test_comments_download_fetches_only_the_ticked_days_threads_not_their_posts(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    QTest.mouseClick(c.what.buttons["comments"], Qt.MouseButton.LeftButton)
+    assert not c.download_ticked.isEnabled()  # nothing ticked
+    tick(c, TODAY - DAY)
+    tick(c, TODAY - 3 * DAY)
+    assert "2\u00a0threads" in c.estimate.text() and c.download_ticked.isEnabled()
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert sorted(downloads()) == [("all_comments", "p0"), ("all_comments", "p2")]  # p1, on the day between, isn't
+    assert c.ticked == set()
+    assert QSettings().value("coverage/what") == "comments"  # remembered
+
+
+def test_a_days_comments_button_fetches_that_days_threads_only(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals and c._threads)
+    row = c.days.index(TODAY - 2 * DAY)
+    button = c.day_table.cellWidget(row, 4).findChild(QPushButton)
+    assert button.text() == coverage.DOWNLOAD and button.isEnabled()
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy and c.day_table.cellWidget(row, 3).main.full_text().startswith("✓"))
+    assert downloads() == [("all_comments", "p1")]
+    assert c.day_table.cellWidget(row, 4).findChild(QPushButton).text() == coverage.CHECK
+
+
+def test_the_filter_shows_only_days_missing_something_and_select_all_ticks_those(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals and c._threads)
+    tick(c, TODAY)  # nothing saved today
+    QTest.mouseClick(c.filter.buttons["comments"], Qt.MouseButton.LeftButton)
+    assert c._shown_days() == [TODAY - k * DAY for k in (1, 2, 3)]  # the days with saved posts
+    assert c.ticked == set()  # a day the filter hides is ticked no longer
+    c.tick_all.click()
+    assert c.ticked == {TODAY - k * DAY for k in (1, 2, 3)}
+    QTest.mouseClick(c.filter.buttons["all"], Qt.MouseButton.LeftButton)
+    assert len(c._shown_days()) == len(c.days)
+    assert downloads() == []
+
+
+def test_a_stopped_download_offers_resume_even_after_a_restart(window, monkeypatch):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    reads = FakeArchive.fetch_posts
+
+    def stop_after_one(self, *a, **kw):
+        got = reads(self, *a, **kw)
+        w.fetch_job.stop()
+        return got
+    monkeypatch.setattr(FakeArchive, "fetch_posts", stop_after_one)
+    QTest.mouseClick(c.what.buttons["posts"], Qt.MouseButton.LeftButton)
+    assert not c.resume_bar.isVisible()
+    tick(c, TODAY - DAY)
+    tick(c, TODAY - 3 * DAY, shift=True)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert c.resume_bar.isVisible() and "3\u00a0days" in c.resume_text.text()
+    monkeypatch.setattr(FakeArchive, "fetch_posts", reads)
+    FakeArchive.calls = []
+    again = reopen(w)
+    try:
+        c = again.coverage
+        assert c.resume_bar.isVisible()
+        QTest.mouseClick(c.resume, Qt.MouseButton.LeftButton)
+        settle(again, lambda: not again.fetch_job.busy)
+        assert [d[2] for d in downloads() if d[0] == "posts"] == [TODAY - k * DAY for k in (1, 2, 3)]
+        assert not c.resume_bar.isVisible() and c.ticked == set()
+    finally:
+        again.close()
+
+
+def test_a_day_with_no_posts_anywhere_isnt_listed_ticked_or_downloaded(window, monkeypatch):
+    empty, saved = TODAY - 5 * DAY, TODAY - 2 * DAY  # the archive counts 0 on both; p1 is saved on the second
+
+    def counts(self, subreddit, after, before, should_stop=None):
+        FakeArchive.calls.append(("counts", subreddit))
+        return {d: 0 if d in (empty, saved) else 10 for d in range(int(after // DAY * DAY), int(before), DAY)}
+    monkeypatch.setattr(FakeArchive, "day_counts", counts)
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals and c._threads)
+    assert empty not in c._shown_days() and saved in c._shown_days()
+    assert "1 day with no posts left out" in c.subtitle.full_text()
+    QTest.mouseClick(c.what.buttons["posts"], Qt.MouseButton.LeftButton)
+    c.tick_all.click()
+    assert empty not in c.ticked and c.download_ticked.text() == f"Download {len(c.days) - 1} days"
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    fetched = [d[2] for d in downloads() if d[0] == "posts"]
+    assert fetched and empty not in fetched and saved in fetched

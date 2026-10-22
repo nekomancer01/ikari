@@ -1,5 +1,6 @@
 """The word cloud: which words count, how they're tallied and placed, and the Words page on real saved data."""
 import math
+from collections import Counter
 import os
 import time
 
@@ -16,7 +17,8 @@ from subsentiment import sentiment  # noqa: E402
 from subsentiment.analysis import WordCounts, words_in  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import motion  # noqa: E402
-from subsentiment.gui.words import KINDS, WordCloud, WordTally  # noqa: E402
+from subsentiment.gui.rows import Saved  # noqa: E402
+from subsentiment.gui.words import KINDS, WordCloud, WordMeanings, WordTally  # noqa: E402
 from subsentiment.reddit import Comment, Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
@@ -140,22 +142,35 @@ def test_a_little_less_room_keeps_the_words_where_they_are_and_a_lot_lays_them_o
     assert all(abs(big[k][0] - 700) < 700 for k in big) and len(big) == 25  # filled afresh, every word fits
 
 
-def test_a_big_recount_runs_on_a_thread_and_keeps_rows_added_meanwhile(monkeypatch):
+def saved_comments(path, sub, bodies) -> dict:
+    """A subreddit with these comments saved (no posts), as the window reads it: {kind: rows.Saved}."""
+    s = Store(path)
+    for i, body in enumerate(bodies):
+        s.save_comment(Comment(f"{sub}{i}", "p", sub, "t3_p", "b", body, 1, 1_700_000_000.0 + i, 0, "/r/x/"), 0.0,
+                       "neutral")
+    s.commit()
+    s.close()
+    return {k: Saved(str(path), k, sub) for k in KINDS}
+
+
+def test_a_big_recount_runs_on_a_thread_and_takes_rows_added_meanwhile(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(WordTally, "THREAD_FROM", 10)
+    saved = saved_comments(tmp_path / "w.db", "big", ["river market"] * 2000)
     tally = WordTally()
     done = []
     tally.changed.connect(lambda: done.append(True))
-    tally.count([], [comment(i, "river market") for i in range(2000)])
+    tally.count(saved, None, (None, None))
     assert not tally.ready  # counting on its thread; the window carries on
-    tally.add("comments", [comment(5000, "river bridge")])  # a fetch saved one meanwhile
+    saved["comments"].add([dict(comment(5000, "river bridge"), score=1, sentiment=0.0, created_utc=1_700_000_000.0)])
+    tally.count(saved, None, (None, None))  # a fetch saved one meanwhile, and the overview refreshed
     end = time.monotonic() + 10
-    while not done:
+    while not (tally.ready and not tally._slices.running()):
         assert time.monotonic() < end
         app.processEvents()
         time.sleep(0.01)
-    assert tally.ready and dict((w, n) for w, n, _ in tally.top(["comments"])) == {
-        "river": 2001, "market": 2000, "bridge": 1}
+    assert dict((w, n) for w, n, _ in tally.top(["comments"])) == {"river": 2001, "market": 2000, "bridge": 1}
+    assert done
 
 
 @pytest.fixture
@@ -201,13 +216,14 @@ def test_the_words_page_shows_the_saved_words_and_follows_scope_and_span(window)
     assert shown() == {"harbour": 1, "festival": 2, "tonight": 1, "lights": 1, "lovely": 1}
 
 
-def test_a_small_recount_drops_rows_added_for_a_big_one_still_running(monkeypatch):
+def test_a_small_count_lets_a_big_one_still_running_go(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(WordTally, "THREAD_FROM", 10)
+    big = saved_comments(tmp_path / "w.db", "big", ["river market"] * 2000)
+    small = saved_comments(tmp_path / "w.db", "small", ["quiet lane"])
     tally = WordTally()
-    tally.count([], [comment(i, "river market") for i in range(2000)])
-    tally.add("comments", [comment(5000, "river bridge")])  # saved for the big subreddit meanwhile
-    tally.count([], [comment(1, "quiet lane")])  # then a small one is chosen: counted at once
+    tally.count(big, None, (None, None))
+    tally.count(small, None, (None, None))  # then a small one is chosen: counted at once
     assert tally.ready and [w for w, *_ in tally.top(["comments"])] == ["lane", "quiet"]
     end = time.monotonic() + 3
     while time.monotonic() < end:  # the big count ends and is let go
@@ -252,6 +268,7 @@ def test_setting_a_word_rescores_that_subreddit_only_and_every_page_follows(tmp_
         row = meanings.rows["grinding"]
         QTest.mouseClick(row.slider, Qt.MouseButton.LeftButton, pos=QPoint(row.slider.width() - 4, row.slider.height() // 2))
         assert w.store.words("town") == {"grinding": 1.0} and row.reads.text() == "Very positive"
+        assert row.result.text().startswith("Scoring saved items\u2026")  # the owner: a way to see it's working
         end = time.monotonic() + 10
         while w.rescore.running():
             assert time.monotonic() < end
@@ -265,7 +282,12 @@ def test_setting_a_word_rescores_that_subreddit_only_and_every_page_follows(tmp_
         assert {r["id"]: r["label"] for r in w.posts_tab.model.rows}["town2"] == "positive"  # the tables
         assert {r["id"]: r["label"] for r in w.posts}["town0"] == "positive"  # and what export writes
         assert dict((word, lean) for word, _, lean in w.word_tally.top(KINDS))["grinding"] == 1.0  # the cloud
-        assert meanings.status.text() == "Saved items scored again"
+        assert meanings.status.isHidden()  # only says something when scoring failed
+        moved = {(a, "positive"): sum(1 for i in ("town0", "town2", "townc") if before[i.replace("town", "city")] == a)
+                 for a in ("negative", "neutral")}
+        assert row.result.text() == "\u2713 3 of 3 saved items changed label"
+        assert row.result.toolTip() == "\n".join(
+            f"{n} {a} \u2192 {b}" for (a, b), n in sorted(moved.items(), key=lambda m: -m[1]) if n)
         w._refresh_datasets("city")
         assert meanings.subreddit == "city" and meanings.rows == {}
         w._refresh_datasets("town")  # back from memory, rescored
@@ -301,7 +323,7 @@ def test_a_word_set_while_its_subreddit_is_fetched_is_rescored_again_after(windo
 
 
 def test_moving_the_span_keeps_the_words_both_spans_share_where_they_are(window, monkeypatch):
-    """Ame: the cloud should move fluidly "not just when you scrape but when you move around the timeline"."""
+    """The owner: the cloud should move fluidly "not just when you scrape but when you move around the timeline"."""
     w, app = window, QApplication.instance()
     w.show()
     w.show_page("words")
@@ -330,3 +352,167 @@ def test_moving_the_span_keeps_the_words_both_spans_share_where_they_are(window,
         assert time.monotonic() < end
         app.processEvents()
     assert not page.busy and page._dimming.target == 1.0 and "library" in {word for _, word, *_ in page.placed()}
+
+
+def test_the_result_counts_only_what_the_setting_changes_and_old_scores_apart(tmp_path):
+    """The owner set "dungeon" to neutral and read "130 neutral \u2192 positive, 50 negative \u2192 positive": most of that
+    was items scored by an older version getting today's score, not the setting."""
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("subsentiment-test")
+    app.setApplicationName(tmp_path.name)
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path / "cfg"))
+    QSettings().setValue("updates/auto", False)
+    s = Store(tmp_path / "w.db")
+    day = 1_700_000_000.0
+    texts = ["Grinding the boss all night", "Grinding again", "The grinding is awful and broken, I hate it",
+             "Library reopened today"]
+    for i, title in enumerate(texts):
+        score, label = sentiment.score(title)
+        if i == 2:
+            label = "positive"  # as an older version had it
+        s.save_post(Post(f"p{i}", "town", title, "", "a", 1, 0.9, 0, day - i * 86400, "https://r", ""), score, label)
+    s.commit()
+    s.close()
+    set_to = sentiment.Lexicon({"grinding": 1.0})
+    usual = {t: sentiment.score(t)[1] for t in texts[:3]}
+    now = {t: set_to.score(t)[1] for t in texts[:3]}
+    assert usual[texts[2]] == now[texts[2]] == "negative"  # what the setting doesn't change, but was out of date
+    changes = Counter((usual[t], now[t]) for t in texts[:2] if usual[t] != now[t])
+    assert changes
+    w = mw.MainWindow(str(tmp_path / "w.db"))
+    try:
+        w.show()
+        w._refresh_datasets("town")
+        meanings = w.words_page.meanings
+        meanings.pick("grinding")
+        meanings.rows["grinding"].slider.setValue(100)
+        meanings._save(meanings.rows["grinding"])
+        end = time.monotonic() + 10
+        while w.rescore.running():
+            assert time.monotonic() < end
+            app.processEvents()
+            time.sleep(0.01)
+        n = sum(changes.values())
+        result = meanings.rows["grinding"].result
+        assert result.text() == f"\u2713 {n} of 3 saved items changed label"
+        assert result.toolTip() == "\n".join([f"{k} {a} \u2192 {b}" for (a, b), k in changes.most_common()]
+                                             + ["Also updated 1 scored by an older version"])
+    finally:
+        w.close()
+        QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
+
+
+def test_a_word_set_where_the_window_doesnt_have_every_row_rescores_from_the_saved_ones(tmp_path):
+    """With a score filter on (or another subreddit shown), the rescore reads the subreddit itself. It failed at
+    once: its read was asked for one minimum score, where it takes one for posts and one for comments."""
+    QApplication.instance() or QApplication([])
+    from subsentiment.gui.words import Rescore
+    s = Store(tmp_path / "w.db")
+    s.save_post(Post("p1", "town", "Grinding the boss all night", "", "a", 1, 0.9, 0, 1_700_000_000.0, "https://r", ""),
+                *sentiment.score("Grinding the boss all night"))
+    s.commit()
+    s.save_word("town", "grinding", 1.0)
+    rescore = Rescore(s, str(tmp_path / "w.db"))
+    failed, done = [], []
+    rescore.failed.connect(lambda sub, message: failed.append(message))
+    rescore.finished.connect(done.append)
+    rescore.start("town", {"grinding"})  # no rows given: read on a thread
+    end = time.monotonic() + 10
+    while not done and not failed:
+        assert time.monotonic() < end
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert failed == [] and done == ["town"]
+    assert s.posts("town")[0]["label"] == "positive"
+    rescore.stop()
+    s.close()
+
+
+@pytest.mark.parametrize("processes, again", [(True, False), (False, False), (True, True)],
+                         ids=["in other processes", "where they can't run", "set again while it runs"])
+def test_a_big_rescore_is_scored_a_chunk_at_a_time_in_other_processes(tmp_path, monkeypatch, processes, again):
+    """The owner's r/classicwow had 31,497 items using "dungeon", which took minutes to score on the window's own
+    thread. Chunks go to worker processes instead; where those can't start, every item is still scored here.
+    A word set while a rescore runs starts it again, with new processes: what the old ones were on is dropped."""
+    from subsentiment.gui import worker, words
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("subsentiment-test")
+    app.setApplicationName(tmp_path.name)
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path / "cfg"))
+    QSettings().setValue("updates/auto", False)
+    monkeypatch.setattr(words.Rescore, "CHUNK", 4)
+    if not processes:
+        def refuse(*a, **k):
+            raise OSError("no processes here")
+        monkeypatch.setattr(worker, "ProcessPoolExecutor", refuse)
+    s = Store(tmp_path / "w.db")
+    day = 1_700_000_000.0
+    texts = [f"Grinding {what} today" for what in ("is fun", "again", "is awful", "for hours", "the boss", "sucks",
+                                                    "with friends", "is broken", "forever", "is great", "alone")]
+    texts += ["Library reopened today", "The weather is lovely"]
+    for i, title in enumerate(texts):
+        s.save_post(Post(f"p{i}", "town", title, "", "a", 1, 0.9, 0, day - i * 3600, "https://r", ""), *sentiment.score(title))
+    s.commit()
+    s.close()
+    w = mw.MainWindow(str(tmp_path / "w.db"))
+    pooled = []
+    w.rescore.pool.scored.connect(lambda tag, results: pooled.append(len(results)))
+    try:
+        w.show()
+        w._refresh_datasets("town")
+        meanings = w.words_page.meanings
+        meanings.pick("grinding")
+        meanings.rows["grinding"].set(-1.0)  # as if dragged there: no wait for a slider moved with the keys
+        meanings._save(meanings.rows["grinding"])
+        if again:
+            until_out = time.monotonic() + 30
+            while not w.rescore._out:  # some chunks are with the processes
+                assert time.monotonic() < until_out
+                app.processEvents()
+            first = w.rescore.pool._pool
+            meanings.pick("library")
+            meanings.rows["library"].set(0.0)
+            meanings._save(meanings.rows["library"])
+            assert first._shutdown_thread and w.rescore.pool._pool is not first
+        end = time.monotonic() + 60
+        while w.rescore.running():
+            assert time.monotonic() < end
+            app.processEvents()
+            time.sleep(0.01)
+        assert w.rescore.pool.broken == (not processes)
+        set_to = sentiment.Lexicon({"grinding": -1.0, **({"library": 0.0} if again else {})})
+        assert {r["id"]: r["label"] for r in w.store.posts("town")} == {
+            f"p{i}": set_to.score(t)[1] for i, t in enumerate(texts)}
+        if not again:
+            assert sorted(pooled) == ([3, 4, 4] if processes else [])  # back in any order
+        assert (w.rescore.pool._pool is not None) == processes  # kept for a word set next
+        assert w.rescore.pool._idle.isActive() == processes  # until a minute after
+        w.rescore.pool._idle.timeout.emit()
+        assert w.rescore.pool._pool is None
+        changes = sum(1 for t in texts[:11 + again] if set_to.score(t)[1] != sentiment.score(t)[1])
+        assert meanings.rows["grinding"].result.text() == f"\u2713 {changes} of {11 + again} saved items changed label"
+    finally:
+        w.close()
+        QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
+
+
+def test_a_setting_that_changes_no_label_says_why():
+    """The owner set "zenless" to Neutral and read "None of 61 saved items changed label", which looked broken:
+    neither scorer knows the word, so it read as neutral already."""
+    app = QApplication.instance() or QApplication([])
+    meanings = WordMeanings()
+    meanings.set_subreddit("ZZZ", {"zenless": 0.0, "hoyo": 0.0, "wow": 0.0, "great": 0.3})
+    meanings.show_result("zzz", {"zenless"}, 61, Counter())
+    meanings.show_result("zzz", {"wow"}, 1, Counter())
+    meanings.show_result("zzz", {"great"}, 4, Counter({("neutral", "positive"): 2}))
+    app.processEvents()
+    assert meanings.rows["zenless"].result.text() == (
+        "✓ No labels changed. 61 saved items use “zenless”, but the scorer doesn't know the word, so "
+        "it already read as neutral.")
+    assert meanings.rows["wow"].result.text() == (
+        "✓ No labels changed. 1 saved item uses “wow”, but the setting wasn't enough to move any of "
+        "them to another label.")
+    assert meanings.rows["great"].result.text() == "✓ 2 of 4 saved items changed label"

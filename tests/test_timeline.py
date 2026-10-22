@@ -324,12 +324,11 @@ def test_clicking_a_week_zooms_in_to_its_days_and_shows_its_notes(window, monkey
     assert tl.view == (week[0], week[1])
 
 
-def test_the_timeline_page_shows_the_same_notes_and_adds_them_too(window):
+def test_the_overview_timeline_shows_saved_notes_and_adds_them(window):
     w = window()
     w._save_note("Python", SAVED[10], "OV", "from the overview")
-    w.show_page("timeline")
     pump(50)
-    tl = w.timeline_page.body
+    tl = w.overview.timeline
     assert tl.notes == {SAVED[10]: ("OV", "from the overview")}
     QTest.mouseClick(tl.presets["1m"], Qt.MouseButton.LeftButton)
     QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=dot(tl, SAVED[-3]))
@@ -337,7 +336,7 @@ def test_the_timeline_page_shows_the_same_notes_and_adds_them_too(window):
     QTest.keyClicks(dialog.tag, "TL")
     QTest.mouseClick(dialog.save, Qt.MouseButton.LeftButton)
     pump(50)
-    assert w.overview.timeline.notes == tl.notes == {SAVED[10]: ("OV", "from the overview"), SAVED[-3]: ("TL", "")}
+    assert tl.notes == {SAVED[10]: ("OV", "from the overview"), SAVED[-3]: ("TL", "")}
 
 
 def test_a_range_button_keeps_the_latest_days_when_the_days_shown_change(window):
@@ -350,3 +349,43 @@ def test_a_range_button_keeps_the_latest_days_when_the_days_shown_change(window)
     assert tl.view is None and tl.preset == "1w"
     tl.set_points([(d, 0.1, 1) for d in SAVED])
     assert tl.view == (LAST_END - 7 * DAY, LAST_END) and w.span == tl.view
+
+
+def test_a_years_first_and_last_days_can_be_hovered_clicked_and_resized_at_the_edges(window, monkeypatch):
+    """A year a week or a month a point: the weeks at either end are only partly saved, and their points sit
+    where their saved days are, inside the plot, so the edges hover, click and drag like the rest."""
+    w = window()
+    tl = w.overview.timeline
+    start = days.from_date(date(2025, 10, 23))  # a Thursday
+    year = [(start + d * DAY, ((d * 7) % 11 - 5) / 10, 1 + d % 3) for d in range(362)]  # to Monday 19 Oct 2026
+    tl.set_points(year)
+    plot, nav = tl._areas()
+    a, b = tl.domain()
+    for grouping in (4, plot.width() / 30):  # weeks, then months
+        monkeypatch.setattr(charts, "GROUP_PX", grouping)
+        tl._grouped.clear()
+        tl.show_every_day()
+        unit, shown = tl.groups(a, b, plot.width())
+        assert unit == ("week" if grouping < 10 else "month")
+        assert shown[-1][1] > b  # the last week or month runs past the last saved day
+        y = round(plot.center().y())
+        for x, edge in ((plot.left() + 1, shown[0]), (plot.right() - 1, shown[-1])):
+            QTest.mouseMove(tl, QPoint(round(x), y))
+            assert tl._hover[1:3] == edge[:2]
+            at = tl._spot(edge, plot)
+            assert plot.left() <= at.x() <= plot.right()  # where the crosshair, its dot and the box are drawn
+            assert tl._target(at) == edge  # so a click on it zooms in to it
+    monkeypatch.setattr(charts, "GROUP_PX", 4)
+    tl._grouped.clear()
+    # The navigator's grips stick out past the strip at either end: grabbing their outer half works too.
+    my = round(nav.center().y())
+    QTest.mousePress(tl, Qt.MouseButton.LeftButton, pos=QPoint(round(nav.left()) - 3, my))
+    QTest.mouseMove(tl, QPoint(round(nav.center().x()), my))
+    QTest.mouseRelease(tl, Qt.MouseButton.LeftButton, pos=QPoint(round(nav.center().x()), my))
+    assert tl.view is not None and tl.view[1] == b and abs(tl.view[0] - (a + b) / 2) < 2 * DAY
+    # Zoomed in, the point nearest an edge may be one just out of view; the hover picks the nearest in view.
+    tl.set_view(start + 100.5 * DAY, start + 130.5 * DAY)
+    plot, _ = tl._areas()
+    lo, hi, _ = tl._screen
+    QTest.mouseMove(tl, QPoint(round(plot.left()) + 1, round(plot.center().y())))
+    assert tl._hover and lo <= (tl._hover[1] + tl._hover[2]) / 2 <= hi
