@@ -4,7 +4,10 @@ settles, a step a frame. Work is counted (paints, recounts, reads), not timed, s
 runner too; tools/perf.py measures the frame times themselves."""
 import os
 import sqlite3
+import sys
+import threading
 import time
+import traceback
 
 import pytest
 
@@ -30,7 +33,10 @@ from test_big_data import COMMENTS, POSTS, count_calls, fill  # noqa: E402
 def until(done, seconds: float = 10, doing=lambda: "") -> None:
     end = time.monotonic() + seconds
     while not done():
-        assert time.monotonic() < end, doing()
+        names = {t.ident: t.name for t in threading.enumerate()}
+        assert time.monotonic() < end, doing() + "".join(  # where each thread was (QThreads too) when it timed out
+            f"\n--- {names.get(ident, ident)}\n" + "".join(traceback.format_stack(frame))
+            for ident, frame in sys._current_frames().items())
         QApplication.processEvents()
         time.sleep(0.002)
 
