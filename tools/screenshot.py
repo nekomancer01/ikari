@@ -150,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
             cov.day_table.selectRow(3)
             cov.ticked = set(cov.days[2:4])
             cov._show_ticked()
-        settle(app, 1.5 if page in ("coverage", "words") else 0.3)  # counts, tallies, charts
+        settle(app, 1.5 if page in ("coverage", "words", "overview") else 0.3)  # counts, word tallies, charts
         path = out / name
         window.grab().save(str(path))
         print("wrote", path)
