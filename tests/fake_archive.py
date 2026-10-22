@@ -18,7 +18,9 @@ answers them, so a request ikari shouldn't send fails here too:
 - scores are 1 and num_comments 0 until a post is 36 hours old; removed posts stay in the archive.
 
 It can also be told to answer some requests with errors first (``fail``), or to answer slowly
-(``delay``), so a test can stop a fetch midway.
+(``delay``), so a test can stop a fetch midway; to be down for a while (``outage``: HTTP 500 to everything, as
+the real one was from 03:14 UTC on 22 Oct 2026), to fail a share of requests at random (``flaky``: a 503 or a
+connection dropped without an answer), or to fail every request about some posts' threads (``broken``).
 """
 from __future__ import annotations
 
@@ -167,6 +169,10 @@ class FakeArchive:
         self.delay = 0.0  # seconds each request takes, so a test can stop a fetch midway
         self.delays: dict[str, float] = {}  # the same for one endpoint only
         self.in_flight = self.peak = 0  # requests being answered now, and the most at once
+        self.down_until = 0.0  # perf_counter time until which every request answers HTTP 500 (see outage)
+        self.flaky, self._rng = 0.0, random.Random(7)  # share of requests failed at random
+        self.broken: set[str] = set()  # post ids whose comment trees always answer HTTP 500
+        self.failed: list[tuple[str, dict, int]] = []  # every request failed by those three: path, params, status
         self._lock = threading.Lock()
         archive = self
 
@@ -175,6 +181,9 @@ class FakeArchive:
                 url = urlparse(self.path)
                 params = {k: v[0] for k, v in parse_qs(url.query).items()}
                 status, payload, headers = archive.answer(url.path, params)
+                if status is None:  # dropped without an answer
+                    self.close_connection = True
+                    return
                 body = json.dumps(payload).encode()
                 self.send_response(status)
                 for k, v in headers.items():
@@ -206,6 +215,14 @@ class FakeArchive:
     def fail(self, path: str, *responses: tuple[int, dict]) -> None:
         self.faults.setdefault(path, []).extend(responses)
 
+    def outage(self, seconds: float) -> None:
+        """Answer every request with HTTP 500 for the next ``seconds``."""
+        self.down_until = time.perf_counter() + seconds
+
+    def requests_failed(self, status: int | None = 500) -> int:
+        with self._lock:
+            return sum(1 for *_, s in self.failed if s == status)
+
     def answer(self, path: str, q: dict) -> tuple[int, dict, dict]:
         with self._lock:
             self.in_flight += 1
@@ -224,6 +241,15 @@ class FakeArchive:
             if fault:
                 status, payload = fault.pop(0)
                 return status, payload, headers
+            down = time.perf_counter() < self.down_until
+            unlucky = self.flaky and self._rng.random() < self.flaky
+            if down or (path == "/api/comments/tree" and q.get("link_id", "").removeprefix("t3_") in self.broken):
+                self.failed.append((path, q, 500))
+                return 500, {"error": "Internal server error"}, headers
+            if unlucky:
+                status = self._rng.choice([503, None])
+                self.failed.append((path, q, status))
+                return status, {"error": "Service unavailable"}, headers
         if self.delays.get(path, self.delay):
             time.sleep(self.delays.get(path, self.delay))
         try:
