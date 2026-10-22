@@ -392,6 +392,9 @@ class CoveragePage(VerticalScrollArea):
         for signal in (self.comment_cap.count.valueChanged, self.comment_cap.pick.currentIndexChanged):
             signal.connect(self.comment_cap.save)
             signal.connect(self._show_ticked)
+        # A thread holding the cap is done at that cap, so the threads and the opened day's posts follow it.
+        self.comment_cap.count.valueChanged.connect(lambda _: self.subreddit and self.days and (
+            self._count_threads(), self._load_posts()))
         bar_cap.addWidget(self.comment_cap.count)
         bar_cap.addWidget(self.comment_cap.pick)
         for lay in (bar_lay, bar_cap):
@@ -706,7 +709,7 @@ class CoveragePage(VerticalScrollArea):
             self._threads_again = True
             return
         self._threads_again = False
-        want = (self.subreddit.lower(), self.days[-1], self.days[0] + DAY)
+        want = (self.subreddit.lower(), self.days[-1], self.days[0] + DAY, self.comment_cap.count.value())
         worker = StoreWorker(self.window_.db_path, "whole_threads_per_day", *want)
         worker.finished.connect(self._on_threads)  # a failed count leaves what's shown, until the next one
         self._threads_got = (want, None)
@@ -723,11 +726,17 @@ class CoveragePage(VerticalScrollArea):
             self._threads, self._threads_for = counts, asked
         if not (self.subreddit and self.days and self.isVisible()):
             return  # left meanwhile; showing the page again counts them
-        if self._threads_again or asked != (self.subreddit.lower(), self.days[-1], self.days[0] + DAY):
+        if self._threads_again or asked != (self.subreddit.lower(), self.days[-1], self.days[0] + DAY,
+                                            self.comment_cap.count.value()):
             self._count_threads()
         self._show_threads()
         self._apply_filter()
         self._show_ticked()
+
+    def _kept(self) -> str:
+        """What a thread needs saved to count as done, for the tooltips: the cap counts as done."""
+        cap = self.comment_cap.count.value()
+        return f"Every comment, or {cap:,} on a bigger thread, is" if cap else "Every comment is"
 
     def _threads_on(self, day: int) -> tuple[int, int]:
         """(posts with every comment saved, saved posts) on a listed day, as last counted; (0, 0) until then."""
@@ -753,7 +762,7 @@ class CoveragePage(VerticalScrollArea):
             cell.show_share(f"✓ {plural(posts, 'thread')}" if done else f"{whole:,} of {plural(posts, 'thread')}",
                             f"✓ {posts:,}" if done else f"{whole:,} of {posts:,}",
                             "" if done else f"{100 * whole // posts}%", whole / posts, done,
-                            f"Every comment is saved on {whole:,} of the {plural(posts, 'post')} saved from this "
+                            f"{self._kept()} saved on {whole:,} of the {plural(posts, 'post')} saved from this "
                             "day. " + THREADS_TIP)
             button.setText(CHECK if done else DOWNLOAD)
             button.setEnabled(not self.busy)
@@ -843,7 +852,7 @@ class CoveragePage(VerticalScrollArea):
         whole, total = (sum(self._threads_on(d)[i] for d in days) for i in (0, 1))
         where = "the ticked days" if self.ticked else f"these {plural(len(days), 'day')}"
         self.threads_total.setText(f"Comments complete on {whole:,} of {plural(total, 'post')}" if total else "")
-        self.threads_total.setToolTip(f"Every comment is saved on {whole:,} of the {plural(total, 'post')} saved "
+        self.threads_total.setToolTip(f"{self._kept()} saved on {whole:,} of the {plural(total, 'post')} saved "
                                       f"from {where}. " + THREADS_TIP if total else "")
         self.delete_question.setVisible(self._asking)
         self.delete_cancel.setVisible(self._asking)
@@ -876,7 +885,7 @@ class CoveragePage(VerticalScrollArea):
             t.setVisible(False)
             return
         store = self.window_.store
-        rows = store.comment_coverage(self.subreddit, day, day + DAY)  # newest first
+        rows = store.comment_coverage(self.subreddit, day, day + DAY, self.comment_cap.count.value())  # newest first
         order = self.order.value()
         if order == "missing":  # threads not saved whole first, each part newest first
             rows.sort(key=lambda r: bool(r["whole"]))
@@ -926,7 +935,9 @@ class CoveragePage(VerticalScrollArea):
         t, r = self.post_table, self._post_rows[i]
         done = r["id"] in self._comments_done
         so_far = r["num_comments"] is None and r["id"] in self._comments_so_far
-        state = (r["id"], r["title"], r["saved_comments"], r["num_comments"], done, so_far, self.busy)
+        total = r["num_comments"]
+        capped = bool(r["whole"]) and not (done or so_far or (bool(total) and r["saved_comments"] >= total))
+        state = (r["id"], r["title"], r["saved_comments"], r["num_comments"], done, so_far, capped, self.busy)
         if self._built.get(i) == state:
             return
         if i not in self._built:
@@ -938,7 +949,6 @@ class CoveragePage(VerticalScrollArea):
             button.clicked.connect(lambda _=False, row=i: self._download_comments([self._post_rows[row]["id"]]))
             t.setCellWidget(i, 2, centred(button))
         self._built[i] = state
-        total = r["num_comments"]
         t.cellWidget(i, 0).setText(" ".join((r["title"] or "").split()))
         cell: Cell = t.cellWidget(i, 1)
         cell.set(r["saved_comments"], total, done, "comment")
@@ -948,11 +958,17 @@ class CoveragePage(VerticalScrollArea):
             cell.setToolTip("Every comment the archive had on this post when it was downloaded is saved. Arctic "
                             "Shift counts a post's comments when it re-checks the post, usually about 36 hours "
                             "after posting; Check again fetches any that came since.")
+        elif capped:
+            cap = self.comment_cap.count.value()
+            cell.side.setText("at cap")
+            cell.bar.set(1.0, False)  # full for this cap, but not the green of a thread saved whole
+            cell.setToolTip(f"{plural(r['saved_comments'], 'comment')} saved: the {cap:,} per thread the download "
+                            "above keeps. A bigger cap downloads more.")
         elif total is None and not done:
             cell.side.setText("not counted yet")
             cell.setToolTip("Arctic Shift counts a post's comments when it re-checks the post, usually "
                             "about 36 hours after posting. Downloading still fetches what's there now.")
-        full = done or so_far or (bool(total) and r["saved_comments"] >= total)
+        full = done or so_far or capped or (bool(total) and r["saved_comments"] >= total)
         button: QPushButton = t.cellWidget(i, 2).findChild(QPushButton)
         button.setText(CHECK if full else DOWNLOAD)
         button.setToolTip("Check again: look for comments added since" if full else "Download all of its comments")

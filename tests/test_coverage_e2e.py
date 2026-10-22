@@ -390,6 +390,32 @@ def test_a_cap_that_holds_a_whole_thread_marks_it_complete(window):
     assert "p0" in w.store.complete_keys("comments", "Python")  # all 5 fit under 50
 
 
+def test_a_thread_holding_the_cap_counts_as_done_until_the_cap_is_raised(window):
+    # The owner, 22 Oct: "fix the comment cap issue". With a cap set, a thread holding that many comments isn't
+    # downloaded again, but the day's Comment threads still read "0 of 1 thread" and its ↓ asked again, forever.
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals and c._threads)
+    c.comment_cap.count.setValue(3)
+    day = TODAY - 2 * DAY
+    row = c.days.index(day)
+    c.day_table.selectRow(row)
+    QTest.mouseClick(c.day_table.cellWidget(row, 4).findChild(QPushButton), Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert FakeArchive.caps == [(3, "top")] and len(w.store.comments("Python")) == 3  # 3 of p1's 5
+    cell = c.day_table.cellWidget(row, 3)
+    settle(w, lambda: cell.main.full_text().startswith("✓"))
+    assert cell.main.full_text() == "✓ 1\u00a0thread"  # on main: "0 of 1 thread"
+    assert c.day_table.cellWidget(row, 4).findChild(QPushButton).text() == coverage.CHECK
+    assert not c.all_comments.isEnabled()  # the opened day's posts offer nothing more at this cap
+    assert c.post_table.cellWidget(0, 2).findChild(QPushButton).text() == coverage.CHECK
+    c.comment_cap.count.setValue(4)  # a bigger cap: the thread is owed one more
+    settle(w, lambda: not cell.main.full_text().startswith("✓"))
+    assert cell.main.full_text() == "0 of 1\u00a0thread" and c.all_comments.isEnabled()
+
+
 def test_comments_only_downloads_follow_the_cap_too(window):
     w = window
     select(w, "Python")
