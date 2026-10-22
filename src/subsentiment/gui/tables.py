@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import heapq
+import math
 import time
 from datetime import datetime
 from itertools import islice
@@ -1050,13 +1051,15 @@ class TablePage(QWidget):
             spare = sum(w - least for w, least in loose.values())
             over = fixed + sum(w for w, _ in loose.values()) - (room - need)
             give = min(1.0, over / spare) if over > 0 and spare > 0 else (0.0 if over <= 0 else 1.0)
-            used = fixed + sum(round(w - (w - least) * give) for w, least in loose.values())
-            if room - used >= need or key == self.OPTIONAL[-1]:
+            # Rounded down: rounding each to nearest added up to a pixel over, and hid columns that fit.
+            sizes = {col: max(least, math.floor(w - (w - least) * give)) if col in loose else w
+                     for col, (w, least) in widths.items()}
+            if room - fixed - sum(sizes[col] for col in loose) >= need or key == self.OPTIONAL[-1]:
                 break
         header = self.view.horizontalHeader()
-        for col, (w, least) in widths.items():
+        for col, size in sizes.items():
             header.setSectionHidden(col, col in hidden)
-            header.resizeSection(col, round(w - (w - least) * give) if keys[col] in self.SHRINKS else w)
+            header.resizeSection(col, size)
 
     def eventFilter(self, obj, event) -> bool:
         # The view's viewport, not this page: the page is resized before its layout resizes the view, and a
