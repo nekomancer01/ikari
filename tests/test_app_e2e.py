@@ -568,6 +568,9 @@ def test_closing_while_a_search_is_out_ends_the_fetch_at_once(env, monkeypatch):
 
 QUIT_MID_FETCH = """
 import os, sys
+sys.path.insert(0, sys.argv[4])
+from fake_archive import Clock
+Clock.pin()  # the test's clock, which its fake archive's posts were made on
 from PySide6.QtCore import QSettings, QTimer
 from subsentiment import arctic_shift, collect
 from subsentiment.gui import app, main_window, worker
@@ -619,7 +622,7 @@ def test_quitting_mid_fetch_exits_cleanly(env, tmp_path, mode):
     env.archive.delays[IDS] = 20
     start = time.monotonic()
     run = subprocess.run([sys.executable, "-X", "faulthandler", "-c", QUIT_MID_FETCH, env.archive.url,
-                          str(tmp_path), mode],
+                          str(tmp_path), mode, str(Path(__file__).parent)],
                          capture_output=True, text=True, timeout=90,
                          env=dict(os.environ, QT_QPA_PLATFORM="offscreen"))
     assert run.returncode == 0, run.stderr[-2000:]
