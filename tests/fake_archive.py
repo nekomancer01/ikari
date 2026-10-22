@@ -102,15 +102,22 @@ def make_posts(subreddit: str, now: float, days: int = 10, per_day=(6, 12, 0), s
 
 
 def comment_tree(post: dict, limit: int) -> list[dict]:
-    n = max(post["num_comments"], 2)
+    """A post's thread: its num_comments comments (at least two), or "tree" of them where the archive's count
+    lags its tree (live, 22 Oct: r/classicwow posts counted at 1,078 and 2,936 had 1,264 and 3,031 in their
+    trees). A tree bigger than ``limit`` comes back about half expanded, the rest in a "more" stub, as the
+    archive's do (live: 2,936 counted, 3,031 in the tree, limit=2986 gave 1,498 comments and 167 stubs)."""
+    n = post.get("tree") or max(post["num_comments"], 2)
+    shown = n if n <= limit else limit // 2
     items = []
-    for i in range(min(n, limit)):
+    for i in range(shown):
         data = {"id": f"{post['id']}c{i}", "link_id": "t3_" + post["id"], "parent_id": "t3_" + post["id"],
                 "author": f"c{i}", "body": ["nice", "awful", "ok"][i % 3], "score": i,
                 "created_utc": post["created_utc"] + 60 * (i + 1),
                 "retrieved_on": post["retrieved_on"], "replies": "",
                 "permalink": post["permalink"] + f"{post['id']}c{i}/"}
         items.append({"kind": "t1", "data": data})
+    if shown < n:
+        items.append({"kind": "more", "data": {"count": n - shown, "children": [f"{post['id']}c{shown}"]}})
     return items
 
 
