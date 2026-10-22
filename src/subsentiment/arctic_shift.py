@@ -37,7 +37,15 @@ USER_AGENT = f"ikari/{__version__} (+https://github.com/nekomancer01/ikari)"
 SETTLE_SECONDS = 36 * 3600
 PAGE = 100  # the API's largest fixed page size
 IDS_BATCH = 500  # most ids /api/posts/ids takes in one request
-ATTEMPTS = 8
+RETRIES = 5  # tries of a request that keeps failing (5xx, no answer) while the archive answers others
+# Requests failed in a row, with nothing answered between, for the archive to count as down: as many as a request's own
+# tries, so a lone request (a count) finds an outage before it gives up, and a share failing at random rarely looks like one.
+OUTAGE_AFTER = RETRIES
+PROBE_WAITS = (10.0, 20.0, 40.0, 60.0)  # seconds between checks while it's down: then every 60 s
+OUTAGE_PATIENCE = 600.0  # seconds a request waits for a down archive before its job ends (ArchiveDown)
+# Asked while it's down, rather than a request that may be failing for its own reasons: a lookup of one old post.
+PROBE = ("/api/posts/ids", {"ids": "ei30r4", "fields": "id"})
+TIMEOUT = (10, 60)  # seconds to connect (an archive that isn't there is noticed quickly), and between bytes read
 BASE_INTERVAL = 0.4  # seconds between requests: the API docs say "a few requests per second is fine"
 MAX_WAIT = 120.0
 MAX_INTERVAL = 10.0
@@ -87,23 +95,41 @@ class QueryTimeout(FetchError):
 
 
 class _Flight:
-    """A request the limiter let out, until its answer comes."""
+    """A request the limiter let out, until its answer comes. ``probe``: the archive is down, and this thread is to
+    ask it the cheapest question (PROBE) instead of its own; ``outage_start`` is when the request first found the
+    archive down (None if it hasn't)."""
 
-    def __init__(self, should_stop: StopFn | None):
+    def __init__(self, should_stop: StopFn | None, probe: bool = False, outage_start: float | None = None):
         self.should_stop = should_stop
+        self.probe = probe
+        self.outage_start = outage_start
 
     def abandoned(self) -> bool:
         """The job that sent it was stopped, so nobody is waiting for its answer."""
         return bool(self.should_stop and self.should_stop())
 
 
+class ArchiveDown(FetchError):
+    """The archive hasn't answered anything for OUTAGE_PATIENCE: the job ends, keeping what it saved."""
+
+
 class RateLimiter:
-    """Keeps requests at least ``interval`` seconds apart, and holds them back when the server asks.
+    """The one door every request to the archive goes through. It keeps requests at least ``interval`` seconds
+    apart, within the server's budget, and holds them all back only on the archive's own word about load or when
+    it isn't answering at all; a request that fails on its own waits on its own thread (ArcticShiftClient.get).
 
     Arctic Shift's limits change with server load. It answers 429 with ``X-RateLimit-Reset`` (seconds
     until the limit resets) or ``X-RateLimit-Reset-At`` (a Unix time), and may send
     ``X-RateLimit-Remaining`` on any response. Each 429 doubles the spacing (up to MAX_INTERVAL);
     successful requests ease it back to the base interval.
+
+    Down: after OUTAGE_AFTER failures in a row (5xx, no answer, one that can't be read) with nothing answered
+    between, nothing more goes out but one PROBE at a time, PROBE_WAITS apart; the first answer, to a probe or to
+    a request already out, ends it. A request that has waited OUTAGE_PATIENCE for it raises ArchiveDown. (Live, 22
+    Oct 03:14 UTC: every request, even the smallest, answered HTTP 500 for over ten minutes; each request used to
+    hold everything back 5 s, 10 s, ... 120 s, eight times, before failing.)
+
+    Waits are slept with the lock let go, so answers coming in and other jobs' Stop aren't held up by them.
     """
 
     def __init__(self, interval: float = BASE_INTERVAL, clock: Callable[[], float] = time.perf_counter,
@@ -126,17 +152,48 @@ class RateLimiter:
         self._budget_until = 0.0  # when that window resets
         self._budget_known = False  # the server has sent X-RateLimit-Remaining at least once
         self._answered = False  # any answer has arrived yet
+        self._failures = 0  # requests failed in a row, across every job
+        self._down: tuple[float, str] | None = None  # (wall time, what came back) since the archive is down
+        self._probes = 0  # probes that failed since
+        self._probe_at = 0.0  # when the next may go
+        self._probing = False  # one is out
 
-    def wait(self, should_stop: StopFn | None = None, share: float = 1.0) -> _Flight:
+    @property
+    def down(self) -> bool:
+        return self._down is not None
+
+    def down_text(self) -> str:
+        since, what = self._down or (self._wall(), "")
+        return f"Arctic Shift isn't answering ({what} since {time.strftime('%H:%M', time.localtime(since))})"
+
+    def wait(self, should_stop: StopFn | None = None, share: float = 1.0, outage_start: float | None = None) -> _Flight:
         """Block until a request may go out, and count it as in flight until ``observe`` or ``done``
         (given what this returns). Raises Stopped, sending nothing, if ``should_stop`` turns true meanwhile.
-        ``share`` is how much of the spacing the request takes up: less for a light one (see TREE_SHARE)."""
-        announced = False
+        ``share`` is how much of the spacing the request takes up: less for a light one (see TREE_SHARE).
+        While the archive is down, the flight returned may be a probe (see the class); ``outage_start`` is when
+        this request first found it down, and once it has waited OUTAGE_PATIENCE since, ArchiveDown is raised."""
+        announced = None  # the (until, why) last announced
         with self._lock:
             while True:
                 if should_stop and should_stop():
                     raise Stopped
                 now = self._clock()
+                if self._down is not None:
+                    outage_start = now if outage_start is None else outage_start
+                    if now - outage_start >= OUTAGE_PATIENCE:
+                        if announced and self.on_wait:
+                            self.on_wait(0.0, "")
+                        raise ArchiveDown(f"{self.down_text()}. What was downloaded is kept; try again once "
+                                          "it's back.")
+                    if not self._probing and now >= self._probe_at:
+                        self._probing = True
+                        return _Flight(should_stop, probe=True, outage_start=outage_start)
+                    left = max(self._probe_at - now, STOP_POLL)
+                    if self.on_wait and announced != (self._probe_at, self._down):
+                        self.on_wait(left, self.down_text())
+                        announced = (self._probe_at, self._down)
+                    self._rest(min(left, STOP_POLL if should_stop else 1.0))
+                    continue
                 if self._budget is not None and now >= self._budget_until:
                     self._budget = None  # the window reset; the next answer gives the new budget
                 unknown = not self._answered or (self._budget_known and self._budget is None)
@@ -148,27 +205,36 @@ class RateLimiter:
                 if self._budget is not None and self._budget <= 0:
                     self.hold(self._budget_until - now, "Arctic Shift's request limit was reached")
                     self._budget = None
-                # Sleeping with the lock held keeps starts ``interval`` apart by the clock even when a
-                # sleep overshoots (Windows' timer is coarse); planning start times ahead doesn't.
                 delay = self._next - now
                 if delay > 0:
-                    if delay >= 3 and self.on_wait and not announced:
+                    if delay >= 3 and self.on_wait and announced is None:
                         self.on_wait(delay, self._reason)
-                        announced = True
-                    if should_stop and delay > STOP_POLL:
-                        self._sleep(STOP_POLL)  # then look again: Stop may have been pressed
-                        continue
-                    self._sleep(delay)
+                        announced = (self._next, None)
+                    chunk, slot = (min(delay, STOP_POLL) if should_stop else delay), self._next
+                    self._rest(chunk)
                     if should_stop and should_stop():  # pressed during that last short wait
                         raise Stopped
+                    # Look again if it was only part of the wait (Stop may be pressed next), or another request
+                    # took the slot or the archive went down meanwhile. Otherwise it's this one's, whatever the
+                    # clock says: a coarse timer (Windows') can wake a little early.
+                    if chunk < delay or self._next != slot or self._down is not None:
+                        continue
                 self._next = self._clock() + self.interval * share
                 if announced and self.on_wait:
                     self.on_wait(0.0, "")  # over: the UI goes back to what the job is doing
-                flight = _Flight(should_stop)
+                flight = _Flight(should_stop, outage_start=outage_start)
                 self._in_flight.append(flight)
                 if self._budget is not None:
                     self._budget -= 1
                 return flight
+
+    def _rest(self, seconds: float) -> None:
+        """Sleep with the lock let go (it's held on the way in and out)."""
+        self._lock.release()
+        try:
+            self._sleep(seconds)
+        finally:
+            self._lock.acquire()
 
     def done(self, flight: _Flight | None = None) -> None:
         """A request ``wait`` let out got no answer (a network error)."""
@@ -179,7 +245,7 @@ class RateLimiter:
     def _answer(self, flight: _Flight | None) -> None:
         if flight in self._in_flight:
             self._in_flight.remove(flight)
-        elif self._in_flight:
+        elif self._in_flight and (flight is None or not flight.probe):
             self._in_flight.pop(0)
 
     def pause(self, seconds: float, should_stop: StopFn | None = None) -> None:
@@ -203,8 +269,40 @@ class RateLimiter:
     def slow_down(self) -> None:
         self.interval = min(self.interval * 2, MAX_INTERVAL)
 
-    def ok(self) -> None:
-        self.interval = max(self.base, self.interval * 0.8)
+    def ok(self, ease: bool = True) -> None:
+        """A request was answered: the archive is up, and (if ``ease``: it was answered in full) the spacing eases
+        back."""
+        with self._lock:
+            if ease:
+                self.interval = max(self.base, self.interval * 0.8)
+            self._failures = 0
+            back = self._down is not None
+            if back:
+                self._down, self._probing = None, False
+                self._lock.notify_all()
+        if back and self.on_wait:
+            self.on_wait(0.0, "")  # the UI goes back to what the job is doing
+
+    def failed(self, what: str) -> bool:
+        """A request failed (``what``: "HTTP 500", "no answer"); whether the archive now counts as down."""
+        with self._lock:
+            self._failures += 1
+            if self._down is None and self._failures >= OUTAGE_AFTER:
+                self._down, self._probes, self._probing = (self._wall(), what), 0, False
+                self._probe_at = self._clock() + PROBE_WAITS[0]
+            return self._down is not None
+
+    def probed(self, up: bool) -> None:
+        """The probe ``wait`` handed out came back: answered (``up``), or not, so the next waits longer."""
+        if up:
+            self.ok(ease=False)
+            return
+        with self._lock:
+            self._probing = False
+            if self._down is not None:
+                self._probes += 1
+                self._probe_at = self._clock() + PROBE_WAITS[min(self._probes, len(PROBE_WAITS) - 1)]
+            self._lock.notify_all()
 
     def reset_after(self, headers, default: float) -> float:
         """Seconds until the server's limit resets, from whichever header it sent."""
@@ -335,84 +433,123 @@ class ArcticShiftClient:
     # -- HTTP ---------------------------------------------------------------
 
     def get(self, path: str, params: dict, shrink: bool = True, share: float = 1.0) -> list:
-        """One API call with retries: waits on 429, backs off on 5xx and network errors, and on a
-        query timeout backs off and asks for smaller pages (unless ``shrink`` is False, for requests
-        whose ``limit`` isn't a page size), raising QueryTimeout if that doesn't help. ``share`` is
-        RateLimiter.wait's."""
+        """One API call, with what each kind of failure calls for (see RateLimiter for the archive being down):
+
+        * 429, or the budget spent: every request waits for the reset (RateLimiter.hold).
+        * A query timeout: this request alone pauses 2 s, then 4 s, asking for smaller pages (unless ``shrink`` is
+          False, for requests whose ``limit`` isn't a page size), then raises QueryTimeout for the caller to ask
+          for less.
+        * A 5xx, no answer, or one that isn't the archive's JSON: this request alone tries again, 1, 2, 4 and 8 s
+          later, RETRIES times in all, then raises (the network error itself, if that's what it was). Failures
+          in a row across every request mean the archive is down: this request then waits for it to come back
+          rather than using up its tries, and raises ArchiveDown if it doesn't within OUTAGE_PATIENCE.
+        * Any other error is raised at once: the request is wrong, and asking again won't help.
+
+        ``share`` is RateLimiter.wait's."""
         params = dict(params)
         self._local.last_params = params  # what was finally sent, after any shrinking
-        timeouts = garbled = 0
+        timeouts = tries = garbled = 0
+        outage_start = None
         stop = None if getattr(self._local, "finishing", False) else self.should_stop
-        for attempt in range(ATTEMPTS):
-            backoff = min(5.0 * 2 ** attempt, MAX_WAIT)
-            flight = self.limiter.wait(stop, share)
-            try:
-                resp = self.session.get(BASE_URL + path, params=params, timeout=60)
-            except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError,
-                    requests.exceptions.ContentDecodingError):  # no answer, or one cut off on the way
-                self.limiter.done(flight)
-                if attempt == ATTEMPTS - 1:
-                    raise
-                self.limiter.hold(backoff, "Couldn't reach Arctic Shift")
+        while True:
+            flight = self.limiter.wait(stop, share, outage_start)
+            outage_start = flight.outage_start
+            if flight.probe:
+                self.limiter.probed(self._probe(flight))
                 continue
+            try:
+                resp = self.session.get(BASE_URL + path, params=params, timeout=TIMEOUT)
+            except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.ContentDecodingError) as e:  # no answer, or one cut off on the way
+                self.limiter.done(flight)
+                failure, what = e, "no answer"
             except BaseException:
                 self.limiter.done(flight)
                 raise
-            self.limiter.observe(resp.headers, flight)
-            try:
-                payload = resp.json()  # parsed once: a big comment tree takes a while to parse
-            except Exception:  # not JSON
-                payload = None
-            error = str(payload.get("error") or "") if isinstance(payload, dict) else ""
-            if resp.status_code == 200 and not error and isinstance(payload, dict):
-                self.limiter.ok()
-                data = payload.get("data")
-                records = []
-                for d in data if isinstance(data, list) else ():
-                    if not isinstance(d, dict):  # a malformed record: skipping it keeps the rest
-                        continue
-                    if d.get("id") is not None and not isinstance(d["id"], str):  # compared with saved ids as text
-                        d = dict(d, id=str(d["id"]))
-                    records.append(d)
-                return records
-            if resp.status_code == 200 and not isinstance(payload, dict):
-                # Not the archive's JSON: a proxy's or CDN's error page, or a body cut short. It used to fail
-                # the whole fetch on the first one; a few are retried, then it's said what came back.
-                garbled += 1
-                if garbled >= GARBLED_TRIES:
-                    raise FetchError("Arctic Shift's answers couldn't be read (something between this computer "
-                                     "and the archive may be answering instead). Try again in a few minutes.")
-                self.limiter.hold(2.0 * garbled, "Arctic Shift's answer couldn't be read")
-                continue
-            lowered = error.lower()
-            if "timed out" in lowered or "timeout" in lowered or (resp.status_code == 422 and "slow down" in lowered):
-                # The archive answers slow queries with "Query timed out" (HTTP 200) or "Timeout. Maybe
-                # slow down a bit" (HTTP 422). Wait, then try a smaller page.
-                timeouts += 1
-                if timeouts >= TIMEOUT_TRIES:
-                    raise QueryTimeout("Arctic Shift timed out on this query. Try a shorter date range or "
-                                       "fewer posts, or try again in a few minutes.")
-                # A timeout is about how heavy the query was, not how often we ask, so it gets a short
-                # pause and a smaller page rather than slowing the whole job down. Only this request waits:
-                # holding every request back made one heavy query (a busy month's count) stall the downloads
-                # beside it, which then said "Arctic Shift is slow" over and over and saved nothing.
-                self.limiter.pause(2.0 * timeouts, stop)
-                limit = params.get("limit")
-                if shrink and "limit" in params:
-                    params["limit"] = PAGE // 4 if not isinstance(limit, int) else max(10, limit // 2)
-                continue
-            if resp.status_code == 429:
-                self.limiter.slow_down()
-                self.limiter.hold(self.limiter.reset_after(resp.headers, backoff),
-                                  "Arctic Shift asked ikari to slow down")
-                continue
-            if resp.status_code >= 500:
-                self.limiter.hold(backoff)
-                continue
-            if resp.status_code == 200:
-                raise FetchError(f"Arctic Shift: {error}")
-            raise FetchError(f"Arctic Shift returned HTTP {resp.status_code}" + (f": {error}" if error else "."))
-        raise FetchError("Arctic Shift is busy or rate limiting. Try again in a few minutes.")
+            else:
+                self.limiter.observe(resp.headers, flight)
+                try:
+                    payload = resp.json()  # parsed once: a big comment tree takes a while to parse
+                except Exception:  # not JSON
+                    payload = None
+                error = str(payload.get("error") or "") if isinstance(payload, dict) else ""
+                if resp.status_code == 200 and not error and isinstance(payload, dict):
+                    self.limiter.ok()
+                    data = payload.get("data")
+                    records = []
+                    for d in data if isinstance(data, list) else ():
+                        if not isinstance(d, dict):  # a malformed record: skipping it keeps the rest
+                            continue
+                        if d.get("id") is not None and not isinstance(d["id"], str):  # compared with saved ids as text
+                            d = dict(d, id=str(d["id"]))
+                        records.append(d)
+                    return records
+                lowered = error.lower()
+                if "timed out" in lowered or "timeout" in lowered or (resp.status_code == 422 and "slow down" in lowered):
+                    # The archive answers slow queries with "Query timed out" (HTTP 200) or "Timeout. Maybe
+                    # slow down a bit" (HTTP 422). It's up, and the query was too heavy: wait, then try a smaller
+                    # page. Only this request waits: holding every request back made one heavy query (a busy
+                    # month's count) stall the downloads beside it, which then said "Arctic Shift is slow" over
+                    # and over and saved nothing.
+                    self.limiter.ok(ease=False)
+                    timeouts += 1
+                    if timeouts >= TIMEOUT_TRIES:
+                        raise QueryTimeout("Arctic Shift timed out on this query. Try a shorter date range or "
+                                           "fewer posts, or try again in a few minutes.")
+                    self.limiter.pause(2.0 * timeouts, stop)
+                    limit = params.get("limit")
+                    if shrink and "limit" in params:
+                        params["limit"] = PAGE // 4 if not isinstance(limit, int) else max(10, limit // 2)
+                    continue
+                if resp.status_code == 429:
+                    self.limiter.ok(ease=False)  # answering, if not to this
+                    self.limiter.slow_down()
+                    self.limiter.hold(self.limiter.reset_after(resp.headers, 5.0 * 2 ** min(tries, 4)),
+                                      "Arctic Shift asked ikari to slow down")
+                    tries += 1
+                    if tries >= 2 * RETRIES:
+                        raise FetchError("Arctic Shift is rate limiting. Try again in a few minutes.")
+                    continue
+                if resp.status_code < 500 and isinstance(payload, dict):
+                    self.limiter.ok(ease=False)
+                    if resp.status_code == 200:
+                        raise FetchError(f"Arctic Shift: {error}")
+                    raise FetchError(f"Arctic Shift returned HTTP {resp.status_code}" + (f": {error}" if error else "."))
+                # A 5xx, or an answer that isn't the archive's JSON: a proxy's or CDN's error page, or a body cut
+                # short. Either may be this request's own trouble, or the archive's.
+                if resp.status_code >= 500:
+                    failure, what = FetchError(f"Arctic Shift couldn't answer (HTTP {resp.status_code}). Try again "
+                                               "in a few minutes."), f"HTTP {resp.status_code}"
+                else:
+                    garbled += 1
+                    failure, what = FetchError("Arctic Shift's answers couldn't be read (something between this "
+                                               "computer and the archive may be answering instead). Try again in "
+                                               "a few minutes."), "an unreadable answer"
+            if garbled >= GARBLED_TRIES:  # what keeps answering isn't the archive: waiting won't bring it
+                raise failure
+            if self.limiter.failed(what):
+                outage_start = self.limiter._clock() if outage_start is None else outage_start
+                continue  # waited for at the limiter, which probes until it's back
+            tries += 1
+            if tries >= RETRIES:
+                raise failure
+            self.limiter.pause(2.0 ** (tries - 1), stop)
+
+    def _probe(self, flight) -> bool:
+        """Ask the archive the cheapest question there is, for the limiter, which has it down: whether it answered."""
+        path, params = PROBE
+        try:
+            resp = self.session.get(BASE_URL + path, params=params, timeout=(10, 20))
+        except requests.RequestException:
+            return False
+        self.limiter.observe(resp.headers, flight)
+        try:
+            payload = resp.json()
+        except Exception:
+            return False
+        if resp.status_code == 429:
+            self.limiter.hold(self.limiter.reset_after(resp.headers, 10.0), "Arctic Shift asked ikari to slow down")
+        return resp.status_code < 500 and isinstance(payload, dict)
 
     @property
     def last_params(self) -> dict:

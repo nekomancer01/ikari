@@ -9,7 +9,7 @@ from typing import Callable, Collection
 
 import requests
 
-from subsentiment.arctic_shift import ArcticShiftClient, Stopped, in_parallel
+from subsentiment.arctic_shift import ArcticShiftClient, ArchiveDown, Stopped, in_parallel
 from subsentiment.reddit import FetchError, Post, normalize_subreddit
 from subsentiment.sentiment import Lexicon
 from subsentiment.store import Store
@@ -327,6 +327,8 @@ def _each_thread(posts: list[Post], get: Callable, client: ArcticShiftClient, st
             got = get(p)
         except Stopped:
             return None  # not tried
+        except ArchiveDown:
+            raise
         except (FetchError, requests.RequestException):
             with lock:
                 streak[0] += 1
@@ -347,7 +349,8 @@ def _each_thread(posts: list[Post], get: Callable, client: ArcticShiftClient, st
         tried.add(p.id)
         progress(len(tried), len(posts), f"{what} {len(tried)}/{len(posts)}: {p.title[:60]}")
         if error is not None:
-            if not isinstance(error, (FetchError, requests.RequestException)):
+            # Down for good (it waited OUTAGE_PATIENCE): the job ends, rather than each thread left waiting it out.
+            if isinstance(error, ArchiveDown) or not isinstance(error, (FetchError, requests.RequestException)):
                 raise error
             store.mark_comments(p.id, ok=False, settled=False)
             store.commit()

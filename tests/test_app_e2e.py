@@ -450,6 +450,96 @@ def test_an_archive_that_keeps_failing_shows_one_warning_and_unlocks_the_form(en
     assert len(env.warnings) == 1 and w.fetch_btn.isEnabled()
 
 
+def start_fetch(w, sub="python", comments=True, rng="week"):
+    """Start a fetch from the Fetch drawer without waiting for it."""
+    if w._drawer_key() != "fetch":
+        QTest.mouseClick(w.rail.buttons["fetch"], Qt.MouseButton.LeftButton)
+    w.fetch_form.subreddit.setText(sub)
+    w.fetch_form.include_comments.setChecked(comments)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData(rng))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+
+
+def until_saved(env, sub="python", timeout: float = 20) -> None:
+    end = time.monotonic() + timeout
+    while not env.store().posts(sub):
+        assert time.monotonic() < end, "nothing was saved"
+        pump(10)
+
+
+def failed_threads(env) -> int:
+    return env.store().db.execute("SELECT COUNT(*) FROM comment_fetches WHERE ok = 0").fetchone()[0]
+
+
+PROBES = lambda env: [q for p, q in env.archive.requests if (p, q) == arctic_shift.PROBE]  # noqa: E731
+
+
+def test_an_archive_that_goes_down_mid_download_is_waited_out_one_probe_at_a_time(env, monkeypatch):
+    # Live, 22 Oct 03:14 UTC: Arctic Shift answered HTTP 500 to everything for over half an hour. Each request held
+    # every other back 5 s, 10 s, ... 120 s, eight times over, said "Arctic Shift is busy", then failed.
+    monkeypatch.setattr(arctic_shift, "PROBE_WAITS", (0.3, 0.6))
+    w = env.window()
+    env.archive.delay = 0.05
+    start_fetch(w)
+    until_saved(env)
+    # A lone request (the last part of a day) finds it down after OUTAGE_AFTER tries, 1 s, 2 s, ... apart (1.2 s at
+    # most here): about 5 s.
+    env.archive.outage(9.0)
+    said, quiet = set(), False
+    while time.perf_counter() < env.archive.down_until:
+        if not quiet and time.perf_counter() > env.archive.down_until - 2.5:  # what was out has failed by now
+            quiet, env.archive.peak = True, env.archive.in_flight
+        said.add(w.progress_msg.text())
+        pump(10)
+    assert quiet and env.archive.peak <= 1, "more than a probe at a time went out while it was down"
+    assert any("Arctic Shift isn't answering (HTTP 500 since" in m for m in said), said
+    assert len(PROBES(env)) >= 2
+    wait_idle(w, 60)
+    assert not env.warnings and failed_threads(env) == 0  # carried on by itself, and nothing was left failed
+    assert len(env.store().posts("python")) == in_range(env, w)
+    assert w.progress_msg.text().startswith("Added"), w.progress_msg.text()
+
+
+def test_an_archive_down_for_longer_than_the_patience_ends_the_download_keeping_what_it_saved(env, monkeypatch):
+    monkeypatch.setattr(arctic_shift, "PROBE_WAITS", (0.3,))
+    monkeypatch.setattr(arctic_shift, "OUTAGE_PATIENCE", 2.0)
+    w = env.window()
+    env.archive.delay = 0.05
+    start_fetch(w)
+    until_saved(env)
+    env.archive.outage(3600)
+    wait_idle(w, 30)
+    saved = len(env.store().posts("python"))
+    assert len(env.warnings) == 1 and "isn't answering (HTTP 500 since" in env.warnings[0], env.warnings
+    assert 0 < saved and w.fetch_btn.isEnabled()
+    env.archive.down_until = 0  # back: the next fetch carries on
+    fetch(w)
+    assert len(env.store().posts("python")) == in_range(env, w) and failed_threads(env) == 0
+
+
+def test_a_flaky_archive_still_downloads_everything(env):
+    # A 503 or a dropped connection on a fifth of all requests, at random.
+    w = env.window()
+    env.archive.flaky = 0.2
+    fetch(w, timeout=60)
+    assert env.archive.requests_failed(503) and env.archive.requests_failed(None)  # both kinds came up
+    assert not env.warnings and failed_threads(env) == 0
+    assert len(env.store().posts("python")) == in_range(env, w)
+
+
+def test_a_thread_the_archive_cant_answer_fails_alone_without_holding_up_the_rest(env):
+    # A 5xx on one request used to hold back every request in the app, whatever the others were getting.
+    w = env.window()
+    broken = next(p["id"] for p in env.archive.posts if p["subreddit"] == "Python" and p["num_comments"] > 2
+                  and not p.get("removed_by_category") and p["created_utc"] > NOW - 6 * DAY)
+    env.archive.broken = {broken}
+    fetch(w, timeout=60)
+    assert not env.warnings and not PROBES(env)  # the archive answered the rest, so it never counted as down
+    failed = env.store().db.execute("SELECT post_id FROM comment_fetches WHERE ok = 0").fetchall()
+    assert [r[0] for r in failed] == [broken]  # retried on the next fetch
+    assert sum(1 for p, q in env.archive.requests if p == TREE and q["link_id"] == broken) == arctic_shift.RETRIES
+
+
 def test_an_empty_range_says_so(env):
     w = env.window()
     fetch(w, sub="nothinghere", comments=False)
