@@ -568,6 +568,9 @@ def test_closing_while_a_search_is_out_ends_the_fetch_at_once(env, monkeypatch):
 
 QUIT_MID_FETCH = """
 import os, sys
+sys.path.insert(0, sys.argv[4])
+from fake_archive import Clock
+Clock.pin()  # the test's clock, which its fake archive's posts were made on
 from PySide6.QtCore import QSettings, QTimer
 from subsentiment import arctic_shift, collect
 from subsentiment.gui import app, main_window, worker
@@ -619,7 +622,7 @@ def test_quitting_mid_fetch_exits_cleanly(env, tmp_path, mode):
     env.archive.delays[IDS] = 20
     start = time.monotonic()
     run = subprocess.run([sys.executable, "-X", "faulthandler", "-c", QUIT_MID_FETCH, env.archive.url,
-                          str(tmp_path), mode],
+                          str(tmp_path), mode, str(Path(__file__).parent)],
                          capture_output=True, text=True, timeout=90,
                          env=dict(os.environ, QT_QPA_PLATFORM="offscreen"))
     assert run.returncode == 0, run.stderr[-2000:]
@@ -1515,6 +1518,29 @@ def test_coverage_downloads_a_days_comments_many_threads_at_once(env, monkeypatc
     starts = 40 * arctic_shift.BASE_INTERVAL * arctic_shift.TREE_SHARE
     assert took < 40 * arctic_shift.BASE_INTERVAL  # on main, 4 at a time took 40 / 4 * 1.6 s = 16 s
     assert took >= starts  # still spaced out: at most one start every 0.2 s
+
+
+def test_a_days_comments_downloaded_once_read_complete_even_where_the_archive_counts_a_thread_short(env):
+    # The owner, 22 Oct: "comments downloading very rarely shows itself as complete". A day's Comment threads read
+    # "391 of 392 threads" however often it was downloaded. Its biggest thread had more comments in the archive's
+    # tree than the archive counted (live: 1,078 counted, 1,264 in the tree), and asked for that count plus 50 the
+    # tree came back with replies collapsed, so it was never saved whole and each download asked the same again.
+    day = busy_day(env, "bigthreads", 5)
+    big = next(p for p in env.archive.posts if p["id"] == "bd00002")
+    big.update(num_comments=60, tree=400, retrieved_on=big["created_utc"] + 40 * 3600)  # settled, counted short
+    w = env.window()
+    fetch(w, sub="bigthreads", comments=False, rng="week")
+    cov = open_coverage(w)
+    row = cov.days.index(day)
+    QTest.mouseClick(cov.day_table.cellWidget(row, 4).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    end = time.monotonic() + 10
+    while cov.threads_job.busy and time.monotonic() < end:
+        pump(20)
+    pump(100)
+    assert cov.day_table.cellWidget(row, 3).main.full_text() == "✓ 5\u00a0threads"  # on main: 4 of 5 threads
+    assert len(env.store().comment_ids("bd00002")) == 400  # the whole tree, not 55 of it
+    assert env.store().open_threads("bigthreads", [day]) == []  # nothing left to offer again
 
 
 def test_download_all_comments_asks_nothing_for_posts_that_turn_out_to_have_none(env):
