@@ -171,32 +171,21 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         todo = [p for p in picked if p.id not in stored] + updated + [
             _stored_post(r) for pid, r in stored.items()
             if in_part(pid) and not r["image"] and pid not in refreshed and (
-                _comments_missing(r) or (pid in repicked and _never_asked(r))
+                # Asked for before and failed. Saved posts nobody asked comments for are left alone: a fetch must
+                # not quietly download comments for posts it wasn't fetching.
+                (r["comments_ok"] is not None and not r["comments_ok"])
+                or (pid in repicked and r["comments_ok"] is None and not r["has_comments"])  # picked, never asked
                 or (fill and pid not in saved_whole and not (cap and saved_count.get(pid, 0) >= cap)))]
         todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up
         if gave_up:
             tried: set[str] = set()
         else:
-            def save(p: Post, got) -> None:
-                nonlocal n_comments
-                comments, complete = got if fill else (got, False)
-                had = store.comment_ids(p.id)  # a thread asked for again: count only what's new
-                for c in comments:
-                    store.save_comment(c, *score(c.body))
-                    n_comments += c.id not in had
-                store.mark_comments(p.id, ok=True, settled=p.score is not None)
-                if complete:  # an unsettled thread may still be growing, so it's whole only "so far"
-                    store.mark_complete("comments" if p.score is not None else "comments_so_far", name, p.id)
-                store.commit()
-                if comments:
-                    saved()
-
             get = (lambda p: client.fetch_all_comments(p, cap, req.comment_pick)) if fill else (
-                lambda p: client.fetch_comments(p, cap, req.comment_pick))
-            failed, tried, gave_up = _each_thread(
-                todo, get, save, "Comments for post" if cap else "All comments for post",
-                store, getattr(client, "tree_workers", getattr(client, "workers", 1)), report, should_stop)
+                lambda p: (client.fetch_comments(p, cap, req.comment_pick), False))
+            failed, tried, gave_up, added = _each_thread(todo, get, client, store, name, cap=cap, progress=report,
+                                                         should_stop=should_stop, saved=saved)
             errors += failed
+            n_comments += added
         if gave_up:
             rest = [p for p in todo if p.id not in tried]  # not tried this time: retried on the next fetch
             errors += len(rest)
@@ -302,25 +291,9 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
             progress(0, 0, f"Skipping {len(empty):,} of {len(posts):,} posts: no comments to download")
         skip = {p.id for p in empty}
         posts = [p for p in posts if p.id not in skip]
-    n_comments = 0
-
-    def save(p: Post, got) -> None:
-        nonlocal n_comments
-        comments, whole = got
-        had = store.comment_ids(p.id)  # a thread fetched again: count only what's new
-        for c in comments:
-            store.save_comment(c, *score(c.body))
-            n_comments += c.id not in had
-        store.mark_comments(p.id, ok=True, settled=p.score is not None)
-        if whole:  # an unsettled thread may still be growing: it has every comment so far, not all
-            store.mark_complete("comments" if p.score is not None else "comments_so_far", name, p.id)
-        store.commit()
-        saved()
-
-    errors, tried, gave_up = _each_thread(posts, lambda p: client.fetch_all_comments(p, cap, req.comment_pick), save,
-                                          "Comments for post" if cap else "All comments for post",
-                                          store, getattr(client, "tree_workers", getattr(client, "workers", 1)),
-                                          progress, should_stop)
+    errors, tried, gave_up, n_comments = _each_thread(
+        posts, lambda p: client.fetch_all_comments(p, cap, req.comment_pick), client, store, name, cap=cap,
+        progress=progress, should_stop=should_stop, saved=saved, every=True)
     if gave_up:
         errors += len([p for p in posts if p.id not in tried])  # not tried: retried next time
     if posts:
@@ -329,12 +302,16 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
     return FetchResult(subreddit, 0, n_comments, should_stop(), updated=len(fresh), comment_errors=errors)
 
 
-def _each_thread(posts: list[Post], get: Callable, save: Callable, what: str, store: Store, workers: int,
-                 progress, should_stop) -> tuple[int, set[str], bool]:
-    """Run get(post) for each post, a few at once, and hand each result to save(post, result) here, on
-    this thread. A post whose comments couldn't be fetched is recorded as failed, so the next fetch retries
+def _each_thread(posts: list[Post], get: Callable, client: ArcticShiftClient, store: Store, name: str, *, cap: int,
+                 progress, should_stop, saved, every: bool = False) -> tuple[int, set[str], bool, int]:
+    """Run get(post), which returns (comments, whether they're the whole thread), for each post, a few at once,
+    and save each thread here, on this thread, scored by the subreddit's words; ``saved`` is told once it's
+    committed, if it brought comments (``every``: whatever it brought). ``cap`` is the comments asked for per
+    thread, 0 for all. A post whose comments couldn't be fetched is recorded as failed, so the next fetch retries
     it; after GIVE_UP_AFTER failures in a row no new ones start, since the archive is struggling and
-    shouldn't be hammered. Returns (posts that failed, ids of the posts tried, whether it gave up)."""
+    shouldn't be hammered. Returns (posts that failed, ids of the posts tried, whether it gave up, new comments)."""
+    what = "Comments for post" if cap else "All comments for post"
+    workers = getattr(client, "tree_workers", getattr(client, "workers", 1))
     gave_up = threading.Event()
     streak = [0]  # failures in a row, counted as they happen so no new requests start after the limit
     lock = threading.Lock()
@@ -357,7 +334,7 @@ def _each_thread(posts: list[Post], get: Callable, save: Callable, what: str, st
         return got
 
     tried: set[str] = set()
-    errors = 0
+    errors = added = 0
     if posts:  # say what it's waiting on now, not only once the first thread is in
         progress(0, len(posts), f"{what} 0/{len(posts)}")
     for p, got, error in in_parallel(fetch, posts, workers, should_stop):
@@ -372,8 +349,19 @@ def _each_thread(posts: list[Post], get: Callable, save: Callable, what: str, st
             store.commit()
             errors += 1
             continue
-        save(p, got)
-    return errors, tried, gave_up.is_set()
+        comments, whole = got
+        had = store.comment_ids(p.id)  # a thread asked for again: count only what's new
+        lexicon = store.lexicon(name)  # as the words are set now
+        for c in comments:
+            store.save_comment(c, *lexicon.score(c.body))
+            added += c.id not in had
+        store.mark_comments(p.id, ok=True, settled=p.score is not None)
+        if whole:  # an unsettled thread may still be growing, so it's whole only "so far"
+            store.mark_complete("comments" if p.score is not None else "comments_so_far", name, p.id)
+        store.commit()
+        if comments or every:
+            saved()
+    return errors, tried, gave_up.is_set(), added
 
 
 def days_in(after: float, before: float) -> list[int]:
@@ -391,16 +379,6 @@ def _days(name: str, store: Store, after: float | None, before: float | None) ->
     done = store.complete_keys("posts", name)
     return [(max(day, after), min(day + DAY, before)) for day in days_in(after, before)
             if str(day) not in done and min(day + DAY, before) > max(day, after)]
-
-
-def _comments_missing(r) -> bool:
-    # Only a post whose comments were asked for and failed is retried. Saved posts nobody asked comments
-    # for are left alone: a fetch must not quietly download comments for posts it wasn't fetching.
-    return r["comments_ok"] is not None and not r["comments_ok"]
-
-
-def _never_asked(r) -> bool:
-    return r["comments_ok"] is None and not r["has_comments"]
 
 
 def _stored_post(r) -> Post:
