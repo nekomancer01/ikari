@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QToolTip, QVBoxLayout, QWidget,
 )
 
+from subsentiment.analysis import LABELS
 from subsentiment.gui import motion, theme
 from subsentiment.gui.days import DAY, flat_button, short_date
 
@@ -41,7 +42,7 @@ class DistributionChart(QWidget):
     """How the items split across the labels: one segmented bar for the whole, and a row per label with
     its count and share. The segments and the rows' bars ease to new counts instead of jumping."""
 
-    CATEGORIES = ("negative", "neutral", "positive")
+    CATEGORIES = LABELS
     BAR, GAP, RADIUS = 40, 4, 6  # the segmented bar's height, the gap between segments, their corners
     ROW_BAR = 6  # each row's own share bar
 
@@ -311,12 +312,16 @@ class TimelineChart(QWidget):
 
     def set_view(self, lo: float, hi: float, animate: bool = False, preset: str | None = None) -> None:
         """Show [lo, hi), kept inside the days there are and no narrower than MIN_SPAN."""
-        a, b = self.domain()
-        span = min(max(hi - lo, MIN_SPAN), b - a)
-        lo = min(max(lo, a), b - span)
-        self.view = None if span >= b - a else (lo, lo + span)
+        self.view = self._fit(lo, hi, MIN_SPAN)
         self.preset = preset or ("All" if self.view is None else None)
         self._apply(animate)
+
+    def _fit(self, lo: float, hi: float, least: float = 0.0) -> tuple[float, float] | None:
+        """[lo, hi) kept inside the days there are and no narrower than ``least``; None when that's every day."""
+        a, b = self.domain()
+        span = min(max(hi - lo, least), b - a)
+        lo = min(max(lo, a), b - span)
+        return None if span >= b - a else (lo, lo + span)
 
     def zoom_preset(self, key: str) -> None:
         a, b = self.domain()
@@ -384,14 +389,10 @@ class TimelineChart(QWidget):
         """Ease (or jump) to the view. With follow (new data), a zoom that is easing carries on, its start
         moved along with its target, so it neither restarts nor jumps."""
         if self.preset not in (None, "All"):  # a range button's span is always the latest days there are now
-            a, b = self.domain()
-            days = dict(PRESETS)[self.preset] * DAY
-            self.view = None if days >= b - a else (b - days, b)
+            b = self.domain()[1]
+            self.view = self._fit(b - dict(PRESETS)[self.preset] * DAY, b)
         elif self.view is not None:  # the days may have changed under it
-            a, b = self.domain()
-            span = min(self.view[1] - self.view[0], b - a)
-            lo = min(max(self.view[0], a), b - span)
-            self.view = None if span >= b - a else (lo, lo + span)
+            self.view = self._fit(*self.view)
         lo, hi = self.view or self.domain()
         _, shown = self.groups(lo, hi, self._areas()[0].width())
         old, self._to = self._to, (lo, hi, timeline_bound([(g[0], g[2], g[3]) for g in shown]))

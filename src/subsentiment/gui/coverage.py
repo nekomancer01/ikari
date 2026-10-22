@@ -534,16 +534,10 @@ class CoveragePage(VerticalScrollArea):
         shows: showing it does this anyway."""
         if not self.isVisible():
             return
-        if not self.subreddit:
-            self.subtitle.setText("Pick a saved subreddit first.")
-            self.days = self._day_rows = []
-            self.day_table.setRowCount(0)
-            self._show_ticked()
-            self._show_posts(None)
-            return
-        days = self.window_.store.tried_days(self.subreddit)
+        days = self.window_.store.tried_days(self.subreddit) if self.subreddit else []
         if not days:
-            self.subtitle.setText("Nothing fetched yet. Days a fetch asks for are listed here, to download what it missed.")
+            self.subtitle.setText("Nothing fetched yet. Days a fetch asks for are listed here, to download what it missed."
+                                  if self.subreddit else "Pick a saved subreddit first.")
             self.days = self._day_rows = []
             self.day_table.setRowCount(0)
             self._show_ticked()
