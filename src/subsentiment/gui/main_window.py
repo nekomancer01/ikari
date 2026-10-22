@@ -31,7 +31,7 @@ from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.widgets import (
     ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatusLabel, Throbber, fit_to_screen, label, panel, plural, section,
 )
-from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices, finish
+from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices, ThreadScorer, finish
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, scoring_at_least
 
@@ -189,6 +189,8 @@ class MainWindow(QMainWindow):
         self._since = 0.0  # rows saved since this moment belong to the running fetch
         # How far each table has read the running fetch's rows, so each save reads only what's new.
         self._read_to = {"posts": 0.0, "comments": 0.0}
+        # The ids of rows the running fetch saved again that _count_new counted in: the tables show them anew once it ends.
+        self._resaved: dict[str, list] = {"posts": [], "comments": []}
         self._follow = False  # show the subreddit being fetched, until the user picks another one
         # The overview's numbers of every saved day, of the rows that pass the score filters (from _saved).
         self._analysis = {"posts": Analysis(), "comments": Analysis()}
@@ -473,6 +475,7 @@ class MainWindow(QMainWindow):
         self.overview.words.word_clicked.connect(self._pick_word)
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
         self.comments_tab = TablePage(COMMENT_COLUMNS, stretch_col=2)
+        self.tabs = {"posts": self.posts_tab, "comments": self.comments_tab}
         # The post title would otherwise size to its text and squeeze the comment column.
         post_col = self.comments_tab.view.horizontalHeader()
         post_col.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
@@ -686,13 +689,14 @@ class MainWindow(QMainWindow):
         return True
 
     def _launch(self, req: collect.FetchRequest, message: str) -> None:
+        worker = FetchWorker(req, self.db_path)
         self.request = req
-        self._since = time.time() - 1.0
+        self._since = worker.since
         self._read_to = {"posts": self._since, "comments": self._since}
+        self._resaved = {"posts": [], "comments": []}
         self._flush_rows()
         self._follow = True
         self._open_fetched()  # if it's already saved, show it now; otherwise with its first rows
-        worker = FetchWorker(req, self.db_path)
         worker.progress.connect(self._on_progress)
         worker.finished.connect(self._on_finished)
         worker.saved.connect(self._on_saved)
@@ -719,12 +723,12 @@ class MainWindow(QMainWindow):
             msg = "Stopping…"
         self.progress_msg.setText(msg)
 
-    def _on_saved(self) -> None:
-        # A row was committed: queue it for the tables right away, and refresh the sidebar list and
-        # overview charts at most about once a second so big fetches stay smooth.
+    def _on_saved(self, got: dict | None = None) -> None:
+        # Rows were committed (``got``, read back by the fetch's thread): queue them for the tables right away, and
+        # refresh the sidebar list and overview charts at most about once a second so big fetches stay smooth.
         if self._follow and not self._showing_fetch():
             self._open_fetched()
-        self._queue_new_rows()
+        self._queue_new_rows(got)
         if not self._live.isActive():
             self._live.start()
 
@@ -747,12 +751,19 @@ class MainWindow(QMainWindow):
     def _showing_fetch(self) -> bool:
         return bool(self.request and self.current and self.current.lower() == self.request.subreddit.lower())
 
-    def _queue_new_rows(self) -> None:
+    def _queue_new_rows(self, got: dict | None = None) -> None:
+        """Count in and queue what the fetch saved since the tables last took its rows: ``got`` as the fetch's
+        thread read it back ({kind: (saved at or after, rows)}), or read here when that doesn't reach back far
+        enough (the window was showing another subreddit when it was sent)."""
         if not self.fetch_job.busy or not self._showing_fetch():
             return
         name = self.current
         for kind, read in (("posts", self.store.posts_since), ("comments", self.store.comments_since)):
-            rows = read(name, self._read_to[kind])
+            since, rows = (got or {}).get(kind, (None, None))
+            if since is None or since > self._read_to[kind]:
+                rows = read(name, self._read_to[kind])
+            elif since < self._read_to[kind]:  # read here since: only what's newer
+                rows = [r for r in rows if r["fetched_at"] >= self._read_to[kind]]
             if rows:  # rows saved in the same instant as the last one read come back too; the ids catch them
                 self._read_to[kind] = rows[-1]["fetched_at"]
                 self._count_new(kind, rows)
@@ -770,13 +781,17 @@ class MainWindow(QMainWindow):
         again with new scores, take the place of what they were."""
         rows = [r for r in rows if r["created_utc"] is not None]
         if rows:
-            self._saved[kind].add(rows)
+            saved = self._saved[kind]
+            ids = [r["id"] for r in rows]
+            again = saved.where(ids) >= 0
+            saved.add(rows)
+            self._resaved[kind] += [i for i, a in zip(ids, again.tolist()) if a]
             if not self._shown_live.isActive():
                 self._shown_live.start()
 
     def _release_rows(self) -> None:
         """Show the next few queued rows; a long backlog is released faster so it never lags far behind."""
-        for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
+        for kind, tab in self.tabs.items():
             queue = self._queued[kind]
             batch, self._queued[kind] = queue[:max(1, len(queue) // 25)], queue[max(1, len(queue) // 25):]
             if batch:
@@ -792,7 +807,7 @@ class MainWindow(QMainWindow):
 
     def _flush_rows(self) -> None:
         self._drip.stop()
-        for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
+        for kind, tab in self.tabs.items():
             if self._queued[kind]:
                 self._add_rows(kind, tab, self._queued[kind])
             self._queued[kind] = []
@@ -849,13 +864,16 @@ class MainWindow(QMainWindow):
             self._apply_span()
         for kind, read, tab in (("posts", self.store.posts_since, self.posts_tab),
                                 ("comments", self.store.comments_since, self.comments_tab)):
-            rows = read(self.current, self._since)
+            # What it saved was counted in as it went (_count_new), and its new rows put in the tables: only what
+            # came after needs reading, and only rows saved again showing anew.
+            since = max(self._since, self._read_to[kind])
+            rows = [r for r in read(self.current, since) if r["fetched_at"] > since or since == self._since]
             saved = self._saved[kind]
             saved.add(rows)
             # A row rescored below its score filter leaves the table; the rest show their new scores.
             at = chosen(saved, self._table_days, self.min_scores[kind == "comments"])
             tab.retain(at)
-            fetched = saved.where([r["id"] for r in rows])
+            fetched = saved.where(list(dict.fromkeys(self._resaved[kind] + [r["id"] for r in rows])))
             tab.took(fetched[np.isin(fetched, at)])
         self._loaded[self.current.lower()] = (self._stats.get(self.current.lower()), self._saved)
         self._last_fetched = self._newest("posts")
@@ -968,11 +986,7 @@ class MainWindow(QMainWindow):
         # The span remembered for it, shown on the timeline once they have its days.
         self.span, self._preset = days.load_range(self.settings, name)
         self._render_overview(restore=True)
-        if self.isVisible() and sum(map(len, self._saved.values())) >= self.LOAD_THREAD_FROM:
-            self._span_settled.stop()  # a big one's tables fill in over the next few frames
-            self._span_slices.start(self._span_steps(reload=True), lambda: None)
-        else:
-            self._apply_span(reload=True)
+        self._reload_span()
         self._show_notes()
         if switching or self.words_page.meanings.subreddit is None:
             self.words_page.meanings.set_subreddit(self.current, self.store.words(self.current) if self.current else {})
@@ -1063,6 +1077,14 @@ class MainWindow(QMainWindow):
         # Steps left over from a span before this one: the tables may still show it, so go through them all.
         self._span_slices.start(self._span_steps(reload=self._span_slices.running()), lambda: None)
 
+    def _reload_span(self) -> None:
+        """Fill the tables from the span's saved rows again: a big subreddit's over the next few frames."""
+        if self.isVisible() and sum(map(len, self._saved.values())) >= self.LOAD_THREAD_FROM:
+            self._span_settled.stop()
+            self._span_slices.start(self._span_steps(reload=True), lambda: None)
+        else:
+            self._apply_span(reload=True)
+
     def _apply_span(self, reload: bool = False) -> None:
         """Point the tables (and so export) at the saved rows from the days in the span, if those changed."""
         self._span_settled.stop()
@@ -1082,7 +1104,7 @@ class MainWindow(QMainWindow):
         # Rows still queued are in _saved already, so the tables have them once reloaded.
         self._drip.stop()
         self._queued = {"posts": [], "comments": []}
-        for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
+        for kind, tab in self.tabs.items():
             saved = self._saved[kind]
             yield from tab.set_rows_steps(saved, chosen(saved, whole, self.min_scores[kind == "comments"]))
             yield
@@ -1101,11 +1123,7 @@ class MainWindow(QMainWindow):
         motion.crossfade(self.content)
         self._flush_rows()
         self._render_overview()
-        if self.isVisible() and sum(map(len, self._saved.values())) >= self.LOAD_THREAD_FROM:
-            self._span_settled.stop()
-            self._span_slices.start(self._span_steps(reload=True), lambda: None)
-        else:
-            self._apply_span(reload=True)
+        self._reload_span()
 
     def _on_scope_changed(self, text: str) -> None:
         self.settings.setValue("ui/overview_scope", text)
@@ -1210,7 +1228,7 @@ class MainWindow(QMainWindow):
         """The tables (and what export writes) take the rescored rows in one go: each update sorts a table again."""
         ids, self._rescored = self._rescored, {k: set() for k in KINDS}
         if self.current and self.current.lower() == sub:
-            for kind, tab in (("posts", self.posts_tab), ("comments", self.comments_tab)):
+            for kind, tab in self.tabs.items():
                 if ids[kind]:
                     at = self._saved[kind].where(list(ids[kind]))
                     tab.took(at[np.isin(at, tab.all_rows.at)])
@@ -1322,13 +1340,14 @@ class MainWindow(QMainWindow):
         if self.fetch_job.busy:
             # A fetch ending after this must not touch the closed store, so nothing it sends is handled.
             thread, worker = self.fetch_job.qthread, self.fetch_job.worker
-            worker.stop()
+            worker.stop(closing=True)
             for sig in (worker.progress, worker.finished, worker.failed, worker.saved, thread.finished):
                 sig.disconnect()
             thread.quit()
             thread.wait(3000)
             # Signals it sent just before are already queued, and disconnecting doesn't take them back.
             QCoreApplication.removePostedEvents(self, QEvent.Type.MetaCall)
+        ThreadScorer.close()  # its idle processes would keep the app from exiting
         self._live.stop()  # both read the store
         self._drip.stop()
         self._shown_live.stop()

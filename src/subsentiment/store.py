@@ -1,6 +1,7 @@
 """SQLite storage for fetched posts/comments and their sentiment scores."""
 from __future__ import annotations
 
+import collections
 import csv
 import hashlib
 import json
@@ -21,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import zstandard
 
-from subsentiment.analysis import LABELS, words_in
+from subsentiment.analysis import LABEL_AT, words_in
 from subsentiment.reddit import Comment, Post, is_image_post
 from subsentiment.sentiment import Lexicon
 
@@ -206,10 +207,6 @@ class Row(tuple):
 
     def values(self):
         return (self[c] for c in self.COLUMNS)
-
-    def _replace(self, **changes) -> Row:
-        """This row with some of its fields changed (a new score, say)."""
-        return tuple.__new__(type(self), [changes.pop(f, v) for f, v in zip(self._fields, tuple.__iter__(self))])
 
     def get(self, key, default=None):
         try:
@@ -665,9 +662,7 @@ class Store:
         # download them again) but hidden from every read here and never given comments.
         if "image" not in {r["name"] for r in self.db.execute("PRAGMA table_info(posts)")}:
             self.db.execute("ALTER TABLE posts ADD COLUMN image INTEGER NOT NULL DEFAULT 0")
-            self.db.executemany("UPDATE posts SET image = 1 WHERE id = ?", [
-                (r["id"],) for r in self.db.execute("SELECT id, url, selftext FROM posts")
-                if is_image_post(r["url"], r["selftext"])])
+            self._mark_images(self.db.execute("SELECT id, url, selftext FROM posts"))
             self.db.commit()
         self._stamp = 0.0
         self._lexicons: dict[str, tuple] = {}  # subreddit lowercased -> (when read, its words, their Lexicon)
@@ -910,7 +905,8 @@ class Store:
                     raise
             except Exception:  # noqa: BLE001 - busy, or text that can't be packed: leave the day as it is
                 continue
-        if done and vacuum:  # the cleared text leaves its pages part empty, which only a VACUUM gives back
+        # The cleared text leaves its pages part empty, which only a VACUUM gives back; not as the app closes.
+        if done and vacuum and not (stop is not None and stop.is_set()):
             self.search.optimize(pages=2000)  # what the fetch's saves added to the search index, a few MB of it
             self._compact()
         return done
@@ -951,11 +947,10 @@ class Store:
         blob = DayPack.encode(cols, ids, text, zdict)
         if DayPack.read(blob, self.db) != {"columns": list(cols), "rows": {i: text[i] for i in ids}}:
             raise sqlite3.DatabaseError(f"{kind} of r/{sub} on day {day} wouldn't read back the same")
-        label = {lab: k for k, lab in enumerate(LABELS)}
         packed_numbers = {"created": [numbers[i][1] for i in ids],
                           "score": [NO_SCORE if numbers[i][2] is None else numbers[i][2] for i in ids],
                           "sentiment": [numbers[i][3] if numbers[i][3] is not None else 0.0 for i in ids],
-                          "label": [label.get(numbers[i][4], -1) for i in ids],
+                          "label": [LABEL_AT.get(numbers[i][4], -1) for i in ids],
                           "hidden": [int(bool(numbers[i][5])) for i in ids]}
         counts = self._word_counts(kind, sub, ids, text, packed_numbers, packed, new_text, old, split)
         self.db.execute("INSERT OR REPLACE INTO packs (kind, subreddit, day, packed_at, data, cols, words) "
@@ -1087,20 +1082,6 @@ class Store:
                 r.pop(k, None)
         return out
 
-    def day_totals(self, kind: str, subreddit: str, min_score: int | None = None) -> list[tuple]:
-        """How many of a subreddit's posts or comments (``kind``) scoring at least ``min_score`` each day has with
-        each label, and their sentiment added up: [(day start, label, items, sum)]. Counted here, where reading
-        the rows of a big subreddit to count them takes seconds (analysis.Analysis.from_days)."""
-        if kind == "posts":
-            sql = "SELECT created_utc, label, sentiment, score FROM posts WHERE subreddit = ? COLLATE NOCASE AND image = 0"
-        else:
-            sql = ("SELECT c.created_utc, c.label, c.sentiment, c.score FROM comments c "
-                   "WHERE c.subreddit = ? COLLATE NOCASE AND " + NOT_IMAGE)
-        where = "created_utc IS NOT NULL" + ("" if min_score is None else " AND score IS NOT NULL AND score >= ?")
-        return self.db.execute(
-            f"SELECT CAST(created_utc / 86400 AS INTEGER) * 86400, label, COUNT(*), SUM(sentiment) FROM ({sql}) "
-            f"WHERE {where} GROUP BY 1, 2", (subreddit, *([] if min_score is None else [min_score]))).fetchall()
-
     def rows(self, kind: str, subreddit: str, since: float | None = None, words: bool = False,
              days: tuple[float, float] | None = None) -> list[Row]:
         """Every saved post or comment (``kind``) of a subreddit as `Row`s, oldest first; or with ``since``, those
@@ -1195,9 +1176,7 @@ class Store:
                   sentiment, label, self._saved_at(), int(post.image))
         values = tuple(map(_storable, values))
         # Comments whose permalink is rebuilt from this post's get their own copy if it's about to change.
-        old = self.db.execute("SELECT id, subreddit, created_utc, permalink, packed FROM posts WHERE id = ?",
-                              (values[0],)).fetchall()
-        link = self._unpacked("posts", old)[0]["permalink"] if old else None
+        link = self._post_link(values[0])
         if link is not None and link != values[9]:
             self.db.execute("UPDATE comments SET permalink = ? || id || '/' WHERE post_id = ? AND permalink IS NULL",
                             (link, values[0]))
@@ -1205,10 +1184,19 @@ class Store:
                         f"VALUES ({','.join('?' * len(values))})", values)
         self.search.put("posts", [(values[0], (values[2], values[3]))])
 
-    def save_comment(self, c: Comment, sentiment: float, label: str) -> None:
+    def _post_link(self, post_id: str) -> str | None:
+        """A saved post's permalink (in its pack once it's packed), or None if it isn't saved."""
         post = self.db.execute("SELECT id, subreddit, created_utc, permalink, packed FROM posts WHERE id = ?",
-                               (c.post_id,)).fetchall()
-        link = self._unpacked("posts", post)[0]["permalink"] if post else None  # in its pack once it's packed
+                               (post_id,)).fetchall()
+        return self._unpacked("posts", post)[0]["permalink"] if post else None
+
+    def _mark_images(self, rows) -> None:
+        """Mark the posts among ``rows`` (id, url, selftext) that are image posts."""
+        self.db.executemany("UPDATE posts SET image = 1 WHERE id = ?",
+                            [(r["id"],) for r in rows if is_image_post(r["url"], r["selftext"])])
+
+    def save_comment(self, c: Comment, sentiment: float, label: str) -> None:
+        link = self._post_link(c.post_id)
         permalink = None if link is not None and c.permalink == f"{link}{c.id}/" else c.permalink
         values = (c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score,
                   c.created_utc, c.depth, permalink, sentiment, label, self._saved_at())
@@ -1247,7 +1235,7 @@ class Store:
     def read_spans(self, subreddit: str) -> list[tuple[int, int]]:
         """Stretches of time (first, last second) fetches have read every post of (ArcticShiftClient.reached),
         so a stopped download carries on from where it got to."""
-        return sorted(tuple(map(int, k.split(":"))) for k in self.complete_keys("posts_read", subreddit))
+        return self._spans("posts_read", subreddit)
 
     def save_read_spans(self, subreddit: str, spans) -> None:
         self._save_spans("posts_read", subreddit, self.read_spans(subreddit) + list(spans), 1)
@@ -1266,9 +1254,9 @@ class Store:
 
     def _tried_spans(self, subreddit: str) -> list[tuple[int, int]]:
         """(first day, last day) stretches of tried_days; from what's saved when none were recorded."""
-        keys = self.complete_keys("posts_tried", subreddit)
-        if keys:
-            return sorted(tuple(map(int, k.split(":"))) for k in keys)
+        spans = self._spans("posts_tried", subreddit)
+        if spans:
+            return spans
         seen = [t for row in self.db.execute(
             "SELECT MIN(created_utc), MAX(created_utc) FROM posts WHERE subreddit = ? COLLATE NOCASE "
             "UNION ALL SELECT MIN(created_utc), MAX(created_utc) FROM removed_posts WHERE subreddit = ?",
@@ -1276,6 +1264,10 @@ class Store:
         seen += [int(k) for k in self.complete_keys("posts", subreddit)]
         seen += [t for span in self.read_spans(subreddit) for t in span]
         return [(int(min(seen) // 86400 * 86400), int(max(seen) // 86400 * 86400))] if seen else []
+
+    def _spans(self, kind: str, subreddit: str) -> list[tuple[int, int]]:
+        """The (first, last) stretches kept under ``kind`` in ``complete``, in order."""
+        return sorted(tuple(map(int, k.split(":"))) for k in self.complete_keys(kind, subreddit))
 
     def _save_spans(self, kind: str, subreddit: str, spans, touch: int) -> None:
         """Keep (first, last) stretches under ``kind`` in ``complete``, joining ones less than ``touch`` apart."""
@@ -1396,8 +1388,14 @@ class Store:
         rows = self.db.execute(
             "SELECT subreddit, COUNT(*) n, MAX(fetched_at) f FROM posts WHERE image = 0 "
             "GROUP BY subreddit COLLATE NOCASE ORDER BY f DESC").fetchall()
-        comments = {r["s"].lower(): r["n"] for r in self.db.execute(
-            "SELECT c.subreddit s, COUNT(*) n FROM comments c WHERE " + NOT_IMAGE + " GROUP BY c.subreddit COLLATE NOCASE")}
+        # Every comment counted from the index alone, less the few on image posts: asking each comment whether its
+        # post is an image took a quarter of a second for 650,000 comments, once a second while a fetch runs.
+        comments = collections.Counter()
+        for r in self.db.execute("SELECT subreddit s, COUNT(*) n FROM comments GROUP BY subreddit COLLATE NOCASE"):
+            comments[r["s"].lower()] += r["n"]
+        for r in self.db.execute("SELECT c.subreddit s, COUNT(*) n FROM posts p CROSS JOIN comments c ON c.post_id = p.id "
+                                 "WHERE p.image = 1 GROUP BY c.subreddit COLLATE NOCASE"):
+            comments[r["s"].lower()] -= r["n"]
         return [{"name": r["subreddit"], "posts": r["n"], "comments": comments.get(r["subreddit"].lower(), 0),
                  "last_fetched": r["f"]} for r in rows]
 
@@ -1468,6 +1466,9 @@ class Store:
         self.db.executemany(f"UPDATE {kind} SET sentiment = ?, label = ?, packed = CASE packed WHEN 1 THEN 2 ELSE packed END "
                             "WHERE id = ?", [(s, label, i) for i, s, label in scores])
 
+    # What's kept per subreddit (lowercased), besides its posts and comments.
+    _BY_SUBREDDIT = ("complete", "removed_posts", "notes", "words", "packs", "dicts", "vocab")
+
     def delete_subreddit(self, subreddit: str) -> None:
         for kind in PACKED:
             self.search.drop(kind, [i for (i,) in self.db.execute(
@@ -1475,13 +1476,8 @@ class Store:
         self.db.execute("DELETE FROM posts WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
         self.db.execute("DELETE FROM comments WHERE subreddit = ? COLLATE NOCASE", (subreddit,))
         self.db.execute("DELETE FROM comment_fetches WHERE post_id NOT IN (SELECT id FROM posts)")
-        self.db.execute("DELETE FROM complete WHERE subreddit = ?", (subreddit.lower(),))
-        self.db.execute("DELETE FROM removed_posts WHERE subreddit = ?", (subreddit.lower(),))
-        self.db.execute("DELETE FROM notes WHERE subreddit = ?", (subreddit.lower(),))
-        self.db.execute("DELETE FROM words WHERE subreddit = ?", (subreddit.lower(),))
-        self.db.execute("DELETE FROM packs WHERE subreddit = ?", (subreddit.lower(),))
-        self.db.execute("DELETE FROM dicts WHERE subreddit = ?", (subreddit.lower(),))
-        self.db.execute("DELETE FROM vocab WHERE subreddit = ?", (subreddit.lower(),))
+        for table in self._BY_SUBREDDIT:
+            self.db.execute(f"DELETE FROM {table} WHERE subreddit = ?", (subreddit.lower(),))
         self._vocab.pop(subreddit.lower(), None)
         self.db.commit()
         self._compact()
@@ -1534,9 +1530,7 @@ class Store:
                     a = max(a, d + 86400) if a <= d + 86399 and b >= d else a
                 if a <= b:
                     spans.append((a, b))
-            self.db.execute("DELETE FROM complete WHERE kind = 'posts_read' AND subreddit = ?", (sub,))
-            for a, b in spans:
-                self.mark_complete("posts_read", subreddit, f"{a}:{b}")
+            self._save_spans("posts_read", subreddit, spans, 1)
             self.db.commit()
         except BaseException:
             self.db.rollback()
@@ -1547,19 +1541,10 @@ class Store:
         return shown[0], shown[1]
 
     def delete_all(self) -> None:
-        self.db.execute("DELETE FROM posts")
-        self.db.execute("DELETE FROM comments")
-        self.db.execute("DELETE FROM comment_fetches")
-        self.db.execute("DELETE FROM complete")
-        self.db.execute("DELETE FROM removed_posts")
-        self.db.execute("DELETE FROM notes")
-        self.db.execute("DELETE FROM words")
-        self.db.execute("DELETE FROM packs")
-        self.db.execute("DELETE FROM dicts")
-        self.db.execute("DELETE FROM vocab")
+        for table in ("posts", "comments", "comment_fetches", "archive_counts", *self._BY_SUBREDDIT):
+            self.db.execute(f"DELETE FROM {table}")
         self.search.clear()
         self._vocab.clear()
-        self.db.execute("DELETE FROM archive_counts")
         self.db.commit()
         self._compact()
 
@@ -1623,10 +1608,8 @@ class Store:
                 self._lexicons.clear()
             for i in range(0, len(imported), 500):
                 ids = imported[i:i + 500]
-                self.db.executemany("UPDATE posts SET image = 1 WHERE id = ?", [
-                    (r["id"],) for r in self.db.execute(
-                        f"SELECT id, url, selftext FROM main.posts WHERE id IN ({','.join('?' * len(ids))})", ids)
-                    if is_image_post(r["url"], r["selftext"])])
+                self._mark_images(self.db.execute(
+                    f"SELECT id, url, selftext FROM main.posts WHERE id IN ({','.join('?' * len(ids))})", ids))
             for table, cols in (("complete", "kind, subreddit, key, fetched_at"),
                                 ("removed_posts", "id, subreddit, created_utc")):
                 if table in tables:

@@ -9,8 +9,9 @@ from typing import Callable, Collection
 
 import requests
 
-from subsentiment.arctic_shift import ArcticShiftClient, Stopped, in_parallel
+from subsentiment.arctic_shift import ArcticShiftClient, ArchiveDown, Stopped, in_parallel
 from subsentiment.reddit import FetchError, Post, normalize_subreddit
+from subsentiment.sentiment import Lexicon
 from subsentiment.store import Store
 
 GIVE_UP_AFTER = 5  # consecutive posts whose comments couldn't be fetched before the rest are skipped
@@ -61,9 +62,12 @@ class FetchResult:
 def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         progress: Callable[[int, int, str], None] = lambda done, total, msg: None,
         should_stop: Callable[[], bool] = lambda: False,
-        saved: Callable[[], None] = lambda: None) -> FetchResult:
+        saved: Callable[[], None] = lambda: None,
+        score_all: Callable[[Lexicon, list[str]], list[tuple[float, str]] | None] = lambda lexicon, texts: [
+            lexicon.score(t) for t in texts]) -> FetchResult:
     """Run one fetch. ``saved`` is called after each batch of rows is committed, so a UI can show
-    them while the fetch goes on."""
+    them while the fetch goes on. ``score_all`` scores a thread's comments by the subreddit's words (here, unless
+    it's given another way)."""
     shown, said = progress, [(0, 0, "")]
 
     def progress(done: int, total: int, msg: str) -> None:  # remembered, to come back to after a wait
@@ -85,7 +89,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         client.should_stop = should_stop  # so Stop also cuts short retries and waits inside a request
 
     if req.comment_posts:
-        return _all_comments(client, store, req, progress, should_stop, saved)
+        return _all_comments(client, store, req, progress, should_stop, saved, score_all)
 
     name = normalize_subreddit(req.subreddit)
     score = lambda text: store.lexicon(name).score(text)  # noqa: E731 - by the subreddit's own words, as set now
@@ -183,7 +187,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
             get = (lambda p: client.fetch_all_comments(p, cap, req.comment_pick)) if fill else (
                 lambda p: (client.fetch_comments(p, cap, req.comment_pick), False))
             failed, tried, gave_up, added = _each_thread(todo, get, client, store, name, cap=cap, progress=report,
-                                                         should_stop=should_stop, saved=saved)
+                                                         should_stop=should_stop, saved=saved, score_all=score_all)
             errors += failed
             n_comments += added
         if gave_up:
@@ -260,7 +264,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
 
 
 def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, progress, should_stop,
-                  saved) -> FetchResult:
+                  saved, score_all) -> FetchResult:
     """Every comment on each post in req.comment_posts. Posts whose numbers hadn't settled are
     re-checked first, so their comment totals are real where the archive has them by now."""
     name = normalize_subreddit(req.subreddit)
@@ -293,7 +297,7 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
         posts = [p for p in posts if p.id not in skip]
     errors, tried, gave_up, n_comments = _each_thread(
         posts, lambda p: client.fetch_all_comments(p, cap, req.comment_pick), client, store, name, cap=cap,
-        progress=progress, should_stop=should_stop, saved=saved, every=True)
+        progress=progress, should_stop=should_stop, saved=saved, score_all=score_all, every=True)
     if gave_up:
         errors += len([p for p in posts if p.id not in tried])  # not tried: retried next time
     if posts:
@@ -303,11 +307,11 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
 
 
 def _each_thread(posts: list[Post], get: Callable, client: ArcticShiftClient, store: Store, name: str, *, cap: int,
-                 progress, should_stop, saved, every: bool = False) -> tuple[int, set[str], bool, int]:
+                 progress, should_stop, saved, score_all, every: bool = False) -> tuple[int, set[str], bool, int]:
     """Run get(post), which returns (comments, whether they're the whole thread), for each post, a few at once,
-    and save each thread here, on this thread, scored by the subreddit's words; ``saved`` is told once it's
-    committed, if it brought comments (``every``: whatever it brought). ``cap`` is the comments asked for per
-    thread, 0 for all. A post whose comments couldn't be fetched is recorded as failed, so the next fetch retries
+    and save each thread here, on this thread, scored by the subreddit's words (``score_all``, as in run);
+    ``saved`` is told once it's committed, if it brought comments (``every``: whatever it brought). ``cap`` is the
+    comments asked for per thread, 0 for all. A post whose comments couldn't be fetched is recorded as failed, so the next fetch retries
     it; after GIVE_UP_AFTER failures in a row no new ones start, since the archive is struggling and
     shouldn't be hammered. Returns (posts that failed, ids of the posts tried, whether it gave up, new comments)."""
     what = "Comments for post" if cap else "All comments for post"
@@ -343,17 +347,20 @@ def _each_thread(posts: list[Post], get: Callable, client: ArcticShiftClient, st
         tried.add(p.id)
         progress(len(tried), len(posts), f"{what} {len(tried)}/{len(posts)}: {p.title[:60]}")
         if error is not None:
-            if not isinstance(error, (FetchError, requests.RequestException)):
+            # Down for good (it waited OUTAGE_PATIENCE): the job ends, rather than each thread left waiting it out.
+            if isinstance(error, ArchiveDown) or not isinstance(error, (FetchError, requests.RequestException)):
                 raise error
             store.mark_comments(p.id, ok=False, settled=False)
             store.commit()
             errors += 1
             continue
         comments, whole = got
+        # by the subreddit's words as they are set now
+        if (scores := score_all(store.lexicon(name), [c.body for c in comments])) is None:
+            continue  # stopped while scoring: left as if never asked
         had = store.comment_ids(p.id)  # a thread asked for again: count only what's new
-        lexicon = store.lexicon(name)  # as the words are set now
-        for c in comments:
-            store.save_comment(c, *lexicon.score(c.body))
+        for c, scored in zip(comments, scores):
+            store.save_comment(c, *scored)
             added += c.id not in had
         store.mark_comments(p.id, ok=True, settled=p.score is not None)
         if whole:  # an unsettled thread may still be growing, so it's whole only "so far"

@@ -1023,3 +1023,16 @@ def test_a_stopped_upgrade_process_stops_by_itself_and_leaves_no_word_splitting_
     s = Store(path)
     assert s._left_to_pack()  # carried on at the next start
     s.close()
+
+
+def test_comments_on_image_posts_are_left_out_of_each_subreddits_count(tmp_path):
+    # Counted from the index, less those on image posts: the count is asked once a second while a fetch runs.
+    s = Store(tmp_path / "x.db")
+    s.save_post(make_post(1), 0.5, "positive")
+    s.save_post(Post("img", "python", "a picture", "", "a", 1, 0.9, 2, 1_700_000_000, "https://r/img/", "", image=True),
+                None, None)
+    for i, post in enumerate(["p1", "p1", "img", "gone"]):  # "gone": a post that isn't saved
+        s.save_comment(Comment(f"c{i}", post, "Python" if i else "python", f"t3_{post}", "b", "hi", 1, 1_700_000_100,
+                               0, "u"), 0.0, "neutral")
+    s.commit()
+    assert [(d["name"], d["posts"], d["comments"]) for d in s.datasets()] == [("Python", 1, 3)]

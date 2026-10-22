@@ -26,14 +26,13 @@ from subsentiment.gui import motion, theme
 from subsentiment.gui.charts import palette
 from subsentiment.gui.days import flat_button
 from subsentiment.gui.widgets import ElidedLabel, VerticalScrollArea, label
-from subsentiment.analysis import LABELS
+from subsentiment.analysis import LABELS, TEXT
 from subsentiment.gui.rows import RowSource, Saved
 from subsentiment.gui.worker import BackgroundJob, LoadWorker, ScorePool, Slices, on_thread
 from subsentiment.index import top_words
 from subsentiment.sentiment import Lexicon
 
 KINDS = ("posts", "comments")
-_TEXT = {"posts": ("title", "selftext"), "comments": ("body",)}  # what Rescore searches
 _CELL = 2  # px; the word cloud's grid of taken space
 _FONTS: dict[int, object] = {}  # the cloud's font by pixel size
 
@@ -636,7 +635,7 @@ class Rescore(QObject):
         uses = Lexicon(dict.fromkeys(words, 0.0)).uses
         for kind in KINDS:  # a source's text is read first: on a thread, a big step at a time
             if isinstance(rows[kind], RowSource):
-                for key in _TEXT[kind]:
+                for key in TEXT[kind]:
                     yield from rows[kind].read_values(key)
         self._counts, self._shown = [sum(map(len, rows.values())), 0, 0, 0], 0
         self._sent_at = self._committed_at = time.perf_counter()
@@ -665,10 +664,10 @@ class Rescore(QObject):
             return (parts[0] or "") if kind == "comments" else f"{parts[0] or ''}\n\n{parts[1] or ''}".strip()
         if not isinstance(rows, RowSource):
             for r in rows:
-                yield (lambda r=r: r), text(*(r[k] for k in _TEXT[kind]))
+                yield (lambda r=r: r), text(*(r[k] for k in TEXT[kind]))
             return
         ids, sentiment, label = rows.ids, rows.sentiment, rows.label
-        for i, parts in enumerate(zip(*(rows.values(k) for k in _TEXT[kind]))):
+        for i, parts in enumerate(zip(*(rows.values(k) for k in TEXT[kind]))):
             yield (lambda i=i: {"id": ids[i].decode() if isinstance(ids[i], bytes) else ids[i],
                                 "sentiment": float(sentiment[i]), "label": LABELS[label[i]] if label[i] >= 0 else None}
                    ), text(*parts)
@@ -781,23 +780,23 @@ class MeaningSlider(QSlider):
     def minimumSizeHint(self) -> QSize:
         return QSize(80, 22)
 
+    R = 9  # the handle's radius: it stays inside the widget at either end
+
     def _x(self, value: int) -> float:
-        r = 9  # the handle's radius: it stays inside the widget at either end
-        return r + (self.width() - 2 * r) * (value - self.minimum()) / (self.maximum() - self.minimum())
+        return self.R + (self.width() - 2 * self.R) * (value - self.minimum()) / (self.maximum() - self.minimum())
 
     def mousePressEvent(self, e) -> None:  # jump to where it's pressed, then drag from there
         if e.button() == Qt.MouseButton.LeftButton:
-            span = max(self.width() - 18, 1)
             self.setSliderDown(True)
-            self.setValue(round(self.minimum() + (e.position().x() - 9) / span * (self.maximum() - self.minimum())))
+            self.mouseMoveEvent(e)
             e.accept()
         else:
             super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e) -> None:
         if self.isSliderDown():
-            span = max(self.width() - 18, 1)
-            self.setValue(round(self.minimum() + (e.position().x() - 9) / span * (self.maximum() - self.minimum())))
+            lo, hi, span = self.minimum(), self.maximum(), max(self.width() - 2 * self.R, 1)
+            self.setValue(round(lo + (e.position().x() - self.R) / span * (hi - lo)))
 
     def mouseReleaseEvent(self, e) -> None:
         if self.isSliderDown():

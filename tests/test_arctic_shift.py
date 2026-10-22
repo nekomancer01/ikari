@@ -54,6 +54,12 @@ class FakeClock:
         self.t += s
 
 
+def fake_time():
+    """A limiter's clock and sleep that take no real time."""
+    clock = FakeClock()
+    return clock, clock.sleep
+
+
 def post(i, settled=True, **kw):
     created = NOW - i * 10
     d = {"id": f"p{i}", "subreddit": "Python", "title": f"Post {i}", "selftext": "", "author": "a",
@@ -366,18 +372,124 @@ def test_waits_are_capped():
     assert c.clock.sleeps == [120.0]
 
 
-def test_server_and_network_errors_retry_then_give_up():
-    c = client([FakeResponse(503), requests.ConnectionError("reset"), FakeResponse(502), FakeResponse(500),
-                FakeResponse(503), FakeResponse(503), FakeResponse(504), FakeResponse(503)])
-    with pytest.raises(FetchError, match="busy"):
+class Down(FakeSession):
+    """Answers ``responses`` to ikari's own requests, and the limiter's probes with ``probes`` (an answer, an
+    exception, or by default a quick empty one): the archive's trouble can be with one request, or with all."""
+
+    def __init__(self, responses, probes=()):
+        super().__init__(responses)
+        self.probes = list(probes)
+
+    def get(self, url, params=None, timeout=None):
+        if (url.removeprefix(BASE_URL), params) == arctic_shift.PROBE:
+            self.calls.append(("probe", {}))
+            r = self.probes.pop(0) if self.probes else ok([])
+            if isinstance(r, Exception):
+                raise r
+            return r
+        return super().get(url, params, timeout)
+
+
+def down_client(responses, probes=()):
+    clock = FakeClock()
+    c = ArcticShiftClient(session=Down(responses, probes), limiter=RateLimiter(1.0, clock, clock.sleep))
+    c.clock = clock
+    return c
+
+
+def test_a_request_that_keeps_failing_while_the_archive_answers_waits_on_its_own_then_gives_up():
+    # A 5xx used to hold back every request in the app for 5 s, 10 s, ... 120 s, eight times over (6.5 minutes),
+    # whatever the rest were getting.
+    c = down_client([FakeResponse(503)] * (arctic_shift.RETRIES + 1))
+    with pytest.raises(FetchError, match=r"HTTP 503"):
         c.get(*SEARCH)
-    assert len(c.session.calls) == 8
+    calls = [u for u, _ in c.session.calls]
+    # Failing OUTAGE_AFTER times in a row with nothing answered between looks like the archive is down: a probe finds
+    # it isn't, and the request goes on with its own tries, RETRIES in all.
+    assert calls.count("probe") == 1 and len(calls) - 1 == arctic_shift.RETRIES + 1
+    assert [s for s in c.clock.sleeps if s != 1.0] == [2.0, 4.0, 8.0]  # its own pauses (1 s, the probe's wait, are 1.0)
+    assert c.limiter._next <= c.clock.t + 1.0 and not c.limiter.down  # nothing else was held back
 
 
-def test_network_error_on_the_last_attempt_is_raised():
-    c = client([requests.Timeout("slow")] * 8)
+def test_while_the_archive_is_down_only_probes_go_out_until_one_is_answered():
+    # Live, 22 Oct 03:14 UTC: every request, even the smallest, answered HTTP 500 for over ten minutes.
+    c = down_client([FakeResponse(500)] * arctic_shift.OUTAGE_AFTER + [ok([post(1)])],
+                    probes=[FakeResponse(500), requests.ConnectionError("refused"), FakeResponse(502), ok([])])
+    told = []
+    c.limiter.on_wait = lambda secs, why: told.append((round(secs), why))
+    assert len(c.get(*SEARCH)) == 1  # it waits it out, rather than giving up
+    assert [u for u, _ in c.session.calls].count("probe") == 4
+    waits = [secs for secs, why in told if secs]
+    assert waits == [10, 20, 40, 60]  # a probe after each, further apart each time
+    assert all("isn't answering (HTTP 500 since" in why for secs, why in told if secs) and told[-1] == (0, "")
+    assert not [why for _, why in told if "busy" in why]  # said as down, not busy: that read as ikari being throttled
+    assert not c.limiter.down
+
+
+def test_a_rate_limit_that_never_lifts_still_says_rate_limiting():
+    c = client([FakeResponse(429, headers={"X-RateLimit-Reset": "1"})] * 8)
+    with pytest.raises(FetchError, match="busy or rate limiting"):
+        c.get(*SEARCH)
+
+
+def test_an_archive_down_for_longer_than_the_patience_ends_the_request():
+    c = down_client([FakeResponse(500)] * arctic_shift.OUTAGE_AFTER, probes=[FakeResponse(500)] * 100)
+    with pytest.raises(arctic_shift.ArchiveDown, match="isn't answering"):
+        c.get(*SEARCH)
+    assert c.clock.t - 1000.0 >= arctic_shift.OUTAGE_PATIENCE
+    # One probe a minute at most once it's been down a while, not a request a second.
+    assert [u for u, _ in c.session.calls].count("probe") <= 4 + arctic_shift.OUTAGE_PATIENCE // 60
+
+
+def test_a_network_error_on_the_last_try_is_raised():
+    c = down_client([requests.Timeout("slow")] * (arctic_shift.RETRIES + 1))
     with pytest.raises(requests.Timeout):
         c.get(*SEARCH)
+
+
+def test_a_refusal_that_isnt_the_archives_json_is_reported_at_once_with_its_status():
+    c = down_client([FakeResponse(403, None)])
+    with pytest.raises(FetchError, match="HTTP 403"):
+        c.get(*SEARCH)
+    assert len(c.session.calls) == 1 and not c.limiter.down
+
+
+def test_answers_that_cant_be_read_dont_make_the_archive_count_as_down():
+    # Something between this computer and the archive answering instead (a proxy's page) isn't an outage to wait out.
+    c = down_client([FakeResponse(200, None)] * arctic_shift.GARBLED_TRIES)
+    with pytest.raises(FetchError, match="couldn't be read"):
+        c.get(*SEARCH)
+    assert "probe" not in [u for u, _ in c.session.calls] and not c.limiter.down
+
+
+def test_rate_limits_dont_use_up_a_requests_tries_at_server_errors():
+    c = down_client([FakeResponse(429, headers={"X-RateLimit-Reset": "1"})] * 4 + [FakeResponse(503), ok([post(1)])])
+    assert len(c.get(*SEARCH)) == 1
+
+
+def test_a_probe_that_raises_lets_the_next_one_go():
+    c = down_client([FakeResponse(500)] * arctic_shift.OUTAGE_AFTER + [ok([])], probes=[ValueError("odd"), ok([])])
+    with pytest.raises(ValueError):
+        c.get(*SEARCH)
+    assert c.limiter.down and not c.limiter._probing
+    assert c.get(*SEARCH) == [] and not c.limiter.down
+
+
+def test_a_second_outage_gets_its_own_patience():
+    c = down_client([FakeResponse(500)] * arctic_shift.OUTAGE_AFTER + [ok([])]
+                    + [FakeResponse(500)] * arctic_shift.OUTAGE_AFTER + [ok([])],
+                    probes=[FakeResponse(500)] * 9 + [ok([])] + [FakeResponse(500)] * 9 + [ok([])])
+    c.get(*SEARCH)  # down for about 8 minutes, then back
+    c.clock.t += 300
+    c.get(*SEARCH)  # down again: waited out too, not ended at once for the first one's time
+    assert not c.limiter.down
+
+
+def test_a_failure_while_the_archive_answers_others_doesnt_make_it_down():
+    c = down_client([FakeResponse(503), ok([]), FakeResponse(503), ok([]), FakeResponse(503), ok([])])
+    for _ in range(3):
+        c.get(*SEARCH)
+    assert "probe" not in [u for u, _ in c.session.calls] and not c.limiter.down
 
 
 def test_query_timeouts_back_off_with_smaller_pages_then_give_up():
@@ -659,13 +771,14 @@ def test_requests_still_start_no_faster_than_the_limiter_allows():
     limiter = RateLimiter(0.02)
     real_wait, grab = limiter.wait, threading.Lock()
 
-    def wait(should_stop=None, share=1.0):
+    def wait(should_stop=None, share=1.0, *rest):
         # When the limiter let each request go, by its own clock. Timing anything after that also counts how
         # late the OS ran each worker thread, which on a busy machine (the suite runs in parallel) bunches
         # two together. The lock keeps another grant from moving _next before it's read.
         with grab:
-            real_wait(should_stop, share)
+            flight = real_wait(should_stop, share, *rest)
             starts.append(limiter._next - limiter.interval * share)
+            return flight
 
     limiter.wait = wait
     ArcticShiftClient(session=SlowServer(items, delay=0.05), limiter=limiter, workers=4).fetch_posts(
@@ -811,7 +924,7 @@ def test_each_answer_is_parsed_once():
             return super().json()
 
     session = FakeSession([Counting(200, {"data": [{"id": "x"}]})])
-    client = ArcticShiftClient(session=session, limiter=RateLimiter(interval=0, sleep=lambda s: None))
+    client = ArcticShiftClient(session=session, limiter=RateLimiter(0, *fake_time()))
     assert client.get("/api/comments/tree", {"link_id": "abc"}) == [{"id": "x"}]
     assert Counting.parsed == 1
 
@@ -820,7 +933,7 @@ def test_an_ok_answer_that_isnt_json_is_retried_and_fails_only_if_it_keeps_comin
     # A proxy's or CDN's error page with HTTP 200, or a body cut short: it used to fail the whole fetch on
     # the first one, while a 503 is waited out and retried.
     session = FakeSession([FakeResponse(200, None)] * arctic_shift.GARBLED_TRIES)
-    client = ArcticShiftClient(session=session, limiter=RateLimiter(interval=0, sleep=lambda s: None))
+    client = ArcticShiftClient(session=session, limiter=RateLimiter(0, *fake_time()))
     with pytest.raises(FetchError, match="couldn't be read"):
         client.get("/api/posts/search", {"subreddit": "Python"})
     assert len(session.calls) == arctic_shift.GARBLED_TRIES
@@ -830,7 +943,7 @@ def test_an_ok_answer_that_isnt_json_is_retried_and_fails_only_if_it_keeps_comin
                                  requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead")])
 def test_an_answer_that_cant_be_read_is_retried(bad):
     session = FakeSession([bad, FakeResponse(200, {"data": [{"id": "x"}, None, "junk"]})])
-    client = ArcticShiftClient(session=session, limiter=RateLimiter(interval=0, sleep=lambda s: None))
+    client = ArcticShiftClient(session=session, limiter=RateLimiter(0, *fake_time()))
     assert client.get("/api/posts/search", {"subreddit": "Python"}) == [{"id": "x"}]  # junk records skipped
 
 

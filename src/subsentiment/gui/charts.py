@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QToolTip, QVBoxLayout, QWidget,
 )
 
+from subsentiment.analysis import LABELS
 from subsentiment.gui import motion, theme
 from subsentiment.gui.days import DAY, flat_button, short_date
 
@@ -41,7 +42,7 @@ class DistributionChart(QWidget):
     """How the items split across the labels: one segmented bar for the whole, and a row per label with
     its count and share. The segments and the rows' bars ease to new counts instead of jumping."""
 
-    CATEGORIES = ("negative", "neutral", "positive")
+    CATEGORIES = LABELS
     BAR, GAP, RADIUS = 40, 4, 6  # the segmented bar's height, the gap between segments, their corners
     ROW_BAR = 6  # each row's own share bar
 
@@ -242,6 +243,7 @@ class TimelineChart(QWidget):
         self._drawn: QPixmap | None = None
         self._drawn_for = None
         self._painted_for = None  # what the last paint showed
+        self._new_data = False  # points or notes changed since the last paint: a change that then holds still
 
         self.toolbar = QWidget()
         bar = QHBoxLayout(self.toolbar)
@@ -267,6 +269,7 @@ class TimelineChart(QWidget):
         old_end = self.domain()[1]
         self.points = list(points)
         self._version += 1
+        self._new_data = True
         self._days = [d for d, _, _ in self.points]
         self._grouped.clear()
         if self.view is not None and self.view[1] >= old_end:
@@ -278,6 +281,7 @@ class TimelineChart(QWidget):
         self.notes = dict(notes)
         self._note_days = sorted(self.notes)
         self._version += 1
+        self._new_data = True
         self.update()
 
     def notes_in(self, start: float, end: float) -> list[tuple[str, str]]:
@@ -308,12 +312,16 @@ class TimelineChart(QWidget):
 
     def set_view(self, lo: float, hi: float, animate: bool = False, preset: str | None = None) -> None:
         """Show [lo, hi), kept inside the days there are and no narrower than MIN_SPAN."""
-        a, b = self.domain()
-        span = min(max(hi - lo, MIN_SPAN), b - a)
-        lo = min(max(lo, a), b - span)
-        self.view = None if span >= b - a else (lo, lo + span)
+        self.view = self._fit(lo, hi, MIN_SPAN)
         self.preset = preset or ("All" if self.view is None else None)
         self._apply(animate)
+
+    def _fit(self, lo: float, hi: float, least: float = 0.0) -> tuple[float, float] | None:
+        """[lo, hi) kept inside the days there are and no narrower than ``least``; None when that's every day."""
+        a, b = self.domain()
+        span = min(max(hi - lo, least), b - a)
+        lo = min(max(lo, a), b - span)
+        return None if span >= b - a else (lo, lo + span)
 
     def zoom_preset(self, key: str) -> None:
         a, b = self.domain()
@@ -381,14 +389,10 @@ class TimelineChart(QWidget):
         """Ease (or jump) to the view. With follow (new data), a zoom that is easing carries on, its start
         moved along with its target, so it neither restarts nor jumps."""
         if self.preset not in (None, "All"):  # a range button's span is always the latest days there are now
-            a, b = self.domain()
-            days = dict(PRESETS)[self.preset] * DAY
-            self.view = None if days >= b - a else (b - days, b)
+            b = self.domain()[1]
+            self.view = self._fit(b - dict(PRESETS)[self.preset] * DAY, b)
         elif self.view is not None:  # the days may have changed under it
-            a, b = self.domain()
-            span = min(self.view[1] - self.view[0], b - a)
-            lo = min(max(self.view[0], a), b - span)
-            self.view = None if span >= b - a else (lo, lo + span)
+            self.view = self._fit(*self.view)
         lo, hi = self.view or self.domain()
         _, shown = self.groups(lo, hi, self._areas()[0].width())
         old, self._to = self._to, (lo, hi, timeline_bound([(g[0], g[2], g[3]) for g in shown]))
@@ -485,7 +489,10 @@ class TimelineChart(QWidget):
         p = QPainter(self)
         if key == self._drawn_for:
             p.drawPixmap(-lead, self._drawn)
-        elif key == self._painted_for:  # painted like this once already, so it holds still: keep a picture
+        # Painted like this once already, so it holds still: keep a picture. New points do too (a running fetch's,
+        # four times a second): painted straight on, then again as a picture for the hover over it, it was painted
+        # twice for each.
+        elif key == self._painted_for or self._new_data:
             self._drawn = QPixmap((self.size() + QSize(lead.x(), lead.y())) * dpr)
             self._drawn.setDevicePixelRatio(dpr)
             self._drawn.fill(Qt.GlobalColor.transparent)
@@ -498,7 +505,7 @@ class TimelineChart(QWidget):
         else:  # each frame of a zoom or a drag differs: straight onto the widget
             self._paint_chart(p, colors, t)
             p.setFont(_ui_font(9))
-        self._painted_for = key
+        self._painted_for, self._new_data = key, False
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         plot, _ = self._areas()
         lo, hi, bound = self._screen

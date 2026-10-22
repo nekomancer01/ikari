@@ -1,5 +1,6 @@
 """The fetch worker's error reporting and cleanup, with the Reddit client replaced by a fake."""
 import os
+import time
 
 import pytest
 import requests
@@ -129,3 +130,90 @@ def test_a_background_job_runs_its_worker_off_the_gui_thread_and_tidies_up():
         time.sleep(0.01)
     assert ended and not job.busy and not job.running()
     assert Worker.ran_on is not threading.main_thread()
+
+
+@pytest.fixture
+def scorers(monkeypatch):
+    """The app's scoring processes, ended after the test (they're shared by its fetches until the app closes)."""
+    monkeypatch.setattr(worker_mod.ThreadScorer, "broken", False)
+    yield worker_mod.ThreadScorer
+    worker_mod.ThreadScorer.close()
+
+
+def up(scorers) -> None:
+    end = time.monotonic() + 60
+    while not scorers.ready():
+        assert time.monotonic() < end and not scorers.broken
+        time.sleep(0.01)
+
+
+def test_a_big_threads_comments_are_scored_in_other_processes_as_they_are_here(scorers):
+    from subsentiment.sentiment import Lexicon
+    lexicon = Lexicon({"raid": 0.8, "nerf": -0.6})
+    moods = ["was great", "is so annoying", "needs a nerf", "ok I guess", "what a raid", "not bad at all"]
+    texts = [f"the raid tonight {moods[i % len(moods)]} #{i}" for i in range(scorers.LEAST + 50)]
+    scorers.start()
+    up(scorers)
+    scorer = scorers()
+    handed = count_calls_on(scorers._pool, "submit")
+    assert scorer(lexicon, texts[:5]) == [lexicon.score(t) for t in texts[:5]] and not handed  # here
+    assert scorer(lexicon, texts) == [lexicon.score(t) for t in texts]
+    assert handed and not scorers.broken
+
+
+def test_a_big_thread_is_scored_here_while_the_processes_start_and_the_next_ones_go_to_them(scorers):
+    # Waiting on them, each thread of a download waited seconds on Windows, every fetch (they were started for each).
+    from subsentiment.sentiment import Lexicon
+    lexicon = Lexicon({"raid": 0.8})
+    texts = [f"the raid tonight #{i}" for i in range(scorers.LEAST)]
+    scorer = scorers()
+    assert scorers._pool is None
+    assert scorer(lexicon, texts) == [lexicon.score(t) for t in texts]  # here, starting them meanwhile
+    up(scorers)
+    handed = count_calls_on(scorers._pool, "submit")
+    assert scorers()(lexicon, texts) == [lexicon.score(t) for t in texts] and handed  # another fetch's, there
+
+
+def test_stop_while_a_threads_comments_are_scored_elsewhere_leaves_the_thread_unsaved(scorers):
+    # Waiting on the processes, Stop (or quitting) used to wait for the whole thread's scores first.
+    from subsentiment.sentiment import Lexicon
+    texts = ["the raid tonight was great"] * (scorers.LEAST * 50)
+    scorers.start()
+    up(scorers)
+    start = time.monotonic()
+    assert scorers(lambda: True)(Lexicon({"raid": 0.8}), texts) is None
+    assert time.monotonic() - start < 10 and scorers.ready()  # still up for the next fetch
+
+
+def test_scoring_processes_that_dont_answer_in_time_are_given_up_for_scoring_here(scorers, monkeypatch):
+    # A pool that never answered would have held the fetch forever.
+    from subsentiment.sentiment import Lexicon
+    lexicon = Lexicon({"raid": 0.8})
+    texts = [f"the raid tonight #{i}" for i in range(scorers.LEAST)]
+    scorers.start()
+    up(scorers)
+    monkeypatch.setattr(scorers, "WAIT", -1.0)  # out of time at once
+    assert scorers()(lexicon, texts) == [lexicon.score(t) for t in texts]
+    assert scorers.broken and scorers._pool is None
+
+
+def count_calls_on(obj, name):
+    calls, real = [], getattr(obj, name)
+    setattr(obj, name, lambda *a, **k: calls.append(a) or real(*a, **k))
+    return calls
+
+
+def test_a_fetch_reads_back_what_it_saved_and_sends_it_to_the_window(monkeypatch, tmp_path):
+    # The window used to read them itself: a read a row at a time, each waiting on this thread for the interpreter.
+    monkeypatch.setattr(worker_mod, "ArcticShiftClient", FakeClient)
+    FakeClient.error = None
+    w = worker_mod.FetchWorker(collect.FetchRequest("python", include_comments=True), str(tmp_path / "w.db"))
+    sent = []
+    w.saved.connect(sent.append)
+    w.run()
+    posts = [r["id"] for got in sent for r in got["posts"][1]]
+    comments = [r["id"] for got in sent for r in got["comments"][1]]
+    assert sorted(set(posts)) == ["p1", "p2"] and sorted(set(comments)) == ["cp1", "cp2"]
+    assert sent[0]["posts"][0] == w.since  # each from where the one before left off
+    assert all(got[k][0] <= later[k][0] for got, later in zip(sent, sent[1:]) for k in ("posts", "comments"))
+    assert all(r.words is not None for got in sent for r in got["comments"][1])  # split there, not in the window
