@@ -21,6 +21,10 @@ fi
 # Re-sync dependencies whenever pyproject.toml changes (new deps never break a launch).
 if [ ! -f .venv/.deps-stamp ] || [ pyproject.toml -nt .venv/.deps-stamp ]; then
     echo "Installing ikari dependencies..."
-    .venv/bin/python -m pip install -q -e . && touch .venv/.deps-stamp
+    if ! .venv/bin/python -m pip install -q -e .; then
+        echo "Installing dependencies failed (see above). Fix the error and run ./run.sh again." >&2
+        exit 1
+    fi
+    touch .venv/.deps-stamp
 fi
 exec .venv/bin/python -m subsentiment "$@"
