@@ -593,22 +593,18 @@ class _Stopping:
         return self.event.is_set() or parent is not None and not parent.is_alive()
 
 
-def _pack_all(path: str, pack: bool, stop, fetched: bool = False) -> None:
+def _pack_all(path: str, pack: bool, stop) -> None:
     """A big Store.upgrade's packing (if ``pack``) and search index, in a process of its own, splitting words in a
-    few more; or with ``fetched``, only the days a big fetch saved (Store.pack_fetched), splitting the words here.
-    ``stop`` (a multiprocessing Event) ends it between days, its word-splitting processes with it."""
+    few more. ``stop`` (a multiprocessing Event) ends it between days, its word-splitting processes with it."""
     stop = _Stopping(stop)
     store = Store(path)
     pool = None
     try:
-        if pack and not fetched:
+        if pack:
             pool = ProcessPoolExecutor(max(1, min(8, (os.cpu_count() or 2) - 1)), mp_context=multiprocessing.get_context("spawn"))
     except Exception:  # noqa: BLE001 - split them here
         pool = None
     try:
-        if fetched:
-            store.pack_settled(stop=stop)
-            return
         if pack:
             store.pack_settled(vacuum=False, stop=stop, split=pool, old=True)
             if stop.is_set():
@@ -849,27 +845,14 @@ class Store:
         self.search.put(kind, [(r[0], packed.get(r[0], r[4:]) if r[3] else r[4:]) for r in rows])
         self.db.commit()
 
-    def pack_fetched(self, stop: threading.Event | None = None) -> None:
-        """Pack the days a fetch saved that have settled (pack_settled): a big download's (a month of a busy
-        subreddit's comments, say) in a process of its own, as `upgrade` does, so the minutes of Python it takes
-        don't hold the interpreter lock the window needs for every frame; ``stop`` (the app closing) cuts it
-        short, the rest packed after the next fetch."""
-        self.db.commit()
-        left = sum(self.db.execute(f"SELECT COUNT(*) FROM {t} WHERE packed != 1 AND created_utc < ?",
-                                   (self._settled_before(),)).fetchone()[0] for t in PACKED)  # what pack_settled packs
-        if left < self.PACK_ELSEWHERE or not self._pack_elsewhere(stop, fetched=True):
-            self.pack_settled()
-
-    PACK_ELSEWHERE = 20_000  # rows to pack from which pack_fetched packs them in a process of its own
-
-    def _pack_elsewhere(self, stop: threading.Event | None, pack: bool = True, fetched: bool = False) -> bool:
+    def _pack_elsewhere(self, stop: threading.Event | None, pack: bool = True) -> bool:
         """Pack in a process of its own (`_pack_all`), so a minute of it doesn't take the interpreter from the
         window this thread is in; ``stop`` ends it, between days or mid-day (its transaction is then rolled
         back). False if no process could be started here."""
         context = multiprocessing.get_context("spawn")
         try:
             stopping = context.Event()
-            worker = context.Process(target=_pack_all, args=(str(self.path), pack, stopping, fetched), daemon=False)
+            worker = context.Process(target=_pack_all, args=(str(self.path), pack, stopping), daemon=False)
             worker.start()
         except Exception:  # noqa: BLE001
             return False
@@ -928,7 +911,8 @@ class Store:
                     raise
             except Exception:  # noqa: BLE001 - busy, or text that can't be packed: leave the day as it is
                 continue
-        if done and vacuum and not (stop is not None and stop.is_set()):  # the cleared text leaves its pages part empty, which only a VACUUM gives back
+        # The cleared text leaves its pages part empty, which only a VACUUM gives back; not as the app closes.
+        if done and vacuum and not (stop is not None and stop.is_set()):
             self.search.optimize(pages=2000)  # what the fetch's saves added to the search index, a few MB of it
             self._compact()
         return done
