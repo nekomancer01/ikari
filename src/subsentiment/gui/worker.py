@@ -191,42 +191,76 @@ class ScorePool(QObject):
 class ThreadScorer:
     """Scores a fetch's comments, a thread at a time, in other processes, while the fetch's own thread waits without
     the interpreter lock: scored on that thread, a big thread's comments held it for most of each second, and every
-    frame of the window waited on it. A few comments are scored here, as handing them over costs more; and all of
-    them once processes can't run here, or don't answer in time. Stopped while it waits, it gives back None and the
-    thread isn't saved."""
+    frame of the window waited on it. The processes are the app's, shared by its fetches: the first thread big enough
+    starts them, on a thread of their own, and they stay up until the app closes (``close``); each takes seconds to
+    start on Windows. Until they're all up, a thread's comments are scored here, so no thread ever waits on them;
+    a thread of a few comments always is (handing them over costs more), and every one once the processes can't
+    run, fail or don't answer in time. Stopped while it waits, it gives back None and the thread isn't saved."""
 
     LEAST = 100  # comments in a thread for it to go to the processes
     WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
-    WAIT = 30.0  # seconds the processes get to start and answer, and a millisecond more for each comment
+    WAIT = 30.0  # seconds the processes get to answer, and a millisecond more for each comment
+    _pool: ProcessPoolExecutor | None = None
+    _up: list[Future] = []  # one no-op each, done once the processes have started
+    _lock = threading.Lock()
+    broken = False
 
     def __init__(self, should_stop=lambda: False):
-        self._pool: ProcessPoolExecutor | None = None
-        self.broken = False
         self.should_stop = should_stop
 
-    def __call__(self, lexicon: Lexicon, texts: list[str]) -> list[tuple[float, str]] | None:
-        if len(texts) >= self.LEAST and not self.broken:
+    @classmethod
+    def start(cls) -> None:
+        with cls._lock:
+            if cls._pool is not None or cls.broken:
+                return
             try:
-                if self._pool is None:
-                    self._pool = ProcessPoolExecutor(self.WORKERS, mp_context=multiprocessing.get_context("spawn"))
+                cls._pool = ProcessPoolExecutor(cls.WORKERS, mp_context=multiprocessing.get_context("spawn"))
+                cls._up = [cls._pool.submit(int) for _ in range(cls.WORKERS)]
+            except Exception:  # none allowed here
+                cls.broken = True
+        if cls.broken:
+            cls.close()
+
+    @classmethod
+    def ready(cls) -> bool:
+        up = cls._up
+        if cls.broken or not up or not all(f.done() for f in up):
+            return False
+        if any(f.cancelled() or f.exception() for f in up):
+            cls.broken = True
+            cls.close()
+            return False
+        return True
+
+    def __call__(self, lexicon: Lexicon, texts: list[str]) -> list[tuple[float, str]] | None:
+        if len(texts) >= self.LEAST and not self.ready():
+            if self._pool is None and not self.broken:
+                threading.Thread(target=self.start, name="ThreadScorer start", daemon=True).start()
+        elif len(texts) >= self.LEAST:
+            cls = type(self)
+            try:
                 step = -(-len(texts) // self.WORKERS)
-                parts = [self._pool.submit(Lexicon.compare, lexicon.weights, frozenset(), texts[a:a + step])
+                parts = [cls._pool.submit(Lexicon.compare, lexicon.weights, frozenset(), texts[a:a + step])
                          for a in range(0, len(texts), step)]
                 give_up = time.monotonic() + self.WAIT + len(texts) / 1000
                 while futures.wait(parts, timeout=0.1).not_done:
                     if self.should_stop():
-                        self.close()
+                        for part in parts:
+                            part.cancel()
                         return None
                     if time.monotonic() > give_up:
                         raise TimeoutError("the scoring processes didn't answer")
                 return [got[:2] for part in parts for got in part.result()]
-            except Exception:  # none allowed, they died or hung: scored here from now on
-                self.broken = True
-                self.close()
+            except Exception:  # they died, hung or were closed: scored here from now on
+                cls.broken = True
+                cls.close()
         return [lexicon.score(t) for t in texts]
 
-    def close(self) -> None:
-        pool, self._pool = self._pool, None
+    @classmethod
+    def close(cls) -> None:
+        """End the processes (the app is closing): idle ones would keep it from exiting."""
+        with cls._lock:
+            pool, cls._pool, cls._up = cls._pool, None, []
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
             for process in list((pool._processes or {}).values()):
@@ -308,11 +342,10 @@ class FetchWorker(Worker):
             self._send_saved(store)  # whatever its last commits saved without a word
             self.finished.emit(result)
         finally:
-            scorer.close()
             LIMITER.on_wait = None  # collect.run pointed it at this worker, which is about to go
             if store is not None:
                 try:
-                    store.pack_fetched(self._closing)  # days that have settled since get their text compressed (store.PACKED)
+                    store.pack_settled(stop=self._closing)  # days that have settled since get their text compressed
                 except Exception:  # never worth failing a fetch for: the rows stay as they are, packed next time
                     pass
                 store.close()
