@@ -22,8 +22,10 @@ It can also be told to answer some requests with errors first (``fail``), or to 
 """
 from __future__ import annotations
 
+import datetime
 import json
 import math
+import os
 import random
 import threading
 import time
@@ -38,6 +40,34 @@ BUSY_PAGE = 15  # a busy subreddit times out on a window holding more posts than
 BUSY_AGG_DAYS = 7
 CLOCK_SLACK = 0.03
 SLOW_DOWN = (422, {"error": "Timeout. Maybe slow down a bit"})
+
+
+class Clock:
+    """The clock tests run on: today's UTC date at a fixed time of day (IKARI_TEST_HOUR, noon by default), then
+    ticking as usual. Posts sit at fixed hours of their UTC day while the app's ranges ("Past 24 hours", "Past
+    week") end at now, so which posts a range held changed through the day, and tests failed from 00:00 to past
+    01:00 UTC. ``pin`` moves time.time and datetime.now; subprocesses that call it share the first one's clock."""
+    ENV = "IKARI_TEST_CLOCK"  # seconds added to the real clock, set by the first pin for the processes it starts
+
+    @classmethod
+    def pin(cls) -> None:
+        if os.environ.get(cls.ENV) is None:
+            real = time.time()
+            os.environ[cls.ENV] = repr(real // DAY * DAY + float(os.environ.get("IKARI_TEST_HOUR", 12)) * 3600 - real)
+        offset, real_time = float(os.environ[cls.ENV]), time.time
+
+        class Pinned(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls.fromtimestamp(time.time(), tz)
+
+            @classmethod
+            def today(cls):
+                return cls.fromtimestamp(time.time())
+
+        time.time = lambda: real_time() + offset
+        time.time_ns = lambda: int(time.time() * 1e9)
+        datetime.datetime = Pinned
 
 
 def make_posts(subreddit: str, now: float, days: int = 10, per_day=(6, 12, 0), seed: int = 1) -> list[dict]:
