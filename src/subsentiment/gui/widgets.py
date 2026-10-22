@@ -5,13 +5,14 @@ Nothing here knows about ikari's data; the windows put these together.
 from __future__ import annotations
 
 import math
+import time
 from typing import Callable
 
-from PySide6.QtCore import QDate, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt
+from PySide6.QtCore import QDate, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath
 from PySide6.QtWidgets import (
-    QAbstractScrollArea, QCalendarWidget, QComboBox, QDateEdit, QFrame, QLabel, QScrollArea, QTableView,
-    QToolButton, QVBoxLayout, QWidget,
+    QAbstractScrollArea, QCalendarWidget, QComboBox, QDateEdit, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QScrollArea, QSpinBox, QTableView, QToolButton, QVBoxLayout, QWidget,
 )
 
 from subsentiment.gui import motion, theme
@@ -135,6 +136,86 @@ class ShrinkingComboBox(QComboBox):
         return QSize(min(full.width(), 120), full.height())
 
 
+class CommentCap(QObject):
+    """How many comments to keep on each post, ``count`` (0 shows as "All"), and which ones, ``pick``: the
+    highest-scored or a random sample that stays the same for each post. The Fetch drawer and the Coverage
+    page each place one, remembered under their own QSettings prefix as "comments_per_post" and
+    "comment_pick"."""
+
+    PICKS = {"top": "Top scoring", "random": "Random"}
+
+    def __init__(self, settings, prefix: str, default: int, most: int, parent=None):
+        super().__init__(parent)
+        self.settings, self.prefix, self.default = settings, prefix, default
+        self._enabled = True
+        self.count = QSpinBox()
+        self.count.setRange(0, most)
+        self.count.setSingleStep(10)
+        self.count.setSuffix(" per post")
+        # The stylesheet's horizontal padding doesn't reach a spin box's inner editor; match the other inputs.
+        self.count.findChild(QLineEdit).setTextMargins(8, 0, 0, 0)
+        self.count.setSpecialValueText("All")
+        self.count.setToolTip("The most comments kept on each post. Go below 1 for All: every comment on each post.")
+        self.count.setMinimumWidth(100)  # its size hint would squeeze a form's labels
+        self.pick = QComboBox()
+        for key, text in self.PICKS.items():
+            self.pick.addItem(text, key)
+        self.pick.setToolTip("Which comments a post keeps when it has more than that: the highest-scored, or a "
+                             "random sample that stays the same each time the post is asked about")
+        self.count.valueChanged.connect(lambda _: self.set_enabled(self._enabled))
+        self.restore()
+
+    def request(self) -> dict:
+        """The FetchRequest fields this sets."""
+        return {"comments_per_post": self.count.value(), "comment_pick": self.pick.currentData()}
+
+    def set_enabled(self, on: bool) -> None:
+        """Both off with ``on`` False; the pick is off under All too, as nothing is left out to choose from."""
+        self._enabled = on
+        self.count.setEnabled(on)
+        self.pick.setEnabled(on and self.count.value() > 0)
+
+    def restore(self) -> None:
+        self.count.setValue(self.settings.value(f"{self.prefix}/comments_per_post", self.default, int))
+        pick = self.settings.value(f"{self.prefix}/comment_pick", "top", str)
+        self.pick.setCurrentIndex(max(self.pick.findData(pick), 0))
+
+    def save(self) -> None:
+        self.settings.setValue(f"{self.prefix}/comments_per_post", self.count.value())
+        self.settings.setValue(f"{self.prefix}/comment_pick", self.pick.currentData())
+
+class Choice(QFrame):
+    """A row of words in a soft track, one of them chosen (a raised pill): Download coverage's Posts / Comments /
+    Both and its list filters. ``options`` is [(key, text)]; ``changed`` sends the chosen key."""
+
+    changed = Signal(str)
+
+    def __init__(self, options: list[tuple[str, str]], current: str, small: bool = False):
+        super().__init__()
+        mark(self, "choice", True)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(2)
+        self.buttons: dict[str, QPushButton] = {}
+        for key, text in options:
+            b = mark(QPushButton(text), "flat", True)
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(f"padding: {'3px 10px' if small else '4px 12px'}; border-radius: 10px;")
+            b.clicked.connect(lambda _=False, k=key: self.changed.emit(k))
+            self.buttons[key] = b
+            lay.addWidget(b)
+        self.set_value(current if current in self.buttons else options[0][0])
+
+    def value(self) -> str:
+        return next(k for k, b in self.buttons.items() if b.isChecked())
+
+    def set_value(self, key: str) -> None:
+        self.buttons[key].setChecked(True)
+
+
 class QuietScrollBars(QObject):
     """Shows a list's scroll bar handle only while the pointer is over the list, like macOS overlay bars.
 
@@ -215,6 +296,90 @@ class ShareBar(QWidget):
         else:
             p.setBrush(QColor(t["accent"]))
         p.drawRoundedRect(fill, 3, 3)
+
+
+class Throbber(ShareBar):
+    """A ShareBar's sweep laid over ``line`` (a divider), taking no room, once the window has been waiting on
+    something for DELAY seconds: ``waiting()`` names what (a caption shown at the line's right end, in
+    ``beside``'s row when its text leaves room), "" for a wait to show without one, or None for none. It's asked
+    a few times a second, so a wait needn't say when it starts or ends, and one over within the delay shows
+    nothing at all."""
+
+    DELAY = 1.0  # seconds a wait goes on before it shows
+    POLL_MS = 100
+
+    def __init__(self, line: QWidget, waiting: Callable[[], str | None], beside: ElidedLabel | None = None,
+                 inset: int = 16):
+        super().__init__()
+        host = line.parentWidget()
+        self.setParent(host)
+        self.line, self.beside, self.inset, self._waiting = line, beside, inset, waiting
+        self.setFixedHeight(3)
+        self.set(None, waiting=True)
+        self.caption = label("", "caption")
+        self.caption.setParent(host)
+        self._since: float | None = None  # when the wait under way began
+        for w in (self, self.caption):
+            w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            w.hide()
+        line.installEventFilter(self)
+        self._poll = QTimer(self)  # runs while the line is on screen
+        self._poll.setInterval(self.POLL_MS)
+        self._poll.timeout.connect(self.check)
+
+    def check(self) -> None:
+        what = self._waiting()
+        if what is None:
+            self._since = None
+            self.hide()
+            self.caption.hide()
+            return
+        now = time.monotonic()
+        if self._since is None:
+            self._since = now
+        if now - self._since < self.DELAY:
+            return
+        self.caption.setText(what)
+        appearing = self.isHidden()
+        self._place()
+        if appearing:
+            self.show()
+            motion.fade_in(self)
+        self.raise_()  # over a crossfade's picture of the page, too
+        if self.caption.isVisible():
+            self.caption.raise_()
+
+    def eventFilter(self, obj, event) -> bool:
+        kind = event.type()
+        if kind in (QEvent.Type.Move, QEvent.Type.Resize) and self.isVisible():
+            self._place()
+        elif kind == QEvent.Type.Show:
+            self._poll.start()
+        elif kind == QEvent.Type.Hide:
+            self._poll.stop()
+            self._since = None
+            self.hide()
+            self.caption.hide()
+        return False
+
+    def _place(self) -> None:
+        g = self.line.geometry()
+        self.setGeometry(g.x() + self.inset, g.center().y() - 1, max(g.width() - 2 * self.inset, 0), 3)
+        size = self.caption.sizeHint()
+        x = g.right() - self.inset - size.width()
+        if self.beside is not None:  # in its row, past its text
+            row = self.beside.geometry()
+            y = row.center().y() - size.height() // 2
+            room = x - row.x() - self.beside.fontMetrics().horizontalAdvance(self.beside.full_text()) >= 24
+        else:  # just above the line
+            y, room = g.y() - size.height() - 2, True
+        self.caption.setGeometry(x, y, size.width(), size.height())
+        fits = bool(self.caption.text()) and room and x > g.x()
+        if fits and self.caption.isHidden():
+            self.caption.show()
+            motion.fade_in(self.caption)
+        elif not fits:
+            self.caption.hide()
 
 
 class CountingLabel(QLabel):

@@ -10,6 +10,7 @@ and the app installed (pip install -e ".[dev]"), plus a display or QT_QPA_PLATFO
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import sys
 import tempfile
@@ -21,7 +22,7 @@ from PySide6.QtWidgets import QApplication
 
 from subsentiment import sentiment
 from subsentiment.arctic_shift import SETTLE_SECONDS
-from subsentiment.gui import motion, native, theme
+from subsentiment.gui import motion, native, theme, worker
 from subsentiment.gui.main_window import MainWindow
 from subsentiment.reddit import Comment, Post
 from subsentiment.store import Store
@@ -33,14 +34,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SUBREDDIT = "riverton"  # a made-up city; see tools/sample_text.py
 USERS = ["tram_fan_88", "mill_st_local", "quietcommuter", "rivertonmum", "bikes_not_cars",
          "old_bridge_photos", "night_owl_42", "canal_road_res", "dumpling_hunter", "council_watcher"]
-SHOTS = [  # (file name, theme, page)
-    ("overview-light.png", "light", "overview"),
-    ("overview-dark.png", "dark", "overview"),
-    ("posts-light.png", "light", "posts"),
-    ("posts-dark.png", "dark", "posts"),
-    ("comments-light.png", "light", "comments"),
-    ("comments-dark.png", "dark", "comments"),
-]
+PAGES = ["overview", "words", "posts", "comments", "coverage"]
+SHOTS = [(f"{page}-{mode}.png", mode, page) for page in PAGES for mode in ("light", "dark")]
+SIZE = (1280, 800)  # logical; at the 1.5 device pixel ratio set below that is 1920x1200 pixels
 
 # Share of positive / negative / neutral posts in each phase of the made-up story.
 PHASES = [  # (first day, last day, weights)
@@ -92,6 +88,24 @@ def seed(path: str) -> None:
     store.close()
 
 
+class CountingArchive:
+    """Answers the Coverage page's day counts: a little more than saved on most days, so some read as partial."""
+
+    def __init__(self, *args, **kwargs):
+        self.limiter = type("L", (), {"on_wait": None})()
+
+    def day_counts(self, subreddit, after, before, should_stop=None):
+        rng = random.Random(3)
+        return {d: rng.choice([13, 14, 15, 16, 18, 20]) for d in range(int(after // 86400 * 86400), int(before), 86400)}
+
+
+def settle(app, seconds: float = 0.4) -> None:
+    end = time.time() + seconds
+    while time.time() < end:
+        app.processEvents()
+        time.sleep(0.02)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", default=str(ROOT / "docs"), help="folder for the PNG files")
@@ -102,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
     db = Path(tempfile.mkdtemp(prefix="ikari-shots-")) / "sample.db"
     seed(str(db))
 
+    os.environ.setdefault("QT_SCALE_FACTOR", "1.5")  # a real 1.5 device pixel ratio, as on the owner's screen
+    worker.ArcticShiftClient = CountingArchive  # the Coverage page asks the archive for day totals
     native.setup_app_identity()
     app = QApplication(sys.argv[:1])
     app.setOrganizationName("ikari-screenshots")  # keeps this run's settings separate from the user's
@@ -113,7 +129,8 @@ def main(argv: list[str] | None = None) -> int:
 
     window = MainWindow(str(db))
     motion.set_enabled(False)  # stills of the finished state, not mid-fade
-    window.resize(1440, 900)
+    window.resize(*SIZE)
+    window.fetch_form.range.setCurrentIndex(window.fetch_form.range.findData("month"))
     window.show()
     window._refresh_datasets(SUBREDDIT)
     window.fetch_form.subreddit.setText(SUBREDDIT)
@@ -127,9 +144,13 @@ def main(argv: list[str] | None = None) -> int:
         settings.setValue("ui/theme", mode)
         window._apply_theme()
         window.show_page(page)
-        for _ in range(5):  # let Qt lay out and repaint before grabbing
-            app.processEvents()
-            time.sleep(0.05)
+        if page == "coverage":
+            settle(app, 1.5)  # the archive's day counts arrive
+            cov = window.coverage
+            cov.day_table.selectRow(3)
+            cov.ticked = set(cov.days[2:4])
+            cov._show_ticked()
+        settle(app, 1.5 if page in ("coverage", "words") else 0.3)  # counts, tallies, charts
         path = out / name
         window.grab().save(str(path))
         print("wrote", path)

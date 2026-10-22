@@ -1,4 +1,4 @@
-from subsentiment.gui.app import main
+if __name__ == "__main__":  # (rescoring's worker processes import this module too: they stop here)
+    from subsentiment.gui.app import main
 
-if __name__ == "__main__":
     raise SystemExit(main())

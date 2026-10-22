@@ -4,11 +4,17 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+import zstandard
 
 from subsentiment import collect, store
 from subsentiment.reddit import Comment, Post
 from subsentiment.analysis import Analysis
 from subsentiment.store import SCHEMA_VERSION, Store
+
+# How far Store.upgrade takes a database here: an SQLite before 3.43 (Ubuntu 22.04's) has no search index (version 4).
+SEARCHABLE = store.Search(sqlite3.connect(":memory:")).ready
+UPGRADED = SCHEMA_VERSION if SEARCHABLE else 3
+needs_search = pytest.mark.skipif(not SEARCHABLE, reason="this SQLite has no contentless deletes (3.43)")
 
 
 def make_post(i, sub="Python", ts=1_700_000_000.0):
@@ -45,7 +51,7 @@ class FakeClient:
     def fetch_posts(self, *a, **kw):
         return [make_post(1, sub="AskScience"), make_post(2, sub="AskScience")]
 
-    def fetch_comments(self, post, limit):
+    def fetch_comments(self, post, limit, pick="top"):
         return [Comment(f"c{post.id}", post.id, "AskScience", "", "b", "This is wonderful", 1, 1.0, 0, "u")]
 
 
@@ -69,6 +75,39 @@ def test_datasets_summarise_each_subreddit_and_delete_all_empties_the_store(tmp_
     assert s.size_bytes() > 0
     s.delete_all()
     assert s.datasets() == [] and s.comments("python") == []
+
+
+def test_whole_comment_threads_are_counted_per_day_the_way_the_downloader_leaves_them(tmp_path):
+    from subsentiment.reddit import Comment, Post
+    s = Store(tmp_path / "w.db")
+    day = 1_791_936_000
+    posts = {  # id: (num_comments, comments saved, complete mark): whole?
+        "none": (0, 0, None),  # no comments: nothing to download
+        "marked": (9, 2, "comments"),  # Download all read it to the end; the count includes removed ones
+        "early": (None, 1, "comments_so_far"),  # read to the end before the archive counted it
+        "counted": (4, 1, "comments_so_far"),  # counted since, and more than was saved
+        "all": (2, 2, None),  # every comment the archive counts is saved
+        "part": (3, 1, None),
+        "never": (None, 0, None),
+    }
+    for i, (pid, (n, saved, mark)) in enumerate(posts.items()):
+        s.save_post(Post(pid, "Python", "t", "", "a", 1, 0.9, n, day + 10 + i, "u", ""), 0.0, "neutral")
+        for j in range(saved):
+            s.save_comment(Comment(f"{pid}{j}", pid, "Python", "t3_" + pid, "b", "x", 1, day, 0, "u"), 0.0, "neutral")
+        if mark:
+            s.mark_complete(mark, "Python", pid)
+    s.save_post(Post("next", "Python", "t", "", "a", 1, 0.9, 0, day + 86400 + 5, "u", ""), 0.0, "neutral")
+    s.save_post(Post("pic", "Python", "t", "", "a", 1, 0.9, 0, day + 99, "u", "", image=True), None, None)  # hidden
+    s.save_post(Post("other", "rust", "t", "", "a", 1, 0.9, 5, day + 50, "u", ""), 0.0, "neutral")
+    s.mark_complete("comments", "Python", "other")  # a mark in another subreddit doesn't count
+    s.commit()
+    assert s.whole_threads_per_day("PYTHON", day, day + 2 * 86400) == {day: (4, 7), day + 86400: (1, 1)}
+    assert s.whole_threads_per_day("rust", day, day + 86400) == {day: (0, 1)}
+    s.save_post(Post("alone", "Go", "t", "", "a", 1, 0.9, None, day + 5, "u", ""), 0.0, "neutral")
+    assert s.whole_threads_per_day("go", day, day + 86400) == {day: (0, 1)}  # a day of uncounted posts only
+    # The Posts list offers comments for exactly the posts that aren't whole.
+    assert {r["id"]: r["whole"] for r in s.comment_coverage("python", day, day + 86400)} == \
+        {"none": 1, "marked": 1, "early": 1, "counted": 0, "all": 1, "part": 0, "never": 0}
 
 
 def test_coverage_counts_per_day_and_complete_marks_are_cleared_with_the_data(tmp_path):
@@ -205,6 +244,27 @@ def test_a_comments_permalink_made_from_its_posts_is_rebuilt_when_read_not_store
     assert {r["id"]: r["permalink"] for r in csv.DictReader(open(tmp_path / "c.csv", encoding="utf-8-sig"))} == expected
 
 
+def test_a_comment_saved_after_its_post_was_packed_doesnt_store_its_permalink_either(tmp_path):
+    path = tmp_path / "subsentiment.db"
+    s = Store(path)
+    s.save_post(Post("p1", "Python", "t", "", "a", 1, 0.9, 2, 1_700_000_000, POST_LINK, ""), 0.0, "neutral")
+    s.commit()
+    s.pack_settled()  # the post's link is in its pack now, not its row
+    s.save_comment(Comment("c1", "p1", "Python", "t3_p1", "b", "hi", 1, 1_700_000_100, 0, POST_LINK + "c1/"), 0.0, "neutral")
+    s.commit()
+    assert s.db.execute("SELECT permalink FROM comments").fetchone()[0] is None
+    assert s.comments("python")[0]["permalink"] == POST_LINK + "c1/"
+    s.db.execute("UPDATE comments SET permalink = ?", (POST_LINK + "c1/",))  # as 0.4 saved it
+    s.db.execute("PRAGMA user_version = 2")
+    s.commit()
+    s.close()
+    Store.upgrade(path)
+    db = sqlite3.connect(path)
+    assert db.execute("SELECT permalink FROM comments").fetchone()[0] is None
+    db.close()
+    assert Store(path).comments("python")[0]["permalink"] == POST_LINK + "c1/"
+
+
 def test_a_comment_keeps_its_permalink_when_its_posts_changes(tmp_path):
     s = Store(tmp_path / "x.db")
     post = Post("p1", "Python", "t", "", "a", 1, 0.9, 2, 1_700_000_000, POST_LINK, "")
@@ -265,7 +325,7 @@ def test_a_database_from_an_older_ikari_is_shrunk_once_and_reads_back_the_same(t
     before = _contents(path)
     Store.upgrade(path)  # as the app's start does: Store(path) shrinks it, then its text is packed
     s = Store(path)
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == UPGRADED
     assert {"posts_sub", "comments_sub"}.isdisjoint(n for (n,) in s.db.execute("SELECT name FROM sqlite_master"))
     assert s.db.execute("SELECT COUNT(*) FROM comments WHERE permalink IS NULL").fetchone()[0] == 9
     assert s.db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -373,7 +433,7 @@ def test_a_migration_that_cant_finish_leaves_the_database_as_it_was_and_runs_at_
     Store._migration_tried.clear()  # the next start
     Store.upgrade(path)
     s = Store(path)
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == UPGRADED
     s.close()
     assert _contents(path) == before
 
@@ -411,7 +471,7 @@ def test_packing_an_older_database_cut_short_keeps_its_backup_and_carries_on_at_
     Store.upgrade(path)  # the next start
     assert list(tmp_path.iterdir()) == [path]
     s = Store(path)
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == UPGRADED
     assert s.db.execute("SELECT COUNT(*) FROM posts WHERE packed = 0").fetchone()[0] == 0
     s.close()
     assert _contents(path) == before
@@ -593,7 +653,7 @@ def test_a_database_from_an_older_ikari_gets_notes_and_imports_without_them(tmp_
     shutil.copy(OLD_DB, path)
     Store.upgrade(path)
     s = Store(path)  # migrated, and given the notes table
-    assert s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == UPGRADED
     s.save_note("python", 0, "X", "kept")
     shutil.copy(OLD_DB, tmp_path / "old.db")
     s.import_from(tmp_path / "old.db")  # an older file has no notes table
@@ -601,7 +661,7 @@ def test_a_database_from_an_older_ikari_gets_notes_and_imports_without_them(tmp_
     assert Store(path).notes("python") == {0: ("X", "kept")}
 
 
-def test_score_filter_goes_by_the_post_score(tmp_path):
+def test_score_filter_goes_by_the_rows_own_score(tmp_path):
     from subsentiment.store import scoring_at_least
     s = Store(tmp_path / "s.db")
     day = 1_700_006_400.0 // 86400 * 86400
@@ -609,12 +669,12 @@ def test_score_filter_goes_by_the_post_score(tmp_path):
     s.save_comment(Comment("c1", "p10", "Python", "t3_p10", "b", "hi", -4, day + 86400, 0, "u"), 0.2, "positive")
     s.commit()
     posts, comments = s.posts("python"), s.comments("python")
-    assert posts[0]["score"] == 10 and comments[0]["post_score"] == 10
+    assert posts[0]["score"] == 10 and comments[0]["score"] == -4
     assert len(scoring_at_least(posts, 10)) == 1 and scoring_at_least(posts, 11) == []
-    assert len(scoring_at_least(comments, 10)) == 1  # a comment goes by its post's score, not its own -4
-    assert scoring_at_least(comments, 11) == [] and len(scoring_at_least(comments, None)) == 1
+    assert scoring_at_least(comments, 10) == []  # a comment goes by its own -4, not its post's 10
+    assert len(scoring_at_least(comments, -5)) == 1 and len(scoring_at_least(comments, None)) == 1
     out = tmp_path / "c.csv"
-    assert s.export_csv("python", "comments", out, min_score=11) == 0
+    assert s.export_csv("python", "comments", out, min_score=0) == 0
     assert s.export_csv("python", "posts", out, days={int(day)}, min_score=10) == 1
 
 
@@ -626,6 +686,22 @@ def test_read_spans_merge_and_go_with_the_subreddit(tmp_path):
     assert s.read_spans("rust") == []
     s.delete_subreddit("Python")  # its posts are gone, so a download must read them again
     assert s.read_spans("python") == []
+    s.close()
+
+
+def test_tried_days_join_and_fall_back_to_the_saved_days_before_any_were_kept(tmp_path):
+    s = Store(tmp_path / "t.db")
+    d = 86400 * 20000
+    assert s.tried_days("python") == []  # never fetched: nothing to list
+    s.save_post(Post("p1", "Python", "t", "", "a", 1, 0.9, 0, d + 2 * 86400 + 50, "u", ""), 0.0, "neutral")
+    s.save_removed("Python", {"gone": d + 10})
+    assert s.tried_days("PYTHON") == [d + 2 * 86400, d + 86400, d]  # an older database: first saved day to last
+    s.save_tried("python", [d + 5 * 86400, d + 4 * 86400])  # joined to those, and kept from now on
+    s.save_tried("Python", [d + 9 * 86400])
+    assert s.tried_days("python") == [d + k * 86400 for k in (9, 5, 4, 2, 1, 0)]
+    assert s.read_spans("python") == []  # a kind of its own
+    s.delete_subreddit("python")
+    assert s.tried_days("python") == []
     s.close()
 
 
@@ -722,4 +798,228 @@ def test_deleting_days_forgets_them_whole_and_leaves_other_days_and_subreddits_a
     s.commit()
     assert s.pack_settled() == 1
     assert {r["id"]: r["title"] for r in s.posts("python")}["Python1"] == "downloaded again"
+    s.close()
+
+
+def test_deleting_a_day_keeps_the_newer_text_of_a_comment_saved_again_on_a_day_it_shares(tmp_path):
+    s = Store(tmp_path / "x.db")
+    day = 1_700_000_000 // 86400 * 86400
+    s.save_post(Post("pA", "Python", "t", "", "a", 1, 0.9, 2, day - 3600, POST_LINK, ""), 0.0, "neutral")  # the day before
+    s.save_post(Post("pB", "Python", "t", "", "a", 1, 0.9, 2, day + 60, POST_LINK, ""), 0.0, "neutral")
+    for post in ("pA", "pB"):  # both comments on pB's day
+        s.save_comment(Comment("c" + post, post, "Python", f"t3_{post}", "b", "first", 1, day + 100, 0, None), 0.0, "neutral")
+    s.commit()
+    s.pack_settled()
+    s.save_comment(Comment("cpB", "pB", "Python", "t3_pB", "b", "edited", 1, day + 100, 0, None), 0.0, "neutral")
+    s.commit()
+    s.delete_days("python", [day - 86400])  # takes pA and its comment out of the comments' pack of pB's day
+    assert {r["id"]: r["body"] for r in s.comments("python")} == {"cpB": "edited"}
+    s.pack_settled()
+    assert {r["id"]: r["body"] for r in s.comments("python")} == {"cpB": "edited"}
+
+
+def test_archive_counts_are_kept_with_when_they_were_asked(tmp_path):
+    s = Store(tmp_path / "s.db")
+    s.save_archive_counts("Python", {86400: 5, 2 * 86400: 7}, at=1000.0)
+    assert s.archive_counts("python", 0, 3 * 86400) == {86400: 5, 2 * 86400: 7}
+    assert s.archive_counts("Python", 0, 2 * 86400) == {86400: 5}
+    assert s.archive_counts("Python", 0, 3 * 86400, since=1001.0) == {}  # asked before then: not kept as fresh
+    s.save_archive_counts("Python", {86400: 6}, at=2000.0)
+    assert s.archive_counts("Python", 0, 3 * 86400, since=1001.0) == {86400: 6}
+    s.delete_all()
+    assert s.archive_counts("Python", 0, 3 * 86400) == {}
+
+
+def test_open_threads_are_the_days_posts_without_every_comment(tmp_path):
+    from subsentiment.reddit import Post
+    s = Store(tmp_path / "s.db")
+    day = 20 * 86400
+    for pid, created, n in (("a", day + 10, 2), ("b", day + 20, 0), ("c", day + 30, 1), ("d", day + 86400 + 5, 3)):
+        s.save_post(Post(pid, "Python", pid, "", "u", 1, 1.0, n, created, "", ""), 0.0, "neutral")
+    s.mark_complete("comments", "Python", "c")
+    assert s.open_threads("Python", [day]) == ["a"]  # b has no comments, c is saved whole
+    assert s.open_threads("Python", [day + 86400, day]) == ["d", "a"]
+    assert s.open_threads("Python", []) == []
+
+
+V2_DB = Path(__file__).parent / "data" / "store-v2.db"  # saved by 0.4's store: days packed as JSON, no column blocks
+
+
+def test_a_database_packed_by_0_4_is_packed_again_in_frames_and_reads_back_the_same(tmp_path):
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(V2_DB, path)
+    db = sqlite3.connect(path)
+    assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+    db.close()
+    before = _contents(path)
+    s = Store(path)
+    rows = {k: s.rows(k, "deltarune") for k in ("posts", "comments")}
+    s.close()
+    Store.upgrade(path)
+    assert list(tmp_path.iterdir()) == [path]  # its backup is gone once it worked
+    assert _contents(path) == before
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == UPGRADED and SCHEMA_VERSION == 4
+    assert {k: s.rows(k, "deltarune") for k in rows} == rows
+    packs = s.db.execute("SELECT data, cols, words FROM packs").fetchall()
+    assert len(packs) == 8 and all(c and w for d, c, w in packs)  # small days stay one frame of JSON
+    assert s.db.execute("SELECT COUNT(*) FROM comments WHERE packed != 1").fetchone()[0] == 0
+    assert s.db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    s.close()
+
+
+def test_packing_a_0_4_database_cut_short_keeps_its_backup_and_reads_from_both_formats(tmp_path):
+    import threading
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(V2_DB, path)
+    before = _contents(path)
+    stop = threading.Event()
+    stop.set()  # the app is closed before any day is packed again
+    Store.upgrade(path, stop)
+    backup = tmp_path / "subsentiment.db-before-v3"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [path.name, backup.name]
+    assert _contents(path) == _contents(backup) == before
+    s = Store(path)
+    s._write_pack("comments", "deltarune", s.db.execute("SELECT MIN(day) FROM packs").fetchone()[0], ())
+    s.commit()
+    s.close()
+    assert _contents(path) == before  # one day in frames, the rest still JSON
+    Store.upgrade(path)  # the next start
+    assert list(tmp_path.iterdir()) == [path]
+    assert _contents(path) == before
+    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == UPGRADED
+
+
+def test_a_subreddits_packs_share_a_dictionary_made_from_a_big_day(tmp_path):
+    import random
+    rng = random.Random(6)
+    path = tmp_path / "x.db"
+    s = Store(path)
+    day0 = 1_690_000_000 // 86400 * 86400
+    link = "https://www.reddit.com/r/Deltarune/comments/p1/x/"
+    s.save_post(Post("p1", "Deltarune", "t", "", "a", 1, 0.9, 2, day0, link, link), 0.0, "neutral")
+    for i in range(1500):  # the first day big enough to make one; the next day is packed with it too
+        s.save_comment(Comment(f"c{i}", "p1", "Deltarune", "t3_p1", f"user{rng.randint(1, 400)}", _chatter(rng, rng.randint(3, 30)),
+                               1, day0 + (i // 1100) * 86400 + i, 0, link + f"c{i}/"), 0.0, "neutral")
+    s.commit()
+    before = s.comments("deltarune")
+    s.pack_settled()
+    (made,) = s.db.execute("SELECT data FROM dicts WHERE kind = 'comments' AND subreddit = 'deltarune'").fetchone()
+    assert 1000 < len(made) <= store.DayPack.DICT_SIZE
+    assert s.db.execute("SELECT COUNT(*) FROM dicts WHERE kind = 'posts'").fetchone()[0] == 0  # one post: too few
+    heads = [store.DayPack.header(d)[0] for (d,) in s.db.execute("SELECT data FROM packs WHERE kind = 'comments'")]
+    assert len(heads) == 2 and {h["dict"] for h in heads} == {zstandard.ZstdCompressionDict(made).dict_id()}
+    s.close()
+    store.DayPack.dicts.clear()  # a new start reads it back from the file
+    s = Store(path)
+    assert s.comments("deltarune") == before
+    other = tmp_path / "other.db"
+    Store(other).close()
+    store.DayPack.dicts.clear()
+    o = Store(other)
+    assert o.import_from(path) == (1, 1500)  # another file's packs read with its own dictionary
+    assert [r["body"] for r in o.comments("deltarune")] == [r["body"] for r in before]
+    o.close()
+    s.close()
+
+
+@needs_search
+def test_search_keeps_up_with_deletes_and_imports_and_a_0_4_database_gets_its_index(tmp_path, monkeypatch):
+    import numpy as np
+    key = lambda ids: sorted(store.Search.key(i) for i in ids)  # noqa: E731
+    # Image posts and their comments are indexed too, though never shown: compared among the rows shown.
+    shown = lambda found, rows: sorted(set(found.tolist()) & set(key(r["id"] for r in rows)))  # noqa: E731
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(V2_DB, path)
+    s = Store(path)
+    assert s.search.matches("comments", "the") is None  # not indexed yet
+    s.close()
+    Store.upgrade(path)
+    s = Store(path)
+    comments = s.rows("comments", "deltarune")
+    with_boss = [r["id"] for r in comments if "boss" in (r["body"] or "").split()]
+    assert with_boss and shown(s.search.matches("comments", "boss"), comments) == key(with_boss)
+    day = int(min(r["created_utc"] for r in s.rows("posts", "deltarune"))) // 86400 * 86400
+    s.delete_days("deltarune", [day])
+    left = {r["id"] for r in s.rows("comments", "deltarune")}
+    assert shown(s.search.matches("comments", "boss"), comments) == key(i for i in with_boss if i in left)
+    other = tmp_path / "other.db"
+    o = Store(other)
+    assert o.import_from(path)[1] == len(left)
+    assert shown(o.search.matches("comments", "boss"), comments) == key(i for i in with_boss if i in left)
+    o.delete_subreddit("deltarune")
+    assert len(o.search.matches("comments", "boss")) == 0
+    o.close()
+    s.delete_all()
+    assert len(s.search.matches("posts", "the")) == 0
+    assert isinstance(s.search.matches("posts", "the"), np.ndarray)
+    s.close()
+
+
+def test_search_words_and_keys_match_how_fts5_and_ids_are_split():
+    import numpy as np
+    assert store.Search.query("snake_case Boss's") == '"snake" "case" "boss" "s"*'
+    assert store.Search.query(" _ ") is None
+    ids = ["", "abc", "zzzzzzzzzzz", "abcdefghijkl", "t1_ab"]
+    assert store.Search.keys(np.array([i.encode() for i in ids])).tolist() == [store.Search.key(i) for i in ids]
+    assert store.Search.key("") == 0
+
+
+@needs_search
+def test_a_version_3_database_with_unpacked_settled_rows_gets_its_index(tmp_path):
+    path = tmp_path / "subsentiment.db"
+    s = Store(path)
+    s.save_post(make_post(1, ts=1_600_000_000.0), 0.5, "positive")  # settled, not packed till the next fetch
+    s.search.clear()
+    s.db.execute("PRAGMA user_version = 3")
+    s.db.commit()
+    s.close()
+    Store.upgrade(path)
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == UPGRADED
+    assert s.search.matches("posts", "t").tolist() == [store.Search.key("p1")]
+    s.close()
+
+
+@needs_search
+def test_an_sqlite_without_search_leaves_the_index_for_one_with_it(tmp_path, monkeypatch):
+    path = tmp_path / "subsentiment.db"
+    probe = store.Search._probe
+    monkeypatch.setattr(store.Search, "_probe", lambda self: False)
+    s = Store(path)
+    s.save_post(make_post(1, ts=1_600_000_000.0), 0.5, "positive")
+    s.db.commit()
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == 3 and s.search.matches("posts", "t") is None
+    s.close()
+    Store.upgrade(path)
+    s = Store(path)
+    assert s.db.execute("PRAGMA user_version").fetchone()[0] == 3  # not marked indexed
+    s.close()
+    monkeypatch.setattr(store.Search, "_probe", probe)
+    Store.upgrade(path)
+    s = Store(path)
+    assert s.search.matches("posts", "t").tolist() == [store.Search.key("p1")]
+    s.close()
+
+
+def test_an_older_sqlite_is_swapped_for_pysqlite3s_where_it_is_installed():
+    import subprocess
+    import sys
+    pytest.importorskip("pysqlite3")  # Linux x86_64 only
+    code = ("import sqlite3; sqlite3.sqlite_version_info = (3, 37, 2); import subsentiment.store as s; "
+            "print(s.sqlite3.__name__, s.Search(s.sqlite3.connect(':memory:')).ready)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.split()
+    assert out == ["pysqlite3", "True"]
+
+
+def test_a_stopped_upgrade_process_stops_by_itself_and_leaves_no_word_splitting_processes(tmp_path):
+    import multiprocessing
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(V2_DB, path)
+    stop = multiprocessing.get_context("spawn").Event()
+    stop.set()  # the window closed: it ends its pool itself (ended from outside, the pool's processes were left)
+    store._pack_all(str(path), True, stop)
+    assert multiprocessing.active_children() == []
+    s = Store(path)
+    assert s._left_to_pack()  # carried on at the next start
     s.close()

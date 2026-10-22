@@ -364,7 +364,7 @@ class TimelineChart(QWidget):
         long zigzag path very slowly (most of a second for ten years of days)."""
         segments, alone, prev = [], [], None
         for i, (start, end, mean, _) in enumerate(shown):
-            pt = QPointF(x_of((start + end) / 2), y_of(mean))
+            pt = QPointF(x_of(self._mid(start, end)), y_of(mean))
             if prev is not None and shown[i - 1][1] >= start:
                 segments.append(QLineF(prev, pt))
             elif i + 1 == len(shown) or shown[i + 1][0] > end:
@@ -435,7 +435,13 @@ class TimelineChart(QWidget):
         """Where a point (start, end, mean, items) is drawn now."""
         lo, hi, bound = self._screen
         start, end, mean = point[:3]
-        return QPointF(self._x((start + end) / 2, lo, hi, plot), plot.center().y() - mean / bound * plot.height() / 2)
+        return QPointF(self._x(self._mid(start, end), lo, hi, plot), plot.center().y() - mean / bound * plot.height() / 2)
+
+    def _mid(self, start: float, end: float) -> float:
+        """Where a point for [start, end) is drawn: the middle of the days of it there are, so the week or month
+        at either end, which the days there are may only partly fill, sits inside the plot like the rest."""
+        a, b = self.domain()
+        return (max(start, a) + min(end, b)) / 2
 
     @staticmethod
     def _x(t: float, lo: float, hi: float, r: QRectF) -> float:
@@ -503,7 +509,7 @@ class TimelineChart(QWidget):
             p.fillRect(QRectF(a, plot.top(), b - a, plot.height()), sel)
         elif self._hover:
             unit, start, end, mean, n = self._hover
-            x = self._x((start + end) / 2, lo, hi, plot)
+            x = self._x(self._mid(start, end), lo, hi, plot)
             y = plot.center().y() - mean / bound * plot.height() / 2
             if plot.left() - 1 <= x <= plot.right() + 1:
                 p.setPen(QPen(QColor(colors["muted"]), 1))
@@ -584,7 +590,7 @@ class TimelineChart(QWidget):
             p.setPen(ring)
             p.setBrush(line)
             for start, end, mean, _ in shown:
-                p.drawEllipse(QPointF(x_of((start + end) / 2), y_of(mean)), 4, 4)
+                p.drawEllipse(QPointF(x_of(self._mid(start, end)), y_of(mean)), 4, 4)
         p.restore()
         self._paint_notes(p, plot, shown, ring)
         self._paint_navigator(p, nav, colors, t)
@@ -727,7 +733,7 @@ class TimelineChart(QWidget):
             return super().mousePressEvent(event)
         plot, nav = self._areas()
         pos = event.position()
-        if nav.adjusted(0, -4, 0, 4).contains(pos):
+        if nav.adjusted(-6, -4, 6, 4).contains(pos):
             part = self._nav_part(pos.x())
             if part == "outside":  # jump there: the window centres on the click, then follows the drag
                 a, b = self.domain()
@@ -747,7 +753,7 @@ class TimelineChart(QWidget):
         pos = event.position()
         if self._drag is None:
             self._hover_at(pos, plot)
-            part = self._nav_part(pos.x()) if nav.adjusted(0, -4, 0, 4).contains(pos) else None
+            part = self._nav_part(pos.x()) if nav.adjusted(-6, -4, 6, 4).contains(pos) else None
             if part is None and self._target(pos):
                 part = "point"
             self.setCursor({"left": Qt.CursorShape.SizeHorCursor, "right": Qt.CursorShape.SizeHorCursor,
@@ -838,8 +844,10 @@ class TimelineChart(QWidget):
             lo, hi, _ = self._screen
             at = self._t(pos.x(), lo, hi, plot)
             unit, shown = self.groups(lo, hi, plot.width())
-            if shown:
-                hover = (unit, *min(shown, key=lambda g: abs((g[0] + g[1]) / 2 - at)))
+            # The nearest point in view: one just past an edge would hide the crosshair there.
+            inside = [g for g in shown if lo <= self._mid(g[0], g[1]) <= hi] or shown
+            if inside:
+                hover = (unit, *min(inside, key=lambda g: abs(self._mid(g[0], g[1]) - at)))
         if hover != self._hover:
             self._hover = hover
             self.update()

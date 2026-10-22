@@ -9,7 +9,9 @@ description = "Desktop app to gather subreddit posts/comments and analyse their 
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "numpy>=1.26",
     "PySide6>=6.7",
+    "pysqlite3-binary>=0.5.4; sys_platform == 'linux' and platform_machine == 'x86_64'",  # a newer SQLite, for search
     "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",
     "requests>=2.31",
     "vaderSentiment>=3.3.2",

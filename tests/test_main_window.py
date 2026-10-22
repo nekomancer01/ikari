@@ -316,7 +316,7 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     assert (cell.main.text(), cell.note.text()) == ("1 saved so far", "Today")
     assert "of" not in cell.main.text() and "%" not in cell.note.text()
     button = c.day_table.cellWidget(row, 2).findChild(mw.QPushButton)
-    assert button.text() == "Download all" and button.isEnabled()
+    assert button.text() == coverage.DOWNLOAD and button.isEnabled()
     button.click()
     req, msg = started[-1]
     assert req.everything and req.after == today and req.limit == coverage.MAX_DAY_POSTS
@@ -401,13 +401,20 @@ def test_bundled_fonts_are_weights_of_the_families_the_theme_asks_for():
 
 def test_each_rail_button_opens_its_page_and_the_last_one_is_reopened(make_window):
     w = make_window()
-    for page in ("timeline", "words", "posts", "comments", "overview", "timeline"):
+    for page in ("words", "posts", "comments", "overview", "words"):
         w.rail.buttons[page].click()
         assert w.page() == page and w.pages.currentWidget() is w.page_widgets[page]
-        assert w.scope.isVisibleTo(w) == (page in ("overview", "timeline", "words"))  # what it counts shows there
-    assert w.timeline_page.body.points == w.overview.timeline.points != []  # the same days, on its own page
+        assert w.scope.isVisibleTo(w) == (page in ("overview", "words"))  # what it counts shows there
+    assert "timeline" not in w.rail.buttons  # the Overview's chart is the only timeline
     w.close()
-    assert make_window().page() == "timeline"
+    assert make_window().page() == "words"
+
+
+def test_a_remembered_timeline_page_opens_the_overview(make_window):
+    w = make_window()
+    w.settings.setValue("ui/page", "timeline")  # the page an earlier version had
+    w.close()
+    assert make_window().page() == "overview"
 
 
 def test_the_old_tab_setting_opens_the_same_page(make_window):
@@ -569,53 +576,58 @@ def test_import_database_adds_its_subreddits_to_the_list(make_window, tmp_path, 
     assert len(warnings) == 1 and w.datasets.count() == 3
 
 
-def test_score_filter_hides_low_posts_and_their_comments_everywhere_and_is_remembered(make_window, tmp_path):
+def test_score_filters_hide_low_posts_and_low_comments_everywhere_and_are_remembered(make_window, tmp_path):
     from subsentiment.reddit import Comment
     s = Store(tmp_path / "w.db")
     ts = 1_700_000_000.0
     for pid, score in (("low", 3), ("mid", 40), ("high", 900), ("pending", None)):
         s.save_post(Post(pid, "Python", pid, "", "a", score, 0.9, 1, ts, f"https://r/{pid}/", ""), 0.5, "positive")
-        s.save_comment(Comment(f"c-{pid}", pid, "Python", f"t3_{pid}", "b", "hi", 1, ts, 0, ""), -0.5, "negative")
+        s.save_comment(Comment(f"c-{pid}", pid, "Python", f"t3_{pid}", "b", "hi", score, ts, 0, ""), -0.5, "negative")
     s.commit()
     s.close()
     w = make_window()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     assert w.score_pick.currentText() == "Any score" and len(w.posts) == 5 and len(w.comments) == 4
     w.score_pick.setCurrentIndex(w.score_pick.findText("Score 10+"))
-    # p0 (score 1) and "low" go, with low's comment; a post with no score yet is left out too (with its comment).
+    # p0 (score 1) and "low" go, and a post with no score yet; the posts filter leaves the comments alone.
     assert sorted(r["id"] for r in w.posts) == ["high", "mid"]
+    assert len(w.comments) == 4 and w.comments_tab.model.rowCount() == 4
+    w.comment_score_pick.setCurrentIndex(w.comment_score_pick.findText("Comments 10+"))
     assert sorted(r["id"] for r in w.comments) == ["c-high", "c-mid"]
     assert w.posts_tab.model.rowCount() == 2 and w.comments_tab.model.rowCount() == 2
-    assert w._counted.count == 4  # the Overview and Timeline count what the tables show
+    assert w._counted.count == 4  # the Overview counts what the tables show
     assert "2\xa0posts" in w.subheading.text()
     out = tmp_path / "p.csv"
-    assert w.store.export_csv("Python", "comments", out, min_score=w.min_score) == 2
+    assert w.store.export_csv("Python", "comments", out, min_score=w.min_scores[1]) == 2
 
-    # A running fetch's rows go through the same filter as they arrive.
+    # A running fetch's rows go through the same filters as they arrive.
     w.fetch_job.qthread = object()
     w.request, w._since = mw.collect.FetchRequest("Python"), time.time()
     w._read_to = {"posts": w._since, "comments": w._since}
     w.store.save_post(Post("new-low", "Python", "n", "", "a", 2, 0.9, 1, ts, "https://r/n/", ""), 0.5, "positive")
     w.store.save_post(Post("new-high", "Python", "n", "", "a", 50, 0.9, 1, ts, "https://r/h/", ""), 0.5, "positive")
-    w.store.save_comment(Comment("c-new-low", "new-low", "Python", "t3_new-low", "b", "x", 1, ts, 0, ""), 0.1, "neutral")
+    w.store.save_comment(Comment("c-new-low", "new-high", "Python", "t3_new-high", "b", "x", 1, ts, 0, ""), 0.1, "neutral")
+    w.store.save_comment(Comment("c-new-high", "new-low", "Python", "t3_new-low", "b", "x", 60, ts, 0, ""), 0.1, "neutral")
     w.store.commit()
     w._queue_new_rows()
     w._flush_rows()
     w.fetch_job.qthread = None
     assert sorted(r["id"] for r in w.posts_tab.all_rows) == ["high", "mid", "new-high"]
-    assert "c-new-low" not in {r["id"] for r in w.comments_tab.all_rows}
-    # The finished fetch rescored "high" below the filter: it leaves every page, and so does its comment.
+    assert sorted(r["id"] for r in w.comments_tab.all_rows) == ["c-high", "c-mid", "c-new-high"]
+    # The finished fetch rescored "high" below the filter: it leaves every page; its comment stays on its own score.
     w.store.save_post(Post("high", "Python", "high", "", "a", 4, 0.9, 1, ts, "https://r/high/", ""), 0.5, "positive")
     w.store.commit()
     w._merge_fetched()
     assert "high" not in {r["id"] for r in w.posts_tab.all_rows} and "high" not in {r["id"] for r in w.posts}
-    assert "c-high" not in {r["id"] for r in w.comments_tab.all_rows}
+    assert "c-high" in {r["id"] for r in w.comments_tab.all_rows}
     w.close()
 
     again = make_window()
-    assert again.score_pick.currentText() == "Score 10+" and len(again.posts) == 2
+    assert again.score_pick.currentText() == "Score 10+" and again.comment_score_pick.currentText() == "Comments 10+"
+    assert len(again.posts) == 2
     again.score_pick.setCurrentIndex(again.score_pick.findText("Any score"))
-    assert len(again.posts) == 7 and len(again.comments) == 5
+    again.comment_score_pick.setCurrentIndex(again.comment_score_pick.findText("Any comments"))
+    assert len(again.posts) == 7 and len(again.comments) == 6
 
 
 def test_download_coverage_is_a_page_in_the_rail(make_window, monkeypatch):

@@ -37,7 +37,7 @@ class FakeClient:
                 on_posts([p])
         return picked
 
-    def fetch_comments(self, post, limit):
+    def fetch_comments(self, post, limit, pick="top"):
         self.calls.append(("comments", post.id))
         if post.id in self.failing:
             raise FetchError("Arctic Shift: Query timed out")
@@ -119,7 +119,7 @@ def test_a_post_whose_comments_came_back_empty_isnt_asked_again(tmp_path):
     s = store_with(tmp_path, [])
 
     class Quiet(FakeClient):
-        def fetch_comments(self, post, limit):
+        def fetch_comments(self, post, limit, pick="top"):
             self.calls.append(("comments", post.id))
             return []
     c = Quiet(posts=[mk(1, score=None, num_comments=None)])
@@ -141,7 +141,7 @@ class FullThreadClient(FakeClient):
         super().__init__(**kw)
         self.whole = whole
 
-    def fetch_all_comments(self, post):
+    def fetch_all_comments(self, post, cap=0, pick="top"):
         self.calls.append(("all", post.id, post.num_comments))
         if post.id in self.failing:
             raise FetchError("Arctic Shift: Query timed out")
@@ -243,7 +243,7 @@ class SlowClient(FakeClient):
         self.waited = False  # the 5 s ran out once: the rest don't wait
         self.lock = threading.Condition()
 
-    def fetch_comments(self, post, limit):
+    def fetch_comments(self, post, limit, pick="top"):
         with self.lock:
             self.busy += 1
             self.most = max(self.most, self.busy)
@@ -280,19 +280,28 @@ def test_comments_fetched_at_once_still_give_up_after_repeated_failures(tmp_path
 
 def test_stop_doesnt_wait_for_a_comment_tree_still_downloading(tmp_path):
     # One huge thread takes the archive ages to send; Stop shouldn't sit it out.
+    huge = threading.Event()
+
     class HugeThread(SlowClient):
-        def fetch_comments(self, post, limit):
+        def fetch_comments(self, post, limit, pick="top"):
             if post.id == "p0":
+                huge.set()
                 time.sleep(3)
             return super().fetch_comments(post, limit)
 
+    # Stop is pressed once the huge thread is downloading and timed from there. A timer started with the fetch
+    # also counted saving the posts first, which took Windows runners 2-3 s (each commit waits on the disk).
     s = store_with(tmp_path, [])
-    stop = threading.Event()
-    threading.Timer(0.3, stop.set).start()
-    start = time.perf_counter()
+    stop, pressed = threading.Event(), []
+
+    def press_once_the_huge_thread_is_out():
+        huge.wait(10)
+        pressed.append(time.perf_counter())
+        stop.set()
+    threading.Thread(target=press_once_the_huge_thread_is_out, daemon=True).start()
     result = collect.run(HugeThread(posts=[mk(i) for i in range(12)]), s, collect.FetchRequest("python"),
                          should_stop=stop.is_set)
-    assert time.perf_counter() - start < 1.5 and result.stopped
+    assert pressed and time.perf_counter() - pressed[0] < 1.5 and result.stopped
     assert s.posts("python") and result.comment_errors == 0  # what finished is kept, nothing marked failed
 
 
@@ -413,6 +422,32 @@ def test_all_comments_asks_again_for_threads_still_growing_and_counts_only_new_c
     assert again.comments == 0  # the same three comments came back: nothing new
 
 
+def test_a_capped_fill_asks_until_each_thread_has_its_cap_and_a_bigger_cap_tops_it_up(tmp_path):
+    s = store_with(tmp_path, [mk(1), mk(2)], comments_for=["p1"])  # p1 has 1 comment saved, p2 none
+    s.mark_comments("p1", ok=True, settled=True)
+    s.commit()
+
+    class Capped(FullThreadClient):
+        def fetch_all_comments(self, post, cap=0, pick="top"):
+            self.calls.append(("all", post.id, cap, pick))
+            thread = [Comment(f"c{post.id}{j}", post.id, "Python", "t3_" + post.id, "b", "ok", j, T, 0, "u")
+                      for j in range(6)]
+            return thread[:cap or None], cap == 0 or cap >= 6
+    c = Capped(posts=[mk(1), mk(2)])
+    req = dict(comments_per_post=3, comment_pick="random", fill_threads=True)
+    result = collect.run(c, s, collect.FetchRequest("python", **req))
+    assert sorted(call[1:] for call in c.calls if call[0] == "all") == [("p1", 3, "random"), ("p2", 3, "random")]
+    assert result.comments == 6 and s.complete_keys("comments", "python") == set()
+    c.calls.clear()
+    collect.run(c, s, collect.FetchRequest("python", **req))
+    assert not [call for call in c.calls if call[0] in ("all", "comments")]  # each has its 3
+    bigger = collect.run(c, s, collect.FetchRequest("python", **dict(req, comments_per_post=10)))
+    assert bigger.comments == 6 and s.complete_keys("comments", "python") == {"p1", "p2"}  # whole under 10
+    c.calls.clear()
+    collect.run(c, s, collect.FetchRequest("python", comments_per_post=3))  # the Fetch drawer: asks each post once
+    assert not [call for call in c.calls if call[0] in ("all", "comments")]
+
+
 def test_a_whole_range_gets_each_days_comments_before_the_next_days_posts(tmp_path):
     # Live on r/AskReddit: a week's fetch read ~31k posts before asking for one comment, so Stop in the first
     # minutes left none. Now each day's comments follow its posts, newest day first.
@@ -430,7 +465,7 @@ def test_stopping_after_a_day_keeps_its_comments(tmp_path):
     stop = threading.Event()
     real = c.fetch_comments
 
-    def fetch_comments(post, limit):
+    def fetch_comments(post, limit, pick="top"):
         got = real(post, limit)
         if post.id == "d2p2":  # the newest day's last post: Stop pressed as its comments come in
             stop.set()
@@ -476,3 +511,22 @@ def test_a_fetch_scores_by_the_subreddits_own_words(tmp_path):
     collect.run(FakeClient(posts=[mk(1)]), s, collect.FetchRequest("python", limit=1))
     assert [(r["body"], r["label"]) for r in s.comments("python")] == [("lovely", "negative")]
     assert [r["label"] for r in s.posts("python")] == ["neutral"]
+
+
+def test_a_days_comments_skip_posts_whose_recheck_finds_nothing_to_download(tmp_path):
+    # The owner, 21 Oct: Download all comments "checks posts with empty comments". Posts saved before the archive had
+    # counted their comments are re-checked first; the ones that turn out to have none (or only ones already
+    # saved) were still asked for their thread, one request each.
+    s = store_with(tmp_path, [mk(i, score=None, num_comments=None) for i in (1, 2, 3)], comments_for=("p2",))
+    c = FullThreadClient(by_id=[mk(1, score=5, num_comments=0), mk(2, score=5, num_comments=1),
+                                mk(3, score=5, num_comments=3)])
+    said = []
+    collect.run(c, s, collect.FetchRequest("python", comment_posts=("p1", "p2", "p3")),
+                progress=lambda done, total, msg: said.append(msg))
+    assert [call[1] for call in c.calls if call[0] == "all"] == ["p3"]
+    assert "Skipping 2 of 3 posts: no comments to download" in said
+    assert {"p1", "p2"} <= s.complete_keys("comments", "python")  # not offered again
+    # Check again on one post still asks the archive: its count can lag behind its comments.
+    c.calls.clear()
+    collect.run(c, s, collect.FetchRequest("python", comment_posts=("p1",)))
+    assert [call[1] for call in c.calls if call[0] == "all"] == ["p1"]

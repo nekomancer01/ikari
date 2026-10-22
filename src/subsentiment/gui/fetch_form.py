@@ -4,10 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import QDate, QObject, QSettings, Qt, Signal
-from PySide6.QtWidgets import QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QLineEdit, QSpinBox, QWidget
+from PySide6.QtWidgets import QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QLineEdit, QWidget
 
 from subsentiment import collect
-from subsentiment.gui.widgets import DateEdit, label
+from subsentiment.gui.widgets import CommentCap, DateEdit, label
 
 # Date ranges the fetch form offers: key -> (label, days back from now). "custom" uses the From/To dates.
 RANGES = {"day": ("Past 24 hours", 1), "week": ("Past week", 7), "month": ("Past 30 days", 30),
@@ -15,6 +15,7 @@ RANGES = {"day": ("Past 24 hours", 1), "week": ("Past week", 7), "month": ("Past
 
 # Last-used fetch form, restored at startup. Keys live under "fetch/" in QSettings.
 # A fetch downloads every post in the range, so the old "fetch/pick" and "fetch/limit" keys are no longer read.
+# The CommentCap saves "comments_per_post" (default here) and "comment_pick" under "fetch/" itself.
 FETCH_DEFAULTS = {"subreddit": "", "query": "", "range": "week", "from": "", "to": "",
                   "include_comments": True, "comments_per_post": 50, "refresh_scores": False}
 
@@ -41,11 +42,9 @@ def date_edit() -> DateEdit:
 
 
 class FetchForm(QObject):
-    """The fields and their ``layout``, which the sidebar shows. Enter in a text field sends ``submitted``;
-    a change of range, a preset or a typed date, sends ``range_moved``."""
+    """The fields and their ``layout``, which the sidebar shows. Enter in a text field sends ``submitted``."""
 
     submitted = Signal()
-    range_moved = Signal()
 
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)
@@ -69,17 +68,8 @@ class FetchForm(QObject):
             edit.userDateChanged.connect(self._on_date_edited)
         self.include_comments = QCheckBox("Fetch")
         # 0 is "All": every comment on each post, as Download coverage's Download all comments fetches.
-        self.comments_per_post = QSpinBox()
-        self.comments_per_post.setRange(0, 500)
-        self.comments_per_post.setSingleStep(10)
-        self.comments_per_post.setValue(FETCH_DEFAULTS["comments_per_post"])
-        self.comments_per_post.setSuffix(" per post")
-        # The stylesheet's horizontal padding doesn't reach a spin box's inner editor; match the other inputs.
-        self.comments_per_post.findChild(QLineEdit).setTextMargins(8, 0, 0, 0)
-        self.comments_per_post.setSpecialValueText("All")
-        self.comments_per_post.setToolTip("The highest-scored comments on each post. Go below 1 for All: "
-                                          "every comment on each post.")
-        self.comments_per_post.setMinimumWidth(100)  # its size hint would squeeze the form's labels
+        self.comment_cap = CommentCap(settings, "fetch", FETCH_DEFAULTS["comments_per_post"], 500, self)
+        self.comments_per_post = self.comment_cap.count
         self.include_comments.toggled.connect(lambda _: self._update_comments_enabled())
         self.refresh_scores = QCheckBox("Update saved posts")
         self.refresh_scores.setToolTip("Also re-check saved posts in this range whose scores and comment counts "
@@ -102,6 +92,7 @@ class FetchForm(QObject):
         form.addRow(label("From", "muted"), self.date_from)
         form.addRow(label("To", "muted"), self.date_to)
         form.addRow(label("Comments", "muted"), comments_row)
+        form.addRow(label("Keep", "muted"), self.comment_cap.pick)
         form.addRow(label("Scores", "muted"), self.refresh_scores)
 
     def align_labels(self) -> None:
@@ -129,7 +120,7 @@ class FetchForm(QObject):
         return collect.FetchRequest(
             subreddit=name, after=after, before=before, limit=None, query=self.query.text().strip(),
             include_comments=self.include_comments.isChecked(), refresh_scores=self.refresh_scores.isChecked(),
-            comments_per_post=self.comments_per_post.value())
+            **self.comment_cap.request())
 
     def set_busy(self, busy: bool) -> None:
         """No changes while a fetch runs."""
@@ -154,7 +145,7 @@ class FetchForm(QObject):
                     edit.blockSignals(False)
         self.include_comments.setChecked(v["include_comments"])
         self.refresh_scores.setChecked(v["refresh_scores"])
-        self.comments_per_post.setValue(v["comments_per_post"])
+        self.comment_cap.restore()
         self._update_comments_enabled()
 
     def save(self) -> None:
@@ -163,9 +154,9 @@ class FetchForm(QObject):
                      "from": self.date_from.date().toString(Qt.DateFormat.ISODate),
                      "to": self.date_to.date().toString(Qt.DateFormat.ISODate),
                      "include_comments": self.include_comments.isChecked(),
-                     "refresh_scores": self.refresh_scores.isChecked(),
-                     "comments_per_post": self.comments_per_post.value()}.items():
+                     "refresh_scores": self.refresh_scores.isChecked()}.items():
             self.settings.setValue(f"fetch/{k}", v)
+        self.comment_cap.save()
 
     def _on_range_changed(self) -> None:
         """A preset fills in the dates it covers, so the From and To boxes always show the range."""
@@ -177,14 +168,12 @@ class FetchForm(QObject):
                 edit.setMaximumDate(today)
                 edit.setDate(date)
                 edit.blockSignals(False)
-        self.range_moved.emit()
 
     def _on_date_edited(self) -> None:
         """Typing or picking a date means a custom range."""
         self.range.blockSignals(True)
         self.range.setCurrentIndex(self.range.findData("custom"))
         self.range.blockSignals(False)
-        self.range_moved.emit()
 
     def _update_comments_enabled(self) -> None:
-        self.comments_per_post.setEnabled(not self._busy and self.include_comments.isChecked())
+        self.comment_cap.set_enabled(not self._busy and self.include_comments.isChecked())

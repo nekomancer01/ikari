@@ -27,7 +27,7 @@ class FakeClient:
             raise self.error
         return list(self.posts)
 
-    def fetch_comments(self, p, limit):
+    def fetch_comments(self, p, limit, pick="top"):
         return [Comment(f"c{p.id}", p.id, "Python", "", "b", "lovely", 1, 1.0, 0, "u")]
 
 

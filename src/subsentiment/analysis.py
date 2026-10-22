@@ -5,8 +5,9 @@ from __future__ import annotations
 import heapq
 import re
 import sys
-from collections import Counter
+from collections import Counter, namedtuple
 from itertools import chain
+from operator import itemgetter
 
 LABELS = ("negative", "neutral", "positive")
 
@@ -40,6 +41,19 @@ class Analysis:
             bucket[2][r["label"]] += sign
             if not bucket[1]:  # every row of the day taken out
                 del days[day]
+
+    @classmethod
+    def from_days(cls, totals) -> Analysis:
+        """An analysis of rows counted by the store a day and label at a time (Store.day_totals)."""
+        out = cls()
+        for day, label, n, total in totals:
+            bucket = out.days.setdefault(int(day), [0.0, 0, dict.fromkeys(LABELS, 0)])
+            bucket[0] += total
+            bucket[1] += n
+            bucket[2][label] += n
+            out.counts[label] += n
+            out.total += total
+        return out
 
     @classmethod
     def combined(cls, *parts: Analysis, days: tuple[int, int] | None = None) -> Analysis:
@@ -117,57 +131,84 @@ def words_in(text: str) -> set[str]:
     return {w for w in words - STOPWORDS if len(w) > 2 and not w.isdigit()}
 
 
+_Counted = namedtuple("_Counted", "label words")  # what a row that may change later counted
+
+
 class WordCounts:
     """How many posts or comments use each word, and how many of those are positive and negative, so the cloud
     can size a word by how often it comes up and colour it by which way the items using it lean.
 
-    Rows are kept by id: a fetch that rescores or edits a saved row replaces what that row counted. ``seen``
-    ({id: (text, words)}) can be shared between counts of the same rows, so each text is split into words
-    once, not again every time another span of days is counted."""
+    Rows are kept by id: a fetch that rescores or edits a saved row replaces what that row counted. A row read
+    for the word cloud brings its words along (store.Row.words), split once as it was read; any other row's text
+    is split here."""
 
-    def __init__(self, kind: str, rows=(), seen: dict | None = None):
+    def __init__(self, kind: str, rows=(), known: dict | None = None):
         self.fields = _TEXT[kind]
         self.counts = {"all": Counter(), "positive": Counter(), "negative": Counter()}
-        self._rows: dict[str, tuple[str, tuple[str, ...]]] = {}
-        self.seen = {} if seen is None else seen
+        self._rows: dict[str, object] = {}  # id -> the row as counted (its label and words)
+        self.known = {} if known is None else known  # id -> the words of a row split elsewhere (LoadWorker)
         self.add(rows)
 
+    def words(self, row) -> tuple[str, ...]:
+        words = getattr(row, "words", None)
+        if words is None:
+            words = self.known.get(row["id"])
+        if words is not None:
+            return words
+        fields = self.fields
+        text = (row[fields[0]] or "") if len(fields) == 1 else " ".join(row[f] or "" for f in fields)
+        return tuple(map(sys.intern, words_in(text)))  # a word's text is kept once, however many use it
+
     def add(self, rows) -> None:
-        counts, seen, fields, kept = self.counts, self.seen, self.fields, self._rows
+        counts, kept, words = self.counts, self._rows, self.words
         added = {"all": [], "positive": [], "negative": []}  # counted in at the end, in one go each
+        gone = {"all": [], "positive": [], "negative": []}  # what rows counted before, saved again, counted
         for r in rows:
-            text = (r[fields[0]] or "") if len(fields) == 1 else " ".join(r[f] or "" for f in fields)
-            hit = seen.get(r["id"])
-            if hit is not None and hit[0] == text:
-                words = hit[1]
-            else:
-                words = tuple(map(sys.intern, words_in(text)))  # a word's text is kept once, however many use it
-                seen[r["id"]] = (text, words)
-            old = kept.get(r["id"])
+            try:  # a saved row (store.Row): read as attributes, much quicker than by name
+                rid, label, w = r.id, r.label, r.words
+            except AttributeError:
+                rid, label, w = r["id"], r["label"], None
+            old = kept.get(rid)
             if old is not None:
-                counts["all"].subtract(old[1])
-                if old[0] in counts:
-                    counts[old[0]].subtract(old[1])
-            label = r["label"]
-            kept[r["id"]] = (label, words)
-            added["all"].append(words)
+                was = words(old)
+                gone["all"].append(was)
+                if old.label in gone:
+                    gone[old.label].append(was)
+            if w is None:
+                w = words(r)
+            if isinstance(r, tuple):  # a saved row (store.Row) doesn't change, so it's kept as it is
+                kept[rid] = r
+            else:  # what was counted is kept with it, as the row may change after
+                kept[rid] = _Counted(label, w)
+            added["all"].append(w)
             if label in added:
-                added[label].append(words)
+                added[label].append(w)
         for key, lists in added.items():
             counts[key].update(chain.from_iterable(lists))
+        self._take(gone)
 
     def remove(self, ids) -> None:
         """Stop counting the rows with these ids (ones never counted are skipped)."""
         gone = {"all": [], "positive": [], "negative": []}
         for i in ids:
-            row = self._rows.pop(i, None)
-            if row is not None:
-                gone["all"].append(row[1])
-                if row[0] in gone:
-                    gone[row[0]].append(row[1])
+            old = self._rows.pop(i, None)
+            if old is not None:
+                was = self.words(old)
+                gone["all"].append(was)
+                if old.label in gone:
+                    gone[old.label].append(was)
+        self._take(gone)
+
+    def _take(self, gone: dict) -> None:
+        """Take what some rows counted back out: counted up first (quick), then taken off a word at a time. A
+        word no row uses any more goes, so every count left is above zero (as top relies on)."""
         for key, lists in gone.items():
             if lists:
-                self.counts[key].subtract(Counter(chain.from_iterable(lists)))
+                less, counts = Counter(chain.from_iterable(lists)), self.counts[key]
+                counts.subtract(less)
+                for word in less:
+                    if counts[word] <= 0:
+                        del counts[word]
 
     def ids(self):
         return self._rows.keys()
@@ -175,12 +216,31 @@ class WordCounts:
     @staticmethod
     def top(*parts: WordCounts, n: int = 100) -> list[tuple[str, int, float]]:
         """The ``n`` words used by the most items across ``parts``: [(word, items, lean)], where lean runs
-        from -1 (every item using it negative) to +1 (every one positive)."""
-        total = parts[0].counts["all"] if len(parts) == 1 else sum((p.counts["all"] for p in parts), Counter())
+        from -1 (every item using it negative) to +1 (every one positive). Ties go alphabetically, so the same
+        rows always make the same cloud."""
+        alls = [p.counts["all"] for p in parts]
+        if len(alls) == 1:
+            total = alls[0]
+        else:
+            # Adding whole counts up took ~60 ms with a big subreddit's comments, and adding up every word another
+            # part uses, ~100 ms. The biggest part's top n words, added up, give a total the n-th word reaches at
+            # least; any other word has at most the n-th of those counts from that part, so it needs the rest of
+            # that total from the others. Only words that can get there are added up.
+            big = max(range(len(alls)), key=lambda i: len(alls[i]))
+            others = [c for i, c in enumerate(alls) if i != big]
+            best = heapq.nlargest(n, alls[big].items(), key=itemgetter(1))
+            least = best[-1][1] if len(best) == n else 0
+            total = {w: sum(c[w] for c in alls) for w, _ in best}
+            floor = heapq.nlargest(n, total.values())[-1] if len(total) == n else 0
+            need = floor - least  # from the other parts together: one of them has at least its share
+            words = set()
+            for c in others:
+                words.update(w for w, k in c.items() if k * len(others) >= need)
+            if floor <= least:  # a word only the biggest part uses can tie the n-th
+                words.update(w for w, k in alls[big].items() if k >= floor)
+            total.update((w, sum(c[w] for c in alls)) for w in words - total.keys())
         out = []
-        # Ties go alphabetically, so the same rows always make the same cloud.
-        for w, k in heapq.nsmallest(n, total.items(), key=lambda wk: (-wk[1], wk[0])):
-            if k > 0:  # a replaced row can leave a word at zero
-                lean = sum(p.counts["positive"][w] - p.counts["negative"][w] for p in parts) / k
-                out.append((w, k, lean))
+        for w, k in heapq.nsmallest(n, ((w, k) for w, k in total.items() if k > 0), key=lambda wk: (-wk[1], wk[0])):
+            lean = sum(p.counts["positive"][w] - p.counts["negative"][w] for p in parts) / k
+            out.append((w, k, lean))
         return out
