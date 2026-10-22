@@ -212,17 +212,6 @@ def fade_in(widget: QWidget, ms: int = APPEAR_MS) -> None:
     anim.start()
 
 
-def fade_window(window: QWidget, ms: int = APPEAR_MS) -> None:
-    """A window that has just opened fades in (where the platform supports window opacity)."""
-    if not enabled():
-        return
-    window.setWindowOpacity(0.0)
-    anim = _ease(QVariantAnimation(window, duration=ms, startValue=0.0, endValue=1.0))
-    anim.valueChanged.connect(window.setWindowOpacity)
-    anim.finished.connect(lambda: window.setWindowOpacity(1.0))
-    anim.start()
-
-
 # -- tween --------------------------------------------------------------------------------------------------
 
 class Tween(QObject):

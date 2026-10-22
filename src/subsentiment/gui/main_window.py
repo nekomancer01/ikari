@@ -31,7 +31,7 @@ from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.widgets import (
     ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatusLabel, Throbber, fit_to_screen, label, panel, plural, section,
 )
-from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices, finish
+from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices, ThreadScorer, finish
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, scoring_at_least
 
@@ -1346,6 +1346,7 @@ class MainWindow(QMainWindow):
             thread.wait(3000)
             # Signals it sent just before are already queued, and disconnecting doesn't take them back.
             QCoreApplication.removePostedEvents(self, QEvent.Type.MetaCall)
+        ThreadScorer.close()  # its idle processes would keep the app from exiting
         self._live.stop()  # both read the store
         self._drip.stop()
         self._shown_live.stop()
