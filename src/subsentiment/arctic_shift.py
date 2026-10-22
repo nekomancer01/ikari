@@ -37,6 +37,7 @@ USER_AGENT = f"ikari/{__version__} (+https://github.com/nekomancer01/ikari)"
 SETTLE_SECONDS = 36 * 3600
 PAGE = 100  # the API's largest fixed page size
 IDS_BATCH = 500  # most ids /api/posts/ids takes in one request
+LIMITED_TRIES = 8  # 429s in a row on one request before it gives up
 RETRIES = 5  # tries of a request that keeps failing (5xx, no answer) while the archive answers others
 # Requests failed in a row, with nothing answered between, for the archive to count as down: as many as a request's own
 # tries, so a lone request (a count) finds an outage before it gives up, and a share failing at random rarely looks like one.
@@ -154,6 +155,7 @@ class RateLimiter:
         self._budget_known = False  # the server has sent X-RateLimit-Remaining at least once
         self._answered = False  # any answer has arrived yet
         self._failures = 0  # requests failed in a row, across every job
+        self._answered_at = float("-inf")  # when the last request was answered
         self._down: tuple[float, str, float] | None = None  # since it's down: (wall time, what came back, clock time)
         self._probes = 0  # probes that failed since
         self._probe_at = 0.0  # when the next may go
@@ -277,6 +279,7 @@ class RateLimiter:
             if ease:
                 self.interval = max(self.base, self.interval * 0.8)
             self._failures = 0
+            self._answered_at = self._clock()
             back = self._down is not None
             if back:
                 self._down, self._probing = None, False
@@ -284,10 +287,15 @@ class RateLimiter:
         if back and self.on_wait:
             self.on_wait(0.0, "")  # the UI goes back to what the job is doing
 
-    def failed(self, what: str) -> bool:
-        """A request failed (``what``: "HTTP 500", "no answer"); whether the archive now counts as down."""
+    def failed(self, what: str, since: float | None = None) -> bool:
+        """A request failed (``what``: "HTTP 500", "no answer"); whether the archive now counts as down. With ``since``
+        (when the request failed the time before), it's about to give up: unless something was answered since, the
+        trouble may well be the archive's, so it counts as down now (a probe tells which). (Not since its first
+        failure: answers to requests sent before the archive went down still come in just after.)"""
         with self._lock:
             self._failures += 1
+            if since is not None and self._answered_at < since:
+                self._failures = max(self._failures, OUTAGE_AFTER)
             if self._down is None and self._failures >= OUTAGE_AFTER:
                 self._down, self._probes, self._probing = (self._wall(), what, self._clock()), 0, False
                 self._probe_at = self._clock() + PROBE_WAITS[0]
@@ -453,7 +461,7 @@ class ArcticShiftClient:
         params = dict(params)
         self._local.last_params = params  # what was finally sent, after any shrinking
         timeouts = tries = limited = garbled = 0
-        since = None
+        since = failed_at = None
         stop = None if getattr(self._local, "finishing", False) else self.should_stop
         while True:
             flight = self.limiter.wait(stop, share, since)
@@ -515,8 +523,8 @@ class ArcticShiftClient:
                     self.limiter.hold(self.limiter.reset_after(resp.headers, 5.0 * 2 ** min(limited, 4)),
                                       "Arctic Shift asked ikari to slow down")
                     limited += 1
-                    if limited >= 2 * RETRIES:
-                        raise FetchError("Arctic Shift is rate limiting. Try again in a few minutes.")
+                    if limited >= LIMITED_TRIES:
+                        raise FetchError("Arctic Shift is busy or rate limiting. Try again in a few minutes.")
                     continue
                 if resp.status_code == 200 and isinstance(payload, dict):
                     self.limiter.ok(ease=False)
@@ -536,10 +544,11 @@ class ArcticShiftClient:
                 failure, what = FetchError(f"Arctic Shift couldn't answer (HTTP {resp.status_code}). Try again in a "
                                            "few minutes."), f"HTTP {resp.status_code}"
             # A 5xx, or no answer: this request's own trouble, or the archive's.
-            if self.limiter.failed(what):
+            last, failed_at = failed_at, self.limiter._clock()
+            if self.limiter.failed(what, last if tries + 1 >= RETRIES else None):
                 continue  # waited for at the limiter, which probes until it's back
             tries += 1
-            if tries >= RETRIES:
+            if tries >= RETRIES:  # while the archive answered others: it's this request's trouble
                 raise failure
             self.limiter.pause(2.0 ** (tries - 1), stop)
 

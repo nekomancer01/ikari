@@ -422,7 +422,14 @@ def test_while_the_archive_is_down_only_probes_go_out_until_one_is_answered():
     waits = [secs for secs, why in told if secs]
     assert waits == [10, 20, 40, 60]  # a probe after each, further apart each time
     assert all("isn't answering (HTTP 500 since" in why for secs, why in told if secs) and told[-1] == (0, "")
+    assert not [why for _, why in told if "busy" in why]  # said as down, not busy: that read as ikari being throttled
     assert not c.limiter.down
+
+
+def test_a_rate_limit_that_never_lifts_still_says_rate_limiting():
+    c = client([FakeResponse(429, headers={"X-RateLimit-Reset": "1"})] * 8)
+    with pytest.raises(FetchError, match="busy or rate limiting"):
+        c.get(*SEARCH)
 
 
 def test_an_archive_down_for_longer_than_the_patience_ends_the_request():

@@ -492,7 +492,7 @@ def test_an_archive_that_goes_down_mid_download_is_waited_out_one_probe_at_a_tim
         said.add(w.progress_msg.text())
         pump(10)
     assert quiet and env.archive.peak <= 1, "more than a probe at a time went out while it was down"
-    assert any("Arctic Shift isn't answering (HTTP 500 since" in m for m in said), said
+    assert any("Arctic Shift isn't answering (HTTP 500 since" in m for m in said), (said, env.warnings)
     assert len(PROBES(env)) >= 2
     wait_idle(w, 60)
     assert not env.warnings and failed_threads(env) == 0  # carried on by itself, and nothing was left failed
@@ -534,10 +534,13 @@ def test_a_thread_the_archive_cant_answer_fails_alone_without_holding_up_the_res
                   and not p.get("removed_by_category") and p["created_utc"] > NOW - 6 * DAY)
     env.archive.broken = {broken}
     fetch(w, timeout=60)
-    assert not env.warnings and not PROBES(env)  # the archive answered the rest, so it never counted as down
+    # The archive answered the rest, so it never counted as down: at most one probe, if nothing else was out to tell
+    # whether it's up when the thread was about to give up.
+    assert not env.warnings and len(PROBES(env)) <= 1
     failed = env.store().db.execute("SELECT post_id FROM comment_fetches WHERE ok = 0").fetchall()
     assert [r[0] for r in failed] == [broken]  # retried on the next fetch
-    assert sum(1 for p, q in env.archive.requests if p == TREE and q["link_id"] == broken) == arctic_shift.RETRIES
+    tries = sum(1 for p, q in env.archive.requests if p == TREE and q["link_id"] == broken)
+    assert tries == arctic_shift.RETRIES + len(PROBES(env))
 
 
 def test_an_empty_range_says_so(env):
@@ -1662,3 +1665,25 @@ def test_download_all_comments_asks_nothing_for_posts_that_turn_out_to_have_none
     asked = {q["link_id"] for p, q in env.archive.requests if p == TREE}
     assert asked == {p["id"] for p in in_day if p["num_comments"]}  # none for the posts with no comments
     assert cov.all_comments.text() == "Download all comments" and not cov.all_comments.isEnabled()
+
+
+
+def test_one_server_error_is_neither_called_busy_nor_holds_up_the_fetch(env, monkeypatch):
+    # Live, 22 Oct: the archive answered 500 "Internal server error" to everything, and the strip said "Arctic Shift
+    # is busy. Waiting 40 s…", which read as ikari being rate limited. A server error on one request now waits on
+    # that request alone; the archive being down for everything is said as such (see the outage test above).
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 4.0)  # long enough to be announced (3 s or more), if it were
+    w = env.window()
+    env.archive.fail(SEARCH, (500, {"data": None, "error": "Internal server error"}))
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(False)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("day"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    said = set()
+    end = time.monotonic() + 30
+    while w.fetch_job.busy:
+        assert time.monotonic() < end, said
+        said.add(w.progress_msg.text())
+        pump(5)
+    assert not [m for m in said if "busy" in m or "Waiting" in m], said
+    assert not env.warnings and "Added" in w.progress_msg.text()
