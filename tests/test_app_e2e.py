@@ -542,7 +542,7 @@ def test_a_save_reported_just_before_closing_isnt_handled_after_it(env, monkeypa
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     pump(300)
     worker_ = w.fetch_job.worker
-    emitter = threading.Thread(target=worker_.saved.emit)  # from another thread, so it's queued
+    emitter = threading.Thread(target=worker_.saved.emit, args=({},))  # from another thread, so it's queued
     emitter.start()
     emitter.join()
     w.close()

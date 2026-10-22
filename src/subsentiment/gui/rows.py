@@ -14,12 +14,11 @@ from pathlib import Path
 
 import numpy as np
 
-from subsentiment.analysis import LABELS, Analysis
+from subsentiment.analysis import LABEL_AT, Analysis
 from subsentiment.gui.worker import on_thread
 from subsentiment.index import RowIndex
 from subsentiment.store import NO_SCORE, PACKED, column, scoring_at_least
 
-LABEL_AT = {lab: k for k, lab in enumerate(LABELS)}
 # The values a source keeps as arrays, by column: missing ones sort first (NO_SCORE, -inf), as the tables had them.
 ARRAYS = {"sentiment": "sentiment", "score": "score", "created_utc": "created", "label": "label"}
 

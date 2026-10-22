@@ -1,6 +1,7 @@
 """SQLite storage for fetched posts/comments and their sentiment scores."""
 from __future__ import annotations
 
+import collections
 import csv
 import hashlib
 import json
@@ -21,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import zstandard
 
-from subsentiment.analysis import LABELS, words_in
+from subsentiment.analysis import LABEL_AT, words_in
 from subsentiment.reddit import Comment, Post, is_image_post
 from subsentiment.sentiment import Lexicon
 
@@ -592,18 +593,22 @@ class _Stopping:
         return self.event.is_set() or parent is not None and not parent.is_alive()
 
 
-def _pack_all(path: str, pack: bool, stop) -> None:
+def _pack_all(path: str, pack: bool, stop, fetched: bool = False) -> None:
     """A big Store.upgrade's packing (if ``pack``) and search index, in a process of its own, splitting words in a
-    few more. ``stop`` (a multiprocessing Event) ends it between days, its word-splitting processes with it."""
+    few more; or with ``fetched``, only the days a big fetch saved (Store.pack_fetched), splitting the words here.
+    ``stop`` (a multiprocessing Event) ends it between days, its word-splitting processes with it."""
     stop = _Stopping(stop)
     store = Store(path)
     pool = None
     try:
-        if pack:
+        if pack and not fetched:
             pool = ProcessPoolExecutor(max(1, min(8, (os.cpu_count() or 2) - 1)), mp_context=multiprocessing.get_context("spawn"))
     except Exception:  # noqa: BLE001 - split them here
         pool = None
     try:
+        if fetched:
+            store.pack_settled(stop=stop)
+            return
         if pack:
             store.pack_settled(vacuum=False, stop=stop, split=pool, old=True)
             if stop.is_set():
@@ -844,14 +849,27 @@ class Store:
         self.search.put(kind, [(r[0], packed.get(r[0], r[4:]) if r[3] else r[4:]) for r in rows])
         self.db.commit()
 
-    def _pack_elsewhere(self, stop: threading.Event | None, pack: bool = True) -> bool:
+    def pack_fetched(self, stop: threading.Event | None = None) -> None:
+        """Pack the days a fetch saved that have settled (pack_settled): a big download's (a month of a busy
+        subreddit's comments, say) in a process of its own, as `upgrade` does, so the minutes of Python it takes
+        don't hold the interpreter lock the window needs for every frame; ``stop`` (the app closing) cuts it
+        short, the rest packed after the next fetch."""
+        self.db.commit()
+        left = sum(self.db.execute(f"SELECT COUNT(*) FROM {t} WHERE packed != 1 AND created_utc < ?",
+                                   (self._settled_before(),)).fetchone()[0] for t in PACKED)  # what pack_settled packs
+        if left < self.PACK_ELSEWHERE or not self._pack_elsewhere(stop, fetched=True):
+            self.pack_settled()
+
+    PACK_ELSEWHERE = 20_000  # rows to pack from which pack_fetched packs them in a process of its own
+
+    def _pack_elsewhere(self, stop: threading.Event | None, pack: bool = True, fetched: bool = False) -> bool:
         """Pack in a process of its own (`_pack_all`), so a minute of it doesn't take the interpreter from the
         window this thread is in; ``stop`` ends it, between days or mid-day (its transaction is then rolled
         back). False if no process could be started here."""
         context = multiprocessing.get_context("spawn")
         try:
             stopping = context.Event()
-            worker = context.Process(target=_pack_all, args=(str(self.path), pack, stopping), daemon=False)
+            worker = context.Process(target=_pack_all, args=(str(self.path), pack, stopping, fetched), daemon=False)
             worker.start()
         except Exception:  # noqa: BLE001
             return False
@@ -910,7 +928,7 @@ class Store:
                     raise
             except Exception:  # noqa: BLE001 - busy, or text that can't be packed: leave the day as it is
                 continue
-        if done and vacuum:  # the cleared text leaves its pages part empty, which only a VACUUM gives back
+        if done and vacuum and not (stop is not None and stop.is_set()):  # the cleared text leaves its pages part empty, which only a VACUUM gives back
             self.search.optimize(pages=2000)  # what the fetch's saves added to the search index, a few MB of it
             self._compact()
         return done
@@ -951,11 +969,10 @@ class Store:
         blob = DayPack.encode(cols, ids, text, zdict)
         if DayPack.read(blob, self.db) != {"columns": list(cols), "rows": {i: text[i] for i in ids}}:
             raise sqlite3.DatabaseError(f"{kind} of r/{sub} on day {day} wouldn't read back the same")
-        label = {lab: k for k, lab in enumerate(LABELS)}
         packed_numbers = {"created": [numbers[i][1] for i in ids],
                           "score": [NO_SCORE if numbers[i][2] is None else numbers[i][2] for i in ids],
                           "sentiment": [numbers[i][3] if numbers[i][3] is not None else 0.0 for i in ids],
-                          "label": [label.get(numbers[i][4], -1) for i in ids],
+                          "label": [LABEL_AT.get(numbers[i][4], -1) for i in ids],
                           "hidden": [int(bool(numbers[i][5])) for i in ids]}
         counts = self._word_counts(kind, sub, ids, text, packed_numbers, packed, new_text, old, split)
         self.db.execute("INSERT OR REPLACE INTO packs (kind, subreddit, day, packed_at, data, cols, words) "
@@ -1086,20 +1103,6 @@ class Store:
             for k in ("post_packed", "post_sub", "post_created"):
                 r.pop(k, None)
         return out
-
-    def day_totals(self, kind: str, subreddit: str, min_score: int | None = None) -> list[tuple]:
-        """How many of a subreddit's posts or comments (``kind``) scoring at least ``min_score`` each day has with
-        each label, and their sentiment added up: [(day start, label, items, sum)]. Counted here, where reading
-        the rows of a big subreddit to count them takes seconds (analysis.Analysis.from_days)."""
-        if kind == "posts":
-            sql = "SELECT created_utc, label, sentiment, score FROM posts WHERE subreddit = ? COLLATE NOCASE AND image = 0"
-        else:
-            sql = ("SELECT c.created_utc, c.label, c.sentiment, c.score FROM comments c "
-                   "WHERE c.subreddit = ? COLLATE NOCASE AND " + NOT_IMAGE)
-        where = "created_utc IS NOT NULL" + ("" if min_score is None else " AND score IS NOT NULL AND score >= ?")
-        return self.db.execute(
-            f"SELECT CAST(created_utc / 86400 AS INTEGER) * 86400, label, COUNT(*), SUM(sentiment) FROM ({sql}) "
-            f"WHERE {where} GROUP BY 1, 2", (subreddit, *([] if min_score is None else [min_score]))).fetchall()
 
     def rows(self, kind: str, subreddit: str, since: float | None = None, words: bool = False,
              days: tuple[float, float] | None = None) -> list[Row]:
@@ -1396,8 +1399,14 @@ class Store:
         rows = self.db.execute(
             "SELECT subreddit, COUNT(*) n, MAX(fetched_at) f FROM posts WHERE image = 0 "
             "GROUP BY subreddit COLLATE NOCASE ORDER BY f DESC").fetchall()
-        comments = {r["s"].lower(): r["n"] for r in self.db.execute(
-            "SELECT c.subreddit s, COUNT(*) n FROM comments c WHERE " + NOT_IMAGE + " GROUP BY c.subreddit COLLATE NOCASE")}
+        # Every comment counted from the index alone, less the few on image posts: asking each comment whether its
+        # post is an image took a quarter of a second for 650,000 comments, once a second while a fetch runs.
+        comments = collections.Counter()
+        for r in self.db.execute("SELECT subreddit s, COUNT(*) n FROM comments GROUP BY subreddit COLLATE NOCASE"):
+            comments[r["s"].lower()] += r["n"]
+        for r in self.db.execute("SELECT c.subreddit s, COUNT(*) n FROM posts p CROSS JOIN comments c ON c.post_id = p.id "
+                                 "WHERE p.image = 1 GROUP BY c.subreddit COLLATE NOCASE"):
+            comments[r["s"].lower()] -= r["n"]
         return [{"name": r["subreddit"], "posts": r["n"], "comments": comments.get(r["subreddit"].lower(), 0),
                  "last_fetched": r["f"]} for r in rows]
 

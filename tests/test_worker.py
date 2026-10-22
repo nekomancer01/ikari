@@ -1,5 +1,6 @@
 """The fetch worker's error reporting and cleanup, with the Reddit client replaced by a fake."""
 import os
+import time
 
 import pytest
 import requests
@@ -129,3 +130,59 @@ def test_a_background_job_runs_its_worker_off_the_gui_thread_and_tidies_up():
         time.sleep(0.01)
     assert ended and not job.busy and not job.running()
     assert Worker.ran_on is not threading.main_thread()
+
+
+def test_a_big_threads_comments_are_scored_in_other_processes_as_they_are_here():
+    from subsentiment.sentiment import Lexicon
+    lexicon = Lexicon({"raid": 0.8, "nerf": -0.6})
+    moods = ["was great", "is so annoying", "needs a nerf", "ok I guess", "what a raid", "not bad at all"]
+    texts = [f"the raid tonight {moods[i % len(moods)]} #{i}" for i in range(worker_mod.ThreadScorer.LEAST + 50)]
+    scorer = worker_mod.ThreadScorer()
+    try:
+        assert scorer(lexicon, texts[:5]) == [lexicon.score(t) for t in texts[:5]] and scorer._pool is None  # here
+        got = scorer(lexicon, texts)
+        assert scorer._pool is not None and not scorer.broken
+    finally:
+        scorer.close()
+    assert got == [lexicon.score(t) for t in texts]
+
+
+def test_stop_while_a_threads_comments_are_scored_elsewhere_leaves_the_thread_unsaved():
+    # Waiting on the processes, Stop (or quitting) used to wait for the whole thread's scores first.
+    from subsentiment.sentiment import Lexicon
+    texts = ["the raid tonight was great"] * (worker_mod.ThreadScorer.LEAST * 50)
+    scorer = worker_mod.ThreadScorer(lambda: True)
+    start = time.monotonic()
+    try:
+        assert scorer(Lexicon({"raid": 0.8}), texts) is None
+    finally:
+        scorer.close()
+    assert time.monotonic() - start < 10 and scorer._pool is None and not scorer.broken
+
+def test_scoring_processes_that_dont_answer_in_time_are_given_up_for_scoring_here(monkeypatch):
+    # A pool that never answered would have held the fetch forever.
+    from subsentiment.sentiment import Lexicon
+    lexicon = Lexicon({"raid": 0.8})
+    texts = [f"the raid tonight #{i}" for i in range(worker_mod.ThreadScorer.LEAST)]
+    monkeypatch.setattr(worker_mod.ThreadScorer, "WAIT", -1.0)  # out of time at once
+    scorer = worker_mod.ThreadScorer()
+    try:
+        assert scorer(lexicon, texts) == [lexicon.score(t) for t in texts]
+    finally:
+        scorer.close()
+    assert scorer.broken and scorer._pool is None
+
+def test_a_fetch_reads_back_what_it_saved_and_sends_it_to_the_window(monkeypatch, tmp_path):
+    # The window used to read them itself: a read a row at a time, each waiting on this thread for the interpreter.
+    monkeypatch.setattr(worker_mod, "ArcticShiftClient", FakeClient)
+    FakeClient.error = None
+    w = worker_mod.FetchWorker(collect.FetchRequest("python", include_comments=True), str(tmp_path / "w.db"))
+    sent = []
+    w.saved.connect(sent.append)
+    w.run()
+    posts = [r["id"] for got in sent for r in got["posts"][1]]
+    comments = [r["id"] for got in sent for r in got["comments"][1]]
+    assert sorted(set(posts)) == ["p1", "p2"] and sorted(set(comments)) == ["cp1", "cp2"]
+    assert sent[0]["posts"][0] == w.since  # each from where the one before left off
+    assert all(got[k][0] <= later[k][0] for got, later in zip(sent, sent[1:]) for k in ("posts", "comments"))
+    assert all(r.words is not None for got in sent for r in got["comments"][1])  # split there, not in the window

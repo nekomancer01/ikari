@@ -10,6 +10,8 @@ from itertools import chain
 from operator import itemgetter
 
 LABELS = ("negative", "neutral", "positive")
+LABEL_AT = {lab: k for k, lab in enumerate(LABELS)}  # a label's index into LABELS, as rows keep it
+TEXT = {"posts": ("title", "selftext"), "comments": ("body",)}  # the fields that hold what a row says
 
 
 class Analysis:
@@ -41,19 +43,6 @@ class Analysis:
             bucket[2][r["label"]] += sign
             if not bucket[1]:  # every row of the day taken out
                 del days[day]
-
-    @classmethod
-    def from_days(cls, totals) -> Analysis:
-        """An analysis of rows counted by the store a day and label at a time (Store.day_totals)."""
-        out = cls()
-        for day, label, n, total in totals:
-            bucket = out.days.setdefault(int(day), [0.0, 0, dict.fromkeys(LABELS, 0)])
-            bucket[0] += total
-            bucket[1] += n
-            bucket[2][label] += n
-            out.counts[label] += n
-            out.total += total
-        return out
 
     @classmethod
     def combined(cls, *parts: Analysis, days: tuple[int, int] | None = None) -> Analysis:
@@ -113,7 +102,6 @@ would wouldn't yeah yes yet you you'd you'll you're you've your yours yourself y
 im ive id dont doesnt didnt cant wont isnt arent wasnt thats theres whats youre theyre lol lmao gonna wanna
 http https www com amp gt lt nbsp removed deleted edit png jpg jpeg gif imgur reddit preview redd
 """.split())
-_TEXT = {"posts": ("title", "selftext"), "comments": ("body",)}
 # Everything but letters, digits and apostrophes splits words (through general punctuation, so dashes too).
 _SPACES = {i: " " for i in range(0x2070) if not chr(i).isalnum() and chr(i) != "'"} | {0x2019: "'"}  # ’ too
 _LINK = re.compile(r"\S*(?:https?://|www\.)\S*|&\w+;")
@@ -143,7 +131,7 @@ class WordCounts:
     is split here."""
 
     def __init__(self, kind: str, rows=(), known: dict | None = None):
-        self.fields = _TEXT[kind]
+        self.fields = TEXT[kind]
         self.counts = {"all": Counter(), "positive": Counter(), "negative": Counter()}
         self._rows: dict[str, object] = {}  # id -> the row as counted (its label and words)
         self.known = {} if known is None else known  # id -> the words of a row split elsewhere (LoadWorker)
@@ -162,7 +150,7 @@ class WordCounts:
     def add(self, rows) -> None:
         counts, kept, words = self.counts, self._rows, self.words
         added = {"all": [], "positive": [], "negative": []}  # counted in at the end, in one go each
-        gone = {"all": [], "positive": [], "negative": []}  # what rows counted before, saved again, counted
+        gone = []  # rows counted before, saved again
         for r in rows:
             try:  # a saved row (store.Row): read as attributes, much quicker than by name
                 rid, label, w = r.id, r.label, r.words
@@ -170,10 +158,7 @@ class WordCounts:
                 rid, label, w = r["id"], r["label"], None
             old = kept.get(rid)
             if old is not None:
-                was = words(old)
-                gone["all"].append(was)
-                if old.label in gone:
-                    gone[old.label].append(was)
+                gone.append(old)
             if w is None:
                 w = words(r)
             if isinstance(r, tuple):  # a saved row (store.Row) doesn't change, so it's kept as it is
@@ -189,19 +174,17 @@ class WordCounts:
 
     def remove(self, ids) -> None:
         """Stop counting the rows with these ids (ones never counted are skipped)."""
-        gone = {"all": [], "positive": [], "negative": []}
-        for i in ids:
-            old = self._rows.pop(i, None)
-            if old is not None:
-                was = self.words(old)
-                gone["all"].append(was)
-                if old.label in gone:
-                    gone[old.label].append(was)
-        self._take(gone)
+        self._take([old for i in ids if (old := self._rows.pop(i, None)) is not None])
 
-    def _take(self, gone: dict) -> None:
-        """Take what some rows counted back out: counted up first (quick), then taken off a word at a time. A
+    def _take(self, rows) -> None:
+        """Take what these rows counted back out: counted up first (quick), then taken off a word at a time. A
         word no row uses any more goes, so every count left is above zero (as top relies on)."""
+        gone = {"all": [], "positive": [], "negative": []}
+        for old in rows:
+            was = self.words(old)
+            gone["all"].append(was)
+            if old.label in gone:
+                gone[old.label].append(was)
         for key, lists in gone.items():
             if lists:
                 less, counts = Counter(chain.from_iterable(lists)), self.counts[key]

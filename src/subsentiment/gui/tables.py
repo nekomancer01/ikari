@@ -154,7 +154,9 @@ class RowsModel(QAbstractTableModel):
 
     BIG = 50_000  # rows from which a sort is worked out away from the frames
     STEP = 20_000  # rows gone through between two frames: a few milliseconds
-    SLOTTED = 5_000_000  # rows added times rows shown up to which added rows are slotted in one at a time
+    # Rows added times rows shown up to which added rows are slotted in one at a time. Each copies the order (0.3 ms
+    # with 190,000 rows shown); past this, putting them all in at once and laying the rows out again is quicker.
+    SLOTTED = 1_000_000
 
     def __init__(self, columns: list[Column], parent=None, clock: Callable[[], float] = time.monotonic):
         super().__init__(parent)
@@ -194,15 +196,17 @@ class RowsModel(QAbstractTableModel):
         key, missing = self.columns[column][1], self._missing(column)
         return lambda row: missing if (v := row[key]) is None else v
 
-    def _key_at(self, source: RowSource, p: int):
-        """Row ``p``'s key in the current sort, as _keys holds them."""
+    def _keys_at(self, source: RowSource, positions) -> list:
+        """The rows' keys in the current sort, as _keys holds them: the column's values got once for them all (a
+        date's are worked out for every row, a few ms for 650,000)."""
         column, descending = self._sort
         values = source.values(self.columns[column][1])
         if isinstance(values, np.ndarray):
-            k = float(values[p])
-            return -k if descending else k
-        v = values[p] if values is not None else source.row(p)[self.columns[column][1]]
-        return self._missing(column) if v is None else v
+            k = values[np.asarray(positions, np.int64)].astype(float)
+            return (-k if descending else k).tolist()
+        missing = self._missing(column)
+        got = [values[p] if values is not None else source.row(p)[self.columns[column][1]] for p in positions]
+        return [missing if v is None else v for v in got]
 
     def _ordering(self, source: RowSource, at: np.ndarray, step: int | None):
         """The order the current sort puts the rows at ``at`` in, as (their positions in it, their keys), worked
@@ -294,7 +298,7 @@ class RowsModel(QAbstractTableModel):
             self._sorting = False
         late, self._late = self._late, []
         if late and sort is not None:  # added meanwhile: where the new order puts them
-            placed, keys = self._merged(placed, keys, late, [self._key_at(source, p) for p in late])
+            placed, keys = self._merged(placed, keys, late, self._keys_at(source, late))
         elif late:
             placed = np.concatenate([placed, np.array(late, np.int64)])
         self._relayout(placed, keys)
@@ -423,7 +427,7 @@ class RowsModel(QAbstractTableModel):
                 self._late += added
             self.endInsertRows()
         else:
-            keys = [self._key_at(self.source, p) for p in added]
+            keys = self._keys_at(self.source, added)
             if len(added) * len(self.order) <= self.SLOTTED:  # each slotted in where it goes, the view kept as it is
                 for p, k in zip(added, keys):
                     i = self._place(k)
@@ -513,9 +517,8 @@ class RowsModel(QAbstractTableModel):
         self._edits += 1
         moved = False
         if self._sort is not None and not self._sorting and self._keys is not None:
-            rows = np.flatnonzero(np.isin(self.order, changed))
-            for i in rows.tolist():
-                k = self._key_at(self.source, int(self.order[i]))
+            rows = np.flatnonzero(np.isin(self.order, changed)).tolist()
+            for i, k in zip(rows, self._keys_at(self.source, self.order[rows])):
                 if k != self._keys[i]:
                     self._keys[i], moved = k, True
         self.dataChanged.emit(self.index(0, 0), self.index(len(self.order) - 1, len(self.columns) - 1))
@@ -649,6 +652,7 @@ class TablePage(QWidget):
         self._text_key = columns[stretch_col][1]
         self._builds = 0  # counts loads and filterings, so one worked out between frames sees it's been overtaken
         self._waiting: list | None = None  # while one is: what a fetch brought meanwhile, to take in turn once it's done
+        self._unshown: list[int] = []  # rows a fetch added to a big table out of sight, put in when it shows
         self._last: tuple | None = None  # (label, needle, the positions they let through), for the next keystroke
         self._by_words = False  # whether the text filter was looked up in the search index
         self._slices = Slices(self)
@@ -743,7 +747,7 @@ class TablePage(QWidget):
         self._slices.stop()
         self._builds += 1
         builds = self._builds
-        self.source, self._last = source, None
+        self.source, self._last, self._unshown = source, None, []
         self._set_base(np.arange(len(source)) if at is None else np.asarray(at, np.int64))
         self._waiting = []
         yield from self._filtering(step, builds)
@@ -783,8 +787,17 @@ class TablePage(QWidget):
         if new:
             self._add_base(new)
             self._last = None
-            self.model.insert(self._picked(np.array(new, np.int64), *self._wanted()))
+            if self.isVisible() or not self.window().isVisible() or self.model.rowCount() < self.model.BIG:
+                self.model.insert(self._picked(np.array(new, np.int64), *self._wanted()))
+            else:  # put in where they go once its page shows: a big table out of sight took a few ms a batch
+                self._unshown += new
         return len(new)
+
+    def _show_unshown(self) -> None:
+        unshown, self._unshown = self._unshown, []
+        at = np.array([p for p in unshown if self._in(p)], np.int64)
+        if len(at):
+            self.model.insert(self._picked(at, *self._wanted()))
 
     def update_rows(self, rows) -> int:
         """Bring in rows a finished fetch saved: ones saved again (new scores) replace the rows shown, the rest
@@ -946,6 +959,7 @@ class TablePage(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self._show_unshown()
         if self._fit_due or self._fit_unread:
             self._fit_columns()
 
