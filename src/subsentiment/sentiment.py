@@ -14,8 +14,6 @@ from subsentiment import sentiment_model
 POSITIVE_THRESHOLD = 0.05
 NEGATIVE_THRESHOLD = -0.05
 
-LABELS = ("negative", "neutral", "positive")
-
 _URL = re.compile(r"https?://\S+")
 _MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _QUOTE = re.compile(r"^[ \t]*>.*$", re.MULTILINE)  # someone else's words ([ \t]: \s ran across lines, slow)
@@ -79,8 +77,10 @@ def label_for(compound: float) -> str:
     return "neutral"
 
 
-def vader_features(cleaned: str) -> list[float]:
-    p = _analyzer().polarity_scores(cleaned) if cleaned else {"neg": 0, "neu": 1, "pos": 0, "compound": 0}
+def vader_features(cleaned: str, p: dict | None = None) -> list[float]:
+    """What the classifier takes from VADER's scores of cleaned text (or ``p``, ones worked out already)."""
+    if p is None:
+        p = _analyzer().polarity_scores(cleaned) if cleaned else {"neg": 0, "neu": 1, "pos": 0, "compound": 0}
     return [p["neg"], p["neu"], p["pos"], p["compound"], abs(p["compound"])]
 
 
@@ -213,7 +213,7 @@ class Lexicon:
         plain = self.blanked(cleaned)
         without = self._analyzer.polarity_scores(plain)["compound"]
         shift = max(-self.MOST, min(self.MOST, self.NUDGE * (p["compound"] - without)))
-        return p, model.probabilities(plain, [p["neg"], p["neu"], p["pos"], p["compound"], abs(p["compound"])], shift)
+        return p, model.probabilities(plain, vader_features(cleaned, p), shift)
 
     _made: dict = {}  # the last lexicons ``compare`` made, by their words, so each process makes them once
 

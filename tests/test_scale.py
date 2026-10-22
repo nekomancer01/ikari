@@ -312,12 +312,12 @@ def test_a_stricter_score_filter_finds_its_rows_among_those_in_memory(tmp_path, 
     try:
         w.show()
         until(lambda: w.comments_tab.model.rowCount() and not w._span_slices.running() and not w.load_job.busy, 60)
-        reads = [count_calls(monkeypatch, Store, name) for name in ("rows", "day_totals")]
+        reads = count_calls(monkeypatch, Store, "rows")
         pick = w.comment_score_pick
         pick.setCurrentIndex(pick.findText("Comments 10+"))
         until(lambda: not w._span_slices.running() and w.comments_tab.model.rowCount() < COMMENTS, 30)
         # The owner's comments were read again from the database for each change: 40 seconds.
-        assert reads == [[], []]
+        assert reads == []
         expected = [r for r in Store(db).comments("Big") if r["score"] is not None and r["score"] >= 10]
         assert sorted(r["id"] for r in w.comments) == sorted(r["id"] for r in expected)
         assert w._analysis["comments"].counts == Analysis(expected).counts

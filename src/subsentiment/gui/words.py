@@ -26,14 +26,13 @@ from subsentiment.gui import motion, theme
 from subsentiment.gui.charts import palette
 from subsentiment.gui.days import flat_button
 from subsentiment.gui.widgets import ElidedLabel, VerticalScrollArea, label
-from subsentiment.analysis import LABELS
+from subsentiment.analysis import LABELS, TEXT
 from subsentiment.gui.rows import RowSource, Saved
 from subsentiment.gui.worker import BackgroundJob, LoadWorker, ScorePool, Slices, on_thread
 from subsentiment.index import top_words
 from subsentiment.sentiment import Lexicon
 
 KINDS = ("posts", "comments")
-_TEXT = {"posts": ("title", "selftext"), "comments": ("body",)}  # what Rescore searches
 _CELL = 2  # px; the word cloud's grid of taken space
 _FONTS: dict[int, object] = {}  # the cloud's font by pixel size
 
@@ -636,7 +635,7 @@ class Rescore(QObject):
         uses = Lexicon(dict.fromkeys(words, 0.0)).uses
         for kind in KINDS:  # a source's text is read first: on a thread, a big step at a time
             if isinstance(rows[kind], RowSource):
-                for key in _TEXT[kind]:
+                for key in TEXT[kind]:
                     yield from rows[kind].read_values(key)
         self._counts, self._shown = [sum(map(len, rows.values())), 0, 0, 0], 0
         self._sent_at = self._committed_at = time.perf_counter()
@@ -665,10 +664,10 @@ class Rescore(QObject):
             return (parts[0] or "") if kind == "comments" else f"{parts[0] or ''}\n\n{parts[1] or ''}".strip()
         if not isinstance(rows, RowSource):
             for r in rows:
-                yield (lambda r=r: r), text(*(r[k] for k in _TEXT[kind]))
+                yield (lambda r=r: r), text(*(r[k] for k in TEXT[kind]))
             return
         ids, sentiment, label = rows.ids, rows.sentiment, rows.label
-        for i, parts in enumerate(zip(*(rows.values(k) for k in _TEXT[kind]))):
+        for i, parts in enumerate(zip(*(rows.values(k) for k in TEXT[kind]))):
             yield (lambda i=i: {"id": ids[i].decode() if isinstance(ids[i], bytes) else ids[i],
                                 "sentiment": float(sentiment[i]), "label": LABELS[label[i]] if label[i] >= 0 else None}
                    ), text(*parts)

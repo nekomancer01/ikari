@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-from subsentiment.analysis import LABELS, Analysis, words_in
+from subsentiment.analysis import LABEL_AT, LABELS, Analysis, words_in
 from subsentiment.store import (COMMENT_COLUMNS, NO_SCORE, NOT_IMAGE, PACKED, POST_COLUMNS, SCORE_STEPS as STEPS,
                                  CommentRow, DayPack, PostRow, Search, score_bucket)
 
@@ -101,12 +101,11 @@ class RowIndex:
             args += [self.subreddit, *old]
             sql += " ORDER BY 2"  # a day's rows together: each old pack is read whole once, not once a row
         rows = self.db.execute(sql, args).fetchall()
-        label = {lab: k for k, lab in enumerate(LABELS)}
         part = {"ids": np.array([r[0].encode() for r in rows], dtype="S1" if not rows else None),
                 "created": np.array([np.nan if r[1] is None else r[1] for r in rows], np.float64),
                 "score": np.array([NO_SCORE if r[2] is None else r[2] for r in rows], np.int32),
                 "sentiment": np.array([r[3] or 0.0 for r in rows], np.float64),
-                "label": np.array([label.get(r[4], -1) for r in rows], np.int8),
+                "label": np.array([LABEL_AT.get(r[4], -1) for r in rows], np.int8),
                 "hidden": np.zeros(len(rows), np.int8),
                 "pack": np.full(len(rows), LOOSE, np.int32), "at": np.zeros(len(rows), np.int32),
                 "packed": np.array([r[5] for r in rows], np.int8)}
@@ -475,7 +474,6 @@ class RowIndex:
         rows = list(rows)
         if not rows:
             return
-        label = {lab: k for k, lab in enumerate(LABELS)}
         at = self.where([r["id"] for r in rows])
         old = at[at >= 0]
         self._count(old, -1)
@@ -487,7 +485,7 @@ class RowIndex:
                 self.created[a] = np.nan if r["created_utc"] is None else r["created_utc"]
                 self.score[a] = NO_SCORE if r["score"] is None else r["score"]
                 self.sentiment[a] = r["sentiment"] or 0.0
-                self.label[a] = label.get(r["label"], -1)
+                self.label[a] = LABEL_AT.get(r["label"], -1)
                 self._pack_of[a] = LOOSE
         self._count(old, 1)
         start = len(self.ids)
@@ -496,7 +494,7 @@ class RowIndex:
                      "created": np.concatenate([self.created, [np.nan if r["created_utc"] is None else r["created_utc"] for r in new]]),
                      "score": np.concatenate([self.score, np.array([NO_SCORE if r["score"] is None else r["score"] for r in new], np.int32)]),
                      "sentiment": np.concatenate([self.sentiment, [r["sentiment"] or 0.0 for r in new]]),
-                     "label": np.concatenate([self.label, np.array([label.get(r["label"], -1) for r in new], np.int8)]),
+                     "label": np.concatenate([self.label, np.array([LABEL_AT.get(r["label"], -1) for r in new], np.int8)]),
                      "_pack_of": np.concatenate([self._pack_of, np.full(len(new), LOOSE, np.int32)]),
                      "_at": np.concatenate([self._at, np.zeros(len(new), np.int32)])}
             with self._lock:  # all at once, for a thread reading them together (`column`)
@@ -561,9 +559,8 @@ class RowIndex:
         words = [self._words_at(int(a)) for a in positions] if self.with_words else []
         if words:
             self._change(words, self.created[positions], self.label[positions], self.score[positions], -1)
-        label = {lab: k for k, lab in enumerate(LABELS)}
         self.sentiment[positions] = [s for (_, s, _), k in zip(scores, known) if k]
-        self.label[positions] = [label.get(lab, -1) for (_, _, lab), k in zip(scores, known) if k]
+        self.label[positions] = [LABEL_AT.get(lab, -1) for (_, _, lab), k in zip(scores, known) if k]
         self._count(positions, 1)
         if words:
             self._change(words, self.created[positions], self.label[positions], self.score[positions], 1)
