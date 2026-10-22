@@ -192,10 +192,12 @@ class ThreadScorer:
     """Scores a fetch's comments, a thread at a time, in other processes, while the fetch's own thread waits without
     the interpreter lock: scored on that thread, a big thread's comments held it for most of each second, and every
     frame of the window waited on it. A few comments are scored here, as handing them over costs more; and all of
-    them once processes can't run here. Stopped while it waits, it gives back None and the thread isn't saved."""
+    them once processes can't run here, or don't answer in time. Stopped while it waits, it gives back None and the
+    thread isn't saved."""
 
     LEAST = 100  # comments in a thread for it to go to the processes
     WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
+    WAIT = 30.0  # seconds the processes get to start and answer, and a millisecond more for each comment
 
     def __init__(self, should_stop=lambda: False):
         self._pool: ProcessPoolExecutor | None = None
@@ -210,12 +212,15 @@ class ThreadScorer:
                 step = -(-len(texts) // self.WORKERS)
                 parts = [self._pool.submit(Lexicon.compare, lexicon.weights, frozenset(), texts[a:a + step])
                          for a in range(0, len(texts), step)]
+                give_up = time.monotonic() + self.WAIT + len(texts) / 1000
                 while futures.wait(parts, timeout=0.1).not_done:
                     if self.should_stop():
                         self.close()
                         return None
+                    if time.monotonic() > give_up:
+                        raise TimeoutError("the scoring processes didn't answer")
                 return [got[:2] for part in parts for got in part.result()]
-            except Exception:  # none allowed, or they died: scored here from now on
+            except Exception:  # none allowed, they died or hung: scored here from now on
                 self.broken = True
                 self.close()
         return [lexicon.score(t) for t in texts]

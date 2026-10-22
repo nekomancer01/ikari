@@ -27,10 +27,10 @@ from subsentiment.store import Store  # noqa: E402
 from test_big_data import COMMENTS, POSTS, count_calls, fill  # noqa: E402
 
 
-def until(done, seconds: float = 10) -> None:
+def until(done, seconds: float = 10, doing=lambda: "") -> None:
     end = time.monotonic() + seconds
     while not done():
-        assert time.monotonic() < end
+        assert time.monotonic() < end, doing()
         QApplication.processEvents()
         time.sleep(0.002)
 
@@ -333,7 +333,7 @@ def test_a_download_into_a_big_subreddit_hands_its_rows_to_the_window(window, mo
     try:
         assert w.start_request(collect.FetchRequest("Big", limit=None, days=(day,), include_comments=True,
                                                     comments_per_post=0), "Downloading")
-        until(lambda: not w.fetch_job.busy, 60)
+        until(lambda: not w.fetch_job.busy, 60, lambda: w.statusBar().currentMessage())
     finally:
         archive.close()
     saved = threads * (1 + per)

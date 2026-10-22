@@ -310,8 +310,8 @@ def _each_thread(posts: list[Post], get: Callable, client: ArcticShiftClient, st
                  progress, should_stop, saved, score_all, every: bool = False) -> tuple[int, set[str], bool, int]:
     """Run get(post), which returns (comments, whether they're the whole thread), for each post, a few at once,
     and save each thread here, on this thread, scored by the subreddit's words (``score_all``, as in run);
-    ``saved`` is told once it's committed, if it brought comments (``every``: whatever it brought). ``cap`` is the comments asked for per
-    thread, 0 for all. A post whose comments couldn't be fetched is recorded as failed, so the next fetch retries
+    ``saved`` is told once it's committed, if it brought comments (``every``: whatever it brought). ``cap`` is the
+    comments asked for per thread, 0 for all. A post whose comments couldn't be fetched is recorded as failed, so the next fetch retries
     it; after GIVE_UP_AFTER failures in a row no new ones start, since the archive is struggling and
     shouldn't be hammered. Returns (posts that failed, ids of the posts tried, whether it gave up, new comments)."""
     what = "Comments for post" if cap else "All comments for post"

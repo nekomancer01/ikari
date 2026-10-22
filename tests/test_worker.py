@@ -159,6 +159,19 @@ def test_stop_while_a_threads_comments_are_scored_elsewhere_leaves_the_thread_un
         scorer.close()
     assert time.monotonic() - start < 10 and scorer._pool is None and not scorer.broken
 
+def test_scoring_processes_that_dont_answer_in_time_are_given_up_for_scoring_here(monkeypatch):
+    # A pool that never answered would have held the fetch forever.
+    from subsentiment.sentiment import Lexicon
+    lexicon = Lexicon({"raid": 0.8})
+    texts = [f"the raid tonight #{i}" for i in range(worker_mod.ThreadScorer.LEAST)]
+    monkeypatch.setattr(worker_mod.ThreadScorer, "WAIT", -1.0)  # out of time at once
+    scorer = worker_mod.ThreadScorer()
+    try:
+        assert scorer(lexicon, texts) == [lexicon.score(t) for t in texts]
+    finally:
+        scorer.close()
+    assert scorer.broken and scorer._pool is None
+
 def test_a_fetch_reads_back_what_it_saved_and_sends_it_to_the_window(monkeypatch, tmp_path):
     # The window used to read them itself: a read a row at a time, each waiting on this thread for the interpreter.
     monkeypatch.setattr(worker_mod, "ArcticShiftClient", FakeClient)
