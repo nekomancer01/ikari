@@ -187,32 +187,47 @@ class ScorePool(QObject):
             self.scored.emit(tag, results)
 
 
-class FetchWorker(QObject):
+class Worker(QObject):
+    """A job for BackgroundJob, run on its thread: ``work`` does it and emits ``finished`` (each worker's own
+    signal, with what it found); an error it raises is sent as ``failed``, with what to tell the user. ``stop``
+    asks it to end early: ``stopping`` turns true."""
+    failed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.stopping = False
+
+    def stop(self) -> None:
+        self.stopping = True
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.work()
+        except Exception as e:  # keep the GUI alive on unexpected failures too
+            self.failed.emit(failure_text(e))
+
+    def work(self) -> None:
+        raise NotImplementedError
+
+
+class FetchWorker(Worker):
     progress = Signal(int, int, str)
     finished = Signal(object)  # collect.FetchResult
-    failed = Signal(str)
     saved = Signal()  # some rows were committed; the window can show them
 
     def __init__(self, request: collect.FetchRequest, db_path: str):
         super().__init__()
         self.request = request
         self.db_path = db_path
-        self._stop = False
 
-    def stop(self) -> None:
-        self._stop = True
-
-    @Slot()
-    def run(self) -> None:
+    def work(self) -> None:
         store = None
         try:
             store = Store(self.db_path)  # sqlite connections can't cross threads; opening can fail too
-            result = collect.run(ArcticShiftClient(limiter=LIMITER), store, self.request,
-                                 progress=self.progress.emit, should_stop=lambda: self._stop,
-                                 saved=self.saved.emit)
-            self.finished.emit(result)
-        except Exception as e:  # keep the GUI alive on unexpected failures too
-            self.failed.emit(failure_text(e))
+            self.finished.emit(collect.run(ArcticShiftClient(limiter=LIMITER), store, self.request,
+                                           progress=self.progress.emit, should_stop=lambda: self.stopping,
+                                           saved=self.saved.emit))
         finally:
             LIMITER.on_wait = None  # collect.run pointed it at this worker, which is about to go
             if store is not None:
@@ -239,103 +254,81 @@ def lasting():
             gc.enable()
 
 
-class LoadWorker(QObject):
+class LoadWorker(Worker):
     """Reads a saved subreddit with connections of its own, so opening a big one doesn't hold up the window: numpy,
     zstd and sqlite let go of the interpreter lock as they work, so the window paints meanwhile. ``read`` sends its
     posts and comments as rows.Saved (a RowIndex each, 0.7 s for 650,000 comments); with ``rows``, every one of
     them as a store.Row instead (half a minute for those), for Rescore to search through."""
     read = Signal(object)  # (tag, {kind: rows.Saved, or a list of rows}): the tag it was given
     finished = Signal(object)  # (tag,)
-    failed = Signal(str)
 
     def __init__(self, db_path: str, subreddit: str, tag=None, rows: bool = False, words: bool = True):
         super().__init__()
         self.db_path, self.subreddit, self.tag, self.rows, self.words = db_path, subreddit, tag, rows, words
         self.store: Store | None = None
-        self._stop = False
 
     def stop(self) -> None:
         """Cut the read short (the window is closing): Qt aborted the process when the window went with its thread
         still running."""
-        self._stop = True
+        super().stop()
         store = self.store
         if store is not None:
             store.db.interrupt()  # (from any thread) the query being read fails at its next row
 
-    @Slot()
-    def run(self) -> None:
+    def work(self) -> None:
         from subsentiment.gui.rows import Saved  # (it runs work on threads with on_thread, from here)
         store = None
         try:
             if self.rows:
                 store = self.store = Store(self.db_path)
-                if self._stop:
+                if self.stopping:
                     raise sqlite3.OperationalError("interrupted")
                 with store.snapshot(), lasting():
                     got = {k: store.rows(k, self.subreddit) for k in ("posts", "comments")}
             else:
                 got = {}
                 for kind in ("posts", "comments"):
-                    if self._stop:
+                    if self.stopping:
                         raise sqlite3.OperationalError("interrupted")
                     got[kind] = Saved(self.db_path, kind, self.subreddit, self.words)
             self.read.emit((self.tag, got))
             self.finished.emit((self.tag,))
-        except Exception as e:
-            self.failed.emit(failure_text(e))
         finally:
             if store is not None:
                 self.store = None
                 store.close()
 
 
-class StoreWorker(QObject):
+class StoreWorker(Worker):
     """Makes one change to the saved data with a connection of its own, such as deleting days and giving their
-    space back: sqlite lets go of the interpreter while it works, so the window paints meanwhile."""
+    space back: sqlite lets go of the interpreter while it works, so the window paints meanwhile. Stop doesn't cut
+    it short: it's one transaction, which ends by itself."""
     finished = Signal(object)  # what the Store method returned
-    failed = Signal(str)
 
     def __init__(self, db_path: str, method: str, *args):
         super().__init__()
         self.db_path, self.method, self.args = db_path, method, args
 
-    def stop(self) -> None:
-        pass  # one transaction; it ends by itself
-
-    @Slot()
-    def run(self) -> None:
-        store = None
+    def work(self) -> None:
+        store = Store(self.db_path)
         try:
-            store = Store(self.db_path)
             self.finished.emit(getattr(store, self.method)(*self.args))
-        except Exception as e:
-            self.failed.emit(failure_text(e))
         finally:
-            if store is not None:
-                store.close()
+            store.close()
 
 
-class CountWorker(QObject):
+class CountWorker(Worker):
     """Asks the archive how many posts each day in a range has (ArcticShiftClient.day_counts)."""
     finished = Signal(str, object)  # subreddit, {day start: count}
-    failed = Signal(str)
 
     def __init__(self, subreddit: str, after: float, before: float):
         super().__init__()
         self.args = (subreddit, after, before)
-        self._stop = False
 
-    def stop(self) -> None:
-        self._stop = True
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            counts = ArcticShiftClient(limiter=LIMITER, should_stop=lambda: self._stop).day_counts(
-                *self.args, should_stop=lambda: self._stop)
-            self.finished.emit(self.args[0], counts)
-        except Exception as e:
-            self.failed.emit(failure_text(e))
+    def work(self) -> None:
+        stopping = lambda: self.stopping  # noqa: E731
+        counts = ArcticShiftClient(limiter=LIMITER, should_stop=stopping).day_counts(*self.args, should_stop=stopping)
+        self.finished.emit(self.args[0], counts)
 
 
 class BackgroundJob(QObject):
