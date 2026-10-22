@@ -4,7 +4,10 @@ settles, a step a frame. Work is counted (paints, recounts, reads), not timed, s
 runner too; tools/perf.py measures the frame times themselves."""
 import os
 import sqlite3
+import sys
+import threading
 import time
+import traceback
 
 import pytest
 
@@ -30,7 +33,10 @@ from test_big_data import COMMENTS, POSTS, count_calls, fill  # noqa: E402
 def until(done, seconds: float = 10, doing=lambda: "") -> None:
     end = time.monotonic() + seconds
     while not done():
-        assert time.monotonic() < end, doing()
+        names = {t.ident: t.name for t in threading.enumerate()}
+        assert time.monotonic() < end, doing() + "".join(  # where each thread was (QThreads too) when it timed out
+            f"\n--- {names.get(ident, ident)}\n" + "".join(traceback.format_stack(frame))
+            for ident, frame in sys._current_frames().items())
         QApplication.processEvents()
         time.sleep(0.002)
 
@@ -328,6 +334,12 @@ def test_a_download_into_a_big_subreddit_hands_its_rows_to_the_window(window, mo
         real = getattr(w.store, name)
         monkeypatch.setattr(w.store, name, lambda *a, real=real: (rows := real(*a), read.append(len(rows)))[0])
     scored_here = count_calls(monkeypatch, worker.Lexicon, "score")
+    filled = Store(w.db_path)
+    filled.pack_settled()  # the 40,000 rows the window was filled with (seconds on Windows): the fetch packs its own
+    filled.close()
+    monkeypatch.setattr(worker.ThreadScorer, "broken", False)
+    worker.ThreadScorer.start()  # up, as on a download long enough for them to come up (seconds, on Windows)
+    until(worker.ThreadScorer.ready, 60)
     w.show_page("overview")
     shown = w.comments_tab.model.rowCount()
     try:
@@ -336,6 +348,7 @@ def test_a_download_into_a_big_subreddit_hands_its_rows_to_the_window(window, mo
         until(lambda: not w.fetch_job.busy, 60, lambda: w.statusBar().currentMessage())
     finally:
         archive.close()
+        worker.ThreadScorer.close()
     saved = threads * (1 + per)
     assert len(w._saved["posts"]) + len(w._saved["comments"]) == POSTS + COMMENTS + saved
     assert sum(read) <= 2  # the end of the fetch looked for anything after the last rows sent: the last again at most
