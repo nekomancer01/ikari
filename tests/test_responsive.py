@@ -334,6 +334,9 @@ def test_a_download_into_a_big_subreddit_hands_its_rows_to_the_window(window, mo
         real = getattr(w.store, name)
         monkeypatch.setattr(w.store, name, lambda *a, real=real: (rows := real(*a), read.append(len(rows)))[0])
     scored_here = count_calls(monkeypatch, worker.Lexicon, "score")
+    filled = Store(w.db_path)
+    filled.pack_settled()  # the 40,000 rows the window was filled with (seconds on Windows): the fetch packs its own
+    filled.close()
     monkeypatch.setattr(worker.ThreadScorer, "broken", False)
     worker.ThreadScorer.start()  # up, as on a download long enough for them to come up (seconds, on Windows)
     until(worker.ThreadScorer.ready, 60)
