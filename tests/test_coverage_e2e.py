@@ -719,3 +719,30 @@ def test_a_day_with_no_posts_anywhere_isnt_listed_ticked_or_downloaded(window, m
     settle(w, lambda: not w.fetch_job.busy)
     fetched = [d[2] for d in downloads() if d[0] == "posts"]
     assert fetched and empty not in fetched and saved in fetched
+
+
+def test_the_once_a_second_refresh_during_a_download_redraws_only_the_days_that_changed(window, monkeypatch):
+    # Every cell of every listed day was filled in again each second a fetch ran: a fifth of a second for two years.
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    cells = {id(c.day_table.cellWidget(row, col)): (day, col) for row, day in enumerate(c.days) for col in (1, 3)}
+    drawn = []
+    for name in ("set", "set_open", "show_share"):
+        real = getattr(coverage.Cell, name)
+        monkeypatch.setattr(coverage.Cell, name,
+                            lambda self, *a, real=real, **k: drawn.append(cells.get(id(self))) or real(self, *a, **k))
+    c.refresh_saved()
+    settle(w)
+    assert drawn == []  # nothing changed
+    day = TODAY - 3 * DAY
+    s = Store(w.db_path)
+    s.save_post(post("p-new", "Python", day + 900), 0.0, "neutral")  # as a running fetch saves one
+    s.commit()
+    s.close()
+    c.refresh_saved()
+    settle(w)
+    assert (day, 1) in drawn and {d for d, _ in drawn} == {day}  # its posts, and its threads once they're counted
+    assert c.day_table.cellWidget(c.days.index(day), 1).main.full_text().startswith("2")

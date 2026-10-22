@@ -499,6 +499,12 @@ class RowIndex:
                      "label": np.concatenate([self.label, np.array([label.get(r["label"], -1) for r in new], np.int8)]),
                      "_pack_of": np.concatenate([self._pack_of, np.full(len(new), LOOSE, np.int32)]),
                      "_at": np.concatenate([self._at, np.zeros(len(new), np.int32)])}
+            if self._sorted_ids is not None:  # (`where` made it above) the new ids go in their places in id order:
+                # sorting every id again took 65 ms for 190,000 comments, at each thread of comments a fetch saved
+                added = grown["ids"][start:]
+                order = np.argsort(added, kind="stable")
+                places = np.searchsorted(self.ids, added[order], sorter=self._sorted_ids)
+                self._sorted_ids = np.insert(self._sorted_ids, places, start + order)
             with self._lock:  # all at once, for a thread reading them together (`column`)
                 for name, values in grown.items():
                     setattr(self, name, values)
@@ -515,7 +521,6 @@ class RowIndex:
         tail = self.created[max(start - 1, 0):]
         if new and self.ordered == start and np.all(tail[:-1] <= tail[1:]):
             self.ordered = len(self.ids)  # all the newest, in order
-        self._sorted_ids = None
 
     def _split(self, row) -> tuple[str, ...]:
         words = getattr(row, "words", None)

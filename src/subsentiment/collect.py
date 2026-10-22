@@ -11,6 +11,7 @@ import requests
 
 from subsentiment.arctic_shift import ArcticShiftClient, Stopped, in_parallel
 from subsentiment.reddit import FetchError, Post, normalize_subreddit
+from subsentiment.sentiment import Lexicon
 from subsentiment.store import Store
 
 GIVE_UP_AFTER = 5  # consecutive posts whose comments couldn't be fetched before the rest are skipped
@@ -61,9 +62,12 @@ class FetchResult:
 def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         progress: Callable[[int, int, str], None] = lambda done, total, msg: None,
         should_stop: Callable[[], bool] = lambda: False,
-        saved: Callable[[], None] = lambda: None) -> FetchResult:
+        saved: Callable[[], None] = lambda: None,
+        score_all: Callable[[Lexicon, list[str]], list[tuple[float, str]] | None] = lambda lexicon, texts: [
+            lexicon.score(t) for t in texts]) -> FetchResult:
     """Run one fetch. ``saved`` is called after each batch of rows is committed, so a UI can show
-    them while the fetch goes on."""
+    them while the fetch goes on. ``score_all`` scores a thread's comments by the subreddit's words (here, unless
+    it's given another way)."""
     shown, said = progress, [(0, 0, "")]
 
     def progress(done: int, total: int, msg: str) -> None:  # remembered, to come back to after a wait
@@ -85,7 +89,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
         client.should_stop = should_stop  # so Stop also cuts short retries and waits inside a request
 
     if req.comment_posts:
-        return _all_comments(client, store, req, progress, should_stop, saved)
+        return _all_comments(client, store, req, progress, should_stop, saved, score_all)
 
     name = normalize_subreddit(req.subreddit)
     score = lambda text: store.lexicon(name).score(text)  # noqa: E731 - by the subreddit's own words, as set now
@@ -180,9 +184,11 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
             def save(p: Post, got) -> None:
                 nonlocal n_comments
                 comments, complete = got if fill else (got, False)
+                if (scores := score_all(store.lexicon(name), [c.body for c in comments])) is None:
+                    return  # stopped while scoring: asked for again next time
                 had = store.comment_ids(p.id)  # a thread asked for again: count only what's new
-                for c in comments:
-                    store.save_comment(c, *score(c.body))
+                for c, scored in zip(comments, scores):
+                    store.save_comment(c, *scored)
                     n_comments += c.id not in had
                 store.mark_comments(p.id, ok=True, settled=p.score is not None)
                 if complete:  # an unsettled thread may still be growing, so it's whole only "so far"
@@ -271,7 +277,7 @@ def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
 
 
 def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, progress, should_stop,
-                  saved) -> FetchResult:
+                  saved, score_all) -> FetchResult:
     """Every comment on each post in req.comment_posts. Posts whose numbers hadn't settled are
     re-checked first, so their comment totals are real where the archive has them by now."""
     name = normalize_subreddit(req.subreddit)
@@ -307,9 +313,11 @@ def _all_comments(client: ArcticShiftClient, store: Store, req: FetchRequest, pr
     def save(p: Post, got) -> None:
         nonlocal n_comments
         comments, whole = got
+        if (scores := score_all(store.lexicon(name), [c.body for c in comments])) is None:
+            return  # stopped while scoring: asked for again next time
         had = store.comment_ids(p.id)  # a thread fetched again: count only what's new
-        for c in comments:
-            store.save_comment(c, *score(c.body))
+        for c, scored in zip(comments, scores):
+            store.save_comment(c, *scored)
             n_comments += c.id not in had
         store.mark_comments(p.id, ok=True, settled=p.score is not None)
         if whole:  # an unsettled thread may still be growing: it has every comment so far, not all

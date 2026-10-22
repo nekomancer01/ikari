@@ -108,6 +108,14 @@ def test_comments_stop_after_repeated_failures_and_are_retried_next_time(tmp_pat
     assert (result.posts, result.comments, result.comment_errors) == (0, 8, 0)
 
 
+def test_a_thread_stopped_while_its_comments_were_scored_is_left_unasked_like_one_stopped_before(tmp_path):
+    s = store_with(tmp_path, [])
+    collect.run(FakeClient(posts=[mk(1)]), s, collect.FetchRequest("python"), score_all=lambda lexicon, texts: None)
+    assert s.comments("python") == [] and s.posts_between("python")[0]["comments_ok"] is None
+    c = FakeClient(posts=[mk(1)])
+    result = collect.run(c, s, collect.FetchRequest("python", top=True))  # picked again, its comments are asked for
+    assert ("comments", "p1") in c.calls and result.comments == 1
+
 def test_posts_known_to_have_no_comments_are_not_looked_up(tmp_path):
     s = store_with(tmp_path, [])
     c = FakeClient(posts=[mk(1, num_comments=0), mk(2, score=None, num_comments=None)])
