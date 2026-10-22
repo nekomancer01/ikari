@@ -227,7 +227,7 @@ class Lexicon:
             cls._made.clear()
             made = cls._made[key] = (cls(weights), cls({w: v for w, v in weights.items() if w not in words}))
         lexicon, without = made
-        return [(*lexicon.score(t), without.score(t)[1]) for t in texts]
+        return [(*(got := lexicon.score(t)), without.score(t)[1] if words else got[1]) for t in texts]
 
     def blanked(self, cleaned: str) -> str:
         """Cleaned text with each set word as BLANK: as if it were a word neither scorer knows."""

@@ -9,6 +9,7 @@ import os
 import sqlite3
 import threading
 import time
+from concurrent import futures
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
@@ -19,7 +20,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from subsentiment import collect
 from subsentiment.arctic_shift import ArcticShiftClient, RateLimiter
-from subsentiment.reddit import FetchError
+from subsentiment.reddit import FetchError, normalize_subreddit
 from subsentiment.sentiment import Lexicon
 from subsentiment.store import Store
 
@@ -187,6 +188,51 @@ class ScorePool(QObject):
             self.scored.emit(tag, results)
 
 
+class ThreadScorer:
+    """Scores a fetch's comments, a thread at a time, in other processes, while the fetch's own thread waits without
+    the interpreter lock: scored on that thread, a big thread's comments held it for most of each second, and every
+    frame of the window waited on it. A few comments are scored here, as handing them over costs more; and all of
+    them once processes can't run here, or don't answer in time. Stopped while it waits, it gives back None and the
+    thread isn't saved."""
+
+    LEAST = 100  # comments in a thread for it to go to the processes
+    WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
+    WAIT = 30.0  # seconds the processes get to start and answer, and a millisecond more for each comment
+
+    def __init__(self, should_stop=lambda: False):
+        self._pool: ProcessPoolExecutor | None = None
+        self.broken = False
+        self.should_stop = should_stop
+
+    def __call__(self, lexicon: Lexicon, texts: list[str]) -> list[tuple[float, str]] | None:
+        if len(texts) >= self.LEAST and not self.broken:
+            try:
+                if self._pool is None:
+                    self._pool = ProcessPoolExecutor(self.WORKERS, mp_context=multiprocessing.get_context("spawn"))
+                step = -(-len(texts) // self.WORKERS)
+                parts = [self._pool.submit(Lexicon.compare, lexicon.weights, frozenset(), texts[a:a + step])
+                         for a in range(0, len(texts), step)]
+                give_up = time.monotonic() + self.WAIT + len(texts) / 1000
+                while futures.wait(parts, timeout=0.1).not_done:
+                    if self.should_stop():
+                        self.close()
+                        return None
+                    if time.monotonic() > give_up:
+                        raise TimeoutError("the scoring processes didn't answer")
+                return [got[:2] for part in parts for got in part.result()]
+            except Exception:  # none allowed, they died or hung: scored here from now on
+                self.broken = True
+                self.close()
+        return [lexicon.score(t) for t in texts]
+
+    def close(self) -> None:
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+            for process in list((pool._processes or {}).values()):
+                process.terminate()
+
+
 class Worker(QObject):
     """A job for BackgroundJob, run on its thread: ``work`` does it and emits ``finished`` (each worker's own
     signal, with what it found); an error it raises is sent as ``failed``, with what to tell the user. ``stop``
@@ -212,27 +258,61 @@ class Worker(QObject):
 
 
 class FetchWorker(Worker):
+    """Runs one fetch with a connection of its own. After each commit it reads back what it saved (since ``since``)
+    and sends those rows to the window: read there, each row's read let go of the interpreter lock, and with this
+    thread busy scoring, the window waited up to a switch interval for it back, row after row (seconds of frozen
+    window for a big thread's comments)."""
     progress = Signal(int, int, str)
     finished = Signal(object)  # collect.FetchResult
-    saved = Signal()  # some rows were committed; the window can show them
+    # Rows committed, read back: {kind: (saved at or after, [store.Row in the order saved])}, kind posts or comments.
+    saved = Signal(object)
 
     def __init__(self, request: collect.FetchRequest, db_path: str):
         super().__init__()
         self.request = request
         self.db_path = db_path
+        self.since = time.time() - 1.0  # rows saved from now on are this fetch's
+        self._read_to = {"posts": self.since, "comments": self.since}
+        self._last: dict[str, str] = {}  # the id of the last row of each kind sent
+        self._closing = threading.Event()  # the window is closing: what's left of packing waits for the next fetch
+
+    def _send_saved(self, store: Store) -> None:
+        got = {}
+        for kind in ("posts", "comments"):
+            since, last = self._read_to[kind], self._last.get(kind)
+            try:
+                rows = store.rows(kind, normalize_subreddit(self.request.subreddit), since, words=True)
+            except sqlite3.Error:  # the window reads them itself instead; the fetch goes on
+                self.saved.emit({})
+                return
+            if rows and rows[0]["fetched_at"] == since and rows[0]["id"] == last:
+                rows = rows[1:]  # the last one sent, read again (saved at or after it)
+            if rows:
+                self._read_to[kind], self._last[kind] = rows[-1]["fetched_at"], rows[-1]["id"]
+            got[kind] = (since, rows)
+        self.saved.emit(got)
+
+    def stop(self, closing: bool = False) -> None:
+        super().stop()
+        if closing:
+            self._closing.set()
 
     def work(self) -> None:
         store = None
+        scorer = ThreadScorer(lambda: self.stopping)
         try:
             store = Store(self.db_path)  # sqlite connections can't cross threads; opening can fail too
-            self.finished.emit(collect.run(ArcticShiftClient(limiter=LIMITER), store, self.request,
-                                           progress=self.progress.emit, should_stop=lambda: self.stopping,
-                                           saved=self.saved.emit))
+            result = collect.run(ArcticShiftClient(limiter=LIMITER), store, self.request,
+                                 progress=self.progress.emit, should_stop=lambda: self.stopping,
+                                 saved=lambda: self._send_saved(store), score_all=scorer)
+            self._send_saved(store)  # whatever its last commits saved without a word
+            self.finished.emit(result)
         finally:
+            scorer.close()
             LIMITER.on_wait = None  # collect.run pointed it at this worker, which is about to go
             if store is not None:
                 try:
-                    store.pack_settled()  # days that have settled since get their text compressed (store.PACKED)
+                    store.pack_fetched(self._closing)  # days that have settled since get their text compressed (store.PACKED)
                 except Exception:  # never worth failing a fetch for: the rows stay as they are, packed next time
                     pass
                 store.close()

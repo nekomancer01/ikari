@@ -24,13 +24,13 @@ from subsentiment.gui.words import KINDS, WordCloud, WordTally  # noqa: E402
 from subsentiment.reddit import Comment, Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
-from test_big_data import COMMENTS, count_calls, fill  # noqa: E402
+from test_big_data import COMMENTS, POSTS, count_calls, fill  # noqa: E402
 
 
-def until(done, seconds: float = 10) -> None:
+def until(done, seconds: float = 10, doing=lambda: "") -> None:
     end = time.monotonic() + seconds
     while not done():
-        assert time.monotonic() < end
+        assert time.monotonic() < end, doing()
         QApplication.processEvents()
         time.sleep(0.002)
 
@@ -302,3 +302,64 @@ def test_opening_filtering_and_counting_a_big_subreddit_show_the_throbber_until_
     until(watch, 30)
     w.throbber.check()
     assert w.throbber.isHidden()
+
+
+def test_a_download_into_a_big_subreddit_hands_its_rows_to_the_window(window, monkeypatch):
+    # The window read back every row the fetch saved on its own connection, a row at a time, each read waiting on
+    # the fetch's thread for the interpreter lock: seconds of frozen window for a big thread's comments. Now the
+    # fetch's thread reads them, its comments are scored in other processes, and a big table out of sight takes
+    # them in when its page shows.
+    from fake_archive import FakeArchive
+    from subsentiment import arctic_shift, collect
+    from subsentiment.gui import tables, worker
+    w = window
+    day = int(time.time() // 86400 * 86400) - 3 * 86400
+    threads, per = 4, worker.ThreadScorer.LEAST + 20
+    posts = [{"id": f"dl{k}", "subreddit": "Big", "title": f"thread {k}", "selftext": "", "author": "a", "score": 9,
+              "upvote_ratio": 0.9, "num_comments": per, "created_utc": day + 600 * k, "retrieved_on": day + 2 * 86400,
+              "permalink": f"/r/Big/comments/dl{k}/x/", "url": ""} for k in range(threads)]
+    archive = FakeArchive(posts, rate=(30, 1.0))
+    monkeypatch.setattr(arctic_shift, "BASE_URL", archive.url)
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 1.2)
+    monkeypatch.setattr(worker, "LIMITER", arctic_shift.RateLimiter(arctic_shift.BASE_INTERVAL / 10))
+    monkeypatch.setattr(tables.RowsModel, "BIG", 1000)  # these tables count as big ones
+    read = []
+    for name in ("posts_since", "comments_since"):
+        real = getattr(w.store, name)
+        monkeypatch.setattr(w.store, name, lambda *a, real=real: (rows := real(*a), read.append(len(rows)))[0])
+    scored_here = count_calls(monkeypatch, worker.Lexicon, "score")
+    w.show_page("overview")
+    shown = w.comments_tab.model.rowCount()
+    try:
+        assert w.start_request(collect.FetchRequest("Big", limit=None, days=(day,), include_comments=True,
+                                                    comments_per_post=0), "Downloading")
+        until(lambda: not w.fetch_job.busy, 60, lambda: w.statusBar().currentMessage())
+    finally:
+        archive.close()
+    saved = threads * (1 + per)
+    assert len(w._saved["posts"]) + len(w._saved["comments"]) == POSTS + COMMENTS + saved
+    assert sum(read) <= 2  # the end of the fetch looked for anything after the last rows sent: the last again at most
+    assert len(scored_here) == threads  # its posts' titles; their comments went to other processes
+    assert len(w.comments) == COMMENTS + threads * per  # counted in (the heading says so) but not put in the table
+    assert w.comments_tab.model.rowCount() == shown
+    w.show_page("comments")
+    assert w.comments_tab.model.rowCount() == COMMENTS + threads * per
+
+
+def test_new_points_from_a_fetch_are_painted_once_while_the_mouse_is_over_the_chart(window, monkeypatch):
+    # Painted straight onto the widget, then again as a picture for the hover that followed: twice for each new
+    # set of points, four times a second while a fetch ran.
+    chart = window.overview.timeline
+    chart.repaint()
+    chart.repaint()
+    drawn = count_calls(monkeypatch, TimelineChart, "_paint_chart")
+    plot = chart._areas()[0]
+    for k in range(3):
+        chart.set_points([(d, mean, n + 1) for d, mean, n in chart.points])
+        for i in range(4):
+            pos = QPointF(plot.left() + 20 * (4 * k + i), plot.center().y())
+            QApplication.sendEvent(chart, QMouseEvent(QMouseEvent.Type.MouseMove, pos, chart.mapToGlobal(pos),
+                                                      Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                                                      Qt.KeyboardModifier.NoModifier))
+            chart.repaint()
+    assert len(drawn) == 3

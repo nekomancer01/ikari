@@ -3,6 +3,12 @@ panned, and the stalls when a page or a saved subreddit is switched.
 
     QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.5 python tools/perf.py            # The owner's size: ~2,900 posts, ~48,000 comments
     QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.5 python tools/perf.py --scale 4  # four times that
+    QT_QPA_PLATFORM=offscreen python tools/perf.py --scale 4 --fetch coverage     # while comments download
+
+With --fetch, a stand-in archive on this machine (tests/fake_archive.py; nothing is downloaded) serves a day of 80
+posts with 400 comments each, a thread every 0.2 s at most as the app paces requests to the real one, and the window
+downloads them into the open subreddit as Coverage's Download comments does, with the page named shown and the mouse
+moving over the timeline. Reported: frame gaps while it downloads, and when it ends.
 
 Seeds throwaway databases (your own data and settings aren't touched), opens the real MainWindow at 1280x760
 (1920x1200 at 150%, maximized) and drives it with mouse events at 60 per second while a 1 ms heartbeat timer
@@ -141,6 +147,56 @@ class Heartbeat:
                 "busy": sum(g - 1 for g in gaps if g > 2)}
 
 
+def downloading(w, page: str, beat: "Heartbeat") -> None:
+    """Frame gaps while the window downloads a day's comments into the subreddit shown (see --fetch)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
+    from fake_archive import DAY, FakeArchive
+    import fake_archive
+    from subsentiment import arctic_shift, collect
+    from subsentiment.gui import worker
+    rng = random.Random(3)
+    corpus = Corpus(rng)
+    bodies = [corpus.text(rng.randint(3, 40)) for _ in range(5000)]
+    plain = fake_archive.comment_tree
+
+    def tree(post, limit):  # comments as long as real ones, not a word each
+        items = plain(post, limit)
+        for i, item in enumerate(items):
+            item["data"]["body"] = bodies[(int(post["id"][2:]) * 400 + i) % len(bodies)]
+        return items
+    fake_archive.comment_tree = tree
+    sub, day = w.current, int(time.time() // DAY * DAY) - 3 * DAY
+    posts = [{"id": f"dl{k:03d}", "subreddit": sub, "title": corpus.text(8), "selftext": "", "author": "a",
+              "score": 50, "upvote_ratio": 0.9, "num_comments": 400, "created_utc": day + 600 * k,
+              "retrieved_on": day + 600 * k + 2 * DAY, "permalink": f"/r/{sub}/comments/dl{k:03d}/x/", "url": ""}
+             for k in range(80)]
+    archive = FakeArchive(posts, rate=(1000, 1.0))
+    archive.delays["/api/comments/tree"] = 0.6  # about as long as the real archive takes for a thread this size
+    arctic_shift.BASE_URL = archive.url
+    worker.LIMITER = arctic_shift.RateLimiter()  # the app's pace
+    w.show_page(page)
+    w.start_request(collect.FetchRequest(sub, limit=None, days=(day,), include_comments=False), "posts first")
+    while w.fetch_job.busy:
+        beat.run([], 200)
+    beat.run([], 1500)
+    w.start_request(collect.FetchRequest(sub, comment_posts=tuple(p["id"] for p in posts), fill_threads=True,
+                                         comments_per_post=0), "comments")
+    ended, during, after = [0.0], [], []
+    start = time.perf_counter()
+    w.fetch_job.worker.finished.connect(lambda *_: ended.__setitem__(0, time.perf_counter() - start))
+    while w.fetch_job.busy:
+        r = beat.run(gestures(w)["hover"]() if page == "overview" else [], 200)
+        (after if ended[0] else during).append((r, beat.clock.elapsed()))
+    print(f"{len(posts) * 400:,} comments downloaded into r/{sub} in {ended[0]:.1f} s, then packed in "
+          f"{time.perf_counter() - start - ended[0]:.1f} s; {page} shown")
+    print(f"{'':<34}{'worst ms':>9}{'>16.7ms':>9}{'busy %':>9}")
+    for name, part in (("while downloading", during), ("as it ends (and packs)", after)):
+        if part:
+            busy = 100 * sum(r["busy"] for r, _ in part) / sum(ms for _, ms in part)
+            print(f"{name:<34}{max(r['worst'] for r, _ in part):>9.1f}{sum(r['over'] for r, _ in part):>9}{busy:>9.0f}")
+    archive.close()
+
+
 def rss_mb() -> float:
     """The process's resident memory now (Linux), or its peak elsewhere."""
     try:
@@ -227,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sort", default="cumulative", help="profile order: cumulative or tottime")
     parser.add_argument("--profile", help="print where the time goes in interactions whose name has this in it")
     parser.add_argument("--db", help="a copy of this database instead of made-up data (the file isn't changed)")
+    parser.add_argument("--fetch", metavar="PAGE", help="frame gaps with PAGE shown while comments download")
     args = parser.parse_args(argv)
 
     tmp = Path(tempfile.mkdtemp(prefix="ikari-perf-"))
@@ -292,6 +349,10 @@ def main(argv: list[str] | None = None) -> int:
                 pstats.Stats(prof).sort_stats(args.sort).print_stats(45)
             print(f"{name:<34}{r['worst']:>9.1f}{r['over']:>9}{r['busy']:>9.0f}")
 
+    if args.fetch:
+        downloading(w, args.fetch, beat)
+        w.close()
+        return 0
     if args.repaints:
         for page in ("overview", "words"):
             w.show_page(page)

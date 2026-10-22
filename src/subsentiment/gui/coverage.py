@@ -294,6 +294,7 @@ class CoveragePage(VerticalScrollArea):
         self._comments_done: set[str] = set()
         self._comments_so_far: set[str] = set()
         self._day_rows: list[int] = []
+        self._drawn: dict[tuple, tuple] = {}  # what each day's cells show (_changed)
         # Day -> (saved, archive count or None, removed and image posts seen, complete), as last shown.
         self._day_state: dict[int, tuple] = {}
         # Day -> (posts with every comment saved, saved posts), for self._threads_for: (subreddit lowercased, after,
@@ -606,6 +607,7 @@ class CoveragePage(VerticalScrollArea):
                 threads.clicked.connect(lambda _=False, d=day: self._download_day_threads(d))
                 t.setCellWidget(row, 4, centred(threads))
             self._day_rows = list(self.days)
+            self._drawn.clear()
             row = self.days.index(keep) if keep in self.days else 0
             t.selectRow(row)
         counting = self.count_job.busy
@@ -615,20 +617,23 @@ class CoveragePage(VerticalScrollArea):
             n, total, done = saved.get(day, 0), totals.get(day), str(day) in complete
             gone = removed.get(day, 0)
             self._day_state[day] = (n, total, gone, done)
+            opened = no_total(day, n, total, done)
+            # Until its count is in, a day can't be told apart from one that's done or empty, so it waits;
+            # a complete day needs no count to be checked again.
+            waiting = not opened and total is None and counting and not done
+            if waiting:
+                self._waiting.add(day)
+            if not self._changed(("posts", day), n, total, gone, done, waiting, self.busy, current, self.days[0]):
+                continue
             cell: Cell = t.cellWidget(row, 1)
             button: QPushButton = t.cellWidget(row, 2).findChild(QPushButton)
-            if no_total(day, n, total, done):
+            if opened:
                 cell.set_open(n, "today" if day >= current else "wrong", total)
                 button.setText(DOWNLOAD)
                 button.setEnabled(not self.busy)
                 button.setToolTip("Download all: every post from today so far" if day >= current
                                   else f"Download all: every post from {day_text(day)}")
                 continue
-            # Until its count is in, a day can't be told apart from one that's done or empty, so it waits;
-            # a complete day needs no count to be checked again.
-            waiting = total is None and counting and not done
-            if waiting:
-                self._waiting.add(day)
             cell.set(n, total, done, "post", gone, waiting)
             full = done or (total is not None and 0 < total <= n + gone)
             button.setText(CHECK if full else DOWNLOAD)
@@ -650,6 +655,15 @@ class CoveragePage(VerticalScrollArea):
         self.subtitle.setText(f"{range_text(self.days[-1], self.days[0])} · {plural(len(self.days), 'day')} "
                               "fetched before" + (f" · {plural(empty, 'day')} with no posts left out" if empty else ""))
         self._show_ticked()
+
+    def _changed(self, cell, *shown) -> bool:
+        """Whether a day's cell (("posts" or "threads", day)) is to show other than it does: once a second while
+        a download runs, filling in every cell of two years of days again took a fifth of a second."""
+        shown = (self.subreddit, *shown)
+        if self._drawn.get(cell) == shown:
+            return False
+        self._drawn[cell] = shown
+        return True
 
     def _no_posts(self, day: int) -> bool:
         """The archive counts no posts on the day and none are saved: it isn't listed, ticked or downloaded."""
@@ -723,9 +737,11 @@ class CoveragePage(VerticalScrollArea):
     def _show_threads(self) -> None:
         """Each day's comment threads column: how many of its saved posts have every comment saved."""
         for row, day in enumerate(self._day_rows):
+            whole, posts = self._threads_on(day)
+            if not self._changed(("threads", day), whole, posts, self.busy):
+                continue
             cell: Cell = self.day_table.cellWidget(row, 3)
             button: QPushButton = self.day_table.cellWidget(row, 4).findChild(QPushButton)
-            whole, posts = self._threads_on(day)
             if not posts:
                 cell.show_share("No posts saved", "None", "", None, False,
                                 "Download the day's posts first; their comments come after.")

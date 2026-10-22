@@ -242,6 +242,7 @@ class TimelineChart(QWidget):
         self._drawn: QPixmap | None = None
         self._drawn_for = None
         self._painted_for = None  # what the last paint showed
+        self._new_data = False  # points or notes changed since the last paint: a change that then holds still
 
         self.toolbar = QWidget()
         bar = QHBoxLayout(self.toolbar)
@@ -267,6 +268,7 @@ class TimelineChart(QWidget):
         old_end = self.domain()[1]
         self.points = list(points)
         self._version += 1
+        self._new_data = True
         self._days = [d for d, _, _ in self.points]
         self._grouped.clear()
         if self.view is not None and self.view[1] >= old_end:
@@ -278,6 +280,7 @@ class TimelineChart(QWidget):
         self.notes = dict(notes)
         self._note_days = sorted(self.notes)
         self._version += 1
+        self._new_data = True
         self.update()
 
     def notes_in(self, start: float, end: float) -> list[tuple[str, str]]:
@@ -485,7 +488,10 @@ class TimelineChart(QWidget):
         p = QPainter(self)
         if key == self._drawn_for:
             p.drawPixmap(-lead, self._drawn)
-        elif key == self._painted_for:  # painted like this once already, so it holds still: keep a picture
+        # Painted like this once already, so it holds still: keep a picture. New points do too (a running fetch's,
+        # four times a second): painted straight on, then again as a picture for the hover over it, it was painted
+        # twice for each.
+        elif key == self._painted_for or self._new_data:
             self._drawn = QPixmap((self.size() + QSize(lead.x(), lead.y())) * dpr)
             self._drawn.setDevicePixelRatio(dpr)
             self._drawn.fill(Qt.GlobalColor.transparent)
@@ -498,7 +504,7 @@ class TimelineChart(QWidget):
         else:  # each frame of a zoom or a drag differs: straight onto the widget
             self._paint_chart(p, colors, t)
             p.setFont(_ui_font(9))
-        self._painted_for = key
+        self._painted_for, self._new_data = key, False
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         plot, _ = self._areas()
         lo, hi, bound = self._screen

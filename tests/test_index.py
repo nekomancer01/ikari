@@ -380,3 +380,24 @@ def test_search_finds_every_word_typed_the_last_as_it_is_being_typed(saved, kind
     index.reorder()
     assert {i.decode() for i in index.ids[index.search("fight")]} == _found(rows, kind, "fight")
     index.close()
+
+
+def test_rows_a_fetch_adds_are_found_by_id_without_sorting_every_id_again(saved, monkeypatch):
+    # Each thread of comments a fetch saved sorted every id of the subreddit again: 65 ms with 190,000 comments.
+    path, s = saved
+    index = RowIndex(path, "comments", "deltarune")
+    assert index.where(["c3_1"])[0] >= 0  # the ids sorted once, here
+    sorted_sizes, real_argsort = [], np.argsort
+    monkeypatch.setattr(np, "argsort", lambda a, *args, **kw: sorted_sizes.append(len(a)) or real_argsort(a, *args, **kw))
+    rng = random.Random(4)
+    for n in range(3):
+        since = clock.time()
+        clock.sleep(0.01)
+        _fill(s, rng, posts=3, per=4, day0=DAY0 + 13 + n, prefix=f"more{n}")
+        index.add(s.rows("comments", "deltarune", since=since))
+    assert sorted_sizes and max(sorted_sizes) <= 12  # only each fetch's own
+    at = {i.decode(): p for p, i in enumerate(index.ids)}
+    every = [r["id"] for r in s.rows("comments", "deltarune")]
+    assert len(at) == len(every) and index.where(every).tolist() == [at[i] for i in every]
+    assert index.where(["more9c0_0", "c3_1x"]).tolist() == [-1, -1]
+    index.close()
