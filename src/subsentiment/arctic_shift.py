@@ -344,6 +344,7 @@ class ArcticShiftClient:
         timeouts = garbled = 0
         stop = None if getattr(self._local, "finishing", False) else self.should_stop
         for attempt in range(ATTEMPTS):
+            down = 0  # this answer's HTTP status, if it's a server error (5xx)
             backoff = min(5.0 * 2 ** attempt, MAX_WAIT)
             flight = self.limiter.wait(stop, share)
             try:
@@ -407,11 +408,17 @@ class ArcticShiftClient:
                                   "Arctic Shift asked ikari to slow down")
                 continue
             if resp.status_code >= 500:
-                self.limiter.hold(backoff)
+                # The archive itself failing (it answered 500 "Internal server error" to everything, 22 Oct), not a
+                # limit: said as such rather than "busy", which read as ikari being throttled.
+                down = resp.status_code
+                self.limiter.hold(backoff, f"Arctic Shift is down right now (server error {down})")
                 continue
             if resp.status_code == 200:
                 raise FetchError(f"Arctic Shift: {error}")
             raise FetchError(f"Arctic Shift returned HTTP {resp.status_code}" + (f": {error}" if error else "."))
+        if down:
+            raise FetchError(f"Arctic Shift is down right now: it kept answering with a server error ({down}). "
+                             "Try again later; what was saved is kept.")
         raise FetchError("Arctic Shift is busy or rate limiting. Try again in a few minutes.")
 
     @property
