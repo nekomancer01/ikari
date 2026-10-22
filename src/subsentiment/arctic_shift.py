@@ -64,7 +64,6 @@ TREE_SHARE = 0.5
 TREE_WORKERS = 8
 TREE_LIMIT = 300  # comments asked for per thread; big trees are slow for the archive and trip its limits
 TREE_MAX = 25000  # the most comments the tree endpoint returns in one request
-UNKNOWN_THREAD = 1000  # what fetch_all_comments asks for when a post's comment count isn't known yet
 INGEST_LAG = 3600  # seconds; a stretch read more recently than this may still get posts (see fetch_posts)
 COUNT_CHUNK_DAYS = 31  # days per aggregate request; a timing-out chunk is split down to one day
 DAY = 86400
@@ -819,11 +818,11 @@ class ArcticShiftClient:
         picked by ``pick`` from the whole thread, and whether what's returned is the whole thread: False when
         the archive cut it short, left replies collapsed, or the cap left some out. The whole thread is asked
         for either way, as the archive can't rank it, and a whole tree came back as fast as a 100-comment
-        one live (1.2-3 s for 141-1,123 comments, 21 Oct)."""
-        known = post.num_comments if post.num_comments is not None else UNKNOWN_THREAD
-        size = min(TREE_MAX, max(PAGE, known + 50))
-        comments, items, collapsed = self._thread(post, size)
-        sent = _number(self.last_params.get("limit"), size)  # smaller if the archive timed out
+        one live (1.2-3 s for 141-1,123 comments, 21 Oct). Always TREE_MAX, not the post's comment count: the
+        archive's count lags its tree, and a big thread asked for its count plus some came back with replies
+        collapsed every time, so it was never saved whole (live, 22 Oct: 1,078 counted, 1,264 in the tree)."""
+        comments, items, collapsed = self._thread(post, TREE_MAX)
+        sent = _number(self.last_params.get("limit"), TREE_MAX)  # smaller if the archive timed out
         kept = keep(comments, cap, pick, post.id)
         return kept, items < sent and not collapsed and len(kept) == len(comments)
 

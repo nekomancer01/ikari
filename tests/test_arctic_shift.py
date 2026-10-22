@@ -517,14 +517,13 @@ def test_all_comments_ask_for_the_whole_thread_and_say_whether_it_is_complete():
     c = client([ok(tree)])
     comments, whole = c.fetch_all_comments(p)
     assert len(comments) == 5 and whole
-    assert c.session.calls[0][1] == {"link_id": "p1", "limit": 1250}
+    assert c.session.calls[0][1] == {"link_id": "p1", "limit": arctic_shift.TREE_MAX}  # not the post's count
 
     collapsed = tree + [{"kind": "more", "data": {"count": 4, "children": ["x1", "x2"]}}]
     assert client([ok(collapsed)]).fetch_all_comments(p)[1] is False
 
-    small = Post("p1", "Python", "t", "", "a", 10, 0.9, 0, 1.0, "u", "")  # asks for at least a page
-    full = [node(comment(f"c{i}", "t3_p1", i)) for i in range(100)]
-    assert client([ok(full)]).fetch_all_comments(small)[1] is False  # a full page may have been cut short
+    full = [node(comment(f"c{i}", "t3_p1", i)) for i in range(arctic_shift.TREE_MAX)]
+    assert client([ok(full)]).fetch_all_comments(p)[1] is False  # a full tree may have been cut short
 
 
 def test_a_capped_thread_is_read_whole_then_picked_top_scoring_or_at_random_the_same_way_each_time():
@@ -534,7 +533,7 @@ def test_a_capped_thread_is_read_whole_then_picked_top_scoring_or_at_random_the_
     tree = [node(comment(f"c{i}", "t3_p1", i, score=i % 7, depth=0)) for i in range(40)]
     c = client([ok(tree)] * 4)
     top, whole = c.fetch_all_comments(p, 5, "top")
-    assert c.session.calls[0][1] == {"link_id": "p1", "limit": 100}  # the whole thread, not 5
+    assert c.session.calls[0][1] == {"link_id": "p1", "limit": arctic_shift.TREE_MAX}  # the whole thread, not 5
     assert [x.score for x in top] == [6] * 5 and not whole
     some, whole = c.fetch_all_comments(p, 5, "random")
     assert len(some) == 5 and not whole
