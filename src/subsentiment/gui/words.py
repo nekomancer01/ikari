@@ -780,23 +780,23 @@ class MeaningSlider(QSlider):
     def minimumSizeHint(self) -> QSize:
         return QSize(80, 22)
 
+    R = 9  # the handle's radius: it stays inside the widget at either end
+
     def _x(self, value: int) -> float:
-        r = 9  # the handle's radius: it stays inside the widget at either end
-        return r + (self.width() - 2 * r) * (value - self.minimum()) / (self.maximum() - self.minimum())
+        return self.R + (self.width() - 2 * self.R) * (value - self.minimum()) / (self.maximum() - self.minimum())
 
     def mousePressEvent(self, e) -> None:  # jump to where it's pressed, then drag from there
         if e.button() == Qt.MouseButton.LeftButton:
-            span = max(self.width() - 18, 1)
             self.setSliderDown(True)
-            self.setValue(round(self.minimum() + (e.position().x() - 9) / span * (self.maximum() - self.minimum())))
+            self.mouseMoveEvent(e)
             e.accept()
         else:
             super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e) -> None:
         if self.isSliderDown():
-            span = max(self.width() - 18, 1)
-            self.setValue(round(self.minimum() + (e.position().x() - 9) / span * (self.maximum() - self.minimum())))
+            lo, hi, span = self.minimum(), self.maximum(), max(self.width() - 2 * self.R, 1)
+            self.setValue(round(lo + (e.position().x() - self.R) / span * (hi - lo)))
 
     def mouseReleaseEvent(self, e) -> None:
         if self.isSliderDown():
