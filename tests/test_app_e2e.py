@@ -1572,3 +1572,25 @@ def test_download_all_comments_asks_nothing_for_posts_that_turn_out_to_have_none
     asked = {q["link_id"] for p, q in env.archive.requests if p == TREE}
     assert asked == {p["id"] for p in in_day if p["num_comments"]}  # none for the posts with no comments
     assert cov.all_comments.text() == "Download all comments" and not cov.all_comments.isEnabled()
+
+
+
+def test_the_strip_says_the_archive_is_down_while_it_answers_server_errors(env, monkeypatch):
+    # Live, 22 Oct: the archive answered 500 "Internal server error" to everything, and the strip said "Arctic Shift
+    # is busy. Waiting 40 s…", which read as ikari being rate limited.
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 4.0)  # long enough to be announced (3 s or more)
+    w = env.window()
+    env.archive.fail(SEARCH, (500, {"data": None, "error": "Internal server error"}))
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(False)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("day"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    said = set()
+    end = time.monotonic() + 30
+    while w.fetch_job.busy:
+        assert time.monotonic() < end, said
+        said.add(w.progress_msg.text())
+        pump(5)
+    assert "Arctic Shift is down right now (server error 500). Waiting 4 s before the next request…" in said, said
+    assert not [m for m in said if "busy" in m], said
+    assert not env.warnings and "Added" in w.progress_msg.text()

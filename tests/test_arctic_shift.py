@@ -369,9 +369,29 @@ def test_waits_are_capped():
 def test_server_and_network_errors_retry_then_give_up():
     c = client([FakeResponse(503), requests.ConnectionError("reset"), FakeResponse(502), FakeResponse(500),
                 FakeResponse(503), FakeResponse(503), FakeResponse(504), FakeResponse(503)])
-    with pytest.raises(FetchError, match="busy"):
+    with pytest.raises(FetchError, match="Arctic Shift is down right now: it kept answering with a server error "
+                                         r"\(503\)"):
         c.get(*SEARCH)
     assert len(c.session.calls) == 8
+
+
+def test_an_archive_answering_server_errors_is_said_to_be_down_not_busy():
+    # Live, 22 Oct: every request got 500 "Internal server error". It was announced as "Arctic Shift is busy" and
+    # given up on as "busy or rate limiting", which read as ikari being throttled.
+    c = client([FakeResponse(500, {"data": None, "error": "Internal server error"})] * 8)
+    told = []
+    c.limiter.on_wait = lambda secs, why: told.append((round(secs), why))
+    with pytest.raises(FetchError) as raised:
+        c.get(*SEARCH)
+    assert told[0] == (5, "Arctic Shift is down right now (server error 500)")
+    assert {why for _, why in told} == {"Arctic Shift is down right now (server error 500)", ""}
+    assert "down right now" in str(raised.value) and "busy" not in str(raised.value)
+
+
+def test_a_rate_limit_that_never_lifts_still_says_rate_limiting():
+    c = client([FakeResponse(429, headers={"X-RateLimit-Reset": "1"})] * 8)
+    with pytest.raises(FetchError, match="busy or rate limiting"):
+        c.get(*SEARCH)
 
 
 def test_network_error_on_the_last_attempt_is_raised():
