@@ -35,7 +35,7 @@ from subsentiment.gui.widgets import (
     ElidedLabel, ProgressBar, QuietScrollBars, ShrinkingComboBox, StatusLabel, Throbber, fit_to_screen, label, panel,
     plural, section,
 )
-from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices, ThreadScorer, finish
+from subsentiment.gui.worker import BackgroundJob, Collector, FetchWorker, LoadWorker, Slices, ThreadScorer, finish
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, scoring_at_least
 
@@ -181,6 +181,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, db_path: str):
         super().__init__()
+        Collector.start()  # garbage is collected on this thread from here on, never on a reading thread
         self.setWindowTitle(self.title_text())
         self.resize(fit_to_screen(QSize(1320, 860), QGuiApplication.primaryScreen()))
         self.db_path = db_path
