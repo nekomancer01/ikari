@@ -2,6 +2,7 @@
 store, and a fake archive in place of Arctic Shift. Nothing may be downloaded unless a Download all
 button is clicked, and each button fetches only what it says."""
 import os
+import threading
 import time
 
 from dataclasses import replace
@@ -111,12 +112,19 @@ def settle(w, until=lambda: True, timeout=5.0):
         QApplication.processEvents()
         cov = w.coverage
         idle = not w.fetch_job.busy and (cov is None or not (cov.count_job.busy or cov.delete_job.busy
-                                                             or cov.threads_job.busy))
+                                                             or cov.reading()))
         if idle and until():
             break
         time.sleep(0.01)
     for _ in range(5):
         QApplication.processEvents()
+
+
+def day_cell(cov, row: int, col: int):
+    """A day row's widget in a column, the row scrolled into view first as a user would: Download coverage gives
+    rows their widgets as they come near the view."""
+    cov.day_table.scrollTo(cov.day_table.model().index(row, col))
+    return cov.day_table.cellWidget(row, col)
 
 
 def downloads():
@@ -174,7 +182,7 @@ def test_a_days_download_all_fetches_that_days_posts_and_no_comments(window):
     assert w.store.posts_per_day("Python", day, day + DAY) == {day: 5}  # one saved before, four new
     # Enter afterwards doesn't run it again: give it focus as a real click does (the offscreen platform
     # doesn't) and press Enter.
-    used = c.day_table.cellWidget(c.days.index(day), 2).findChild(QPushButton)
+    used = day_cell(c, c.days.index(day), 2).findChild(QPushButton)
     assert used.focusPolicy() == Qt.FocusPolicy.NoFocus  # a click doesn't leave it focused, so Space can't either
     w.activateWindow()
     used.setFocus(Qt.FocusReason.MouseFocusReason)
@@ -210,11 +218,11 @@ def test_each_day_says_how_many_comment_threads_are_saved_whole_and_follows_down
     settle(w, lambda: c.totals)
 
     def line(day):  # the day's Comment threads column
-        return c.day_table.cellWidget(c.days.index(day), 3).main
+        return day_cell(c, c.days.index(day), 3).main
     day = TODAY - DAY  # p0 is on this day; p1 and p2 on the two before, each with 5 comments to get
     assert [line(TODAY - k * DAY).full_text() for k in (1, 2, 3)] == ["0 of 1\u00a0thread"] * 3
     assert line(TODAY).full_text() == "No posts saved"  # nothing saved today: no threads to count
-    assert not c.day_table.cellWidget(c.days.index(TODAY), 4).findChild(QPushButton).isEnabled()
+    assert not day_cell(c, c.days.index(TODAY), 4).findChild(QPushButton).isEnabled()
     assert c.threads_total.text() == "Comments complete on 0 of 3\u00a0posts"
     c.day_table.selectRow(c.days.index(day))
     settle(w)
@@ -236,9 +244,51 @@ def test_each_day_says_how_many_comment_threads_are_saved_whole_and_follows_down
     narrow.close()
 
 
+def test_a_long_history_opens_with_the_rows_on_screen_and_reads_off_the_window_thread(window, monkeypatch):
+    """Two years of days and a day of 1,500 posts. Every day's five widgets were built as the page opened (three
+    seconds for 711 days at the owner's size), and what's saved was read on the window's thread: now only the
+    rows near the view are built, and the reads run on threads of their own."""
+    w = window
+    day = TODAY - DAY
+    for d in range(TODAY - 729 * DAY, TODAY - DAY, DAY):  # a post on each day: the days listed are the ones saved
+        w.store.save_post(post(f"old{d}", "Python", d + 300), 0.0, "neutral")
+    for i in range(1500):
+        w.store.save_post(post(f"busy{i}", "Python", day + 600 + i), 0.0, "neutral")
+    w.store.commit()
+    on_window = []  # reads of what Coverage shows made on the window's thread
+    for name in ("downloaded_days", "tried_days", "posts_per_day", "removed_per_day", "archive_counts", "complete_keys",
+                 "comment_coverage", "whole_threads_per_day"):
+        real = getattr(Store, name)
+
+        def read(self, *a, real=real, name=name, **k):
+            if threading.current_thread() is threading.main_thread():
+                on_window.append(name)
+            return real(self, *a, **k)
+        monkeypatch.setattr(Store, name, read)
+    cells = []  # each day row has two, each post row one
+    real_cell = coverage.Cell.__init__
+    monkeypatch.setattr(coverage.Cell, "__init__", lambda self: (cells.append(1), real_cell(self))[1])
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    assert len(c.days) == 730 and c.day_table.rowCount() == 730
+    c.day_table.selectRow(c.days.index(day))  # the busy day, opened
+    settle(w, lambda: c.post_table.rowCount() == 1501)
+    assert c.posts_title.text() == f"Posts on {coverage.short_day(day)} · 1,501"
+    assert 0 < len(cells) < 100, len(cells)  # before: 1,460 for the days, as the page opened
+    assert on_window == []  # before: every read but the threads' count
+    c.day_table.scrollToBottom()  # scrolled to the oldest day: its row is built as it comes into view
+    settle(w)
+    assert len(cells) < 200
+    oldest = c.days.index(TODAY - 729 * DAY)
+    assert day_cell(c, oldest, 1).main.text() == "1 of 10"  # the stand-in archive counts 10 a day
+    assert on_window == [] and downloads() == []
+
+
 def tick(c, day, shift=False):
     """A real click on a day's tick box, with Shift held for a run of days."""
-    box = c.day_table.cellWidget(c.days.index(day), 0).findChild(QCheckBox)
+    box = day_cell(c, c.days.index(day), 0).findChild(QCheckBox)
     QTest.mouseClick(box, Qt.MouseButton.LeftButton,
                      Qt.KeyboardModifier.ShiftModifier if shift else Qt.KeyboardModifier.NoModifier)
     settle(c.window_)
@@ -259,12 +309,12 @@ def test_ticking_days_downloads_nothing_until_download_selected(window):
     assert c.ticked == {TODAY - DAY, TODAY - 3 * DAY, TODAY - 4 * DAY}
     c.tick_all.click()
     assert c.ticked == set(c.days) and c.tick_all.text() == "Select none"
-    boxes = [c.day_table.cellWidget(r, 0).findChild(QCheckBox) for r in range(c.day_table.rowCount())]
+    boxes = [day_cell(c, r, 0).findChild(QCheckBox) for r in range(c.day_table.rowCount())]
     assert all(b.isChecked() for b in boxes)
     w.show_page("overview")
     w.show_page("coverage")  # the page rebuilt its rows: the ticks stay
     settle(w)
-    assert all(c.day_table.cellWidget(r, 0).findChild(QCheckBox).isChecked() for r in range(c.day_table.rowCount()))
+    assert all(day_cell(c, r, 0).findChild(QCheckBox).isChecked() for r in range(c.day_table.rowCount()))
     c.tick_all.click()
     assert c.ticked == set() and c.tick_all.text() == "Select all"
     tick(c, TODAY - DAY)
@@ -417,13 +467,13 @@ def test_a_thread_holding_the_cap_counts_as_done_until_the_cap_is_raised(window)
     day = TODAY - 2 * DAY
     row = c.days.index(day)
     c.day_table.selectRow(row)
-    QTest.mouseClick(c.day_table.cellWidget(row, 4).findChild(QPushButton), Qt.MouseButton.LeftButton)
+    QTest.mouseClick(day_cell(c, row, 4).findChild(QPushButton), Qt.MouseButton.LeftButton)
     settle(w, lambda: not w.fetch_job.busy)
     assert FakeArchive.caps == [(3, "top")] and len(w.store.comments("Python")) == 3  # 3 of p1's 5
-    cell = c.day_table.cellWidget(row, 3)
+    cell = day_cell(c, row, 3)
     settle(w, lambda: cell.main.full_text().startswith("✓"))
     assert cell.main.full_text() == "✓ 1\u00a0thread"  # on main: "0 of 1 thread"
-    assert c.day_table.cellWidget(row, 4).findChild(QPushButton).text() == coverage.CHECK
+    assert day_cell(c, row, 4).findChild(QPushButton).text() == coverage.CHECK
     assert not c.all_comments.isEnabled()  # the opened day's posts offer nothing more at this cap
     assert c.post_table.cellWidget(0, 2).findChild(QPushButton).text() == coverage.CHECK
     c.comment_cap.count.setValue(4)  # a bigger cap: the thread is owed one more
@@ -571,7 +621,7 @@ def test_nothing_else_writes_while_days_are_deleted(window, monkeypatch):
     answer(c, True, wait=False)
     assert c.delete_job.busy
     assert not w.fetch_btn.isEnabled() and not c.download_ticked.isEnabled() and not w.delete_btn.isEnabled()
-    assert not c.day_table.cellWidget(0, 2).findChild(QPushButton).isEnabled()
+    assert not day_cell(c, 0, 2).findChild(QPushButton).isEnabled()
     assert not w.start_request(mw.collect.FetchRequest(subreddit="Python"), "x")
     names = [w.datasets.item(i).data(Qt.ItemDataRole.UserRole) for i in range(w.datasets.count())]
     w.datasets.setCurrentRow(names.index("rust"))  # another subreddit looked at meanwhile stays on screen
@@ -580,7 +630,7 @@ def test_nothing_else_writes_while_days_are_deleted(window, monkeypatch):
     settle(w, lambda: not c.delete_job.busy)
     assert w.current == "rust" and c.subreddit == "rust"
     assert w.fetch_btn.isEnabled() and w.delete_btn.isEnabled()
-    assert c.day_table.cellWidget(0, 2).findChild(QPushButton).isEnabled()
+    assert day_cell(c, 0, 2).findChild(QPushButton).isEnabled()
     assert w.store.posts_per_day("Python", TODAY - DAY, TODAY) == {}
     assert downloads() == []
 
@@ -615,7 +665,7 @@ def test_day_counts_are_kept_and_asked_for_again_only_the_next_day(window, monke
         c = again.coverage
         assert len(counts_asked()) == 1
         row = c.days.index(TODAY - 2 * DAY)
-        assert c.day_table.cellWidget(row, 1).main.text() == "1 of 10"
+        assert day_cell(c, row, 1).main.text() == "1 of 10"
         c.recount.click()  # Recount asks anyway
         settle(again)
         assert len(counts_asked()) == 2
@@ -667,12 +717,12 @@ def test_a_days_comments_button_fetches_that_days_threads_only(window):
     c = w.coverage
     settle(w, lambda: c.totals and c._threads)
     row = c.days.index(TODAY - 2 * DAY)
-    button = c.day_table.cellWidget(row, 4).findChild(QPushButton)
+    button = day_cell(c, row, 4).findChild(QPushButton)
     assert button.text() == coverage.DOWNLOAD and button.isEnabled()
     QTest.mouseClick(button, Qt.MouseButton.LeftButton)
-    settle(w, lambda: not w.fetch_job.busy and c.day_table.cellWidget(row, 3).main.full_text().startswith("✓"))
+    settle(w, lambda: not w.fetch_job.busy and day_cell(c, row, 3).main.full_text().startswith("✓"))
     assert downloads() == [("all_comments", "p1")]
-    assert c.day_table.cellWidget(row, 4).findChild(QPushButton).text() == coverage.CHECK
+    assert day_cell(c, row, 4).findChild(QPushButton).text() == coverage.CHECK
 
 
 def test_the_filter_shows_only_days_missing_something_and_select_all_ticks_those(window):
@@ -752,7 +802,7 @@ def test_the_once_a_second_refresh_during_a_download_redraws_only_the_days_that_
     w.show_page("coverage")
     c = w.coverage
     settle(w, lambda: c.totals)
-    cells = {id(c.day_table.cellWidget(row, col)): (day, col) for row, day in enumerate(c.days) for col in (1, 3)}
+    cells = {id(day_cell(c, row, col)): (day, col) for row, day in enumerate(c.days) for col in (1, 3)}
     drawn = []
     for name in ("set", "set_open", "show_share"):
         real = getattr(coverage.Cell, name)
@@ -769,7 +819,7 @@ def test_the_once_a_second_refresh_during_a_download_redraws_only_the_days_that_
     c.refresh_saved()
     settle(w)
     assert (day, 1) in drawn and {d for d, _ in drawn} == {day}  # its posts, and its threads once they're counted
-    assert c.day_table.cellWidget(c.days.index(day), 1).main.full_text().startswith("2")
+    assert day_cell(c, c.days.index(day), 1).main.full_text().startswith("2")
 
 
 def test_row_buttons_sit_whole_and_centred_in_their_cells(window):
@@ -788,6 +838,7 @@ def test_row_buttons_sit_whole_and_centred_in_their_cells(window):
         assert t.cellWidget(0, cols[0]).width() < t.columnWidth(cols[0])  # the theme's item padding is off it
         for row in range(t.rowCount()):
             for col in cols:
+                t.scrollTo(t.model().index(row, col))  # a row gets its widgets as it comes near the view
                 box = t.cellWidget(row, col)
                 b = box.findChild(QPushButton)
                 assert box.rect().contains(b.geometry()), (row, col, box.rect(), b.geometry())

@@ -529,3 +529,55 @@ class BackgroundJob(QObject):
         self.worker.deleteLater()
         self.qthread = self.worker = None
         self.ended.emit()
+
+
+class StoreRead(QObject):
+    """Reads saved data with a Store method on a thread of its own (a StoreWorker), so the window paints meanwhile.
+    ``got`` emits (what was asked, the answer) for each read. Asked again while a read runs, it reads once more
+    when that one ends, with the newest ask; the answer in hand is still given, so asks coming faster than reads
+    never hold every answer back. A failed read gives nothing."""
+    got = Signal(object, object)
+
+    def __init__(self, db_path: str, method: str, parent: QObject | None = None):
+        super().__init__(parent)
+        self.db_path, self.method = db_path, method
+        self.job = BackgroundJob(self)
+        self.job.ended.connect(self._ended)
+        self._asked: tuple | None = None
+        self._next: tuple | None = None
+        self._answer = None
+
+    @property
+    def busy(self) -> bool:
+        return self.job.busy
+
+    def ask(self, *args) -> None:
+        self._next = args
+        if not self.job.busy:
+            self._start()
+
+    def close(self) -> None:
+        """As the app closes: a read under way is waited for, and its answer dropped."""
+        self._next = None
+        if self.job.busy:
+            self.job.ended.disconnect()
+            self.job.qthread.quit()
+            self.job.qthread.wait(3000)
+
+    def _start(self) -> None:
+        self._asked, self._next, self._answer = self._next, None, None
+        worker = StoreWorker(self.db_path, self.method, *self._asked)
+        worker.finished.connect(self._on_answer)  # a bound method, so it's handled on this object's thread
+        self.job.start(worker)
+
+    @Slot(object)
+    def _on_answer(self, answer) -> None:
+        self._answer = answer
+
+    @Slot()
+    def _ended(self) -> None:
+        asked, answer = self._asked, self._answer
+        if self._next is not None:  # asked again meanwhile
+            self._start()
+        if answer is not None:
+            self.got.emit(asked, answer)
