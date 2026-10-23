@@ -992,8 +992,9 @@ class CoveragePage(VerticalScrollArea):
             count = sum(saved.get(d, 0) for d in days)
             when = day_text(days[0]) if n == 1 else f"{range_text(days[0], days[-1])} ({plural(n, 'day')})"
             self.delete_question.setText(
-                f"Delete {plural(count, 'post')} saved from {when} in r/{self.subreddit}, with their comments and "
-                "sentiment? The days show as not downloaded, ready to download again. Timeline notes stay. "
+                f"Delete {plural(count, 'post')} saved from {when} in r/{self.subreddit}, with their comments, every "
+                f"comment written on {'that day' if n == 1 else 'those days'}, and their sentiment? The days show as not "
+                "downloaded, ready to download again. Timeline notes stay. "
                 "This can't be undone.")
             self.delete_confirm.setText(f"Delete {plural(n, 'day')}")
         days = sorted(self.ticked) or self._day_rows

@@ -605,6 +605,38 @@ def test_deleting_every_saved_day_keeps_the_subreddit_on_screen_to_download_agai
     assert TODAY - DAY not in c.days  # the day has nothing saved now: it isn't listed
 
 
+def test_a_deleted_day_leaves_the_timeline_with_the_late_comments_written_on_it(window):
+    """A comment counts on the day it was written, so a reply written on a deleted day to an older day's post
+    goes with the day: nothing of it stays on the timeline, tiles, tables or words. The older post's thread
+    keeps its record of being downloaded, so the reply isn't fetched back onto the deleted day."""
+    w = window
+    s = w.store
+    s.save_comment(Comment("late", "p2", "Python", "t3_p2", "b", "zebrafish", 1, TODAY - DAY + 900, 0, "u"),
+                   0.8, "positive")
+    s.mark_complete("comments", "Python", "p2")
+    s.commit()
+    select(w, "rust")
+    select(w, "Python")
+    assert [d for d, _, _ in w.overview.timeline.points] == [TODAY - 3 * DAY, TODAY - 2 * DAY, TODAY - DAY]
+    assert "zebrafish" in {word for word, _, _ in w.word_tally.top(["posts", "comments"], 500)}
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    tick(c, TODAY - DAY)  # p0's day, and the day "late" was written
+    QTest.mouseClick(c.delete_ticked, Qt.MouseButton.LeftButton)
+    settle(w)
+    assert "every comment written on that day" in c.delete_question.text().replace("\u00a0", " ")
+    answer(c, True)
+    settle(w, lambda: not c.delete_job.busy)
+    assert [d for d, _, _ in w.overview.timeline.points] == [TODAY - 3 * DAY, TODAY - 2 * DAY]
+    assert sum(w._counted.counts.values()) == 2  # p1 and p2
+    assert w.comments == [] and w.comments_tab.model.rowCount() == 0
+    assert "zebrafish" not in {word for word, _, _ in w.word_tally.top(["posts", "comments"], 500)}
+    assert "1 comment" in w.statusBar().currentMessage().replace("\u00a0", " ")
+    assert "p2" in s.complete_keys("comments", "Python")
+    assert downloads() == []
+
+
 def test_nothing_else_writes_while_days_are_deleted(window, monkeypatch):
     w = window
     select(w, "Python")
