@@ -532,14 +532,14 @@ def test_a_timing_out_window_is_narrowed_and_the_rest_still_read():
 
 
 class StuckArchive(ArchiveSession):
-    """Times out on any search window holding ``stuck``, however narrow."""
+    """Times out on any search window holding one of the ``stuck`` times, however narrow."""
 
-    def __init__(self, items, stuck):
+    def __init__(self, items, *stuck):
         super().__init__(items)
         self.stuck = stuck
 
     def get(self, url, params=None, timeout=None):
-        if url.endswith("/api/posts/search") and params["after"] < self.stuck < params["before"]:
+        if url.endswith("/api/posts/search") and any(params["after"] < t < params["before"] for t in self.stuck):
             self.calls.append((url, dict(params)))
             return FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
         return super().get(url, params, timeout)
@@ -550,7 +550,7 @@ def test_a_window_that_times_out_however_narrow_leaves_the_rest_of_the_range_rea
     # an error box at 69%. The rest of the day can still be read; the day just can't be called whole.
     items = [at(T0 + 100 + i * 600, i) for i in range(140)]  # a post every 10 minutes for a day
     clock = FakeClock()
-    c = ArcticShiftClient(session=StuckArchive(items, stuck=T0 + 3 * 3600 + 50),
+    c = ArcticShiftClient(session=StuckArchive(items, T0 + 3 * 3600 + 50),
                           limiter=RateLimiter(0.0, clock, clock.sleep))
     posts = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True)
     got = {p.created_utc for p in posts}
@@ -558,6 +558,21 @@ def test_a_window_that_times_out_however_narrow_leaves_the_rest_of_the_range_rea
     assert len(posts) >= 100 and not c.exhausted and c.timed_out
     c.fetch_posts("python", after=T0 + 12 * 3600, before=T0 + DAY, limit=10000, exhaust=True)
     assert c.exhausted and not c.timed_out  # a fetch that doesn't touch it is unaffected
+
+
+def test_a_stretch_that_times_out_whatever_is_asked_leaves_its_slice_unread_not_the_fetch_failed():
+    # Two hours where every window times out, however narrow: the slice holding them (6:00-12:00) is left
+    # unread from there and the range isn't called read, but the rest of the day is, instead of the whole
+    # fetch failing.
+    items = [at(T0 + 100 + i * 600, i) for i in range(140)]
+    clock = FakeClock()
+    stuck = [T0 + 6 * 3600 + s for s in range(0, 2 * 3600, 300)]
+    c = ArcticShiftClient(session=StuckArchive(items, *stuck), limiter=RateLimiter(0.0, clock, clock.sleep))
+    posts = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True)
+    got = {p.created_utc for p in posts}
+    assert all(T0 + h * 3600 + 100 in got for h in (0, 2, 5, 12, 20))
+    assert not [t for t in got if T0 + 6 * 3600 <= t < T0 + 12 * 3600]
+    assert not c.exhausted and c.timed_out and not c.reached
 
 
 def test_other_errors_are_reported():

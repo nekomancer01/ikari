@@ -1016,6 +1016,43 @@ def test_a_days_download_all_that_hits_a_window_the_archive_cant_answer_saves_th
     assert in_day[0] in saved and in_day[-1] in saved  # both ends of the day were still read
 
 
+def test_a_day_with_hours_the_archive_never_answers_doesnt_end_a_weeks_download(env, monkeypatch):
+    # Three hours of one day time out however narrow the window: that day is left not complete, and the
+    # download goes on through the other days and their comments, with no error box. It used to end the
+    # whole fetch with "Fetch failed" on that day.
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.2)  # timeout back-offs, shortened further
+    w = env.window()
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    after = w.fetch_form.bounds()[0]
+    bad = int(after // DAY * DAY) + 3 * DAY
+    env.archive.stuck = [bad + 8 * 3600 + s for s in range(0, 3 * 3600, 300)]
+    fetch(w)
+    assert env.warnings == [] and "Fetch failed" not in w.progress_msg.text()
+    s = env.store()
+    whole = {str(d) for d in range(int(after // DAY * DAY) + DAY, coverage.today(), DAY)}
+    assert s.complete_keys("posts", "python") == whole - {str(bad)}
+    saved = s.posts("python")
+    older = [r for r in saved if r["created_utc"] < bad]  # read after the bad day, as days go newest first
+    assert older and all(s.comment_ids(r["id"]) for r in older if r["num_comments"])  # and their comments
+    assert any(bad <= r["created_utc"] < bad + 8 * 3600 for r in saved)  # the bad day's first hours
+    assert "timed out on part of the range" in w.progress_msg.text()  # said, though older days read fine
+
+
+def test_a_download_stops_reading_days_once_the_archive_times_out_on_every_one(env, monkeypatch):
+    # When every post search times out, a week's download stops after TIMED_OUT_DAYS days that gave nothing,
+    # rather than putting each of the eight through the whole narrowing, and says to try again later.
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.2)  # timeout back-offs, shortened further
+    w = env.window()
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    after = w.fetch_form.bounds()[0]
+    env.archive.stuck = [t for t in range(int(after) - DAY, int(time.time()) + DAY, 300)]
+    fetch(w)
+    assert env.warnings == [] and not env.store().posts("python")
+    assert "timed out" in w.progress_msg.text() and "try again" in w.progress_msg.text()
+    days_asked = {(int(q["after"]) + 1) // DAY for p, q in env.archive.requests if p == SEARCH}
+    assert len(days_asked) == collect.TIMED_OUT_DAYS
+
+
 def test_coverage_downloads_do_only_what_they_say(env):
     w = env.window()
     fetch(w, comments=False)
