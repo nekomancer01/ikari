@@ -420,6 +420,13 @@ def child(spec: dict) -> int:
         for _ in range(6):
             app.processEvents()
             time.sleep(0.02)
+        # Download coverage reads what's saved on threads: it's measured once that's drawn, or a slow runner
+        # measured it mid-read (its days table lower than the posts one).
+        end = time.monotonic() + 10
+        while window.coverage.isVisible() and window.coverage.reading() and time.monotonic() < end:
+            app.processEvents()
+            time.sleep(0.02)
+        app.processEvents()
 
     def sizes_for(top, opening: QSize) -> list:
         top.resize(opening)
