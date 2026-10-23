@@ -279,11 +279,11 @@ class LazyRows(QObject):
         self.viewport.installEventFilter(self)  # resized or shown: more rows may be on screen
 
     def reset(self, rows: int) -> None:
-        """``rows`` rows, none built yet but the ones on screen."""
+        """``rows`` rows, none built yet: ``fill`` builds the ones on screen, once they're hidden or scrolled to as
+        they're to be."""
         self.table.setRowCount(0)
         self.table.setRowCount(rows)
         self.built.clear()
-        self.fill()
 
     def fill(self, *_) -> None:
         """Build the rows on screen, and soon after the ones a screenful either side."""
@@ -297,6 +297,9 @@ class LazyRows(QObject):
         for row in range(first, last + 1):
             if not t.isRowHidden(row):
                 self._make(row)
+        # Each cell widget set asks for a layout, and the ones set while it's pending are left at the table's
+        # corner, over the rows on screen, until it runs: it runs now.
+        t.executeDelayedItemsLayout()
         span = last - first + 1
         self._near = [r for k in range(1, span + 1) for r in (last + k, first - k) if 0 <= r < n]
         if any(r not in self.built for r in self._near):
@@ -305,9 +308,6 @@ class LazyRows(QObject):
     def _make(self, row: int) -> None:
         if row not in self.built:
             self.build(row)
-            # Each cell widget set asks for a layout, and the ones set while it's pending are left at the table's
-            # corner, over the rows on screen, until it runs: it runs now.
-            self.table.executeDelayedItemsLayout()
             self.built.add(row)
             self.draw(row)
 
@@ -317,8 +317,10 @@ class LazyRows(QObject):
             if row < self.table.rowCount() and not self.table.isRowHidden(row):
                 self._make(row)
                 if time.perf_counter() > end:
-                    return  # more after the next frame
-        self._timer.stop()
+                    break  # more after the next frame
+        else:
+            self._timer.stop()
+        self.table.executeDelayedItemsLayout()
 
     def redraw(self) -> None:
         for row in sorted(self.built):
@@ -585,6 +587,8 @@ class CoveragePage(VerticalScrollArea):
         self.status.setMinimumHeight(self.status.fontMetrics().lineSpacing())
         root.addWidget(self.status)
         self.setWidget(inner)
+        self.viewport().installEventFilter(self)
+        inner.installEventFilter(self)
         self._show_resume()
 
     # -- what's shown ---------------------------------------------------------
@@ -592,7 +596,10 @@ class CoveragePage(VerticalScrollArea):
     def set_subreddit(self, name: str | None) -> None:
         if (name or "").lower() != (self.subreddit or "").lower():
             self.subreddit = name
-            self.day_table.clearSelection()
+            # The last one's days go at once, so no button acts on them for this one while its own are read.
+            self.days, self._day_rows, self._days_for = [], [], ""
+            self.day_rows.reset(0)
+            self._show_posts(None)
             self.ticked.clear()
             self._anchor = None
             self._asking = False
@@ -876,8 +883,7 @@ class CoveragePage(VerticalScrollArea):
 
     def _show_ticked(self, *_) -> None:
         """Tick boxes, the download bar and the buttons under the list, from self.ticked."""
-        for row in self.day_rows.built:  # the rest are ticked as they're built
-            self.day_table.cellWidget(row, 0).findChild(QCheckBox).setChecked(self._day_rows[row] in self.ticked)
+        self.day_rows.redraw()  # the rows not built yet are ticked as they're built
         n = len(self.ticked)
         shown = set(self._shown_days())
         every = bool(shown) and self.ticked >= shown
@@ -982,6 +988,7 @@ class CoveragePage(VerticalScrollArea):
             self._post_ids, self._post_drawn = ids, {}
             self.post_rows.reset(len(rows))
             t.verticalScrollBar().setValue(keep)
+            self.post_rows.fill()
         else:
             self.post_rows.redraw()
         # Not offered again: threads saved whole, or saved whole before the archive counted them (until it
@@ -1050,6 +1057,19 @@ class CoveragePage(VerticalScrollArea):
         return hint
 
     def resizeEvent(self, event) -> None:
+        self._arrange()
+        super().resizeEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:
+        # What's read in on a thread can change what the panels need (a button's text grows) or narrow the
+        # viewport without the page resizing (the page grows taller and a scroll bar comes): they may no longer
+        # fit side by side.
+        if ((obj is self.viewport() and event.type() == QEvent.Type.Resize)
+                or (obj is self.widget() and event.type() == QEvent.Type.LayoutRequest)):
+            self._arrange()
+        return super().eventFilter(obj, event)
+
+    def _arrange(self) -> None:
         left, right = self.panels
         need = left.minimumSizeHint().width() + self.body.spacing() + right.minimumSizeHint().width()
         wide = self.viewport().width() >= need
@@ -1064,7 +1084,6 @@ class CoveragePage(VerticalScrollArea):
         for lay, one in ((self.bar_lines, what + cap + end + 20 + 160 <= room), (self.bar_first, what + cap + 10 <= room)):
             if lay.direction() != (across if one else down):
                 lay.setDirection(across if one else down)
-        super().resizeEvent(event)
 
     # -- archive counts -------------------------------------------------------
 

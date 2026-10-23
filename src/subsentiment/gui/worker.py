@@ -491,8 +491,9 @@ class BackgroundJob(QObject):
 
 class StoreRead(QObject):
     """Reads saved data with a Store method on a thread of its own (a StoreWorker), so the window paints meanwhile.
-    Asked again while a read runs, it reads once more when that one ends, with the newest ask, and only that
-    answer is given: ``got`` emits (what was asked, the answer). A failed read gives nothing."""
+    ``got`` emits (what was asked, the answer) for each read. Asked again while a read runs, it reads once more
+    when that one ends, with the newest ask; the answer in hand is still given, so asks coming faster than reads
+    never hold every answer back. A failed read gives nothing."""
     got = Signal(object, object)
 
     def __init__(self, db_path: str, method: str, parent: QObject | None = None):
@@ -533,9 +534,8 @@ class StoreRead(QObject):
 
     @Slot()
     def _ended(self) -> None:
-        if self._next is not None:  # asked again meanwhile: this answer is already old
+        asked, answer = self._asked, self._answer
+        if self._next is not None:  # asked again meanwhile
             self._start()
-            return
-        answer, self._answer = self._answer, None
         if answer is not None:
-            self.got.emit(self._asked, answer)
+            self.got.emit(asked, answer)

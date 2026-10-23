@@ -1441,6 +1441,9 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
     c = w.coverage
     saved = env.store().posts_per_day("Burst", c.days[-1], c.days[0] + DAY)
     for row, day in enumerate(c.days):
+        if c.day_table.isRowHidden(row):  # a day with no posts, saved or counted, isn't listed
+            assert not saved.get(day), day
+            continue
         shown = day_cell(c, row, 1).main.text()  # "12 of 20", "3 saved so far" or "No posts"
         assert int(re.match(r"[\d,]*", shown).group().replace(",", "") or 0) == saved.get(day, 0), (day, shown)
     w._stop_fetch()
