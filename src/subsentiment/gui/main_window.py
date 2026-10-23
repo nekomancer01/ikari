@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -138,9 +141,23 @@ class MainWindow(QMainWindow):
     # window shows at once and the subreddit fills in once it's read on a thread.
     wait_for_data = True
 
+    @staticmethod
+    def title_text() -> str:
+        """"ikari", plus the checked-out commit in brackets when run from source (not a packaged build)."""
+        if getattr(sys, "frozen", False):
+            return "ikari"
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=here, capture_output=True,
+                                 text=True, timeout=2, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            return "ikari"
+        commit = out.stdout.strip()
+        return f"ikari ({commit})" if out.returncode == 0 and commit else "ikari"
+
     def __init__(self, db_path: str):
         super().__init__()
-        self.setWindowTitle("ikari")
+        self.setWindowTitle(self.title_text())
         self.resize(fit_to_screen(QSize(1320, 860), QGuiApplication.primaryScreen()))
         self.db_path = db_path
         self.store = Store(db_path)

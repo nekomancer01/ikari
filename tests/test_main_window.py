@@ -707,3 +707,16 @@ def test_columns_that_fit_once_shrunk_are_not_hidden(make_window):
     used = sum(header.sectionSize(c) for c in page._widths)
     assert room - used >= room / 3
     page.close()
+
+
+def test_window_title_has_the_commit_when_run_from_source_and_not_when_packaged(make_window, monkeypatch):
+    head = mw.subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert make_window().windowTitle() == f"ikari ({head})"
+    monkeypatch.setattr(mw.sys, "frozen", True, raising=False)
+    assert make_window().windowTitle() == "ikari"
+    monkeypatch.undo()
+
+    def no_git(*a, **k):
+        raise FileNotFoundError
+    monkeypatch.setattr(mw.subprocess, "run", no_git)
+    assert make_window().windowTitle() == "ikari"
