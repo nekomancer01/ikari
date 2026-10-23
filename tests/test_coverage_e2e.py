@@ -950,5 +950,7 @@ def test_a_queued_button_turns_and_is_lighter_and_stays_still_with_motion_off(wi
             assert shot != upright  # turned a quarter
         else:
             assert shot == upright and shot != still  # motion off: lighter, but still
+    b.setText(coverage.CHECK if b.text() == coverage.DOWNLOAD else coverage.DOWNLOAD)
+    assert b.grab().toImage() == upright  # a wheel in place of either arrow
     hold.set()
     settle(w, lambda: not c._queue)
