@@ -772,3 +772,109 @@ def test_the_once_a_second_refresh_during_a_download_redraws_only_the_days_that_
     settle(w)
     assert (day, 1) in drawn and {d for d, _ in drawn} == {day}  # its posts, and its threads once they're counted
     assert c.day_table.cellWidget(c.days.index(day), 1).main.full_text().startswith("2")
+
+
+def held_posts(monkeypatch):
+    """The first posts download waits until the returned event is set, so the test can click while it runs."""
+    import threading
+    hold = threading.Event()
+    reads = FakeArchive.fetch_posts
+    first = []
+
+    def held(self, *a, **kw):
+        if not first:
+            first.append(1)
+            hold.wait(5)
+        return reads(self, *a, **kw)
+    monkeypatch.setattr(FakeArchive, "fetch_posts", held)
+    return hold
+
+
+def row_button(c, day, col=2):
+    return c.day_table.cellWidget(c.days.index(day), col).findChild(coverage.RowButton)
+
+
+def test_a_row_button_clicked_during_a_download_queues_it_and_a_second_click_takes_it_out(window, monkeypatch):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    hold = held_posts(monkeypatch)
+    one, two, three = TODAY - DAY, TODAY - 2 * DAY, TODAY - 3 * DAY
+    QTest.mouseClick(row_button(c, one), Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert w.fetch_job.busy
+    for day in (two, three):  # queued while the first runs: still clickable, and nothing more is fetched yet
+        assert row_button(c, day).isEnabled()
+        QTest.mouseClick(row_button(c, day), Qt.MouseButton.LeftButton)
+    assert row_button(c, two).queued and row_button(c, three).queued and not row_button(c, one).queued
+    assert "Queued" in row_button(c, two).toolTip()
+    QTest.mouseClick(row_button(c, two), Qt.MouseButton.LeftButton)  # clicked again: out of the queue
+    assert not row_button(c, two).queued and row_button(c, three).queued
+    hold.set()
+    settle(w, lambda: not c._queue and len(downloads()) == 2)
+    assert downloads() == [("posts", "Python", one, one + DAY), ("posts", "Python", three, three + DAY)]
+    assert not any(row_button(c, d).queued for d in (one, two, three))
+    assert w.store.posts_per_day("Python", three, three + DAY) == {three: 5}
+
+
+def test_a_queued_days_comments_take_in_the_posts_downloaded_before_them(window, monkeypatch):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals and c._threads)
+    hold = held_posts(monkeypatch)
+    day = TODAY - 3 * DAY  # p2 is saved; the archive has four more
+    QTest.mouseClick(row_button(c, day), Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    QTest.mouseClick(row_button(c, day, 4), Qt.MouseButton.LeftButton)
+    assert row_button(c, day, 4).queued
+    hold.set()
+    settle(w, lambda: not c._queue and len(downloads()) > 1)
+    assert downloads()[0] == ("posts", "Python", day, day + DAY)
+    assert sorted(downloads()[1:]) == sorted(("all_comments", p) for p in ("p2", "new0", "new1", "new2", "new3"))
+
+
+def test_stop_also_drops_the_queued_downloads(window, monkeypatch):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    hold = held_posts(monkeypatch)
+    QTest.mouseClick(row_button(c, TODAY - DAY), Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    QTest.mouseClick(row_button(c, TODAY - 2 * DAY), Qt.MouseButton.LeftButton)
+    assert row_button(c, TODAY - 2 * DAY).queued
+    w._stop_fetch()
+    hold.set()
+    settle(w)
+    assert not row_button(c, TODAY - 2 * DAY).queued
+    assert [d[2] for d in downloads()] == [TODAY - DAY]
+
+
+def test_a_queued_button_turns_and_is_lighter_and_stays_still_with_motion_off(window, monkeypatch):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    hold = held_posts(monkeypatch)
+    QTest.mouseClick(row_button(c, TODAY - DAY), Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    b = row_button(c, TODAY - 2 * DAY)
+    still = b.grab().toImage()
+    QTest.mouseClick(b, Qt.MouseButton.LeftButton)
+    shots = []
+    for _ in range(3):
+        shots.append(b.grab().toImage())
+        time.sleep(0.2)
+    assert shots[0] != still  # lighter
+    assert shots[0] != shots[1] or shots[1] != shots[2]  # turning
+    monkeypatch.setattr(coverage.motion, "enabled", lambda: False)
+    a, z = b.grab().toImage(), (time.sleep(0.2), b.grab().toImage())[1]
+    assert a == z and a != still
+    hold.set()
+    settle(w, lambda: not c._queue)

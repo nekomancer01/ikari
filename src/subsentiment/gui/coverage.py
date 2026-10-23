@@ -12,18 +12,21 @@ from __future__ import annotations
 
 import json
 import time
+from functools import partial
+from typing import Callable
 from datetime import datetime, timezone
 
 import shiboken6
-from PySide6.QtCore import QEvent, QSize, Qt, Slot
+from PySide6.QtCore import QEvent, QPointF, QSize, Qt, QTimer, Slot
+from PySide6.QtGui import QFontMetricsF
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QBoxLayout, QCheckBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton,
-    QSizePolicy, QTableWidget, QVBoxLayout, QWidget,
+    QSizePolicy, QStyle, QStyleOptionButton, QStylePainter, QTableWidget, QVBoxLayout, QWidget,
 )
 
 from subsentiment import collect
 from subsentiment.arctic_shift import TREE_MAX
-from subsentiment.gui import theme
+from subsentiment.gui import motion, theme
 from subsentiment.gui.widgets import (
     Choice, CommentCap, ElidedLabel, ShareBar, VerticalScrollArea, label, panel, plural, section,
 )
@@ -231,12 +234,66 @@ def small_button(text: str) -> QPushButton:
 DOWNLOAD, CHECK = "↓", "↻"  # a row's buttons: download what's missing, or look for what came since
 
 
-def row_button() -> QPushButton:
-    """A row's download (↓) or check again (↻) button; its tooltip says what it fetches."""
-    b = small_button(DOWNLOAD)
-    b.setStyleSheet("padding: 3px 0; border-radius: 9px;")
-    b.setFixedWidth(34)
-    return b
+class RowButton(QPushButton):
+    """A row's download (↓) or check again (↻) button; its tooltip says what it fetches. Clicked while a download
+    runs, it waits its turn in the page's queue: lighter, its arrow turning (still with motion off), until it
+    starts or is clicked again to leave the queue."""
+
+    QUEUED_OPACITY = 0.55
+
+    def __init__(self):
+        super().__init__(DOWNLOAD)
+        self.setStyleSheet("padding: 3px 0; border-radius: 9px;")
+        self.setFixedWidth(34)
+        self.setAutoDefault(False)  # downloads start from a click only, as small_button's
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.queued = False
+        self.later = False  # a download is running, so a click queues this one
+        self.tip = ""
+
+    def show_as(self, text: str, tip: str, enabled: bool) -> None:
+        self.setText(text)
+        self.setEnabled(enabled)
+        self.tip = tip
+        self._show_tip()
+
+    def mark(self, queued: bool, later: bool) -> None:
+        if (queued, later) != (self.queued, self.later):
+            self.queued, self.later = queued, later
+            self._show_tip()
+            self.update()
+
+    def _show_tip(self) -> None:
+        if self.queued:
+            self.setToolTip(f"{self.tip}\nQueued: it starts once the downloads before it end. Click to take it out "
+                            "of the queue.")
+        else:
+            self.setToolTip(self.tip + ("\nA download is running: click to queue this one after it." if self.later
+                                        and self.isEnabled() else ""))
+
+    def paintEvent(self, event) -> None:
+        if not self.queued:
+            super().paintEvent(event)
+            return
+        p = QStylePainter(self)
+        p.setOpacity(self.QUEUED_OPACITY)
+        opt = QStyleOptionButton()
+        self.initStyleOption(opt)
+        opt.text = ""
+        p.drawControl(QStyle.ControlElement.CE_PushButton, opt)
+        # The arrow turns about the middle of its ink, not its line box, so it spins in place.
+        fm = QFontMetricsF(self.font())
+        ink = fm.tightBoundingRect(self.text())
+        r = self.rect()
+        x = r.center().x() + 0.5 - fm.horizontalAdvance(self.text()) / 2
+        y = r.center().y() + 0.5 - fm.height() / 2 + fm.ascent()
+        middle = QPointF(x + ink.center().x(), y + ink.center().y())
+        p.translate(middle)
+        phase = motion.throb(self)
+        p.rotate(360 * (phase or 0.0))
+        p.setPen(self.palette().buttonText().color())
+        p.drawText(QPointF(-ink.center().x(), -ink.center().y()), self.text())
 
 
 def table(headers: list[str]) -> QTableWidget:
@@ -313,6 +370,9 @@ class CoveragePage(VerticalScrollArea):
         # The download of ticked days this page started last: (request, subreddit, what, days). One that stops
         # part way is kept in the settings, so Resume can start it again after a restart too.
         self._run: tuple | None = None
+        # Row buttons clicked while a download ran, in order: ((subreddit lowercased, kind, day or post id), start).
+        # Each starts as the one before it ends; Stop, or a download that fails, empties it.
+        self._queue: list[tuple[tuple, Callable[[], object]]] = []
         try:
             stopped = json.loads(settings.value("coverage/stopped", "", str) or "null")
             self._stopped: dict | None = stopped if (
@@ -531,6 +591,8 @@ class CoveragePage(VerticalScrollArea):
         self.busy = busy
         self._show_resume()
         self.refresh_saved()
+        if not busy and self._queue:
+            QTimer.singleShot(0, self._next)  # once the window has finished with the download that ended
 
     def refresh_saved(self, rebuild: bool = False) -> None:
         """Re-read what's saved (a fetch may have added some) and redraw both lists. Only while the page
@@ -596,12 +658,12 @@ class CoveragePage(VerticalScrollArea):
                 lay.addWidget(QLabel(short_day(day)), 1)  # a click on the date still picks the row
                 t.setCellWidget(row, 0, box)
                 t.setCellWidget(row, 1, Cell())
-                posts = row_button()
-                posts.clicked.connect(lambda _=False, d=day: self._download_day(d))
+                posts = RowButton()
+                posts.clicked.connect(lambda _=False, d=day: self._ask("posts", d, self._download_day))
                 t.setCellWidget(row, 2, centred(posts))
                 t.setCellWidget(row, 3, Cell())
-                threads = row_button()
-                threads.clicked.connect(lambda _=False, d=day: self._download_day_threads(d))
+                threads = RowButton()
+                threads.clicked.connect(lambda _=False, d=day: self._ask("threads", d, self._download_day_threads))
                 t.setCellWidget(row, 4, centred(threads))
             self._day_rows = list(self.days)
             self._drawn.clear()
@@ -623,25 +685,25 @@ class CoveragePage(VerticalScrollArea):
             if not self._changed(("posts", day), n, total, gone, done, waiting, self.busy, current, self.days[0]):
                 continue
             cell: Cell = t.cellWidget(row, 1)
-            button: QPushButton = t.cellWidget(row, 2).findChild(QPushButton)
+            button: RowButton = t.cellWidget(row, 2).findChild(RowButton)
+            # A download running doesn't turn the buttons off: a click queues theirs after it.
+            idle = not self.delete_job.busy
             if opened:
                 cell.set_open(n, "today" if day >= current else "wrong", total)
-                button.setText(DOWNLOAD)
-                button.setEnabled(not self.busy)
-                button.setToolTip("Download all: every post from today so far" if day >= current
-                                  else f"Download all: every post from {day_text(day)}")
+                button.show_as(DOWNLOAD, "Download all: every post from today so far" if day >= current
+                               else f"Download all: every post from {day_text(day)}", idle)
                 continue
             cell.set(n, total, done, "post", gone, waiting)
             full = done or (total is not None and 0 < total <= n + gone)
-            button.setText(CHECK if full else DOWNLOAD)
-            button.setEnabled(not self.busy and not waiting
-                              and not (total == 0 and not done and day < self.days[0]))
-            button.setToolTip(
+            button.show_as(
+                CHECK if full else DOWNLOAD,
                 "Waiting for Arctic Shift's count of this day" if waiting else
                 "Check again: look for posts the archive has added since" if full else
                 f"Download all: every post from {day_text(day)}"
-                + (f" (up to {total - n - gone:,} more)" if total and total > n + gone else ""))
+                + (f" (up to {total - n - gone:,} more)" if total and total > n + gone else ""),
+                idle and not waiting and not (total == 0 and not done and day < self.days[0]))
         self._show_threads()
+        self._show_queue()
         self._apply_filter()
         self.ticked &= set(self._shown_days())  # a day just found to have no posts drops out
         shown = self._shown_days()
@@ -744,13 +806,11 @@ class CoveragePage(VerticalScrollArea):
             if not self._changed(("threads", day), whole, posts, self.busy):
                 continue
             cell: Cell = self.day_table.cellWidget(row, 3)
-            button: QPushButton = self.day_table.cellWidget(row, 4).findChild(QPushButton)
+            button: RowButton = self.day_table.cellWidget(row, 4).findChild(RowButton)
             if not posts:
                 cell.show_share("No posts saved", "None", "", None, False,
                                 "Download the day's posts first; their comments come after.")
-                button.setText(DOWNLOAD)
-                button.setEnabled(False)
-                button.setToolTip("No posts from this day are saved yet")
+                button.show_as(DOWNLOAD, "No posts from this day are saved yet", False)
                 continue
             done = whole == posts
             cell.show_share(f"✓ {plural(posts, 'thread')}" if done else f"{whole:,} of {plural(posts, 'thread')}",
@@ -758,11 +818,10 @@ class CoveragePage(VerticalScrollArea):
                             "" if done else f"{100 * whole // posts}%", whole / posts, done,
                             f"{self._kept()} saved on {whole:,} of the {plural(posts, 'post')} saved from this "
                             "day. " + THREADS_TIP)
-            button.setText(CHECK if done else DOWNLOAD)
-            button.setEnabled(not self.busy)
-            button.setToolTip(f"Check again: look for comments added since on {day_text(day)}'s posts" if done else
-                              f"Download the comments on the {plural(posts - whole, 'post')} from {day_text(day)} "
-                              "missing some")
+            button.show_as(CHECK if done else DOWNLOAD,
+                           f"Check again: look for comments added since on {day_text(day)}'s posts" if done else
+                           f"Download the comments on the {plural(posts - whole, 'post')} from {day_text(day)} "
+                           "missing some", not self.delete_job.busy)
 
     # -- ticked days ----------------------------------------------------------
 
@@ -939,8 +998,9 @@ class CoveragePage(VerticalScrollArea):
             title.setContentsMargins(8, 0, 4, 0)
             t.setCellWidget(i, 0, title)
             t.setCellWidget(i, 1, Cell())
-            button = row_button()
-            button.clicked.connect(lambda _=False, row=i: self._download_comments([self._post_rows[row]["id"]]))
+            button = RowButton()
+            button.clicked.connect(lambda _=False, row=i: self._ask("comments", self._post_rows[row]["id"],
+                                                                    lambda pid, sub: self._download_comments([pid], sub)))
             t.setCellWidget(i, 2, centred(button))
         self._built[i] = state
         t.cellWidget(i, 0).setText(" ".join((r["title"] or "").split()))
@@ -963,10 +1023,11 @@ class CoveragePage(VerticalScrollArea):
             cell.setToolTip("Arctic Shift counts a post's comments when it re-checks the post, usually "
                             "about 36 hours after posting. Downloading still fetches what's there now.")
         full = done or so_far or capped or (bool(total) and r["saved_comments"] >= total)
-        button: QPushButton = t.cellWidget(i, 2).findChild(QPushButton)
-        button.setText(CHECK if full else DOWNLOAD)
-        button.setToolTip("Check again: look for comments added since" if full else "Download all of its comments")
-        button.setEnabled(not self.busy and (total != 0 or done))
+        button: RowButton = t.cellWidget(i, 2).findChild(RowButton)
+        button.show_as(CHECK if full else DOWNLOAD,
+                       "Check again: look for comments added since" if full else "Download all of its comments",
+                       not self.delete_job.busy and (total != 0 or done))
+        button.mark(((self.subreddit or "").lower(), "comments", r["id"]) in self._queued(), self.busy)
 
     # -- layout ---------------------------------------------------------------
 
@@ -1072,25 +1133,68 @@ class CoveragePage(VerticalScrollArea):
 
     # -- downloads ------------------------------------------------------------
 
-    def _download_day(self, day: int) -> None:
+    def _ask(self, kind: str, what, start: Callable) -> None:
+        """A row button clicked: ``start(what, subreddit)`` now, or while a download runs, queue it after the ones
+        waiting already, or take it back out of the queue if it's there."""
         if not self.subreddit:
+            return
+        if not self.window_.writing():
+            start(what, self.subreddit)
+            return
+        key = (self.subreddit.lower(), kind, what)
+        keys = [k for k, _ in self._queue]
+        if key in keys:
+            del self._queue[keys.index(key)]
+        else:
+            self._queue.append((key, partial(start, what, self.subreddit)))
+        self._show_queue()
+
+    def _next(self) -> None:
+        """Start the first download in the queue, or the next one when there turns out to be nothing to fetch."""
+        while self._queue and not self.window_.writing():
+            self._queue.pop(0)[1]()
+        self._show_queue()
+
+    def clear_queue(self) -> None:
+        """Stop was pressed, or a download failed: the ones waiting don't start."""
+        self._queue.clear()
+        self._show_queue()
+
+    def _queued(self) -> set[tuple]:
+        return {k for k, _ in self._queue}
+
+    def _show_queue(self) -> None:
+        """Mark the buttons whose downloads are queued, and say on every one that a click queues it."""
+        sub, queued = (self.subreddit or "").lower(), self._queued()
+        for row, day in enumerate(self._day_rows):
+            for col, kind in ((2, "posts"), (4, "threads")):
+                self.day_table.cellWidget(row, col).findChild(RowButton).mark((sub, kind, day) in queued, self.busy)
+        for i in self._built:
+            self.post_table.cellWidget(i, 2).findChild(RowButton).mark(
+                (sub, "comments", self._post_rows[i]["id"]) in queued, self.busy)
+
+    def _download_day(self, day: int, sub: str | None = None) -> None:
+        sub = sub or self.subreddit
+        if not sub:
             return
         # Everything there is, not the archive's count less what's saved: the count can lag or be off, and
         # the day is only marked complete when every part of it was read to its end.
         # Posts only: its comments have their own button, beside it.
-        req = collect.FetchRequest(subreddit=self.subreddit, after=day, before=day + DAY,
+        req = collect.FetchRequest(subreddit=sub, after=day, before=day + DAY,
                                    limit=MAX_DAY_POSTS, include_comments=False, everything=True)
         what = "so far today" if day >= today() else f"from {day_text(day)}"
-        self.window_.start_request(req, f"Downloading every post {what} in r/{self.subreddit}…")
+        self.window_.start_request(req, f"Downloading every post {what} in r/{sub}…")
 
-    def _download_day_threads(self, day: int) -> None:
-        """A day's comments button: the threads not saved whole, or, when every one is, all of them again."""
-        if not self.subreddit:
+    def _download_day_threads(self, day: int, sub: str | None = None) -> None:
+        """A day's comments button: the threads not saved whole, or, when every one is, all of them again. Asked
+        as it starts, so a queued one takes in the posts a download before it saved."""
+        sub = sub or self.subreddit
+        if not sub:
             return
         store = self.window_.store
         cap = self.comment_cap.count.value()
-        self._download_comments(store.open_threads(self.subreddit, [day], cap=cap)
-                                or store.open_threads(self.subreddit, [day], every=True))
+        self._download_comments(store.open_threads(sub, [day], cap=cap) or store.open_threads(sub, [day], every=True),
+                                sub)
 
     def _download_ticked(self) -> None:
         if not self.subreddit or not self.ticked:
@@ -1164,10 +1268,11 @@ class CoveragePage(VerticalScrollArea):
         if not self._start(s["subreddit"], s["what"], days) and s["what"] == "comments" and not self.busy:
             self._remember_stopped(None)  # its threads were finished since: nothing is left to resume
 
-    def _download_comments(self, ids: list[str]) -> None:
-        if not self.subreddit or not ids:
+    def _download_comments(self, ids: list[str], sub: str | None = None) -> None:
+        sub = sub or self.subreddit
+        if not sub or not ids:
             return
-        req = collect.FetchRequest(subreddit=self.subreddit, comment_posts=tuple(ids), fill_threads=True,
+        req = collect.FetchRequest(subreddit=sub, comment_posts=tuple(ids), fill_threads=True,
                                    **self.comment_cap.request())
         cap = self.comment_cap.count.value()
         what = f"up to {plural(cap, 'comment')}" if cap else "every comment"

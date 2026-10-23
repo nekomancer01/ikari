@@ -750,6 +750,7 @@ class MainWindow(QMainWindow):
     def _stop_fetch(self) -> None:
         if self.fetch_job.busy:
             self.fetch_job.stop()
+            self.coverage.clear_queue()  # Stop stops the downloads queued after it too
             self._stopping = True
             self.progress_msg.setText("Stopping…")
             self.stop_btn.setEnabled(False)
@@ -925,6 +926,7 @@ class MainWindow(QMainWindow):
         self._live.stop()
         self._flush_rows()
         self.coverage.fetch_ended(self.request, True)
+        self.coverage.clear_queue()  # the archive is likely failing the ones queued too
         # Show anything stored before the error, unless the user went to look at another subreddit.
         self._refresh_datasets(select=self.request.subreddit if self._follow else None)
         kept = self.current and self.current.lower() == self.request.subreddit.lower()
