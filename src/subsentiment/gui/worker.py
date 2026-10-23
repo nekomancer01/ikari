@@ -386,11 +386,13 @@ class Collector(QObject):
 
     @classmethod
     @contextmanager
-    def lasting(cls):
+    def lasting(cls, freeze: bool = True):
         """Read rows that stay for as long as their subreddit is open: the garbage collector went through every
         one of them again and again, a third of a second each time with 650,000 comments, while they were read and
         after, holding up the window's frames. They never make a cycle, so they're read with it held off, then
-        left out of its passes (gc.freeze); their refcounts still let them go."""
+        left out of its passes (gc.freeze); their refcounts still let them go. Without ``freeze`` it's only held
+        off: freezing keeps whatever is alive then out of every later pass, so what it holds that goes in a cycle
+        (a subreddit's sqlite connections once let go, a closed window's widgets) would never be freed."""
         collecting = gc.isenabled()
         gc.disable()
         with cls._lock:
@@ -398,7 +400,8 @@ class Collector(QObject):
         try:
             yield
         finally:
-            gc.freeze()
+            if freeze:
+                gc.freeze()
             with cls._lock:
                 cls._held -= 1
             if collecting:
@@ -438,7 +441,7 @@ class LoadWorker(Worker):
                     got = {k: store.rows(k, self.subreddit) for k in ("posts", "comments")}
             else:
                 got = {}
-                with Collector.lasting():
+                with Collector.lasting(freeze=False):
                     for kind in ("posts", "comments"):
                         if self.stopping:
                             raise sqlite3.OperationalError("interrupted")
