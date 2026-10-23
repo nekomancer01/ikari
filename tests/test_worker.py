@@ -192,6 +192,10 @@ def test_scoring_processes_that_dont_answer_in_time_are_given_up_for_scoring_her
     texts = [f"the raid tonight #{i}" for i in range(scorers.LEAST)]
     scorers.start()
     up(scorers)
+    # Busy processes, so the thread's parts can't come back within the first 0.1 s look (on a quiet runner they
+    # did, before the deadline was checked once).
+    for _ in range(scorers.WORKERS):
+        scorers._pool.submit(time.sleep, 2)
     monkeypatch.setattr(scorers, "WAIT", -1.0)  # out of time at once
     assert scorers()(lexicon, texts) == [lexicon.score(t) for t in texts]
     assert scorers.broken and scorers._pool is None
