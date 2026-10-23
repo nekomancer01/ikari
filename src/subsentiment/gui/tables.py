@@ -11,7 +11,7 @@ from typing import Any, Callable
 import numpy as np
 from PySide6.QtCore import (QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRectF, QSize, Qt, QTimer,
                             QUrl, Signal)
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette, QPen
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QHeaderView, QLineEdit, QStyle, QStyledItemDelegate,
     QStyleOptionViewItem, QTableView, QVBoxLayout, QWidget,
@@ -115,13 +115,10 @@ class ChipDelegate(QStyledItemDelegate):
             width = min(cell.width(), self.INSET * 2 + self.DOT + self.GAP + metrics.horizontalAdvance(text))
         else:
             width = cell.width()
-        chip = QRectF(cell.left(), cell.center().y() - height / 2, width, height).adjusted(0.5, 0.5, -0.5, -0.5)
+        chip = QRectF(cell.left(), cell.center().y() - height / 2, width, height)
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(edge, 1))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        radius = height / 2 if self.kind == "pill" else 6
-        painter.drawRoundedRect(chip, radius, radius)
+        theme.Outline.draw(painter, chip, height / 2 if self.kind == "pill" else 6, edge)
         painter.setFont(font)
         if self.kind == "pill":
             dot = QColor(index.model().color(index) or ink)
@@ -655,7 +652,7 @@ class TablePage(QWidget):
 
     def __init__(self, columns, stretch_col: int):
         super().__init__()
-        self.model = RowsModel(columns)
+        self.model = RowsModel(columns, self)  # goes with the page: its fade timer asks the page what is on screen
         self.source: RowSource = RowList()
         self._base = np.zeros(0, np.int64)  # the positions of the rows given, before the label and text filters
         self._in_base = np.zeros(0, bool)  # by position: in _base
