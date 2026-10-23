@@ -20,8 +20,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRectF, Qt, QVariantAnimation
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QLinearGradient, QPainter, QPalette, QPen
-from PySide6.QtWidgets import (QApplication, QCalendarWidget, QComboBox, QDateEdit, QLineEdit, QPlainTextEdit, QSpinBox,
-                               QTableView, QWidget)
+from PySide6.QtWidgets import (QApplication, QCalendarWidget, QComboBox, QDateEdit, QLineEdit, QPlainTextEdit, QPushButton,
+                               QSpinBox, QTableView, QWidget)
 
 from subsentiment.gui import native
 
@@ -234,15 +234,16 @@ QCheckBox::indicator:hover {{ border-color: {t['accent']}; }}
 QCheckBox::indicator:checked {{ background: {t['accent']}; border-color: {t['accent']}; image: url("{icons}/{_mode}-check.svg"); }}
 QCheckBox:disabled {{ color: {t['faint']}; }}
 
-/* Buttons: outlined pills, the main action filled with the accent */
+/* Buttons: outlined pills, the main action filled with the accent. Outline paints the outlines (Outline.shape has the
+   radii below), so their style sheet borders are transparent; the filled main action keeps its own. */
 QPushButton {{
-    background: {panel}; border: 1px solid {edge}; border-radius: 14px; padding: 8px 16px; font-weight: 500;
+    background: {panel}; border: 1px solid transparent; border-radius: 14px; padding: 8px 16px; font-weight: 500;
 }}
 QPushButton:hover {{ background: {soft}; }}
 QPushButton:pressed {{ background: {press}; }}
-QPushButton:disabled {{ color: {t['faint']}; background: {panel}; border-color: {edge}; }}
-QPushButton:focus {{ border-color: {t['accent']}; }}
-QPushButton:checked {{ background: {sel}; border-color: {t['accent']}; }}  /* a toggle button that is on */
+QPushButton:disabled {{ color: {t['faint']}; background: {panel}; }}
+QPushButton:focus {{ border-color: transparent; }}  /* Outline turns accent; this keeps Qt repainting on focus */
+QPushButton:checked {{ background: {sel}; }}  /* a toggle button that is on */
 QPushButton[primary="true"] {{ color: {t['on_accent']}; border: 1px solid {t['button']}; background: {t['button']}; }}
 QPushButton[primary="true"]:hover {{ background: {QColor(t['button']).darker(110).name()}; }}
 QPushButton[primary="true"]:pressed {{ background: {QColor(t['button']).darker(122).name()}; }}
@@ -251,7 +252,7 @@ QPushButton[primary="true"]:disabled {{ color: rgba(255, 255, 255, 190); backgro
 QPushButton[flat="true"] {{ background: transparent; border: 1px solid transparent; color: {t['muted']}; }}
 QPushButton[flat="true"]:hover {{ background: {soft}; color: {t['text']}; }}
 QPushButton[flat="true"]:pressed {{ background: {press}; color: {t['text']}; }}
-QPushButton[flat="true"]:checked {{ background: {panel}; border-color: {edge}; color: {t['text']}; }}  /* like a chosen tab */
+QPushButton[flat="true"]:checked {{ background: {panel}; color: {t['text']}; }}  /* like a chosen tab */
 QPushButton[flat="true"]:disabled {{ color: {t['faint']}; }}
 QPushButton[small="true"] {{ padding: 3px 9px; border-radius: 8px; font-size: 9pt; }}
 /* Pill sizes, each fully round: "compact" 28 px high, "bar" 32 px to sit level with the boxes and choices beside it,
@@ -264,7 +265,7 @@ QFrame[choice="true"] QPushButton {{ padding: 4px 12px; border-radius: 10px; }}
 QFrame[choice="true"][small="true"] QPushButton {{ padding: 3px 10px; }}
 QFrame[choice="true"] QPushButton[flat="true"]:hover {{ background: {edge}; color: {t['text']}; }}
 QFrame[choice="true"] QPushButton[flat="true"]:pressed {{ background: {_rgba((*t['edge'][:3], t['edge'][3] * 2))}; }}
-QFrame[choice="true"] QPushButton[flat="true"]:checked {{ background: {panel}; border-color: {edge}; color: {t['text']}; }}
+QFrame[choice="true"] QPushButton[flat="true"]:checked {{ background: {panel}; color: {t['text']}; }}
 
 /* Tabs: plain words, the chosen one an outlined pill */
 QTabWidget::pane {{ border: none; top: 0; }}
@@ -446,6 +447,7 @@ class Outline(QObject):
 
     RADII = {"true": 16, "tile": 10, "solid": 10}  # the panels' "glass" kinds
     INPUTS = (QLineEdit, QSpinBox, QComboBox, QDateEdit, QPlainTextEdit)
+    BUTTON_RADII = {"compact": 14, "bar": 16, "glyph": 12}  # the style sheet's QPushButton[pill] sizes
 
     @classmethod
     def install(cls, app: QApplication) -> None:
@@ -477,6 +479,13 @@ class Outline(QObject):
             if isinstance(w, QLineEdit) and not w.hasFrame():  # the text box inside a spin box or date field
                 return None
             return (15 if w.property("pill") is True else 8), None
+        if isinstance(w, QPushButton):  # the filled main action, and a flat one until it's chosen, have no outline
+            if w.property("primary") is True or (w.property("flat") is True and not w.isChecked()):
+                return None
+            parent = w.parentWidget()
+            if parent is not None and parent.property("choice") is True:
+                return 10, None
+            return self.BUTTON_RADII.get(w.property("pill"), 8 if w.property("small") is True else 14), None
         return None
 
     def color(self, w: QWidget) -> QColor:
@@ -486,6 +495,9 @@ class Outline(QObject):
                 return QColor(t["accent"])
             if w.underMouse():
                 return QColor(t["faint"])
+        if isinstance(w, QPushButton) and w.isEnabled() and w.property("flat") is not True:
+            if w.hasFocus() or w.isChecked():  # a toggle that is on
+                return QColor(t["accent"])
         return QColor(*t["edge"])
 
     @staticmethod
