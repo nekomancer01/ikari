@@ -29,6 +29,9 @@ import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# The app's worker processes start with "spawn", which re-runs the main script by its path. This script has no
+# __main__ guard, so it hides its path: the workers only need the app's own modules.
+del __file__
 
 
 def parse() -> argparse.Namespace:
