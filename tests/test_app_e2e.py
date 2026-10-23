@@ -359,6 +359,67 @@ def test_the_fetch_drawer_keeps_a_random_sample_of_each_thread_and_remembers_it(
     assert (again.count.value(), again.pick.currentData()) == (2, "random")
 
 
+def test_the_fetch_drawers_sample_downloads_only_part_of_a_big_days_comments_and_coverage_shows_it(env):
+    """Sample: each settled day keeps a random sample of its comments big enough for ±5 points at 95% (fewer than
+    385 on a day this size, by the finite population correction), from only the threads holding part of it; a
+    day of no more than 385 comments, and a post not counted yet, is downloaded whole."""
+    by_day: dict[int, list[dict]] = {}
+    for p in env.archive.posts:
+        if p["subreddit"] == "Python" and p["num_comments"]:
+            by_day.setdefault(int(p["created_utc"] // DAY), []).append(p)
+    for on in by_day.values():  # a 6-post day stays under the 385 a sample needs; a 12-post one has a big thread
+        for k, p in enumerate(on):
+            p["num_comments"] = 60 if len(on) < 6 else 2000 if k == 0 else 1
+    w = env.window()
+    w.fetch_form.comment_cap.pick.setCurrentIndex(w.fetch_form.comment_cap.pick.findData("sample"))
+    assert not w.fetch_form.comments_per_post.isEnabled()  # the sample sets its own size
+    fetch(w, comments=True)
+    s = env.store()
+    posts = {r["id"]: r for r in s.posts("python")}
+    saved: dict[int, int] = {}
+    for c in s.comments("python"):
+        day = int(posts[c["post_id"]]["created_utc"] // DAY * DAY)
+        saved[day] = saved.get(day, 0) + 1
+    asked = {q["link_id"] for p, q in env.archive.requests if p == TREE}
+    sampled = s.complete_keys("sampled", "python")
+    big, small = set(), set()
+    for day in {int(r["created_utc"] // DAY * DAY) for r in posts.values()}:
+        counts = s.comment_totals("python", day, day + DAY)
+        on = [posts[pid] for pid in counts]
+        if None in counts.values() or not any(counts.values()):
+            continue
+        sample = collect.Sample(counts)
+        total = sum(counts.values())
+        if total > collect.Sample.NEED:
+            big.add(day)
+            assert sample.size < collect.Sample.NEED and saved.get(day) == sample.size  # 2,000 or so: 323
+            fetched = {r["id"] for r in on} & asked
+            assert 0 < len(fetched) < len(on)  # not every thread: the saving
+            assert {r["id"] for r in on} <= sampled  # each holds its part of the sample, or has none in it
+        else:
+            small.add(day)
+            ids = {r["id"] for r in on}
+            whole, n = s.whole_threads_per_day("python", day, day + DAY)[day]
+            assert whole == n and not ids & sampled  # kept whole
+    assert big and small
+    env.archive.clear()
+    fetch(w, comments=True)  # asked again: the sample is held already, so no settled thread is asked for again
+    again = {q["link_id"] for p, q in env.archive.requests if p == TREE}
+    assert not again & sampled
+
+    fetched_before(env, w)
+    cov = open_coverage(w)
+    cov.comment_cap.pick.setCurrentIndex(cov.comment_cap.pick.findData("sample"))
+    end = time.monotonic() + 10
+    texts = lambda days: [cov.day_table.cellWidget(cov._day_rows.index(d), 3).main.full_text() for d in days]
+    while not all(t.startswith("Sampled") for t in texts(big)) and time.monotonic() < end:
+        pump(20)
+    assert all(t.startswith("Sampled") for t in texts(big))  # sampled, not every comment saved
+    assert all(t.startswith("✓") for t in texts(small))  # every comment saved
+    w.close()
+    assert env.window().fetch_form.comment_cap.pick.currentData() == "sample"  # remembered
+
+
 def test_comments_come_with_a_fetch_when_asked(env):
     w = env.window()
     fetch(w, comments=True)
