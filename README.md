@@ -242,13 +242,15 @@ Things to know about the archive:
   range fills them in if **Scores: Update saved posts** is ticked; it re-checks those posts in batches
   of 500. It's off by default because it adds requests to every fetch.
 - **Requests are rate limited and shared.** Every request in a fetch (posts, score updates and
-  comments) goes through one limiter, at most about two and a half a second (the archive's docs say "a few
-  requests per second is fine"). The archive takes a second or two to answer each one, so up to four
-  are in flight at once, for different days or different posts. When the archive says to slow down
-  (HTTP 429) ikari waits as long as it asks and spaces later requests further apart; it also backs
-  off on server and network errors. When a query times out ("Timeout. Maybe slow down a bit"), it
-  waits, asks for a smaller page, then searches a narrower slice of time. The status line says when
-  it's waiting and why.
+  comments) goes through one limiter, at most about two and a half a second (the archive's docs say "a
+  few requests per second is fine"). The archive takes a second or two to answer each one, so up to
+  four are in flight at once, for different days or different posts. When the archive says to slow down
+  (HTTP 429) ikari waits as long as it asks and spaces later requests further apart; it also backs off
+  on network errors. If the archive keeps failing (several server errors in a row), ikari says Arctic
+  Shift is down, stops sending anything but one small check request at a time (10 s apart, growing to a
+  minute), and carries on as soon as it answers; after ten minutes down the fetch stops, keeping what it saved.
+  When a query times out ("Timeout. Maybe slow down a bit"), it waits, asks for a smaller page, then
+  searches a narrower slice of time. The status line says when it's waiting and why.
 - **Comments take one request per post.** ikari asks for each post's comment tree at once and keeps
   what the cap says. If a post's comments can't be fetched, it moves on to the next; after
   five failures in a row it stops asking, and the next fetch of the range picks up the posts that
