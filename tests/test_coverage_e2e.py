@@ -801,3 +801,24 @@ def test_row_buttons_sit_whole_and_centred_in_their_cells(window):
                 b = box.findChild(QPushButton)
                 assert box.rect().contains(b.geometry()), (row, col, box.rect(), b.geometry())
                 assert abs(b.geometry().center().x() - box.rect().center().x()) <= 1
+
+
+def test_a_download_starting_or_ending_only_turns_the_day_buttons_off_and_on(window, monkeypatch):
+    # Every listed day's cells were drawn again then: a quarter of a second for two years of days, as a big
+    # download ended.
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    drawn = []
+    monkeypatch.setattr(coverage.Cell, "set", lambda self, *a: drawn.append(a))
+    monkeypatch.setattr(coverage.Cell, "show_share", lambda self, *a: drawn.append(a))
+    buttons = [c.day_table.cellWidget(row, col).findChild(QPushButton)
+               for row in range(c.day_table.rowCount()) for col in (2, 4)]
+    on = [b.isEnabled() for b in buttons]
+    assert any(on)
+    c.set_busy(True)
+    assert drawn == [] and not any(b.isEnabled() for b in buttons)
+    c.set_busy(False)
+    assert drawn == [] and [b.isEnabled() for b in buttons] == on

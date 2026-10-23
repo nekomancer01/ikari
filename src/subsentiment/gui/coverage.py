@@ -622,22 +622,26 @@ class CoveragePage(VerticalScrollArea):
             waiting = not opened and total is None and counting and not done
             if waiting:
                 self._waiting.add(day)
-            if not self._changed(("posts", day), n, total, gone, done, waiting, self.busy, current, self.days[0]):
+            # A download starting or ending only turns the buttons off or on: every day's cell drawn again then took
+            # a quarter of a second.
+            enabled = not self.busy and (opened or not waiting and not (total == 0 and not done and day < self.days[0]))
+            button: QPushButton | None = None
+            if self._changed(("posts on", day), enabled):
+                button = t.cellWidget(row, 2).findChild(QPushButton)
+                button.setEnabled(enabled)
+            if not self._changed(("posts", day), n, total, gone, done, waiting, current, self.days[0]):
                 continue
             cell: Cell = t.cellWidget(row, 1)
-            button: QPushButton = t.cellWidget(row, 2).findChild(QPushButton)
+            button = button or t.cellWidget(row, 2).findChild(QPushButton)
             if opened:
                 cell.set_open(n, "today" if day >= current else "wrong", total)
                 button.setText(DOWNLOAD)
-                button.setEnabled(not self.busy)
                 button.setToolTip("Download all: every post from today so far" if day >= current
                                   else f"Download all: every post from {day_text(day)}")
                 continue
             cell.set(n, total, done, "post", gone, waiting)
             full = done or (total is not None and 0 < total <= n + gone)
             button.setText(CHECK if full else DOWNLOAD)
-            button.setEnabled(not self.busy and not waiting
-                              and not (total == 0 and not done and day < self.days[0]))
             button.setToolTip(
                 "Waiting for Arctic Shift's count of this day" if waiting else
                 "Check again: look for posts the archive has added since" if full else
@@ -751,16 +755,18 @@ class CoveragePage(VerticalScrollArea):
         """Each day's comment threads column: how many of its saved posts have every comment saved."""
         for row, day in enumerate(self._day_rows):
             whole, posts = self._threads_on(day)
-            if not self._changed(("threads", day), whole, posts, self.busy, self.comment_cap.sampling,
-                                 day in self._sampled):
+            button: QPushButton | None = None
+            if self._changed(("threads on", day), bool(posts) and not self.busy):  # (as for posts, _fill_days)
+                button = self.day_table.cellWidget(row, 4).findChild(QPushButton)
+                button.setEnabled(bool(posts) and not self.busy)
+            if not self._changed(("threads", day), whole, posts, self.comment_cap.sampling, day in self._sampled):
                 continue
             cell: Cell = self.day_table.cellWidget(row, 3)
-            button: QPushButton = self.day_table.cellWidget(row, 4).findChild(QPushButton)
+            button = button or self.day_table.cellWidget(row, 4).findChild(QPushButton)
             if not posts:
                 cell.show_share("No posts saved", "None", "", None, False,
                                 "Download the day's posts first; their comments come after.")
                 button.setText(DOWNLOAD)
-                button.setEnabled(False)
                 button.setToolTip("No posts from this day are saved yet")
                 continue
             done = whole == posts
@@ -773,7 +779,6 @@ class CoveragePage(VerticalScrollArea):
                             f"{self._kept()} saved on {whole:,} of the {plural(posts, 'post')} saved from this "
                             "day. " + THREADS_TIP)
             button.setText(CHECK if done else DOWNLOAD)
-            button.setEnabled(not self.busy)
             button.setToolTip(f"Check again: look for comments added since on {day_text(day)}'s posts" if done else
                               f"Download the comments on the {plural(posts - whole, 'post')} from {day_text(day)} "
                               "missing some")
