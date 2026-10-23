@@ -1278,13 +1278,17 @@ class Store:
         return sorted({d for a, b in spans for d in range(a, b + 1, 86400)}, reverse=True)
 
     def downloaded_days(self, subreddit: str) -> list[int]:
-        """UTC days (their starts, newest first) with a post saved, whether or not a fetch recorded asking for
-        them (imported or older data): Download coverage lists these, so every day on the charts can be
-        downloaded again or deleted. Skipped image posts count, they were downloaded; days asked for with
-        nothing saved don't."""
+        """UTC days (their starts, newest first) with a post or a comment saved, whether or not a fetch recorded
+        asking for them (imported or older data): Download coverage lists these, so every day on the charts can
+        be downloaded again or deleted, a day with only replies to older posts too. Skipped image posts count,
+        they were downloaded; days asked for with nothing saved don't. A comment's day is read from its day's
+        pack, or from its row while it has none (the comments_unpacked index), not from every comment's row."""
         return [r["d"] for r in self.db.execute(
-            "SELECT DISTINCT CAST(created_utc / 86400 AS INTEGER) * 86400 d FROM posts "
-            "WHERE subreddit = ? COLLATE NOCASE ORDER BY d DESC", (subreddit,))]
+            "SELECT CAST(created_utc / 86400 AS INTEGER) * 86400 d FROM posts WHERE subreddit = ? COLLATE NOCASE "
+            "UNION SELECT day * 86400 FROM packs WHERE kind = 'comments' AND subreddit = ? "
+            "UNION SELECT CAST(created_utc / 86400 AS INTEGER) * 86400 FROM comments "
+            "WHERE subreddit = ? COLLATE NOCASE AND packed != 1 ORDER BY d DESC",
+            (subreddit, subreddit.lower(), subreddit))]
 
     def save_tried(self, subreddit: str, days) -> None:
         """Record these UTC days (their starts) as asked for, joined to the ones before."""

@@ -989,11 +989,12 @@ class CoveragePage(VerticalScrollArea):
             saved = self.window_.store.posts_per_day(self.subreddit, days[0], days[-1] + DAY)
             count = sum(saved.get(d, 0) for d in days)
             when = day_text(days[0]) if n == 1 else f"{range_text(days[0], days[-1])} ({plural(n, 'day')})"
+            what = (f"{plural(count, 'post')} saved from {when} in r/{self.subreddit}, with their comments, every "
+                    f"comment written on {'that day' if n == 1 else 'those days'}," if count else
+                    f"the comments written on {when} in r/{self.subreddit}")
             self.delete_question.setText(
-                f"Delete {plural(count, 'post')} saved from {when} in r/{self.subreddit}, with their comments, every "
-                f"comment written on {'that day' if n == 1 else 'those days'}, and their sentiment? The days show as not "
-                "downloaded, ready to download again. Timeline notes stay. "
-                "This can't be undone.")
+                f"Delete {what} and their sentiment? The days show as not downloaded, ready to download again. "
+                "Timeline notes stay. This can't be undone.")
             self.delete_confirm.setText(f"Delete {plural(n, 'day')}")
         days = sorted(self.ticked) or self._day_rows
         whole, total = (sum(self._threads_on(d)[i] for d in days) for i in (0, 1))
