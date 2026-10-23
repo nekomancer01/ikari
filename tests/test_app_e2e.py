@@ -1197,6 +1197,7 @@ def test_coverage_counts_a_subreddit_picked_while_another_is_being_counted(env):
     env.archive.delays[AGG] = 1.0
     w.coverage_act.trigger()
     pump(200)
+    read_in(w)  # the days are read on a thread before their count is asked for
     assert w.coverage.count_job.busy  # python's count is still out
     w.datasets.setCurrentRow(next(i for i in range(w.datasets.count())
                                   if w.datasets.item(i).data(Qt.ItemDataRole.UserRole).lower() == "rust"))
@@ -1220,6 +1221,7 @@ def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
     env.archive.delays[AGG] = 1.5
     w.coverage_act.trigger()
     pump(200)
+    read_in(w)  # the days are read on a thread before their count is asked for
     cov = w.coverage
     assert cov.count_job.busy
 
@@ -1319,6 +1321,7 @@ def test_closing_the_app_while_a_coverage_count_is_out_doesnt_freeze_it(env):
     env.archive.delays[AGG] = 8
     w.coverage_act.trigger()
     pump(200)
+    read_in(w)  # the days are read on a thread before their count is asked for
     assert w.coverage.count_job.busy
     start = time.monotonic()
     w.close()
@@ -1372,6 +1375,7 @@ def test_coverage_left_and_opened_again_mid_count_counts_without_an_error(env):
     env.archive.delays[AGG] = 1.5
     w.coverage_act.trigger()
     pump(200)
+    read_in(w)  # the days are read on a thread before their count is asked for
     w.show_page("overview")  # the count goes on while another page shows
     w.coverage_act.trigger()
     end = time.monotonic() + 15
