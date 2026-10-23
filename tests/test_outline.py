@@ -1,4 +1,4 @@
-"""Panel, table and input outlines at 150% scaling: one crisp device pixel, never a solid pixel with a half-toned
+"""Panel, table, input and button outlines at 150% scaling: one crisp device pixel, never a solid pixel with a half-toned
 one beside it (a 1 px style sheet border is 1.5 device pixels there, which looked fuzzy)."""
 import os
 
@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint  # noqa: E402
 from PySide6.QtGui import QColor, QImage  # noqa: E402
-from PySide6.QtWidgets import QApplication, QComboBox, QLineEdit, QTableView, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QComboBox, QLineEdit, QPushButton, QTableView, QWidget  # noqa: E402
 
 from subsentiment.gui import theme, widgets  # noqa: E402
 
@@ -23,7 +23,7 @@ def rendered(make, at: QPoint, mode: str) -> tuple[QImage, QWidget, QWidget]:
     page.resize(300, 200)
     child = make()
     child.setParent(page)
-    child.setGeometry(at.x(), at.y(), 160, 90 if not isinstance(child, (QLineEdit, QComboBox)) else 32)
+    child.setGeometry(at.x(), at.y(), 160, 90 if not isinstance(child, (QLineEdit, QComboBox, QPushButton)) else 32)
     page.ensurePolished()
     image = QImage(450, 300, QImage.Format.Format_ARGB32)
     image.setDevicePixelRatio(1.5)
@@ -35,8 +35,9 @@ def rendered(make, at: QPoint, mode: str) -> tuple[QImage, QWidget, QWidget]:
 @pytest.mark.parametrize("mode", ["light", "dark"])
 @pytest.mark.parametrize("at", [QPoint(20, 20), QPoint(21, 21)])  # an odd offset lands on half a device pixel
 @pytest.mark.parametrize("make", [lambda: widgets.panel("tile")[0], lambda: widgets.panel("true")[0],
-                                  QTableView, QLineEdit, lambda: theme.mark(QComboBox(), "pill", True)],
-                         ids=["tile", "panel", "table", "input", "pill"])
+                                  QTableView, QLineEdit, lambda: theme.mark(QComboBox(), "pill", True),
+                                  lambda: QPushButton("Go"), lambda: theme.mark(QPushButton("Go"), "pill", "compact")],
+                         ids=["tile", "panel", "table", "input", "pill", "button", "pill-button"])
 def test_edges_are_one_crisp_device_pixel(make, at, mode):
     image, child, _page = rendered(make, at, mode)
     panel = QColor(theme.tokens()["panel"]).rgb()
