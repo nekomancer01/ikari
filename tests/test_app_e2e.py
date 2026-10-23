@@ -1016,6 +1016,43 @@ def test_a_days_download_all_that_hits_a_window_the_archive_cant_answer_saves_th
     assert in_day[0] in saved and in_day[-1] in saved  # both ends of the day were still read
 
 
+def test_a_day_with_hours_the_archive_never_answers_doesnt_end_a_weeks_download(env, monkeypatch):
+    # Three hours of one day time out however narrow the window: that day is left not complete, and the
+    # download goes on through the other days and their comments, with no error box. It used to end the
+    # whole fetch with "Fetch failed" on that day.
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.2)  # timeout back-offs, shortened further
+    w = env.window()
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    after = w.fetch_form.bounds()[0]
+    bad = int(after // DAY * DAY) + 3 * DAY
+    env.archive.stuck = [bad + 8 * 3600 + s for s in range(0, 3 * 3600, 300)]
+    fetch(w)
+    assert env.warnings == [] and "Fetch failed" not in w.progress_msg.text()
+    s = env.store()
+    whole = {str(d) for d in range(int(after // DAY * DAY) + DAY, coverage.today(), DAY)}
+    assert s.complete_keys("posts", "python") == whole - {str(bad)}
+    saved = s.posts("python")
+    older = [r for r in saved if r["created_utc"] < bad]  # read after the bad day, as days go newest first
+    assert older and all(s.comment_ids(r["id"]) for r in older if r["num_comments"])  # and their comments
+    assert any(bad <= r["created_utc"] < bad + 8 * 3600 for r in saved)  # the bad day's first hours
+    assert "timed out on part of the range" in w.progress_msg.text()  # said, though older days read fine
+
+
+def test_a_download_stops_reading_days_once_the_archive_times_out_on_every_one(env, monkeypatch):
+    # When every post search times out, a week's download stops after TIMED_OUT_DAYS days that gave nothing,
+    # rather than putting each of the eight through the whole narrowing, and says to try again later.
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.2)  # timeout back-offs, shortened further
+    w = env.window()
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    after = w.fetch_form.bounds()[0]
+    env.archive.stuck = [t for t in range(int(after) - DAY, int(time.time()) + DAY, 300)]
+    fetch(w)
+    assert env.warnings == [] and not env.store().posts("python")
+    assert "timed out" in w.progress_msg.text() and "try again" in w.progress_msg.text()
+    days_asked = {(int(q["after"]) + 1) // DAY for p, q in env.archive.requests if p == SEARCH}
+    assert len(days_asked) == collect.TIMED_OUT_DAYS
+
+
 def test_coverage_downloads_do_only_what_they_say(env):
     w = env.window()
     fetch(w, comments=False)
@@ -1634,6 +1671,31 @@ def test_a_days_comments_downloaded_once_read_complete_even_where_the_archive_co
     assert cov.day_table.cellWidget(row, 3).main.full_text() == "✓ 5\u00a0threads"  # on main: 4 of 5 threads
     assert len(env.store().comment_ids("bd00002")) == 400  # the whole tree, not 55 of it
     assert env.store().open_threads("bigthreads", [day]) == []  # nothing left to offer again
+
+
+def test_a_huge_thread_whose_tree_comes_back_collapsed_is_read_whole_from_the_comment_search(env):
+    # A tree the archive collapses whatever the limit came back the same way on every download, so its day never
+    # read complete and Coverage offered it again and again.
+    day = busy_day(env, "hugethread", 5)
+    big = next(p for p in env.archive.posts if p["id"] == "bd00002")
+    big.update(num_comments=1500, tree=1500, collapsed=True, same_second=150,  # a burst sharing one second too
+               retrieved_on=big["created_utc"] + 40 * 3600)
+    w = env.window()
+    fetch(w, sub="hugethread", comments=False, rng="week")
+    cov = open_coverage(w)
+    row = cov.days.index(day)
+    QTest.mouseClick(cov.day_table.cellWidget(row, 4).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    wait_idle(w, 60)
+    end = time.monotonic() + 10
+    while cov.threads_job.busy and time.monotonic() < end:
+        pump(20)
+    pump(100)
+    assert cov.day_table.cellWidget(row, 3).main.full_text() == "✓ 5\u00a0threads"
+    saved = env.store().comments("hugethread")
+    assert len([c for c in saved if c["post_id"] == "bd00002"]) == 1500
+    depth = {c["id"]: c["depth"] for c in saved}
+    assert depth["bd00002c3"] == 1 and depth["bd00002c1000"] == 0 and depth["bd00002c1003"] == 1  # from the parents
+    assert env.store().open_threads("hugethread", [day]) == []
 
 
 def test_download_all_comments_asks_nothing_for_posts_that_turn_out_to_have_none(env):

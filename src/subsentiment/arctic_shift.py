@@ -64,7 +64,7 @@ WORKERS = 4  # requests in flight at once. The limiter still spaces out when eac
 TIMEOUT_TRIES = 3  # query timeouts on one request before the caller is asked to narrow it
 GARBLED_TRIES = 3  # answers that aren't the archive's JSON before a request gives up
 MIN_WINDOW = 600  # seconds; a timing-out window is halved down to this
-MAX_SKIPS = 2  # windows that still time out at MIN_WINDOW skipped in a row before the fetch gives up
+MAX_SKIPS = 2  # windows that still time out at MIN_WINDOW skipped in a row before the slice is left unread
 # A comment thread is one cheap lookup by post id; the archive answers it in 1-2.5 s and has never timed one out or
 # limited it (live, 21 Oct: 173 threads on r/AskReddit and r/Deltarune, 4 in flight and 0.4 s apart, no 422 or 429).
 # Spacing and in-flight count were what held "Download all comments" to about two posts a second, so threads go
@@ -773,13 +773,15 @@ class ArcticShiftClient:
                 return out, cursor, True
             except QueryTimeout:
                 # Even the narrowest window: skip it and say the range wasn't all read. Not for a keyword
-                # search, which times out whatever the window, nor when nothing near it answers either.
-                skipped += 1
-                if "query" in base or skipped > MAX_SKIPS:
+                # search, which times out whatever the window. When nothing near it answers either, the rest
+                # of the slice is left unread rather than failing the whole fetch: other slices and days may
+                # still answer, and a range that timed out isn't called read to its end, so it's asked again.
+                if "query" in base:
                     raise
+                skipped += 1
                 self.timed_out = True
                 cursor += MIN_WINDOW
-                if cursor >= hi - 1:
+                if cursor >= hi - 1 or skipped > MAX_SKIPS:
                     return out, cursor, False
                 continue
             skipped = 0
@@ -968,43 +970,86 @@ class ArcticShiftClient:
         return keep(self._thread(post, size)[0], limit, pick, post.id)
 
     def fetch_all_comments(self, post: Post, cap: int = 0, pick: str = "top") -> tuple[list[Comment], bool]:
-        """Every comment the archive has on ``post`` (up to TREE_MAX), or with ``cap`` that many of them
-        picked by ``pick`` from the whole thread, and whether what's returned is the whole thread: False when
-        the archive cut it short, left replies collapsed, or the cap left some out. The whole thread is asked
-        for either way, as the archive can't rank it, and a whole tree came back as fast as a 100-comment
-        one live (1.2-3 s for 141-1,123 comments, 21 Oct). Always TREE_MAX, not the post's comment count: the
-        archive's count lags its tree, and a big thread asked for its count plus some came back with replies
-        collapsed every time, so it was never saved whole (live, 22 Oct: 1,078 counted, 1,264 in the tree)."""
+        """Every comment the archive has on ``post``, or with ``cap`` that many of them picked by ``pick`` from the
+        whole thread, and whether what's returned is the whole thread: False when the archive couldn't give all of
+        it, or the cap left some out. The whole thread is asked for either way, as the archive can't rank it, and a
+        whole tree came back as fast as a 100-comment one live (1.2-3 s for 141-1,123 comments, 21 Oct). Always
+        TREE_MAX, not the post's comment count: the archive's count lags its tree, and a big thread asked for its
+        count plus some came back with replies collapsed every time (live, 22 Oct: 1,078 counted, 1,264 in the
+        tree). A tree that still comes back collapsed or cut short is read in full from the comment search instead,
+        a page at a time (see _rest_of_thread); asked for again whole, it came back the same way every time."""
         comments, items, collapsed = self._thread(post, TREE_MAX)
         sent = _number(self.last_params.get("limit"), TREE_MAX)  # smaller if the archive timed out
+        whole = items < sent and not collapsed
+        if not whole:
+            comments, whole = self._rest_of_thread(post, comments)
         kept = keep(comments, cap, pick, post.id)
-        return kept, items < sent and not collapsed and len(kept) == len(comments)
+        return kept, whole and len(kept) == len(comments)
 
     def _thread(self, post: Post, size: int) -> tuple[list[Comment], int, bool]:
         """The usable comments of a post's tree (parents first), how many items came back, and whether
         any replies were left collapsed."""
         tree = self.get("/api/comments/tree", {"link_id": post.id, "limit": size}, share=TREE_SHARE)
-        comments: list[Comment] = []
-        items = 0
-        for d in _walk(tree):
-            items += 1
+        records = list(_walk(tree))
+        return self._comments(post, records, {}), len(records), _collapsed(tree)
+
+    def _rest_of_thread(self, post: Post, have: list[Comment]) -> tuple[list[Comment], bool]:
+        """``have`` (part of a post's thread) with the rest of it, from the comment search by post, in posting order,
+        and whether every page of it was read. A reply comes after what it answers, so each one's depth follows
+        from its parent's."""
+        comments = {c.id: c for c in have}
+        depths = {c.id: c.depth for c in have}
+        cursor, seen, whole, skipped = int(post.created_utc) - 1, set(), False, False
+        for _ in range(TREE_MAX // PAGE):
+            page = self.get("/api/comments/search", {"link_id": post.id, "sort": "asc", "after": cursor,
+                                                     "limit": PAGE}, share=TREE_SHARE)
+            sent = _number(self.last_params.get("limit"), PAGE)  # smaller if the archive timed out
+            new = [d for d in page if d.get("id") and d["id"] not in seen]
+            seen.update(d["id"] for d in new)
+            for c in self._comments(post, new, depths):
+                comments.setdefault(c.id, c)
+            if len(page) < sent:
+                whole = not skipped
+                break
+            last = int(max(_number(d.get("created_utc"), 0) for d in page))
+            # On from a second early, so comments sharing the page's last second aren't lost (``seen`` drops the
+            # repeats). A full page all from one second can't be read past that way: it's skipped, and the thread
+            # isn't called whole.
+            if new and last - 1 > cursor:
+                cursor = last - 1
+            else:
+                cursor, skipped = last, True
+        return list(comments.values()), whole
+
+    @staticmethod
+    def _comments(post: Post, records: Iterable[dict], depths: dict[str, int]) -> list[Comment]:
+        """The usable comments among a thread's records, in their order. A record without a depth (the search
+        gives none) is one deeper than its parent in ``depths``, which each comment is added to."""
+        out: list[Comment] = []
+        for d in records:
+            if not d.get("id"):
+                continue
+            parent = _text(d.get("parent_id"))
+            depth = d["depth"] if isinstance(d.get("depth"), int) else (
+                depths.get(parent[3:], -1) + 1 if parent.startswith("t1_") else 0)
+            depths[str(d["id"])] = depth
             body = _text(d.get("body"))
-            if not d.get("id") or body in _GONE or _removed(d):
+            if body in _GONE or _removed(d):
                 continue
             permalink = _text(d.get("permalink")) or f"/r/{post.subreddit}/comments/{post.id}/_/{d['id']}/"
-            comments.append(Comment(
+            out.append(Comment(
                 id=str(d["id"]),
                 post_id=post.id,
                 subreddit=post.subreddit,
-                parent_id=_text(d.get("parent_id")),
+                parent_id=parent,
                 author=_text(d.get("author")) or "[deleted]",
                 body=body,
                 score=_finite(d.get("score"), int) if _settled(d) else None,
                 created_utc=_number(d.get("created_utc"), 0),
-                depth=int(d["depth"]) if isinstance(d.get("depth"), int) else 0,
+                depth=depth,
                 permalink="https://www.reddit.com" + permalink,
             ))
-        return comments, items, _collapsed(tree)
+        return out
 
 
 def keep(comments: list[Comment], n: int, pick: str, post_id: str) -> list[Comment]:

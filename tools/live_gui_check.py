@@ -58,9 +58,9 @@ def main() -> None:
     spent = [0.0]
     queue = w._queue_new_rows
 
-    def timed():
+    def timed(*args):  # the window passes the rows the worker sent, when it sends them
         t = time.perf_counter()
-        queue()
+        queue(*args)
         spent[0] += time.perf_counter() - t
     w._queue_new_rows = timed
 

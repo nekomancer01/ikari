@@ -532,14 +532,14 @@ def test_a_timing_out_window_is_narrowed_and_the_rest_still_read():
 
 
 class StuckArchive(ArchiveSession):
-    """Times out on any search window holding ``stuck``, however narrow."""
+    """Times out on any search window holding one of the ``stuck`` times, however narrow."""
 
-    def __init__(self, items, stuck):
+    def __init__(self, items, *stuck):
         super().__init__(items)
         self.stuck = stuck
 
     def get(self, url, params=None, timeout=None):
-        if url.endswith("/api/posts/search") and params["after"] < self.stuck < params["before"]:
+        if url.endswith("/api/posts/search") and any(params["after"] < t < params["before"] for t in self.stuck):
             self.calls.append((url, dict(params)))
             return FakeResponse(422, {"error": "Timeout. Maybe slow down a bit"})
         return super().get(url, params, timeout)
@@ -550,7 +550,7 @@ def test_a_window_that_times_out_however_narrow_leaves_the_rest_of_the_range_rea
     # an error box at 69%. The rest of the day can still be read; the day just can't be called whole.
     items = [at(T0 + 100 + i * 600, i) for i in range(140)]  # a post every 10 minutes for a day
     clock = FakeClock()
-    c = ArcticShiftClient(session=StuckArchive(items, stuck=T0 + 3 * 3600 + 50),
+    c = ArcticShiftClient(session=StuckArchive(items, T0 + 3 * 3600 + 50),
                           limiter=RateLimiter(0.0, clock, clock.sleep))
     posts = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True)
     got = {p.created_utc for p in posts}
@@ -558,6 +558,21 @@ def test_a_window_that_times_out_however_narrow_leaves_the_rest_of_the_range_rea
     assert len(posts) >= 100 and not c.exhausted and c.timed_out
     c.fetch_posts("python", after=T0 + 12 * 3600, before=T0 + DAY, limit=10000, exhaust=True)
     assert c.exhausted and not c.timed_out  # a fetch that doesn't touch it is unaffected
+
+
+def test_a_stretch_that_times_out_whatever_is_asked_leaves_its_slice_unread_not_the_fetch_failed():
+    # Two hours where every window times out, however narrow: the slice holding them (6:00-12:00) is left
+    # unread from there and the range isn't called read, but the rest of the day is, instead of the whole
+    # fetch failing.
+    items = [at(T0 + 100 + i * 600, i) for i in range(140)]
+    clock = FakeClock()
+    stuck = [T0 + 6 * 3600 + s for s in range(0, 2 * 3600, 300)]
+    c = ArcticShiftClient(session=StuckArchive(items, *stuck), limiter=RateLimiter(0.0, clock, clock.sleep))
+    posts = c.fetch_posts("python", after=T0, before=T0 + DAY, limit=10000, exhaust=True)
+    got = {p.created_utc for p in posts}
+    assert all(T0 + h * 3600 + 100 in got for h in (0, 2, 5, 12, 20))
+    assert not [t for t in got if T0 + 6 * 3600 <= t < T0 + 12 * 3600]
+    assert not c.exhausted and c.timed_out and not c.reached
 
 
 def test_other_errors_are_reported():
@@ -631,11 +646,35 @@ def test_all_comments_ask_for_the_whole_thread_and_say_whether_it_is_complete():
     assert len(comments) == 5 and whole
     assert c.session.calls[0][1] == {"link_id": "p1", "limit": arctic_shift.TREE_MAX}  # not the post's count
 
+
+
+def test_a_tree_that_comes_back_collapsed_is_read_in_full_from_the_comment_search():
+    # Asked for again whole, a collapsed tree came back the same way every time, so the thread never read complete.
+    p = Post("p1", "Python", "t", "", "a", 10, 0.9, 7, 1.0, "u", "")
+    tree = [node(comment(f"c{i}", "t3_p1", 10 + i)) for i in range(3)]
     collapsed = tree + [{"kind": "more", "data": {"count": 4, "children": ["x1", "x2"]}}]
-    assert client([ok(collapsed)]).fetch_all_comments(p)[1] is False
+    rest = [comment(f"c{i}", "t3_p1", 10 + i) for i in range(3)] + [
+        comment("x1", "t1_c2", 20), comment("x2", "t1_x1", 21), comment("x3", "t3_p1", 22),
+        comment("x4", "t1_x9", 23)]  # its parent was never archived
+    c = client([ok(collapsed), ok(rest)])
+    comments, whole = c.fetch_all_comments(p)
+    assert whole and [x.id for x in comments] == ["c0", "c1", "c2", "x1", "x2", "x3", "x4"]
+    assert {x.id: x.depth for x in comments}["x2"] == 2 and comments[-1].depth == 0
+    url, params = c.session.calls[1]
+    assert url.endswith("/api/comments/search") and params == {"link_id": "p1", "sort": "asc", "after": 0,
+                                                               "limit": arctic_shift.PAGE}
 
     full = [node(comment(f"c{i}", "t3_p1", i)) for i in range(arctic_shift.TREE_MAX)]
-    assert client([ok(full)]).fetch_all_comments(p)[1] is False  # a full tree may have been cut short
+    pages = [[comment(f"s{k}_{i}", "t3_p1", 1000 * k + i) for i in range(arctic_shift.PAGE)] for k in range(2)]
+    c = client([ok(full), ok(pages[0]), ok(pages[1]), ok([])])  # a full tree may have been cut short
+    comments, whole = c.fetch_all_comments(p)
+    assert whole and len(comments) == arctic_shift.TREE_MAX + 2 * arctic_shift.PAGE
+    assert [q["after"] for _, q in c.session.calls[1:]] == [0, 98, 1098]  # on from each page's last second, less one
+
+    same = [comment(f"z{i}", "t3_p1", 50) for i in range(arctic_shift.PAGE)]  # a page's worth in one second
+    c = client([ok(collapsed), ok(same), ok(same), ok([])])  # asked again from a second early: the same page
+    assert c.fetch_all_comments(p)[1] is False  # read past, so not called whole
+    assert [q["after"] for _, q in c.session.calls[1:]] == [0, 49, 50]
 
 
 def test_a_capped_thread_is_read_whole_then_picked_top_scoring_or_at_random_the_same_way_each_time():
