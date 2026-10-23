@@ -502,10 +502,7 @@ class Download:
             # by the subreddit's words as they are set now
             if (scores := self.score_all(store.lexicon(name), [c.body for c in comments])) is None:
                 continue  # stopped while scoring: left as if never asked
-            had = store.comment_ids(p.id)  # a thread asked for again: count only what's new
-            for c, scored in zip(comments, scores):
-                store.save_comment(c, *scored)
-                added += c.id not in had
+            added += store.save_comments(comments, scores)  # a thread asked for again: only what's new counts
             store.mark_comments(p.id, ok=True, settled=p.score is not None)
             if whole:  # an unsettled thread may still be growing, so it's whole only "so far"
                 store.mark_complete("comments" if p.score is not None else "comments_so_far", name, p.id)

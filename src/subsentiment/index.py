@@ -764,19 +764,25 @@ def top_words(parts, days: tuple[int, int] | None = None, n: int = 100) -> list[
     parts = list(parts)
     shared = min((ix._shared for ix, _ in parts), default=0)  # ids every index's vocab has the same
     every = positive = negative = np.zeros(shared, np.int64)
-    extra: dict[str, list[int]] = {}  # the rest, by word
+    counted = []
     for ix, min_score in parts:
         counts = ix.word_counts(days, min_score)
         every, positive, negative = (a + c[:shared] for a, c in zip((every, positive, negative), counts))
-        for i in np.flatnonzero(counts[0][shared:]) + shared:
-            got = extra.setdefault(ix.vocab[i], [0, 0, 0])
-            for k in range(3):
-                got[k] += int(counts[k][i])
+        counted.append((ix.vocab, counts))
     vocab = parts[0][0].vocab if parts else []
     used = np.flatnonzero(every)
+    least = 1
     if len(used) > n:  # the words with at least the n-th biggest count, ties and all
         least = np.partition(every[used], len(used) - n)[len(used) - n]
         used = used[every[used] >= least]
     words = [(vocab[i], int(every[i]), int(positive[i]), int(negative[i])) for i in used]
+    # The rest, by word: only ones some index counts at least least / len(parts) times can add up to least, and a
+    # fetch's new words were thousands, each gone through every time the word cloud was counted.
+    extra: dict[str, list[int]] = {}
+    for names, counts in counted:
+        for i in np.flatnonzero(counts[0][shared:] * len(parts) >= least) + shared:
+            got = extra.setdefault(names[i], [0, 0, 0])
+            for k in range(3):
+                got[k] += int(counts[k][i])
     words += [(w, a, p, q) for w, (a, p, q) in extra.items() if a]
     return sorted(((w, a, (p - q) / a) for w, a, p, q in words), key=lambda w: (-w[1], w[0]))[:n]

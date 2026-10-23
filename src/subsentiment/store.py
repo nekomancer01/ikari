@@ -1190,7 +1190,7 @@ class Store:
                   sentiment, label, self._saved_at(), int(post.image))
         values = tuple(map(_storable, values))
         # Comments whose permalink is rebuilt from this post's get their own copy if it's about to change.
-        link = self._post_link(values[0])
+        link = self._post_links([values[0]]).get(values[0])
         if link is not None and link != values[9]:
             self.db.execute("UPDATE comments SET permalink = ? || id || '/' WHERE post_id = ? AND permalink IS NULL",
                             (link, values[0]))
@@ -1198,11 +1198,13 @@ class Store:
                         f"VALUES ({','.join('?' * len(values))})", values)
         self.search.put("posts", [(values[0], (values[2], values[3]))])
 
-    def _post_link(self, post_id: str) -> str | None:
-        """A saved post's permalink (in its pack once it's packed), or None if it isn't saved."""
-        post = self.db.execute("SELECT id, subreddit, created_utc, permalink, packed FROM posts WHERE id = ?",
-                               (post_id,)).fetchall()
-        return self._unpacked("posts", post)[0]["permalink"] if post else None
+    def _post_links(self, post_ids) -> dict[str, str]:
+        """Saved posts' permalinks (in their packs once they're packed), by id."""
+        ids = list(set(post_ids))
+        posts = [p for k in range(0, len(ids), 500) for p in self.db.execute(
+            f"SELECT id, subreddit, created_utc, permalink, packed FROM posts "
+            f"WHERE id IN ({', '.join('?' * len(ids[k:k + 500]))})", ids[k:k + 500])]
+        return {p["id"]: p["permalink"] for p in self._unpacked("posts", posts)}
 
     def _mark_images(self, rows) -> None:
         """Mark the posts among ``rows`` (id, url, selftext) that are image posts."""
@@ -1210,14 +1212,28 @@ class Store:
                             [(r["id"],) for r in rows if is_image_post(r["url"], r["selftext"])])
 
     def save_comment(self, c: Comment, sentiment: float, label: str) -> None:
-        link = self._post_link(c.post_id)
-        permalink = None if link is not None and c.permalink == f"{link}{c.id}/" else c.permalink
-        values = (c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score,
-                  c.created_utc, c.depth, permalink, sentiment, label, self._saved_at())
-        values = tuple(map(_storable, values))
-        self.db.execute(f"INSERT OR REPLACE INTO comments ({', '.join(COMMENT_COLUMNS)}) "
-                        f"VALUES ({', '.join('?' * len(values))})", values)
-        self.search.put("comments", [(values[0], (None, None, values[5]))])
+        self.save_comments([c], [(sentiment, label)])
+
+    def save_comments(self, comments: list[Comment], scores) -> int:
+        """Save comments with their (sentiment, label) scores, in place of what they had; returns how many weren't
+        saved before. A fetch saves a thread's together: one at a time held the interpreter long enough to keep
+        the window waiting."""
+        if not comments:
+            return 0
+        links = self._post_links(c.post_id for c in comments)
+        ids = list({c.id: None for c in comments})
+        had = sum(self.db.execute(f"SELECT COUNT(*) FROM comments WHERE id IN ({', '.join('?' * len(chunk))})",
+                                  chunk).fetchone()[0] for chunk in (ids[k:k + 500] for k in range(0, len(ids), 500)))
+        rows = []
+        for c, (sentiment, label) in zip(comments, scores, strict=True):
+            link = links.get(c.post_id)
+            permalink = None if link is not None and c.permalink == f"{link}{c.id}/" else c.permalink
+            rows.append(tuple(map(_storable, (c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score,
+                                              c.created_utc, c.depth, permalink, sentiment, label, self._saved_at()))))
+        self.db.executemany(f"INSERT OR REPLACE INTO comments ({', '.join(COMMENT_COLUMNS)}) "
+                            f"VALUES ({', '.join('?' * len(COMMENT_COLUMNS))})", rows)
+        self.search.put("comments", [(r[0], (None, None, r[5])) for r in rows])
+        return len(ids) - had
 
     def comment_ids(self, post_id: str) -> set[str]:
         """The ids of the comments saved on one post."""
