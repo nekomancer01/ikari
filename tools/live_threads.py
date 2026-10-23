@@ -1,5 +1,7 @@
-"""Live check for PR #164: big threads read whole. Read-only. Run from the repo root on the PR branch:
+"""Live check that big threads are read whole. Read-only. Run from the repo root:
 python tools/live_threads.py [subreddit ...]   (default: classicwow wowforever)
+For each subreddit's three biggest threads of the past two weeks and an ordinary one: what the tree gives, what
+fetch_all_comments gives, and what the comment search alone gives (the path a collapsed tree takes), compared.
 """
 import collections
 import json
@@ -54,4 +56,12 @@ for sub in sys.argv[1:] or ["classicwow", "wowforever"]:
         say(sub=sub, post=post.id, num_comments=post.num_comments, tree=len(tree), tree_items=items,
             collapsed=collapsed, got=len(got), unique=len(ids), whole=whole, secs=round(time.monotonic() - t, 1),
             requests=dict(calls), orphans=orphans, max_depth=max((x.depth for x in got), default=0))
+        t = time.monotonic()
+        calls.clear()
+        searched, all_pages = c._rest_of_thread(post, [])
+        found = {x.id: x for x in searched}
+        say(sub=sub, post=post.id, check="comment_search_alone", got=len(found), whole=all_pages,
+            secs=round(time.monotonic() - t, 1), requests=dict(calls), missing_from_tree=len(ids - found.keys()),
+            not_in_tree=len(found.keys() - ids),
+            depth_differs=sum(1 for x in got if x.id in found and found[x.id].depth != x.depth))
 say(statuses=dict(statuses))
