@@ -2,6 +2,7 @@
 store, and a fake archive in place of Arctic Shift. Nothing may be downloaded unless a Download all
 button is clicked, and each button fetches only what it says."""
 import os
+import threading
 import time
 
 import pytest
@@ -226,6 +227,47 @@ def test_each_day_says_how_many_comment_threads_are_saved_whole_and_follows_down
     QApplication.processEvents()
     assert narrow.text() == "1,234 of 5,678\u00a0threads"
     narrow.close()
+
+
+def test_a_long_history_opens_with_the_rows_on_screen_and_reads_off_the_window_thread(window, monkeypatch):
+    """Two years of days and a day of 1,500 posts. Every day's five widgets were built as the page opened (three
+    seconds for 711 days at the owner's size), and what's saved was read on the window's thread: now only the
+    rows near the view are built, and the reads run on threads of their own."""
+    w = window
+    day = TODAY - DAY
+    w.store.save_tried("Python", range(TODAY - 729 * DAY, TODAY + DAY, DAY))
+    for i in range(1500):
+        w.store.save_post(post(f"busy{i}", "Python", day + 600 + i), 0.0, "neutral")
+    w.store.commit()
+    on_window = []  # reads of what Coverage shows made on the window's thread
+    for name in ("tried_days", "posts_per_day", "removed_per_day", "archive_counts", "complete_keys",
+                 "comment_coverage", "whole_threads_per_day"):
+        real = getattr(Store, name)
+
+        def read(self, *a, real=real, name=name, **k):
+            if threading.current_thread() is threading.main_thread():
+                on_window.append(name)
+            return real(self, *a, **k)
+        monkeypatch.setattr(Store, name, read)
+    cells = []  # each day row has two, each post row one
+    real_cell = coverage.Cell.__init__
+    monkeypatch.setattr(coverage.Cell, "__init__", lambda self: (cells.append(1), real_cell(self))[1])
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    assert len(c.days) == 730 and c.day_table.rowCount() == 730
+    c.day_table.selectRow(c.days.index(day))  # the busy day, opened
+    settle(w, lambda: c.post_table.rowCount() == 1501)
+    assert c.posts_title.text() == f"Posts on {coverage.short_day(day)} · 1,501"
+    assert 0 < len(cells) < 100, len(cells)  # before: 1,460 for the days, as the page opened
+    assert on_window == []  # before: every read but the threads' count
+    c.day_table.scrollToBottom()  # scrolled to the oldest day: its row is built as it comes into view
+    settle(w)
+    assert len(cells) < 200
+    oldest = c.days.index(TODAY - 729 * DAY)
+    assert c.day_table.cellWidget(oldest, 1).main.text() == "0 of 10"  # the stand-in archive counts 10 a day
+    assert on_window == [] and downloads() == []
 
 
 def tick(c, day, shift=False):

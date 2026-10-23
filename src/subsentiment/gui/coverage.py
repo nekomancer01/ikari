@@ -10,7 +10,6 @@ its own posts and comments buttons, and the day picked in the list shows its pos
 """
 from __future__ import annotations
 
-import itertools
 import json
 import time
 from datetime import datetime, timezone
@@ -260,23 +259,22 @@ def table(headers: list[str]) -> QTableWidget:
 
 
 class LazyRows(QObject):
-    """A table whose rows get their widgets only as they come near the view: building five widgets for each of
-    two years of days took three seconds as the page opened, and a busy day has thousands of posts. ``build(row)``
-    gives a row its widgets and ``draw(row)`` fills them in; a row is drawn as it's built, and again by
-    ``redraw``, so ``draw`` skips what it already shows. With ``ahead``, the rest are built too, a few
-    milliseconds' worth between frames, so a dragged scroll bar never shows an empty row."""
+    """A table whose rows get their widgets only as they come near the view: a row's five widgets take about
+    5 ms to build, so building every one of two years of days took three seconds as the page opened, and a busy
+    day has thousands of posts. ``build(row)`` gives a row its widgets and ``draw(row)`` fills them in; a row is
+    drawn as it's built, and again by ``redraw``, so ``draw`` skips what it already shows. The rows on screen
+    are built at once, and a screenful either side a few milliseconds a frame after, ready for scrolling."""
 
-    AHEAD_S = 0.004  # building ahead takes at most this much of a frame
+    NEAR_MS = 4  # building the rows near the view takes at most this much of a frame
 
-    def __init__(self, table: QTableWidget, build, draw, ahead: bool = False):
+    def __init__(self, table: QTableWidget, build, draw):
         super().__init__(table)
         self.table, self.build, self.draw = table, build, draw
         self.built: set[int] = set()
-        self._from = 0  # the first row on screen, where building ahead starts
-        self._ahead = QTimer(self) if ahead else None
-        if self._ahead:
-            self._ahead.setInterval(0)
-            self._ahead.timeout.connect(self._build_ahead)
+        self._near: list[int] = []  # rows near the view, nearest first, for _build_near
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)  # once a frame
+        self._timer.timeout.connect(self._build_near)
         table.verticalScrollBar().valueChanged.connect(self.fill)
         self.viewport = table.viewport()
         self.viewport.installEventFilter(self)  # resized or shown: more rows may be on screen
@@ -289,23 +287,21 @@ class LazyRows(QObject):
         self.fill()
 
     def fill(self, *_) -> None:
-        """Build the rows on screen, plus a screenful either side for smooth scrolling."""
+        """Build the rows on screen, and soon after the ones a screenful either side."""
         t = self.table
         n = t.rowCount()
         if not n:
             return
-        height = max(t.viewport().height(), 1)
-        first, last = t.rowAt(0), t.rowAt(height - 1)
-        first = 0 if first < 0 else first
+        first, last = t.rowAt(0), t.rowAt(max(t.viewport().height(), 1) - 1)
+        first = max(first, 0)
         last = n - 1 if last < 0 else last  # the rows end above the bottom: every row shown after the first
-        # Building ahead fills in the rest after the next frame; otherwise a screenful either side is built now.
-        span = 0 if self._ahead else last - first + 1
-        for row in range(max(0, first - span), min(n, last + span + 1)):
+        for row in range(first, last + 1):
             if not t.isRowHidden(row):
                 self._make(row)
-        if self._ahead and len(self.built) < n:
-            self._from = first
-            self._ahead.start()
+        span = last - first + 1
+        self._near = [r for k in range(1, span + 1) for r in (last + k, first - k) if 0 <= r < n]
+        if any(r not in self.built for r in self._near):
+            self._timer.start()
 
     def _make(self, row: int) -> None:
         if row not in self.built:
@@ -313,14 +309,14 @@ class LazyRows(QObject):
             self.built.add(row)
             self.draw(row)
 
-    def _build_ahead(self) -> None:
-        end = time.perf_counter() + self.AHEAD_S
-        n = self.table.rowCount()
-        for row in itertools.chain(range(self._from, n), range(min(self._from, n))):  # the ones below the view first
-            self._make(row)
-            if time.perf_counter() > end:
-                return  # the timer runs again after the next frame
-        self._ahead.stop()
+    def _build_near(self) -> None:
+        end = time.perf_counter() + self.NEAR_MS / 1000
+        for row in self._near:
+            if row < self.table.rowCount() and not self.table.isRowHidden(row):
+                self._make(row)
+                if time.perf_counter() > end:
+                    return  # more after the next frame
+        self._timer.stop()
 
     def redraw(self) -> None:
         for row in sorted(self.built):
@@ -494,7 +490,7 @@ class CoveragePage(VerticalScrollArea):
         for col in (1, 3):
             h.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
         self.day_table.itemSelectionChanged.connect(self._load_posts)
-        self.day_rows = LazyRows(self.day_table, self._build_day_row, self._draw_day_row, ahead=True)
+        self.day_rows = LazyRows(self.day_table, self._build_day_row, self._draw_day_row)
         self.filter = Choice([("all", "All"), ("posts", "Missing posts"), ("comments", "Missing comments")], "all",
                              small=True)
         self.filter.buttons["posts"].setToolTip("Only days with posts the archive has and ikari hasn't saved")
