@@ -727,7 +727,7 @@ class TablePage(QWidget):
 
     def _on_screen(self) -> tuple[int, int]:
         """The rows the view shows now, (first, last); none while it's out of sight."""
-        if not self.view.isVisible():
+        if not self.view.isVisible() or self.view.viewport().height() <= 0:
             return 0, -1
         last = self.view.rowAt(self.view.viewport().height() - 1)
         return max(self.view.rowAt(0), 0), self.model.rowCount() - 1 if last < 0 else last

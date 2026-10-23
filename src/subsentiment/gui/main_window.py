@@ -775,7 +775,7 @@ class MainWindow(QMainWindow):
                     self._queued_ids.add(r["id"])
                     self._queued[kind].append(r)
         if any(self._queued.values()) and not self._drip.isActive():  # start() would restart it, and
-            self._drip.start()  # comments saved every few ms would then hold every row back
+            self._drip.start(DRIP_MS[0])  # comments saved every few ms would then hold every row back
 
     def _count_new(self, kind: str, rows) -> None:
         """Count rows the running fetch saved into the subreddit shown, whatever their day or score: the timeline

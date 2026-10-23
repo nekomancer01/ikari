@@ -1193,8 +1193,9 @@ class Store:
     def _post_links(self, post_ids) -> dict[str, str]:
         """Saved posts' permalinks (in their packs once they're packed), by id."""
         ids = list(set(post_ids))
-        posts = self.db.execute(f"SELECT id, subreddit, created_utc, permalink, packed FROM posts "
-                                f"WHERE id IN ({', '.join('?' * len(ids))})", ids).fetchall()
+        posts = [p for k in range(0, len(ids), 500) for p in self.db.execute(
+            f"SELECT id, subreddit, created_utc, permalink, packed FROM posts "
+            f"WHERE id IN ({', '.join('?' * len(ids[k:k + 500]))})", ids[k:k + 500])]
         return {p["id"]: p["permalink"] for p in self._unpacked("posts", posts)}
 
     def _mark_images(self, rows) -> None:
@@ -1216,7 +1217,7 @@ class Store:
         had = sum(self.db.execute(f"SELECT COUNT(*) FROM comments WHERE id IN ({', '.join('?' * len(chunk))})",
                                   chunk).fetchone()[0] for chunk in (ids[k:k + 500] for k in range(0, len(ids), 500)))
         rows = []
-        for c, (sentiment, label) in zip(comments, scores):
+        for c, (sentiment, label) in zip(comments, scores, strict=True):
             link = links.get(c.post_id)
             permalink = None if link is not None and c.permalink == f"{link}{c.id}/" else c.permalink
             rows.append(tuple(map(_storable, (c.id, c.post_id, c.subreddit, c.parent_id, c.author, c.body, c.score,
