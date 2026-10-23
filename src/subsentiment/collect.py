@@ -17,6 +17,9 @@ from subsentiment.store import Store
 GIVE_UP_AFTER = 5  # consecutive posts whose comments couldn't be fetched before the rest are skipped
 DAY = 86400
 MAX_DAY_POSTS = 10000  # cap on one UTC day when downloading everything (busy subreddits post ~4,500 a day)
+# Days in a row the archive timed out on without giving a single post before a download stops reading days:
+# it's struggling with every query, and each such day costs dozens of requests that come to nothing.
+TIMED_OUT_DAYS = 2
 
 
 @dataclass
@@ -87,10 +90,13 @@ class Download:
         self.stored: dict = {}  # saved posts of the range, id -> row
         self.streamed: set[str] = set()  # new posts saved as they were downloaded
         self.rechecked: set[str] = set()  # saved posts whose scores were re-fetched first
+        self.cap = req.comments_per_post
+        self.fill = req.fill_threads or not self.cap  # keep asking for a thread until it's whole, or has cap saved
         self.saved_whole: set[str] = set()  # saved posts whose whole thread is saved (when filling threads)
         self.saved_count: dict[str, int] = {}  # comments saved per post (when filling threads up to a cap)
         self.n_comments = self.errors = 0
         self.gave_up = False  # the archive kept failing comment requests; the rest are left for the next fetch
+        self.timed_out = False  # some part of the range was skipped, as the archive kept timing out on it
 
     def progress(self, done: int, total: int, msg: str) -> None:  # remembered, to come back to after a wait
         self.said = (done, total, msg)
@@ -111,8 +117,15 @@ class Download:
         return self.store.lexicon(self.name).score(text)  # by the subreddit's own words, as set now
 
     def run(self) -> FetchResult:
-        if self.req.comment_posts:
-            return self.comment_posts()
+        try:
+            return self.comment_posts() if self.req.comment_posts else self.posts()
+        finally:
+            limiter = getattr(self.client, "limiter", None)
+            if limiter is not None and getattr(limiter, "on_wait", None) == self.waiting:
+                limiter.on_wait = None  # not left holding this job, and everything it read, once it's over
+
+    def posts(self) -> FetchResult:
+        """The posts of the range, and their comments (see run)."""
         req, store, name = self.req, self.store, self.name
         # Asked for, whatever comes of it: Download coverage lists these days, to find what this fetch misses.
         end = time.time() if req.before is None else req.before
@@ -136,10 +149,10 @@ class Download:
         self.rechecked = {p.id for p in updated}
 
         # 2. New posts, then 3. their comments (see comments).
-        fill = req.fill_threads or not req.comments_per_post
-        self.saved_whole = store.complete_keys("comments", name) if fill and req.include_comments else set()
-        self.saved_count = store.comment_counts(name, req.after, req.before) \
-            if fill and req.comments_per_post and req.include_comments else {}
+        if self.fill and req.include_comments:
+            self.saved_whole = store.complete_keys("comments", name)
+            if self.cap:
+                self.saved_count = store.comment_counts(name, req.after, req.before)
         if req.limit is None:
             picked, new, settled = self.by_day(updated)
         else:
@@ -151,7 +164,7 @@ class Download:
         subreddit = first.subreddit if first else name  # canonical capitalisation from Reddit
         return FetchResult(subreddit, len(new), self.n_comments, self.should_stop(), updated=len(updated),
                            already=len(picked) - len(new) - len(settled), comment_errors=self.errors,
-                           timed_out=bool(getattr(self.client, "timed_out", False)))
+                           timed_out=self.timed_out)
 
     def by_day(self, updated: list[Post]) -> tuple[list[Post], list[Post], list[Post]]:
         """Every post of the range, a day at a time, newest first: each day's posts, then their comments, so a
@@ -163,8 +176,9 @@ class Download:
         settled: list[Post] = []
         days = [(d, d + DAY) for d in req.days] if req.days else _days(self.name, self.store, req.after, req.before)
         seen: set[str] = set()  # saved posts on the days read, whose comments those days took care of
+        fruitless = 0  # days in a row the archive timed out on without giving a post
         for k, (lo, hi) in enumerate(days):
-            if self.should_stop():
+            if self.should_stop() or fruitless >= TIMED_OUT_DAYS:
                 break
             whole = hi - lo == DAY and lo % DAY == 0
             when = time.strftime("%a %d %b", time.gmtime(lo))
@@ -180,6 +194,7 @@ class Download:
             in_day = {pid for pid, r in self.stored.items() if lo <= (r["created_utc"] or 0) < hi}
             seen |= in_day
             got = self.read(lo, hi, MAX_DAY_POSTS, True, say, whole_day=whole, skip=in_day)
+            fruitless = fruitless + 1 if getattr(self.client, "timed_out", False) and not got else 0
             day_new, day_settled = self.settle(got)
             picked += got
             new += day_new
@@ -214,6 +229,7 @@ class Download:
                                  skip=() if req.top else skip,
                                  progress=say, should_stop=self.should_stop, on_posts=self.save_streamed,
                                  exhaust=everything, read=() if again else store.read_spans(name))
+        self.timed_out |= bool(getattr(client, "timed_out", False))  # each fetch_posts says only for itself
         if reached := getattr(client, "reached", None):
             store.save_read_spans(name, reached)
         # Taken, not read and cleared: after Stop, slice threads still running may be adding to it.
@@ -259,8 +275,7 @@ class Download:
         req, store, stored, client = self.req, self.store, self.stored, self.client
         if not req.include_comments or self.should_stop():
             return
-        cap = req.comments_per_post
-        fill = req.fill_threads or not cap
+        cap, fill = self.cap, self.fill
         refreshed = {p.id for p in updated}
         repicked = {p.id for p in picked if p.id in stored}  # top mode can pick posts that are already saved
         todo = [p for p in picked if p.id not in stored] + updated + [
@@ -335,8 +350,8 @@ class Download:
     def each_thread(self, posts: list[Post], get: Callable, *, cap: int, progress,
                     every: bool = False) -> tuple[int, set[str], bool, int]:
         """Run get(post), which returns (comments, whether they're the whole thread), for each post, a few at
-        once, and save each thread here, on this thread, scored by the subreddit's words (``score_all``, as in
-        run); ``saved`` is told once it's committed, if it brought comments (``every``: whatever it brought).
+        once, and save each thread here, on this thread, scored by the subreddit's words (``self.score_all``);
+        ``self.saved`` is told once it's committed, if it brought comments (``every``: whatever it brought).
         ``cap`` is the comments asked for per thread, 0 for all. A post whose comments couldn't be fetched is
         recorded as failed, so the next fetch retries it; after GIVE_UP_AFTER failures in a row no new ones
         start, since the archive is struggling and shouldn't be hammered. Returns (posts that failed, ids of the
