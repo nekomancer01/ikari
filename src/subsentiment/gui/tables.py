@@ -182,6 +182,9 @@ class RowsModel(QAbstractTableModel):
         self._fade = QTimer(self)
         self._fade.setInterval(33)
         self._fade.timeout.connect(self._tick)
+        # The rows a view shows now, (first, last), for drawing only the fading rows on screen; the table showing
+        # it sets it.
+        self.on_screen: Callable[[], tuple[int, int]] = lambda: (0, len(self.order) - 1)
 
     @property
     def rows(self) -> Rows:
@@ -531,10 +534,16 @@ class RowsModel(QAbstractTableModel):
 
     def _tick(self) -> None:
         now = self._clock()
-        for p in [p for p, t in self._born.items() if now - t >= FADE_SECONDS]:
+        faded = [p for p, t in self._born.items() if now - t >= FADE_SECONDS]
+        fading = np.fromiter(self._born, np.int64, len(self._born))  # (those done drawn once more, fully in)
+        for p in faded:
             del self._born[p]
-        if len(self.order):  # the view repaints only what is on screen
-            self.dataChanged.emit(self.index(0, 0), self.index(len(self.order) - 1, len(self.columns) - 1),
+        # Only the rows on screen still fading are drawn again: a fetch keeps rows fading the whole time it runs,
+        # and drawing the whole table 30 times a second took most of a frame.
+        first, last = self.on_screen()
+        at = first + np.flatnonzero(np.isin(self.order[max(first, 0):last + 1], fading))
+        if len(at):
+            self.dataChanged.emit(self.index(int(at[0]), 0), self.index(int(at[-1]), len(self.columns) - 1),
                                   [Qt.ItemDataRole.ForegroundRole, Qt.ItemDataRole.BackgroundRole])
         if not self._born:
             self._fade.stop()
@@ -695,6 +704,7 @@ class TablePage(QWidget):
         header.setHighlightSections(False)
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.view.doubleClicked.connect(self._open)
+        self.model.on_screen = self._on_screen
         keys = [key for _, key, _ in columns]
         self._chips = [ChipDelegate("box", self.view), ChipDelegate("pill", self.view)]
         self.view.setItemDelegateForColumn(keys.index("sentiment"), self._chips[0])
@@ -714,6 +724,13 @@ class TablePage(QWidget):
             sig.connect(self._update_count)
         self._fit_unread = False  # columns sized before the rows they're sized to were read
         self.model.read.connect(self._on_read)
+
+    def _on_screen(self) -> tuple[int, int]:
+        """The rows the view shows now, (first, last); none while it's out of sight."""
+        if not self.view.isVisible():
+            return 0, -1
+        last = self.view.rowAt(self.view.viewport().height() - 1)
+        return max(self.view.rowAt(0), 0), self.model.rowCount() - 1 if last < 0 else last
 
     def busy(self) -> str | None:
         """What a big table is working out away from the frames, for the window's throbber; None for nothing."""
