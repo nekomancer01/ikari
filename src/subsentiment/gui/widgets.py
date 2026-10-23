@@ -11,8 +11,8 @@ from typing import Callable
 from PySide6.QtCore import QDate, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath
 from PySide6.QtWidgets import (
-    QAbstractScrollArea, QCalendarWidget, QComboBox, QDateEdit, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QScrollArea, QSpinBox, QTableView, QToolButton, QVBoxLayout, QWidget,
+    QAbstractScrollArea, QCalendarWidget, QComboBox, QDateEdit, QFrame, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
+    QPushButton, QScrollArea, QSpinBox, QTableView, QToolButton, QVBoxLayout, QWidget,
 )
 
 from subsentiment.gui import motion, theme
@@ -112,6 +112,21 @@ class StatusLabel(ElidedLabel):
 
     def text(self) -> str:
         return self.full_text()
+
+
+class ProgressBar(QProgressBar):
+    """A progress bar that is redrawn with the next frame. Qt's paints the whole window there and then on every
+    new value, which a fetch sends for each comment thread it saves."""
+
+    def setValue(self, value: int) -> None:
+        self.setUpdatesEnabled(False)  # repaint() does nothing then; turning them back on asks for a redraw
+        super().setValue(value)
+        self.setUpdatesEnabled(True)
+
+    def setRange(self, low: int, high: int) -> None:
+        self.setUpdatesEnabled(False)
+        super().setRange(low, high)
+        self.setUpdatesEnabled(True)
 
 
 class VerticalScrollArea(QScrollArea):
