@@ -244,6 +244,28 @@ def test_a_comments_permalink_made_from_its_posts_is_rebuilt_when_read_not_store
     assert {r["id"]: r["permalink"] for r in csv.DictReader(open(tmp_path / "c.csv", encoding="utf-8-sig"))} == expected
 
 
+def test_a_threads_comments_are_saved_together_and_say_how_many_are_new(tmp_path):
+    s = Store(tmp_path / "x.db")
+    s.save_post(Post("p1", "Python", "t", "", "a", 1, 0.9, 2, 1_700_000_000, POST_LINK, ""), 0.0, "neutral")
+    s.save_comment(Comment("c1", "p1", "Python", "t3_p1", "b", "hi", 1, 1_700_000_100, 0, POST_LINK + "c1/"), 0.0, "neutral")
+    odd = "https://www.reddit.com/r/Python/comments/p1/_/c3/"
+    thread = [Comment("c1", "p1", "Python", "t3_p1", "b", "hi again", 4, 1_700_000_100, 0, POST_LINK + "c1/"),
+              Comment("c2", "p1", "Python", "t1_c1", "d", "yo", 1, 1_700_000_200, 1, POST_LINK + "c2/"),
+              Comment("c3", "p1", "Python", "t1_c1", "e", "hey", 2, 1_700_000_300, 1, odd)]
+    statements = []
+    s.db.set_trace_callback(statements.append)
+    assert s.save_comments(thread, [(0.5, "positive"), (-0.5, "negative"), (0.0, "neutral")]) == 2  # c1 was saved
+    s.db.set_trace_callback(None)
+    # One look-up of the post and of what was saved before, not one of each per comment.
+    assert sum("FROM posts" in q for q in statements) == 1 and sum("COUNT(*)" in q for q in statements) == 1
+    s.commit()
+    assert {r["id"]: (r["body"], r["label"], r["permalink"]) for r in s.comments("python")} == {
+        "c1": ("hi again", "positive", POST_LINK + "c1/"), "c2": ("yo", "negative", POST_LINK + "c2/"),
+        "c3": ("hey", "neutral", odd)}
+    assert dict(s.db.execute("SELECT id, permalink FROM comments")) == {"c1": None, "c2": None, "c3": odd}
+    assert s.save_comments(thread, [(0.0, "neutral")] * 3) == 0 and s.save_comments([], []) == 0
+
+
 def test_a_comment_saved_after_its_post_was_packed_doesnt_store_its_permalink_either(tmp_path):
     path = tmp_path / "subsentiment.db"
     s = Store(path)
