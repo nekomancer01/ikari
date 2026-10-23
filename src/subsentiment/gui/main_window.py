@@ -14,7 +14,7 @@ from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThre
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QFontMetrics, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
+    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
     QVBoxLayout, QWidget,
 )
 
@@ -32,7 +32,8 @@ from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.widgets import (
-    ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatusLabel, Throbber, fit_to_screen, label, panel, plural, section,
+    ElidedLabel, ProgressBar, QuietScrollBars, ShrinkingComboBox, StatusLabel, Throbber, fit_to_screen, label, panel,
+    plural, section,
 )
 from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices, ThreadScorer, finish
 from subsentiment.reddit import normalize_subreddit, subreddit_error
@@ -44,6 +45,7 @@ SCOPES = ["Posts and comments", "Posts only", "Comments only"]
 MIN_SCORES = {"Any score": None, "Score 1+": 1, "Score 10+": 10, "Score 50+": 50, "Score 100+": 100,
               "Score 500+": 500, "Score 1,000+": 1000}
 DRAWER_WIDTH = 318
+DRIP_MS = (40, 250)  # the shortest and longest wait between lots of a fetch's rows put into the tables
 NO_DATA = "Open Fetch on the left, enter a subreddit and press Fetch and analyse."
 
 
@@ -53,7 +55,7 @@ class FetchStrip(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.progress = QProgressBar()
+        self.progress = ProgressBar()
         self.progress.setFixedWidth(160)
         self.progress.setVisible(False)
         self.message = StatusLabel()
@@ -209,7 +211,7 @@ class MainWindow(QMainWindow):
         self._live.setInterval(1000)
         self._live.timeout.connect(self._live_refresh)
         self._drip = QTimer(self)  # releases fetched rows into the tables a few at a time, so each is seen
-        self._drip.setInterval(40)
+        self._drip.setInterval(DRIP_MS[0])
         self._drip.timeout.connect(self._release_rows)
         # The overview follows the rows a running fetch saves, a few times a second: often enough to read as
         # live, rarely enough that each change has time to ease in.
@@ -813,7 +815,7 @@ class MainWindow(QMainWindow):
                     self._queued_ids.add(r["id"])
                     self._queued[kind].append(r)
         if any(self._queued.values()) and not self._drip.isActive():  # start() would restart it, and
-            self._drip.start()  # comments saved every few ms would then hold every row back
+            self._drip.start(DRIP_MS[0])  # comments saved every few ms would then hold every row back
 
     def _count_new(self, kind: str, rows) -> None:
         """Count rows the running fetch saved into the subreddit shown, whatever their day or score: the timeline
@@ -830,15 +832,21 @@ class MainWindow(QMainWindow):
                 self._shown_live.start()
 
     def _release_rows(self) -> None:
-        """Show the next few queued rows; a long backlog is released faster so it never lags far behind."""
+        """Show the next few queued rows, the share of the backlog that drains it in about a second, so a long one
+        never lags far behind. Rows put into a table of 100,000 take several ms, and the table is drawn again
+        after, so the next lot waits about 25 times as long as this one took (from 25 lots a second for small
+        tables to 4 for big ones): the window keeps its time for frames."""
+        started = time.perf_counter()
         for kind, tab in self.tabs.items():
             queue = self._queued[kind]
-            batch, self._queued[kind] = queue[:max(1, len(queue) // 25)], queue[max(1, len(queue) // 25):]
+            n = max(1, round(len(queue) * self._drip.interval() / 1000))
+            batch, self._queued[kind] = queue[:n], queue[n:]
             if batch:
                 self._add_rows(kind, tab, batch)
         if not any(self._queued.values()):
             self._drip.stop()
         self._update_dataset_labels()
+        self._drip.setInterval(min(DRIP_MS[1], max(DRIP_MS[0], round((time.perf_counter() - started) * 25_000))))
 
     def _add_rows(self, kind: str, tab: TablePage, rows) -> None:
         tab.add_rows(rows)
