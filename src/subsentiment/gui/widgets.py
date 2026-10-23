@@ -180,12 +180,13 @@ class CommentCap(QObject):
 
     def set_enabled(self, on: bool) -> None:
         """Both off with ``on`` False. The count is off while sampling, which sets its own; under All, Top scoring
-        and Random are, as nothing is left out to choose between, leaving Sample to take."""
+        and Random are, as nothing is left out to choose between, leaving Sample to take (and, from Sample, the
+        way back)."""
         self._enabled = on
         self.count.setEnabled(on and not self.sampling)
-        capped = self.count.value() > 0
+        either = self.count.value() > 0 or self.sampling
         for key in ("top", "random"):
-            self.pick.model().item(self.pick.findData(key)).setEnabled(capped)
+            self.pick.model().item(self.pick.findData(key)).setEnabled(either)
         self.pick.setEnabled(on)
 
     def restore(self) -> None:

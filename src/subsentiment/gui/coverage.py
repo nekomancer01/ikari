@@ -720,7 +720,8 @@ class CoveragePage(VerticalScrollArea):
         asked, counts = self._threads_got
         if counts is not None:
             self._threads, self._threads_for = counts, asked
-            self._sampled = self.window_.store.sampled_days(*asked[:3])
+            # Only while sampling: few rows, read by key, but on this thread.
+            self._sampled = self.window_.store.sampled_days(*asked[:3]) if asked[3] == SAMPLED else set()
         if not (self.subreddit and self.days and self.isVisible()):
             return  # left meanwhile; showing the page again counts them
         if self._threads_again or asked != (self.subreddit.lower(), self.days[-1], self.days[0] + DAY,
@@ -1191,8 +1192,8 @@ class CoveragePage(VerticalScrollArea):
         if not self.subreddit or not ids:
             return
         sampling = self.comment_cap.sampling and not one
-        asked = self.comment_cap.request() if sampling or not self.comment_cap.sampling else {
-            "comments_per_post": 0, "comment_pick": "top"}
+        asked = {"comments_per_post": 0, "comment_pick": "top"} if one and self.comment_cap.sampling else \
+            self.comment_cap.request()
         req = collect.FetchRequest(subreddit=self.subreddit, comment_posts=tuple(ids), fill_threads=True, **asked)
         cap = asked["comments_per_post"]
         what = "a sample of the comments" if sampling else f"up to {plural(cap, 'comment')}" if cap else "every comment"

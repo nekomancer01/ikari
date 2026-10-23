@@ -373,7 +373,7 @@ def test_the_fetch_drawers_sample_downloads_only_part_of_a_big_days_comments_and
         saved[day] = saved.get(day, 0) + 1
     asked = {q["link_id"] for p, q in env.archive.requests if p == TREE}
     sampled = s.complete_keys("sampled", "python")
-    big = small = 0
+    big, small = set(), set()
     for day in {int(r["created_utc"] // DAY * DAY) for r in posts.values()}:
         counts = s.comment_totals("python", day, day + DAY)
         on = [posts[pid] for pid in counts]
@@ -382,13 +382,13 @@ def test_the_fetch_drawers_sample_downloads_only_part_of_a_big_days_comments_and
         sample = collect.Sample(counts)
         total = sum(counts.values())
         if total > collect.Sample.NEED:
-            big += 1
+            big.add(day)
             assert sample.size < collect.Sample.NEED and saved.get(day) == sample.size  # 2,000 or so: 323
             fetched = {r["id"] for r in on} & asked
             assert 0 < len(fetched) < len(on)  # not every thread: the saving
             assert {r["id"] for r in on} <= sampled  # each holds its part of the sample, or has none in it
         else:
-            small += 1
+            small.add(day)
             ids = {r["id"] for r in on}
             whole, n = s.whole_threads_per_day("python", day, day + DAY)[day]
             assert whole == n and not ids & sampled  # kept whole
@@ -402,11 +402,11 @@ def test_the_fetch_drawers_sample_downloads_only_part_of_a_big_days_comments_and
     cov = open_coverage(w)
     cov.comment_cap.pick.setCurrentIndex(cov.comment_cap.pick.findData("sample"))
     end = time.monotonic() + 10
-    texts = lambda: [cov.day_table.cellWidget(r, 3).main.full_text() for r in range(len(cov._day_rows))]
-    while not any(t.startswith("Sampled") for t in texts()) and time.monotonic() < end:
+    texts = lambda days: [cov.day_table.cellWidget(cov._day_rows.index(d), 3).main.full_text() for d in days]
+    while not all(t.startswith("Sampled") for t in texts(big)) and time.monotonic() < end:
         pump(20)
-    assert any(t.startswith("Sampled") for t in texts())
-    assert not any(t.startswith("✓") for t in texts())  # sampled, not every comment saved
+    assert all(t.startswith("Sampled") for t in texts(big))  # sampled, not every comment saved
+    assert all(t.startswith("✓") for t in texts(small))  # every comment saved
     w.close()
     assert env.window().fetch_form.comment_cap.pick.currentData() == "sample"  # remembered
 

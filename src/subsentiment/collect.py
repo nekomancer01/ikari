@@ -353,7 +353,7 @@ class Download:
             failed, tried, self.gave_up, added = self.each_thread(todo, get, cap=cap, progress=report)
             self.errors += failed
             self.n_comments += added
-            self.mark_sampled()
+            self.mark_sampled(tried)
         if self.gave_up:
             rest = [p for p in todo if p.id not in tried]  # not tried this time: retried on the next fetch
             self.errors += len(rest)
@@ -400,7 +400,7 @@ class Download:
         errors, tried, gave_up, n_comments = self.each_thread(
             posts, self.take_sample if self.sample else lambda p: self.client.fetch_all_comments(p, cap, req.comment_pick),
             cap=cap, progress=progress, every=True)
-        self.mark_sampled()
+        self.mark_sampled(tried)
         if gave_up:
             errors += len([p for p in posts if p.id not in tried])  # not tried: retried next time
         if posts:
@@ -415,15 +415,16 @@ class Download:
         if not self.sample:
             return posts
         store, name, todo = self.store, self.name, []
+        held = store.complete_keys("sampled", name)
         for p in posts:
             day = int(p.created_utc // DAY * DAY)
             if day not in self.samples:
                 self.samples[day] = Sample(store.comment_totals(name, day, day + DAY))
                 self.saved_count.update(store.comment_counts(name, day, day + DAY))
             q = self.samples[day].quota(p.id)
-            if q is None or self.saved_count.get(p.id, 0) < q:
+            if q is None or (p.id not in held and self.saved_count.get(p.id, 0) < q):
                 todo.append(p)
-            else:
+            elif p.id not in held:
                 store.mark_complete("sampled", name, p.id)
         store.commit()
         return todo
@@ -433,14 +434,15 @@ class Download:
         comments, whole = self.client.fetch_all_comments(p)
         sample = self.samples[int(p.created_utc // DAY * DAY)]
         kept = sample.keep(p.id, comments)
-        if sample.quota(p.id) is not None:
+        if sample.quota(p.id) is not None and comments:  # a tree that came back empty is asked again next time
             self.kept[p.id] = len(kept)
         return kept, whole and len(kept) == len(comments)
 
-    def mark_sampled(self) -> None:
-        """Threads read for the sample whose part of it is saved now: done for the sample."""
-        for pid, n in self.kept.items():
-            if len(self.store.comment_ids(pid)) >= n:
+    def mark_sampled(self, tried: set[str]) -> None:
+        """Threads read for the sample and saved (``tried``, not ones dropped after Stop) whose part of it is saved
+        now: done for the sample."""
+        for pid in tried & self.kept.keys():
+            if len(self.store.comment_ids(pid)) >= self.kept[pid]:
                 self.store.mark_complete("sampled", self.name, pid)
         self.kept.clear()
         self.store.commit()
@@ -455,7 +457,7 @@ class Download:
         start, since the archive is struggling and shouldn't be hammered. Returns (posts that failed, ids of the
         posts tried, whether it gave up, new comments)."""
         store, name, client, should_stop = self.store, self.name, self.client, self.should_stop
-        what = "Comments for post" if cap else "All comments for post"
+        what = "Sampled comments for post" if self.sample else "Comments for post" if cap else "All comments for post"
         workers = getattr(client, "tree_workers", getattr(client, "workers", 1))
         gave_up = threading.Event()
         streak = [0]  # failures in a row, counted as they happen so no new requests start after the limit
