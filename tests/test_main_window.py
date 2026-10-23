@@ -18,6 +18,15 @@ from subsentiment.reddit import Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
 
 
+def read_in(page) -> None:
+    """Download coverage reads what's saved on threads: wait until what it read is drawn."""
+    end = time.monotonic() + 10
+    while page.reading() and time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.005)
+    QApplication.processEvents()
+
+
 @pytest.fixture
 def make_window(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
@@ -248,6 +257,7 @@ def test_coverage_page_lists_days_and_downloads_through_the_fetch_job(make_windo
     w.show_page("coverage")
     c = w.coverage
     c.refresh_saved()
+    read_in(c)
     day = 1_699_920_000  # 14 Nov 2023 00:00 UTC
     assert day in c.days and c.days == sorted(c.days, reverse=True)
     row = c.days.index(day)
@@ -312,6 +322,7 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     w.show_page("coverage")
     c = w.coverage
     c.refresh_saved()
+    read_in(c)
     row = c.days.index(today)
     cell = c.day_table.cellWidget(row, 1)
     assert (cell.main.text(), cell.note.text()) == ("1 saved so far", "Today")
@@ -345,6 +356,7 @@ def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypat
     w.show_page("coverage")
     c = w.coverage
     c.refresh_saved()
+    read_in(c)
     # The older day's count (1) can't be right; yesterday's is whole and shown.
     cell = c.day_table.cellWidget(c.days.index(older), 1)
     assert (cell.main.text(), cell.note.text()) == ("3 saved so far", "No usable count")

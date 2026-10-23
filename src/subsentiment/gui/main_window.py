@@ -681,6 +681,8 @@ class MainWindow(QMainWindow):
             return "Scoring saved items\u2026"
         if self.coverage.delete_job.busy:
             return "Deleting days\u2026"
+        if self.coverage.reading() and self.coverage.isVisible():
+            return "Reading saved days\u2026"
         if not (self.fetch_job.busy and self._showing_fetch()):
             if self._span_slices.running():
                 return "Filling the tables\u2026"
@@ -1430,5 +1432,6 @@ class MainWindow(QMainWindow):
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
         return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job,
-                                    self.coverage.threads_job, self.load_job, self.rescore.job)
+                                    self.coverage.days_read.job, self.coverage.posts_read.job, self.load_job,
+                                    self.rescore.job)
                 if j.running()]
