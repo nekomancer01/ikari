@@ -1,6 +1,7 @@
 """The whole app driven like a user would: the real main window, fetch threads, HTTP client and store,
 talking to a fake Arctic Shift server on localhost. The rule checked throughout: nothing is requested
 unless the user asked for it, and each action requests only what it says."""
+import faulthandler
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ import sys
 import threading
 import time
 import types
+import weakref
 from pathlib import Path
 
 import pytest
@@ -47,7 +49,9 @@ def wait_idle(w, timeout: float = 30) -> None:
     """Until the fetch the window is running has finished and its thread is cleaned up."""
     end = time.monotonic() + timeout
     while w.fetch_job.busy:
-        assert time.monotonic() < end, "fetch didn't finish"
+        if time.monotonic() >= end:
+            faulthandler.dump_traceback(all_threads=True)  # where the fetch is stuck, in the failure's output
+            raise AssertionError("fetch didn't finish")
         QApplication.processEvents()
         time.sleep(0.01)
     pump(50)
@@ -815,6 +819,25 @@ def test_quitting_mid_fetch_exits_cleanly(env, tmp_path, mode):
     assert not (tmp_path / "quit.db-wal").exists() or (tmp_path / "quit.db-wal").stat().st_size == 0
     settings = QSettings(str(next(tmp_path.rglob("*.ini"))), QSettings.Format.IniFormat)
     assert settings.value("fetch/subreddit") == "python"
+
+
+def test_widgets_left_for_the_garbage_collector_go_on_the_windows_thread_not_a_reading_one(env):
+    """A table reads rows on a thread, and Python collects garbage wherever enough objects are made: widgets of a
+    window closed earlier were deleted on that thread, which crashed Linux CI (a segfault). With the window open,
+    garbage waits for the window's thread."""
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QWidget
+    env.window()
+    where = []
+    for _ in range(20):
+        w = QWidget()
+        QTimer(w).start(1000)
+        w.me = w  # a cycle: only the garbage collector deletes it
+        where.append(weakref.ref(w, lambda _: where.append(threading.current_thread() is threading.main_thread())))
+        del w
+    worker.finish(worker.on_thread(lambda: [[] for _ in range(300_000)]))  # as many objects as a big table read
+    pump(300)
+    assert [w for w in where if isinstance(w, bool)] == [True] * 20
 
 
 def test_about_names_the_bundled_model(env, monkeypatch):
