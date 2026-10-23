@@ -774,6 +774,28 @@ def test_the_once_a_second_refresh_during_a_download_redraws_only_the_days_that_
     assert c.day_table.cellWidget(c.days.index(day), 1).main.full_text().startswith("2")
 
 
+def test_row_buttons_sit_whole_and_centred_in_their_cells(window):
+    """The cell a table gives a row button is its column less the theme's item padding: a button set off by
+    margins of its own ran past the cell's right edge and lost its border there."""
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    c.day_table.selectRow(1)
+    settle(w, lambda: c.post_table.rowCount())
+    for t, cols in ((c.day_table, (2, 4)), (c.post_table, (2,))):
+        w._apply_theme()  # cell widgets take the delegate's geometry once the rows are restyled
+        settle(w)
+        assert t.cellWidget(0, cols[0]).width() < t.columnWidth(cols[0])  # the theme's item padding is off it
+        for row in range(t.rowCount()):
+            for col in cols:
+                box = t.cellWidget(row, col)
+                b = box.findChild(QPushButton)
+                assert box.rect().contains(b.geometry()), (row, col, box.rect(), b.geometry())
+                assert abs(b.geometry().center().x() - box.rect().center().x()) <= 1
+
+
 def held_posts(monkeypatch):
     """The first posts download waits until the returned event is set, so the test can click while it runs."""
     import threading

@@ -193,6 +193,8 @@ class Choice(QFrame):
     def __init__(self, options: list[tuple[str, str]], current: str, small: bool = False):
         super().__init__()
         mark(self, "choice", True)
+        if small:
+            mark(self, "small", True)
         lay = QHBoxLayout(self)
         lay.setContentsMargins(3, 3, 3, 3)
         lay.setSpacing(2)
@@ -203,7 +205,6 @@ class Choice(QFrame):
             b.setAutoExclusive(True)
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setStyleSheet(f"padding: {'3px 10px' if small else '4px 12px'}; border-radius: 10px;")
             b.clicked.connect(lambda _=False, k=key: self.changed.emit(k))
             self.buttons[key] = b
             lay.addWidget(b)
