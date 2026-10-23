@@ -1269,6 +1269,7 @@ def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
     while cov.count_job.busy and time.monotonic() < end:
         pump(20)
     pump(50)
+    read_in(w)  # what's saved is read again, on threads, once the count is in
     totals = cov.totals["python"]
     assert not any(cell.bar.waiting for _, cell, _ in rows())
     # Every day with posts to look for can be downloaded now; only past days the archive has none for can't.
