@@ -103,7 +103,7 @@ def settle(w, until=lambda: True, timeout=5.0):
         QApplication.processEvents()
         cov = w.coverage
         idle = not w.fetch_job.busy and (cov is None or not (cov.count_job.busy or cov.delete_job.busy
-                                                             or cov.threads_job.busy))
+                                                             or cov.reading()))
         if idle and until():
             break
         time.sleep(0.01)

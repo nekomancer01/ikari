@@ -1381,6 +1381,30 @@ class Store:
             "AND p.image = 0 GROUP BY d", (subreddit, after, before))
         return {r["d"]: (r["whole"], r["n"]) for r in rows}
 
+    def coverage_days(self, subreddit: str, cap: int = 0, since: float = 0) -> dict:
+        """What Download coverage lists, in one read: "days" fetches asked for (tried_days), and per listed day the
+        posts "saved", the removed and skipped image posts seen ("checked"), the archive "counts" asked for at or
+        after ``since``, the "threads" done at ``cap`` (whole_threads_per_day), and the days "complete"."""
+        with self.snapshot():
+            days = self.tried_days(subreddit)
+            if not days:
+                return {"days": []}
+            after, before = days[-1], days[0] + 86400
+            checked = self.removed_per_day(subreddit, after, before)
+            for day, n in self.posts_per_day(subreddit, after, before, images=True).items():
+                checked[day] = checked.get(day, 0) + n
+            return {"days": days, "saved": self.posts_per_day(subreddit, after, before), "checked": checked,
+                    "counts": self.archive_counts(subreddit, after, before, since),
+                    "threads": self.whole_threads_per_day(subreddit, after, before, cap),
+                    "complete": self.complete_keys("posts", subreddit)}
+
+    def coverage_posts(self, subreddit: str, day: int, cap: int = 0) -> tuple[list, set[str], set[str]]:
+        """A UTC day's saved posts for Download coverage (comment_coverage), with the ids of posts whose comments
+        are complete, and complete so far."""
+        with self.snapshot():
+            return (self.comment_coverage(subreddit, day, day + 86400, cap), self.complete_keys("comments", subreddit),
+                    self.complete_keys("comments_so_far", subreddit))
+
     def posts_by_ids(self, ids) -> list[sqlite3.Row]:
         ids = list(ids)
         return self._unpacked("posts", self.db.execute(f"SELECT * FROM posts WHERE id IN ({','.join('?' * len(ids))})", ids))

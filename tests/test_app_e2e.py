@@ -1665,7 +1665,7 @@ def test_a_days_comments_downloaded_once_read_complete_even_where_the_archive_co
     QTest.mouseClick(cov.day_table.cellWidget(row, 4).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     wait_idle(w)
     end = time.monotonic() + 10
-    while cov.threads_job.busy and time.monotonic() < end:
+    while cov.reading() and time.monotonic() < end:
         pump(20)
     pump(100)
     assert cov.day_table.cellWidget(row, 3).main.full_text() == "✓ 5\u00a0threads"  # on main: 4 of 5 threads
@@ -1687,7 +1687,7 @@ def test_a_huge_thread_whose_tree_comes_back_collapsed_is_read_whole_from_the_co
     QTest.mouseClick(cov.day_table.cellWidget(row, 4).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     wait_idle(w, 60)
     end = time.monotonic() + 10
-    while cov.threads_job.busy and time.monotonic() < end:
+    while cov.reading() and time.monotonic() < end:
         pump(20)
     pump(100)
     assert cov.day_table.cellWidget(row, 3).main.full_text() == "✓ 5\u00a0threads"

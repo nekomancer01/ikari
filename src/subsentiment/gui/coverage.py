@@ -10,12 +10,13 @@ its own posts and comments buttons, and the day picked in the list shows its pos
 """
 from __future__ import annotations
 
+import itertools
 import json
 import time
 from datetime import datetime, timezone
 
 import shiboken6
-from PySide6.QtCore import QEvent, QSize, Qt, Slot
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QBoxLayout, QCheckBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton,
     QSizePolicy, QTableWidget, QVBoxLayout, QWidget,
@@ -27,7 +28,7 @@ from subsentiment.gui import theme
 from subsentiment.gui.widgets import (
     Choice, CommentCap, ElidedLabel, ShareBar, VerticalScrollArea, label, panel, plural, section,
 )
-from subsentiment.gui.worker import BackgroundJob, CountWorker, StoreWorker
+from subsentiment.gui.worker import BackgroundJob, CountWorker, StoreRead, StoreWorker
 
 DAY = 86400
 MAX_DAY_POSTS = collect.MAX_DAY_POSTS  # cap on one day's "Download all"
@@ -258,6 +259,80 @@ def table(headers: list[str]) -> QTableWidget:
     return t
 
 
+class LazyRows(QObject):
+    """A table whose rows get their widgets only as they come near the view: building five widgets for each of
+    two years of days took three seconds as the page opened, and a busy day has thousands of posts. ``build(row)``
+    gives a row its widgets and ``draw(row)`` fills them in; a row is drawn as it's built, and again by
+    ``redraw``, so ``draw`` skips what it already shows. With ``ahead``, the rest are built too, a few
+    milliseconds' worth between frames, so a dragged scroll bar never shows an empty row."""
+
+    AHEAD_S = 0.004  # building ahead takes at most this much of a frame
+
+    def __init__(self, table: QTableWidget, build, draw, ahead: bool = False):
+        super().__init__(table)
+        self.table, self.build, self.draw = table, build, draw
+        self.built: set[int] = set()
+        self._from = 0  # the first row on screen, where building ahead starts
+        self._ahead = QTimer(self) if ahead else None
+        if self._ahead:
+            self._ahead.setInterval(0)
+            self._ahead.timeout.connect(self._build_ahead)
+        table.verticalScrollBar().valueChanged.connect(self.fill)
+        self.viewport = table.viewport()
+        self.viewport.installEventFilter(self)  # resized or shown: more rows may be on screen
+
+    def reset(self, rows: int) -> None:
+        """``rows`` rows, none built yet but the ones on screen."""
+        self.table.setRowCount(0)
+        self.table.setRowCount(rows)
+        self.built.clear()
+        self.fill()
+
+    def fill(self, *_) -> None:
+        """Build the rows on screen, plus a screenful either side for smooth scrolling."""
+        t = self.table
+        n = t.rowCount()
+        if not n:
+            return
+        height = max(t.viewport().height(), 1)
+        first, last = t.rowAt(0), t.rowAt(height - 1)
+        first = 0 if first < 0 else first
+        last = n - 1 if last < 0 else last  # the rows end above the bottom: every row shown after the first
+        # Building ahead fills in the rest after the next frame; otherwise a screenful either side is built now.
+        span = 0 if self._ahead else last - first + 1
+        for row in range(max(0, first - span), min(n, last + span + 1)):
+            if not t.isRowHidden(row):
+                self._make(row)
+        if self._ahead and len(self.built) < n:
+            self._from = first
+            self._ahead.start()
+
+    def _make(self, row: int) -> None:
+        if row not in self.built:
+            self.build(row)
+            self.built.add(row)
+            self.draw(row)
+
+    def _build_ahead(self) -> None:
+        end = time.perf_counter() + self.AHEAD_S
+        n = self.table.rowCount()
+        for row in itertools.chain(range(self._from, n), range(min(self._from, n))):  # the ones below the view first
+            self._make(row)
+            if time.perf_counter() > end:
+                return  # the timer runs again after the next frame
+        self._ahead.stop()
+
+    def redraw(self) -> None:
+        for row in sorted(self.built):
+            self.draw(row)
+
+    def eventFilter(self, obj, event) -> bool:
+        if (obj is self.viewport and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)
+                and shiboken6.isValid(self.table)):  # not while the window is being torn down
+            self.fill()
+        return False
+
+
 def centred(w: QWidget) -> QWidget:
     box = QWidget()
     lay = QHBoxLayout(box)
@@ -280,6 +355,7 @@ class CoveragePage(VerticalScrollArea):
         self.subreddit: str | None = None
         self.busy = False
         self._waiting: set[int] = set()  # days whose Download waits for the archive's count of them
+        self._today = today()  # the UTC day the days list was last drawn for
         self.days: list[int] = []
         self.totals: dict[str, dict[int, int]] = {}  # subreddit (lowercase) -> day -> archive count
         self._totals_day = today()  # the UTC day self.totals were asked on: a count is good for that day only
@@ -290,7 +366,7 @@ class CoveragePage(VerticalScrollArea):
         self._count_stopped = False  # the app closed while it ran, so its answer may be cut short
         self._post_rows: list = []
         self._post_ids: list[str] = []
-        self._built: dict[int, tuple] = {}  # post rows with widgets, and what they last showed
+        self._post_drawn: dict[int, tuple] = {}  # what each built post row last showed
         self._comments_done: set[str] = set()
         self._comments_so_far: set[str] = set()
         self._day_rows: list[int] = []
@@ -298,13 +374,18 @@ class CoveragePage(VerticalScrollArea):
         # Day -> (saved, archive count or None, removed and image posts seen, complete), as last shown.
         self._day_state: dict[int, tuple] = {}
         # Day -> (posts with every comment saved, saved posts), for self._threads_for: (subreddit lowercased, after,
-        # before). Counted on a thread, as counting a month's comments takes a busy subreddit's ~650k about 70 ms.
+        # before, cap).
         self._threads: dict[int, tuple[int, int]] = {}
         self._threads_for: tuple = ()
-        self.threads_job = BackgroundJob(self)
-        self.threads_job.ended.connect(self._on_threads_ended)
-        self._threads_got: tuple = ((), None)  # what the running count asked for, and its answer once in
-        self._threads_again = False  # asked for while one ran: counted again when it ends
+        # What's saved is read on threads, so the page opens at once: a busy subreddit's days took 50 ms to read,
+        # its comment threads 70 ms more, and a busy day's posts tens of milliseconds.
+        self.days_read = StoreRead(window.db_path, "coverage_days", self)
+        self.days_read.got.connect(self._on_days)
+        self.posts_read = StoreRead(window.db_path, "coverage_posts", self)
+        self.posts_read.got.connect(self._on_posts)
+        self._rebuild = False  # the next days read in builds the rows again
+        self._days_for = ""  # the subreddit (lowercased) self.days are of
+        self._todo_comments: list[str] = []  # the opened day's posts whose threads aren't saved whole
         self.ticked: set[int] = set()  # days ticked for Download N days or Delete N days
         self.delete_job = BackgroundJob(self)  # deletes ticked days on a connection of its own
         self.delete_job.ended.connect(self._on_delete_ended)
@@ -393,8 +474,7 @@ class CoveragePage(VerticalScrollArea):
             signal.connect(self.comment_cap.save)
             signal.connect(self._show_ticked)
         # A thread holding the cap is done at that cap, so the threads and the opened day's posts follow it.
-        self.comment_cap.count.valueChanged.connect(lambda _: self.subreddit and self.days and (
-            self._count_threads(), self._load_posts()))
+        self.comment_cap.count.valueChanged.connect(lambda _: self.subreddit and self.days and self.refresh_saved())
         bar_cap.addWidget(self.comment_cap.count)
         bar_cap.addWidget(self.comment_cap.pick)
         for lay in (bar_lay, bar_cap):
@@ -414,6 +494,7 @@ class CoveragePage(VerticalScrollArea):
         for col in (1, 3):
             h.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
         self.day_table.itemSelectionChanged.connect(self._load_posts)
+        self.day_rows = LazyRows(self.day_table, self._build_day_row, self._draw_day_row, ahead=True)
         self.filter = Choice([("all", "All"), ("posts", "Missing posts"), ("comments", "Missing comments")], "all",
                              small=True)
         self.filter.buttons["posts"].setToolTip("Only days with posts the archive has and ikari hasn't saved")
@@ -465,9 +546,7 @@ class CoveragePage(VerticalScrollArea):
         h.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         h.resizeSection(2, 44)
         self.post_table.setTextElideMode(Qt.TextElideMode.ElideRight)
-        self.post_table.verticalScrollBar().valueChanged.connect(self._fill_visible)
-        self._post_viewport = self.post_table.viewport()
-        self._post_viewport.installEventFilter(self)  # resized or shown: more rows may be on screen
+        self.post_rows = LazyRows(self.post_table, self._build_post_row, self._draw_post_row)
         self.posts_title = ElidedLabel("Posts", "section")
         self.all_comments = small_button("Download all comments")
         self.all_comments.clicked.connect(self._download_day_comments)
@@ -525,133 +604,164 @@ class CoveragePage(VerticalScrollArea):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        self.refresh_saved(rebuild=True)
+        self.refresh_saved()  # the rows built before stay: only what changed is drawn again
 
     def set_busy(self, busy: bool) -> None:
+        """Every download and delete button follows at once; what's saved is read again after."""
         self.busy = busy
         self._show_resume()
+        if self.isVisible():
+            self.day_rows.redraw()
+            self.post_rows.redraw()
+            self.all_comments.setEnabled(not busy and bool(self._todo_comments))
+            self._show_ticked()
         self.refresh_saved()
 
     def refresh_saved(self, rebuild: bool = False) -> None:
-        """Re-read what's saved (a fetch may have added some) and redraw both lists. Only while the page
-        shows: showing it does this anyway."""
+        """Re-read what's saved (a fetch may have added some) and redraw both lists once it's in. Only while the
+        page shows: showing it does this anyway."""
         if not self.isVisible():
             return
-        days = self.window_.store.tried_days(self.subreddit) if self.subreddit else []
+        self._rebuild = self._rebuild or rebuild
+        if self.subreddit:
+            self.days_read.ask(self.subreddit, self.comment_cap.count.value(), today())
+        else:
+            self._on_days((None, 0, 0), {"days": []})
+
+    def reading(self) -> bool:
+        return self.days_read.busy or self.posts_read.busy
+
+    @Slot(object, object)
+    def _on_days(self, asked: tuple, got: dict) -> None:
+        sub, cap, _ = asked
+        if not self.isVisible() or (sub or "").lower() != (self.subreddit or "").lower():
+            return  # left, or another subreddit asked for since: what that asks for is drawn instead
+        days = got["days"]
         if not days:
             self.subtitle.setText("Nothing fetched yet. Days a fetch asks for are listed here, to download what it missed."
                                   if self.subreddit else "Pick a saved subreddit first.")
             self.days = self._day_rows = []
-            self.day_table.setRowCount(0)
+            self.day_rows.reset(0)
             self._show_ticked()
             self._show_posts(None)
             return
-        if days != self.days:
-            self.days, rebuild = days, True
-        totals = self._totals()
-        missing = [d for d in days if d not in totals and d < today()]  # today has no usable count yet
-        if missing and not self.count_job.busy and not self.count_error:
-            self._count(min(missing), max(missing) + DAY)
-        self._fill_days(totals, rebuild)
+        rebuild, self._rebuild = self._rebuild or days != self.days, False
+        self.days = days
+        self._threads, self._threads_for = got["threads"], (sub.lower(), days[-1], days[0] + DAY, cap)
+        self._days_for = sub.lower()
+        totals = self._totals(got["counts"])
+        self._count_missing()
+        self._fill_days(totals, got, rebuild)
         self._load_posts()
 
-    def _totals(self) -> dict[int, int]:
-        """The listed days' archive counts asked for today, in this session or kept from an earlier one: a count
-        is asked for at most once a UTC day."""
+    def _count_missing(self) -> None:
+        """Ask the archive for the listed days' counts not in yet (today has no usable count yet)."""
+        if self._days_for != (self.subreddit or "").lower():
+            return  # the days listed are another subreddit's: its own are counted once they're read
+        totals = self.totals.get(self._days_for, {})
+        missing = [d for d in self.days if d not in totals and d < today()]
+        if missing and not self.count_job.busy and not self.count_error:
+            self._count(min(missing), max(missing) + DAY)
+
+    def _totals(self, kept: dict[int, int]) -> dict[int, int]:
+        """The listed days' archive counts asked for today, in this session or ``kept`` from an earlier one: a
+        count is asked for at most once a UTC day."""
         if self._totals_day != today():  # past midnight UTC: yesterday's counts are asked for again
             self.totals, self._totals_day, self.count_error = {}, today(), ""
         totals = self.totals.setdefault(self.subreddit.lower(), {})
         missing = [d for d in self.days if d not in totals and d < today()]
         if missing:
-            totals.update(self.window_.store.archive_counts(self.subreddit, min(missing), max(missing) + DAY,
-                                                            since=today()))
+            totals.update({d: n for d, n in kept.items() if min(missing) <= d <= max(missing)})
         return totals
 
-    def _fill_days(self, totals: dict[int, int], rebuild: bool) -> None:
-        store = self.window_.store
-        saved = store.posts_per_day(self.subreddit, self.days[-1], self.days[0] + DAY)
-        removed = store.removed_per_day(self.subreddit, self.days[-1], self.days[0] + DAY)
-        for day, n in store.posts_per_day(self.subreddit, self.days[-1], self.days[0] + DAY, images=True).items():
-            removed[day] = removed.get(day, 0) + n  # skipped image posts are checked too
-        complete = store.complete_keys("posts", self.subreddit)
-        self._count_threads()
-        t = self.day_table
-        if rebuild or self._day_rows != self.days:
-            keep = self._selected_day()
-            t.setRowCount(0)
-            t.setRowCount(len(self.days))
-            self.ticked &= set(self.days)
-            for row, day in enumerate(self.days):
-                tick = QCheckBox()
-                tick.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-                tick.setCursor(Qt.CursorShape.PointingHandCursor)
-                tick.setToolTip("Tick to download with the other ticked days. Shift-click ticks a run of days.")
-                tick.setChecked(day in self.ticked)
-                tick.clicked.connect(lambda on, d=day: self._tick(d, on))
-                box = QWidget()
-                lay = QHBoxLayout(box)
-                lay.setContentsMargins(10, 0, 0, 0)
-                lay.setSpacing(8)
-                lay.addWidget(tick)
-                lay.addWidget(QLabel(short_day(day)), 1)  # a click on the date still picks the row
-                t.setCellWidget(row, 0, box)
-                t.setCellWidget(row, 1, Cell())
-                posts = row_button()
-                posts.clicked.connect(lambda _=False, d=day: self._download_day(d))
-                t.setCellWidget(row, 2, centred(posts))
-                t.setCellWidget(row, 3, Cell())
-                threads = row_button()
-                threads.clicked.connect(lambda _=False, d=day: self._download_day_threads(d))
-                t.setCellWidget(row, 4, centred(threads))
-            self._day_rows = list(self.days)
-            self._drawn.clear()
-            row = self.days.index(keep) if keep in self.days else 0
-            t.selectRow(row)
+    def _fill_days(self, totals: dict[int, int], got: dict, rebuild: bool) -> None:
+        saved, removed, complete = got["saved"], got["checked"], got["complete"]
         counting = self.count_job.busy
-        current = today()
+        self._today = today()
         self._waiting = set()
-        for row, day in enumerate(self.days):
+        for day in self.days:
             n, total, done = saved.get(day, 0), totals.get(day), str(day) in complete
-            gone = removed.get(day, 0)
-            self._day_state[day] = (n, total, gone, done)
-            opened = no_total(day, n, total, done)
+            self._day_state[day] = (n, total, removed.get(day, 0), done)
             # Until its count is in, a day can't be told apart from one that's done or empty, so it waits;
             # a complete day needs no count to be checked again.
-            waiting = not opened and total is None and counting and not done
-            if waiting:
+            if not no_total(day, n, total, done) and total is None and counting and not done:
                 self._waiting.add(day)
-            if not self._changed(("posts", day), n, total, gone, done, waiting, self.busy, current, self.days[0]):
-                continue
-            cell: Cell = t.cellWidget(row, 1)
-            button: QPushButton = t.cellWidget(row, 2).findChild(QPushButton)
-            if opened:
-                cell.set_open(n, "today" if day >= current else "wrong", total)
-                button.setText(DOWNLOAD)
-                button.setEnabled(not self.busy)
-                button.setToolTip("Download all: every post from today so far" if day >= current
-                                  else f"Download all: every post from {day_text(day)}")
-                continue
-            cell.set(n, total, done, "post", gone, waiting)
-            full = done or (total is not None and 0 < total <= n + gone)
-            button.setText(CHECK if full else DOWNLOAD)
-            button.setEnabled(not self.busy and not waiting
-                              and not (total == 0 and not done and day < self.days[0]))
-            button.setToolTip(
-                "Waiting for Arctic Shift's count of this day" if waiting else
-                "Check again: look for posts the archive has added since" if full else
-                f"Download all: every post from {day_text(day)}"
-                + (f" (up to {total - n - gone:,} more)" if total and total > n + gone else ""))
-        self._show_threads()
+        if rebuild or self._day_rows != self.days:
+            keep = self._selected_day()
+            self.ticked &= set(self.days)
+            self._day_rows = list(self.days)
+            self._drawn.clear()
+            self.day_rows.reset(len(self.days))
+            self.day_table.selectRow(self.days.index(keep) if keep in self.days else 0)
+        else:
+            self.day_rows.redraw()
         self._apply_filter()
         self.ticked &= set(self._shown_days())  # a day just found to have no posts drops out
         shown = self._shown_days()
         if shown and self._selected_day() not in shown:  # the picked day went: pick the first one listed
-            t.selectRow(self.days.index(shown[0]))
+            self.day_table.selectRow(self.days.index(shown[0]))
         empty = sum(self._no_posts(d) for d in self.days)
         # The heading above names the subreddit.
         self.subtitle.setText(f"{range_text(self.days[-1], self.days[0])} · {plural(len(self.days), 'day')} "
                               "fetched before" + (f" · {plural(empty, 'day')} with no posts left out" if empty else ""))
         self._show_ticked()
+
+    def _build_day_row(self, row: int) -> None:
+        t, day = self.day_table, self._day_rows[row]
+        tick = QCheckBox()
+        tick.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        tick.setCursor(Qt.CursorShape.PointingHandCursor)
+        tick.setToolTip("Tick to download with the other ticked days. Shift-click ticks a run of days.")
+        tick.clicked.connect(lambda on, d=day: self._tick(d, on))
+        box = QWidget()
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(10, 0, 0, 0)
+        lay.setSpacing(8)
+        lay.addWidget(tick)
+        lay.addWidget(QLabel(short_day(day)), 1)  # a click on the date still picks the row
+        t.setCellWidget(row, 0, box)
+        t.setCellWidget(row, 1, Cell())
+        posts = row_button()
+        posts.clicked.connect(lambda _=False, d=day: self._download_day(d))
+        t.setCellWidget(row, 2, centred(posts))
+        t.setCellWidget(row, 3, Cell())
+        threads = row_button()
+        threads.clicked.connect(lambda _=False, d=day: self._download_day_threads(d))
+        t.setCellWidget(row, 4, centred(threads))
+
+    def _draw_day_row(self, row: int) -> None:
+        """A built day row's tick, Posts and Comment threads, from what _fill_days and the thread count found."""
+        day = self._day_rows[row]
+        self.day_table.cellWidget(row, 0).findChild(QCheckBox).setChecked(day in self.ticked)
+        self._draw_day_posts(row, day)
+        self._draw_day_threads(row, day)
+
+    def _draw_day_posts(self, row: int, day: int) -> None:
+        t, current = self.day_table, self._today
+        n, total, gone, done = self._day_state.get(day, (0, None, 0, False))
+        opened = no_total(day, n, total, done)
+        waiting = day in self._waiting
+        if not self._changed(("posts", day), n, total, gone, done, waiting, self.busy, current, self.days[0]):
+            return
+        cell: Cell = t.cellWidget(row, 1)
+        button: QPushButton = t.cellWidget(row, 2).findChild(QPushButton)
+        if opened:
+            cell.set_open(n, "today" if day >= current else "wrong", total)
+            button.setText(DOWNLOAD)
+            button.setEnabled(not self.busy)
+            button.setToolTip("Download all: every post from today so far" if day >= current
+                              else f"Download all: every post from {day_text(day)}")
+            return
+        cell.set(n, total, done, "post", gone, waiting)
+        full = done or (total is not None and 0 < total <= n + gone)
+        button.setText(CHECK if full else DOWNLOAD)
+        button.setEnabled(not self.busy and not waiting
+                          and not (total == 0 and not done and day < self.days[0]))
+        button.setToolTip(
+            "Waiting for Arctic Shift's count of this day" if waiting else
+            "Check again: look for posts the archive has added since" if full else
+            f"Download all: every post from {day_text(day)}"
+            + (f" (up to {total - n - gone:,} more)" if total and total > n + gone else ""))
 
     def _changed(self, cell, *shown) -> bool:
         """Whether a day's cell (("posts" or "threads", day)) is to show other than it does: once a second while
@@ -691,41 +801,12 @@ class CoveragePage(VerticalScrollArea):
             hide = self._no_posts(day) or (key == "posts" and not self._missing_posts(day)) or (
                 key == "comments" and not self._missing_threads(day))
             self.day_table.setRowHidden(row, hide)
+        self.day_rows.fill()  # days the filter brings back may be on screen now
 
     def _shown_days(self) -> list[int]:
         return [d for r, d in enumerate(self._day_rows) if not self.day_table.isRowHidden(r)]
 
     # -- comment threads saved whole ------------------------------------------
-
-    def _count_threads(self) -> None:
-        """Count the listed days' whole comment threads again (a download may have added some)."""
-        if self.threads_job.busy:
-            self._threads_again = True
-            return
-        self._threads_again = False
-        want = (self.subreddit.lower(), self.days[-1], self.days[0] + DAY, self.comment_cap.count.value())
-        worker = StoreWorker(self.window_.db_path, "whole_threads_per_day", *want)
-        worker.finished.connect(self._on_threads)  # a failed count leaves what's shown, until the next one
-        self._threads_got = (want, None)
-        self.threads_job.start(worker)
-
-    @Slot(object)
-    def _on_threads(self, counts: dict) -> None:
-        self._threads_got = (self._threads_got[0], counts)
-
-    @Slot()
-    def _on_threads_ended(self) -> None:
-        asked, counts = self._threads_got
-        if counts is not None:
-            self._threads, self._threads_for = counts, asked
-        if not (self.subreddit and self.days and self.isVisible()):
-            return  # left meanwhile; showing the page again counts them
-        if self._threads_again or asked != (self.subreddit.lower(), self.days[-1], self.days[0] + DAY,
-                                            self.comment_cap.count.value()):
-            self._count_threads()
-        self._show_threads()
-        self._apply_filter()
-        self._show_ticked()
 
     def _kept(self) -> str:
         """What a thread needs saved to count as done, for the tooltips: the cap counts as done."""
@@ -737,32 +818,30 @@ class CoveragePage(VerticalScrollArea):
         current = self._threads_for[:1] == ((self.subreddit or "").lower(),)
         return self._threads.get(day, (0, 0)) if current else (0, 0)
 
-    def _show_threads(self) -> None:
-        """Each day's comment threads column: how many of its saved posts have every comment saved."""
-        for row, day in enumerate(self._day_rows):
-            whole, posts = self._threads_on(day)
-            if not self._changed(("threads", day), whole, posts, self.busy):
-                continue
-            cell: Cell = self.day_table.cellWidget(row, 3)
-            button: QPushButton = self.day_table.cellWidget(row, 4).findChild(QPushButton)
-            if not posts:
-                cell.show_share("No posts saved", "None", "", None, False,
-                                "Download the day's posts first; their comments come after.")
-                button.setText(DOWNLOAD)
-                button.setEnabled(False)
-                button.setToolTip("No posts from this day are saved yet")
-                continue
-            done = whole == posts
-            cell.show_share(f"✓ {plural(posts, 'thread')}" if done else f"{whole:,} of {plural(posts, 'thread')}",
-                            f"✓ {posts:,}" if done else f"{whole:,} of {posts:,}",
-                            "" if done else f"{100 * whole // posts}%", whole / posts, done,
-                            f"{self._kept()} saved on {whole:,} of the {plural(posts, 'post')} saved from this "
-                            "day. " + THREADS_TIP)
-            button.setText(CHECK if done else DOWNLOAD)
-            button.setEnabled(not self.busy)
-            button.setToolTip(f"Check again: look for comments added since on {day_text(day)}'s posts" if done else
-                              f"Download the comments on the {plural(posts - whole, 'post')} from {day_text(day)} "
-                              "missing some")
+    def _draw_day_threads(self, row: int, day: int) -> None:
+        whole, posts = self._threads_on(day)
+        if not self._changed(("threads", day), whole, posts, self.busy):
+            return
+        cell: Cell = self.day_table.cellWidget(row, 3)
+        button: QPushButton = self.day_table.cellWidget(row, 4).findChild(QPushButton)
+        if not posts:
+            cell.show_share("No posts saved", "None", "", None, False,
+                            "Download the day's posts first; their comments come after.")
+            button.setText(DOWNLOAD)
+            button.setEnabled(False)
+            button.setToolTip("No posts from this day are saved yet")
+            return
+        done = whole == posts
+        cell.show_share(f"✓ {plural(posts, 'thread')}" if done else f"{whole:,} of {plural(posts, 'thread')}",
+                        f"✓ {posts:,}" if done else f"{whole:,} of {posts:,}",
+                        "" if done else f"{100 * whole // posts}%", whole / posts, done,
+                        f"{self._kept()} saved on {whole:,} of the {plural(posts, 'post')} saved from this "
+                        "day. " + THREADS_TIP)
+        button.setText(CHECK if done else DOWNLOAD)
+        button.setEnabled(not self.busy)
+        button.setToolTip(f"Check again: look for comments added since on {day_text(day)}'s posts" if done else
+                          f"Download the comments on the {plural(posts - whole, 'post')} from {day_text(day)} "
+                          "missing some")
 
     # -- ticked days ----------------------------------------------------------
 
@@ -798,9 +877,8 @@ class CoveragePage(VerticalScrollArea):
 
     def _show_ticked(self, *_) -> None:
         """Tick boxes, the download bar and the buttons under the list, from self.ticked."""
-        t = self.day_table
-        for row, day in enumerate(self._day_rows):
-            t.cellWidget(row, 0).findChild(QCheckBox).setChecked(day in self.ticked)
+        for row in self.day_rows.built:  # the rest are ticked as they're built
+            self.day_table.cellWidget(row, 0).findChild(QCheckBox).setChecked(self._day_rows[row] in self.ticked)
         n = len(self.ticked)
         shown = set(self._shown_days())
         every = bool(shown) and self.ticked >= shown
@@ -860,49 +938,56 @@ class CoveragePage(VerticalScrollArea):
         return None
 
     def _load_posts(self) -> None:
-        self._show_posts(self._selected_day())
+        day = self._selected_day()
+        if day is None or not self.subreddit:
+            self._show_posts(None)
+        else:
+            self.posts_read.ask(self.subreddit, day, self.comment_cap.count.value())
+
+    @Slot(object, object)
+    def _on_posts(self, asked: tuple, got: tuple) -> None:
+        sub, day, _ = asked
+        if sub.lower() == (self.subreddit or "").lower() and day == self._selected_day():  # not one picked since
+            self._show_posts(day, *got)
 
     def _empty(self, text: str) -> None:
         # Two lines' room: in the narrowest window the hint wraps, and the squeezed panel would cut its second line.
         self.posts_empty.setText(text)
         self.posts_empty.setMinimumHeight(self.posts_empty.fontMetrics().lineSpacing() * 2 + 4)
 
-    def _show_posts(self, day: int | None) -> None:
+    def _show_posts(self, day: int | None, rows: list | None = None, complete: set[str] = frozenset(),
+                    so_far: set[str] = frozenset()) -> None:
+        """The posts of ``day`` as Store.coverage_posts read them, or "Pick a day" for None."""
         t = self.post_table
         if day is None or not self.subreddit:
             self.posts_title.setText("Posts")
-            t.setRowCount(0)
-            self._post_ids, self._post_rows, self._built = [], [], {}
+            self._post_ids, self._post_rows, self._post_drawn = [], [], {}
+            self.post_rows.reset(0)
             self.all_comments.setEnabled(False)
             self._empty("Pick a day to see its posts.")
             self.posts_empty.setVisible(True)
             t.setVisible(False)
             return
-        store = self.window_.store
-        rows = store.comment_coverage(self.subreddit, day, day + DAY, self.comment_cap.count.value())  # newest first
         order = self.order.value()
         if order == "missing":  # threads not saved whole first, each part newest first
             rows.sort(key=lambda r: bool(r["whole"]))
         elif order == "comments":
             rows.sort(key=lambda r: -max(r["num_comments"] or 0, r["saved_comments"]))
-        complete = store.complete_keys("comments", self.subreddit)
-        so_far = store.complete_keys("comments_so_far", self.subreddit)
         self.posts_title.setText(f"Posts on {short_day(day)} · {len(rows):,}")
         ids = [r["id"] for r in rows]
-        if ids != self._post_ids:
-            # A busy day has thousands of posts, and three widgets a row took seconds to build; rows get
-            # their widgets when they scroll into view (_fill_visible), so a new post costs the same as any.
-            keep = t.verticalScrollBar().value() if set(ids) >= set(self._post_ids) else 0
-            t.setRowCount(0)
-            t.setRowCount(len(rows))
-            self._post_ids, self._built = ids, {}
-            t.verticalScrollBar().setValue(keep)
         self._post_rows = rows
         self._comments_done, self._comments_so_far = complete, so_far
+        if ids != self._post_ids:
+            # Rows get their widgets as they scroll into view, so a new post costs the same as any.
+            keep = t.verticalScrollBar().value() if set(ids) >= set(self._post_ids) else 0
+            self._post_ids, self._post_drawn = ids, {}
+            self.post_rows.reset(len(rows))
+            t.verticalScrollBar().setValue(keep)
+        else:
+            self.post_rows.redraw()
         # Not offered again: threads saved whole, or saved whole before the archive counted them (until it
         # has, there's nothing to say more came; once it has, a count above what's saved brings them back).
         todo = [r["id"] for r in rows if not r["whole"]]
-        self._fill_visible()
         self._todo_comments = todo
         self.all_comments.setText(f"Download all comments ({len(todo):,} posts)" if todo else "Download all comments")
         self.all_comments.setEnabled(not self.busy and bool(todo))
@@ -910,39 +995,26 @@ class CoveragePage(VerticalScrollArea):
         self.posts_empty.setVisible(not rows)
         t.setVisible(bool(rows))
 
-    def _fill_visible(self, *_) -> None:
-        """Build and fill the post rows on screen, plus a screenful either side for smooth scrolling."""
+    def _build_post_row(self, i: int) -> None:
         t = self.post_table
-        n = len(self._post_rows)
-        if not n:
-            return
-        height = max(t.viewport().height(), 1)
-        first = t.rowAt(0)
-        last = t.rowAt(height - 1)
-        first = 0 if first < 0 else first
-        last = n - 1 if last < 0 else last
-        span = last - first + 1
-        for i in range(max(0, first - span), min(n, last + span + 1)):
-            self._fill_post_row(i)
+        title = ElidedLabel()
+        title.setContentsMargins(8, 0, 4, 0)
+        t.setCellWidget(i, 0, title)
+        t.setCellWidget(i, 1, Cell())
+        button = row_button()
+        button.clicked.connect(lambda _=False, row=i: self._download_comments([self._post_rows[row]["id"]]))
+        t.setCellWidget(i, 2, centred(button))
 
-    def _fill_post_row(self, i: int) -> None:
+    def _draw_post_row(self, i: int) -> None:
         t, r = self.post_table, self._post_rows[i]
         done = r["id"] in self._comments_done
         so_far = r["num_comments"] is None and r["id"] in self._comments_so_far
         total = r["num_comments"]
         capped = bool(r["whole"]) and not (done or so_far or (bool(total) and r["saved_comments"] >= total))
         state = (r["id"], r["title"], r["saved_comments"], r["num_comments"], done, so_far, capped, self.busy)
-        if self._built.get(i) == state:
+        if self._post_drawn.get(i) == state:
             return
-        if i not in self._built:
-            title = ElidedLabel()
-            title.setContentsMargins(8, 0, 4, 0)
-            t.setCellWidget(i, 0, title)
-            t.setCellWidget(i, 1, Cell())
-            button = row_button()
-            button.clicked.connect(lambda _=False, row=i: self._download_comments([self._post_rows[row]["id"]]))
-            t.setCellWidget(i, 2, centred(button))
-        self._built[i] = state
+        self._post_drawn[i] = state
         t.cellWidget(i, 0).setText(" ".join((r["title"] or "").split()))
         cell: Cell = t.cellWidget(i, 1)
         cell.set(r["saved_comments"], total, done, "comment")
@@ -994,12 +1066,6 @@ class CoveragePage(VerticalScrollArea):
             if lay.direction() != (across if one else down):
                 lay.setDirection(across if one else down)
         super().resizeEvent(event)
-
-    def eventFilter(self, obj, event) -> bool:
-        if (obj is self._post_viewport and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)
-                and shiboken6.isValid(self.post_table)):  # not while the window is being torn down
-            self._fill_visible()
-        return super().eventFilter(obj, event)
 
     # -- archive counts -------------------------------------------------------
 
@@ -1053,12 +1119,13 @@ class CoveragePage(VerticalScrollArea):
                                                 for d in self.days):
             # The user picked another subreddit or range while this count ran: count that now. It used to
             # be taken for days that couldn't be counted, so they showed "total unknown" with no reason.
+            self._count_missing()
             self.refresh_saved()
             return
         if any(d not in totals and d < today() for d in self.days) and not self.count_error:
             # some days timed out; don't ask again in a loop
             self.count_error = "Some days couldn't be counted."
-        self._fill_days(totals, rebuild=False)
+        self.refresh_saved()
 
     def _recount(self) -> None:
         """Ask for every listed day's count again, even ones already asked for today."""
@@ -1174,7 +1241,7 @@ class CoveragePage(VerticalScrollArea):
         self.window_.start_request(req, f"Downloading {what} on {plural(len(ids), 'post')}…")
 
     def _download_day_comments(self) -> None:
-        self._download_comments(list(getattr(self, "_todo_comments", [])))
+        self._download_comments(list(self._todo_comments))
 
     # -- deleting -------------------------------------------------------------
 
@@ -1221,15 +1288,13 @@ class CoveragePage(VerticalScrollArea):
 
     def stop_count(self) -> None:
         """As the app closes. The archive count isn't waited for: a request still out held the app's close for
-        up to 3 s. It ends by itself; app.main ends the process if it still runs when the app quits. Counting
-        threads reads the file, so that is waited for, with nothing of it shown."""
+        up to 3 s. It ends by itself; app.main ends the process if it still runs when the app quits. The reads of
+        what's saved read the file, so they're waited for, with nothing of them shown."""
         if self.count_job.busy:
             self.count_job.stop()
             self._count_stopped = True
-        if self.threads_job.busy:
-            self.threads_job.ended.disconnect()
-            self.threads_job.qthread.quit()
-            self.threads_job.qthread.wait(3000)
+        self.days_read.close()
+        self.posts_read.close()
 
 
 def mark_flat(button: QPushButton) -> QPushButton:
