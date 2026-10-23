@@ -5,6 +5,8 @@ import os
 import threading
 import time
 
+from dataclasses import replace
+
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -82,6 +84,12 @@ def window(tmp_path, monkeypatch):
     s.save_post(post("r0", "rust", TODAY - DAY + 500), 0.0, "neutral")
     for sub in ("Python", "rust"):  # each fetched for the past week before: the days the page lists
         s.save_tried(sub, range(TODAY - 7 * DAY, TODAY + DAY, DAY))
+    # The page lists only days with something saved: a skipped image post on each other day of the week (and
+    # today) stands for that, without adding a post to any page.
+    for k in (0, 4, 5, 6, 7):
+        for sub in ("Python", "rust"):
+            picture = post(f"{sub}{k}", sub, TODAY - k * DAY + 700)
+            s.save_post(replace(picture, image=True), 0.0, "neutral")
     s.commit()
     s.close()
     FakeArchive.calls = []
@@ -242,12 +250,13 @@ def test_a_long_history_opens_with_the_rows_on_screen_and_reads_off_the_window_t
     rows near the view are built, and the reads run on threads of their own."""
     w = window
     day = TODAY - DAY
-    w.store.save_tried("Python", range(TODAY - 729 * DAY, TODAY + DAY, DAY))
+    for d in range(TODAY - 729 * DAY, TODAY - DAY, DAY):  # a post on each day: the days listed are the ones saved
+        w.store.save_post(post(f"old{d}", "Python", d + 300), 0.0, "neutral")
     for i in range(1500):
         w.store.save_post(post(f"busy{i}", "Python", day + 600 + i), 0.0, "neutral")
     w.store.commit()
     on_window = []  # reads of what Coverage shows made on the window's thread
-    for name in ("tried_days", "posts_per_day", "removed_per_day", "archive_counts", "complete_keys",
+    for name in ("downloaded_days", "tried_days", "posts_per_day", "removed_per_day", "archive_counts", "complete_keys",
                  "comment_coverage", "whole_threads_per_day"):
         real = getattr(Store, name)
 
@@ -273,7 +282,7 @@ def test_a_long_history_opens_with_the_rows_on_screen_and_reads_off_the_window_t
     settle(w)
     assert len(cells) < 200
     oldest = c.days.index(TODAY - 729 * DAY)
-    assert day_cell(c, oldest, 1).main.text() == "0 of 10"  # the stand-in archive counts 10 a day
+    assert day_cell(c, oldest, 1).main.text() == "1 of 10"  # the stand-in archive counts 10 a day
     assert on_window == [] and downloads() == []
 
 
@@ -568,20 +577,14 @@ def test_delete_selected_asks_then_forgets_only_the_ticked_days_and_they_downloa
     assert [r["id"] for r in w.posts] == ["p1"] and w.comments == []
     assert w.posts_tab.model.rowCount() == 1 and w.comments_tab.model.rowCount() == 0
     assert w._counted.counts and sum(w._counted.counts.values()) == 1
-    row = c.days.index(TODAY - 3 * DAY)
-    assert day_cell(c, row, 1).main.text() == "0 of 10"
-    button = day_cell(c, row, 2).findChild(QPushButton)
-    assert button.text() == coverage.DOWNLOAD and button.isEnabled()
+    assert TODAY - 3 * DAY not in c.days  # nothing left saved on the day: it isn't listed
     assert "2 days" in w.statusBar().currentMessage().replace("\u00a0", " ")
 
-    # Deleted, it stays deleted: not back when the subreddit is opened again, and a download reads it in full.
+    # Deleted, it stays deleted: not back when the subreddit is opened again.
     select(w, "rust")
     select(w, "Python")
     assert store.posts_per_day("Python", TODAY - 3 * DAY, TODAY - 2 * DAY) == {}
-    click(c.day_table, row)
-    settle(w, lambda: not w.fetch_job.busy)
-    assert downloads() == [("posts", "Python", TODAY - 3 * DAY, TODAY - 2 * DAY)]
-    assert store.posts_per_day("Python", TODAY - 3 * DAY, TODAY - 2 * DAY) == {TODAY - 3 * DAY: 4}
+    assert TODAY - 3 * DAY not in c.days and downloads() == []
 
 
 def test_deleting_every_saved_day_keeps_the_subreddit_on_screen_to_download_again(window):
@@ -599,14 +602,7 @@ def test_deleting_every_saved_day_keeps_the_subreddit_on_screen_to_download_agai
     assert names == ["Python"] and w.current == "rust" and c.subreddit == "rust"
     assert w.posts == [] and w.store.posts("Python")
     assert downloads() == []
-    FakeArchive.archive = dict(FakeArchive.archive, rust=[post("r0", "rust", TODAY - DAY + 500)])
-    try:
-        click(c.day_table, c.days.index(TODAY - DAY))
-        settle(w, lambda: not w.fetch_job.busy)
-    finally:
-        del FakeArchive.archive["rust"]
-    names = [w.datasets.item(i).data(Qt.ItemDataRole.UserRole) for i in range(w.datasets.count())]
-    assert "rust" in names and [r["id"] for r in w.posts] == ["r0"]
+    assert TODAY - DAY not in c.days  # the day has nothing saved now: it isn't listed
 
 
 def test_nothing_else_writes_while_days_are_deleted(window, monkeypatch):
@@ -780,27 +776,23 @@ def test_a_stopped_download_offers_resume_even_after_a_restart(window, monkeypat
         again.close()
 
 
-def test_a_day_with_no_posts_anywhere_isnt_listed_ticked_or_downloaded(window, monkeypatch):
-    empty, saved = TODAY - 5 * DAY, TODAY - 2 * DAY  # the archive counts 0 on both; p1 is saved on the second
-
-    def counts(self, subreddit, after, before, should_stop=None):
-        FakeArchive.calls.append(("counts", subreddit))
-        return {d: 0 if d in (empty, saved) else 10 for d in range(int(after // DAY * DAY), int(before), DAY)}
-    monkeypatch.setattr(FakeArchive, "day_counts", counts)
+def test_a_day_with_nothing_saved_isnt_listed_ticked_or_downloaded(window):
+    asked = TODAY - 9 * DAY  # a fetch asked for it and the archive gave nothing
+    window.store.save_tried("Python", [asked])
+    window.store.commit()
     w = window
     select(w, "Python")
     w.show_page("coverage")
     c = w.coverage
     settle(w, lambda: c.totals and c._threads)
-    assert empty not in c._shown_days() and saved in c._shown_days()
-    assert "1 day with no posts left out" in c.subtitle.full_text()
+    assert asked not in c.days and TODAY in c.days  # today's partial day is listed: something is saved
+    assert c.subtitle.full_text().endswith("8\u00a0days downloaded")
     QTest.mouseClick(c.what.buttons["posts"], Qt.MouseButton.LeftButton)
     c.tick_all.click()
-    assert empty not in c.ticked and c.download_ticked.text() == f"Download {len(c.days) - 1} days"
+    assert c.download_ticked.text() == "Download 8\u00a0days"
     QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
     settle(w, lambda: not w.fetch_job.busy)
-    fetched = [d[2] for d in downloads() if d[0] == "posts"]
-    assert fetched and empty not in fetched and saved in fetched
+    assert asked not in [d[2] for d in downloads() if d[0] == "posts"]
 
 
 def test_the_once_a_second_refresh_during_a_download_redraws_only_the_days_that_changed(window, monkeypatch):

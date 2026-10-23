@@ -1277,6 +1277,15 @@ class Store:
         spans = self._tried_spans(subreddit)
         return sorted({d for a, b in spans for d in range(a, b + 1, 86400)}, reverse=True)
 
+    def downloaded_days(self, subreddit: str) -> list[int]:
+        """UTC days (their starts, newest first) with a post saved, whether or not a fetch recorded asking for
+        them (imported or older data): Download coverage lists these, so every day on the charts can be
+        downloaded again or deleted. Skipped image posts count, they were downloaded; days asked for with
+        nothing saved don't."""
+        return [r["d"] for r in self.db.execute(
+            "SELECT DISTINCT CAST(created_utc / 86400 AS INTEGER) * 86400 d FROM posts "
+            "WHERE subreddit = ? COLLATE NOCASE ORDER BY d DESC", (subreddit,))]
+
     def save_tried(self, subreddit: str, days) -> None:
         """Record these UTC days (their starts) as asked for, joined to the ones before."""
         self._save_spans("posts_tried", subreddit, self._tried_spans(subreddit) + [(d, d) for d in days], 86400)
@@ -1404,12 +1413,12 @@ class Store:
             (subreddit.lower(), after, before))}
 
     def coverage_days(self, subreddit: str, cap: int = 0, since: float = 0) -> dict:
-        """What Download coverage lists, in one read: "days" fetches asked for (tried_days), and per listed day the
+        """What Download coverage lists, in one read: the "days" with posts saved (downloaded_days), and per day the
         posts "saved", the removed and skipped image posts seen ("checked"), the archive "counts" asked for at or
         after ``since``, the "threads" done at ``cap`` (whole_threads_per_day), the days a sample was through
         ("sampled", when ``cap`` is SAMPLED), and the days "complete"."""
         with self.snapshot():
-            days = self.tried_days(subreddit)
+            days = self.downloaded_days(subreddit)
             if not days:
                 return {"days": []}
             after, before = days[-1], days[0] + 86400
