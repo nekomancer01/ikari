@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS comment_fetches (
 );
 -- Ranges whose whole content ikari has fetched: kind "posts" keys a UTC day (its start, in epoch
 -- seconds) and kind "comments" keys a post id; "comments_so_far" keys a post whose whole thread was fetched
--- before the archive re-checked it, so more comments may still come. Used to show a day or thread as fully downloaded even
+-- before the archive re-checked it, so more comments may still come; "sampled" a post holding its part of its
+-- day's statistical sample of comments (collect.Sample), none for most. Used to show a day or thread as fully downloaded even
 -- when the archive's totals (which count removed items) are higher than what could be saved.
 CREATE TABLE IF NOT EXISTS complete (
     kind TEXT NOT NULL, subreddit TEXT NOT NULL, key TEXT NOT NULL, fetched_at REAL,  -- subreddit lowercased
@@ -158,9 +159,16 @@ WHOLE_THREAD = (  # IFNULL: an uncounted post (num_comments NULL) would make "= 
     f"OR (p.num_comments > 0 AND {SAVED_COMMENTS} >= p.num_comments), 0)")
 
 
+SAMPLED = -1  # thread_done's cap for Coverage's statistical sample (collect.Sample) instead of a number per thread
+
+
 def thread_done(cap: int = 0) -> str:
     """SQL, 1 or 0: post p's thread needs no more comment downloads. Saved whole (WHOLE_THREAD), or with a
-    per-thread ``cap`` (Coverage's), holding that many comments: a download at that cap asks nothing more of it."""
+    per-thread ``cap`` (Coverage's), holding that many comments: a download at that cap asks nothing more of it.
+    With SAMPLED, done once a sample download has its day's part of it saved (kind "sampled" in complete)."""
+    if cap == SAMPLED:
+        return (f"({WHOLE_THREAD} OR EXISTS (SELECT 1 FROM complete k WHERE k.kind = 'sampled' "
+                "AND k.subreddit = lower(p.subreddit) AND k.key = p.id))")
     return f"({WHOLE_THREAD} OR {SAVED_COMMENTS} >= {int(cap)})" if cap else WHOLE_THREAD
 
 # Comments on image posts are hidden along with the posts (``c`` is the comments table).
@@ -1269,6 +1277,15 @@ class Store:
         spans = self._tried_spans(subreddit)
         return sorted({d for a, b in spans for d in range(a, b + 1, 86400)}, reverse=True)
 
+    def downloaded_days(self, subreddit: str) -> list[int]:
+        """UTC days (their starts, newest first) with a post saved, whether or not a fetch recorded asking for
+        them (imported or older data): Download coverage lists these, so every day on the charts can be
+        downloaded again or deleted. Skipped image posts count, they were downloaded; days asked for with
+        nothing saved don't."""
+        return [r["d"] for r in self.db.execute(
+            "SELECT DISTINCT CAST(created_utc / 86400 AS INTEGER) * 86400 d FROM posts "
+            "WHERE subreddit = ? COLLATE NOCASE ORDER BY d DESC", (subreddit,))]
+
     def save_tried(self, subreddit: str, days) -> None:
         """Record these UTC days (their starts) as asked for, joined to the ones before."""
         self._save_spans("posts_tried", subreddit, self._tried_spans(subreddit) + [(d, d) for d in days], 86400)
@@ -1363,6 +1380,13 @@ class Store:
             "FROM posts p WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? "
             "AND p.image = 0 ORDER BY p.created_utc DESC", (subreddit, after, before)))
 
+    def comment_totals(self, subreddit: str, after: float, before: float) -> dict[str, int | None]:
+        """The archive's comment count (num_comments, None until counted) of each post created in [after, before)
+        that isn't an image post."""
+        return dict(self.db.execute(
+            "SELECT id, num_comments FROM posts WHERE subreddit = ? COLLATE NOCASE AND created_utc >= ? "
+            "AND created_utc < ? AND image = 0", (subreddit, after, before)).fetchall())
+
     def comment_counts(self, subreddit: str, after: float | None, before: float | None) -> dict[str, int]:
         """How many comments are saved on each post created in [after, before) that has any."""
         return dict(self.db.execute(
@@ -1380,6 +1404,13 @@ class Store:
             "FROM posts p WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? "
             "AND p.image = 0 GROUP BY d", (subreddit, after, before))
         return {r["d"]: (r["whole"], r["n"]) for r in rows}
+
+    def sampled_days(self, subreddit: str, after: float, before: float) -> set[int]:
+        """The UTC days in [after, before) with a post holding its part of a statistical sample (kind "sampled")."""
+        return {r[0] for r in self.db.execute(
+            "SELECT DISTINCT CAST(p.created_utc / 86400 AS INTEGER) * 86400 FROM complete k JOIN posts p ON p.id = k.key "
+            "WHERE k.kind = 'sampled' AND k.subreddit = ? AND p.created_utc >= ? AND p.created_utc < ?",
+            (subreddit.lower(), after, before))}
 
     def posts_by_ids(self, ids) -> list[sqlite3.Row]:
         ids = list(ids)
@@ -1533,7 +1564,7 @@ class Store:
             self.search.drop("posts", [i for (i,) in self.db.execute("SELECT id FROM temp.gone")])
             self.db.execute("DELETE FROM comments WHERE post_id IN temp.gone")
             self.db.execute("DELETE FROM comment_fetches WHERE post_id IN temp.gone")
-            self.db.execute("DELETE FROM complete WHERE kind IN ('comments', 'comments_so_far') AND subreddit = ? "
+            self.db.execute("DELETE FROM complete WHERE kind IN ('comments', 'comments_so_far', 'sampled') AND subreddit = ? "
                             "AND key IN temp.gone", (sub,))
             self.db.execute("DELETE FROM posts WHERE id IN temp.gone")
             self.db.executemany("DELETE FROM complete WHERE kind = 'posts' AND subreddit = ? AND key = ?",
