@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
@@ -143,17 +143,39 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def title_text() -> str:
-        """"ikari", plus the checked-out commit in brackets when run from source (not a packaged build)."""
+        """"ikari", plus the checked-out commit in brackets when run from source (not a packaged build).
+
+        Reads .git/HEAD and the ref it names rather than starting git, so it costs microseconds.
+        """
         if getattr(sys, "frozen", False):
             return "ikari"
+        folder = os.path.dirname(os.path.abspath(__file__))
         try:
-            here = os.path.dirname(os.path.abspath(__file__))
-            out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=here, capture_output=True,
-                                 text=True, timeout=2, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        except (OSError, subprocess.SubprocessError):
+            while not os.path.exists(os.path.join(folder, ".git")):
+                if os.path.dirname(folder) == folder:
+                    return "ikari"
+                folder = os.path.dirname(folder)
+            git = os.path.join(folder, ".git")
+            if os.path.isfile(git):  # a worktree: ".git" is a file holding "gitdir: <path>"
+                with open(git, encoding="utf-8") as f:
+                    git = os.path.join(folder, f.read().split(":", 1)[1].strip())
+            with open(os.path.join(git, "HEAD"), encoding="utf-8") as f:
+                head = f.read().strip()
+            if head.startswith("ref:"):
+                ref = head.split(":", 1)[1].strip()
+                common = git
+                if os.path.exists(os.path.join(git, "commondir")):  # worktree refs live in the main repo
+                    with open(os.path.join(git, "commondir"), encoding="utf-8") as f:
+                        common = os.path.join(git, f.read().strip())
+                try:
+                    with open(os.path.join(common, ref), encoding="utf-8") as f:
+                        head = f.read().strip()
+                except FileNotFoundError:  # packed by git gc
+                    with open(os.path.join(common, "packed-refs"), encoding="utf-8") as f:
+                        head = next(line.split()[0] for line in f if line.rstrip().endswith(" " + ref))
+        except (OSError, IndexError, StopIteration):
             return "ikari"
-        commit = out.stdout.strip()
-        return f"ikari ({commit})" if out.returncode == 0 and commit else "ikari"
+        return f"ikari ({head[:7]})" if re.fullmatch(r"[0-9a-f]{40}", head) else "ikari"
 
     def __init__(self, db_path: str):
         super().__init__()
