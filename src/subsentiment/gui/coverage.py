@@ -17,8 +17,8 @@ from typing import Callable
 from datetime import datetime, timezone
 
 import shiboken6
-from PySide6.QtCore import QEvent, QObject, QPointF, QSize, Qt, QTimer, Slot
-from PySide6.QtGui import QFontMetricsF
+from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt, QTimer, Slot
+from PySide6.QtGui import QFontMetricsF, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QBoxLayout, QCheckBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton,
     QSizePolicy, QStyle, QStyleOptionButton, QStylePainter, QTableWidget, QVBoxLayout, QWidget,
@@ -237,8 +237,8 @@ DOWNLOAD, CHECK = "↓", "↻"  # a row's buttons: download what's missing, or l
 
 class RowButton(QPushButton):
     """A row's download (↓) or check again (↻) button; its tooltip says what it fetches. Clicked while a download
-    runs, it waits its turn in the page's queue: lighter, its arrow turning (still with motion off), until it
-    starts or is clicked again to leave the queue."""
+    runs, it waits its turn in the page's queue: lighter, with a wheel turning in place of its arrow (still with
+    motion off), until it starts or is clicked again to leave the queue."""
 
     QUEUED_OPACITY = 0.55
 
@@ -283,19 +283,17 @@ class RowButton(QPushButton):
         self.initStyleOption(opt)
         opt.text = ""
         p.drawControl(QStyle.ControlElement.CE_PushButton, opt)
-        # The arrow turns about the middle of its ink, not its line box, so it spins in place.
-        fm = QFontMetricsF(self.font())
-        ink = fm.tightBoundingRect(self.text())
-        r = self.rect()
-        x = r.center().x() + 0.5 - fm.horizontalAdvance(self.text()) / 2
-        y = r.center().y() + 0.5 - fm.height() / 2 + fm.ascent()
-        middle = QPointF(x + ink.center().x(), y + ink.center().y())
-        p.translate(middle)
-        phase = motion.throb(self)
-        p.rotate(360 * (phase or 0.0))
-        p.setPen(self.palette().buttonText().color())
-        p.drawText(QPointF(-ink.center().x(), -ink.center().y()), self.text())
-
+        # In place of the arrow, a wheel: three quarters of a ring turning on the throbbers' shared clock, the
+        # text's height across.
+        d = QFontMetricsF(self.font()).capHeight() * 1.2
+        ring = QRectF(-d / 2, -d / 2, d, d)
+        p.translate(QRectF(self.rect()).center())
+        p.rotate(360 * (motion.throb(self) or 0.0))
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(self.palette().buttonText().color(), max(1.5, d / 7))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawArc(ring, 0, 270 * 16)
 
 def table(headers: list[str]) -> QTableWidget:
     t = QTableWidget(0, len(headers))
@@ -992,8 +990,9 @@ class CoveragePage(VerticalScrollArea):
             count = sum(saved.get(d, 0) for d in days)
             when = day_text(days[0]) if n == 1 else f"{range_text(days[0], days[-1])} ({plural(n, 'day')})"
             self.delete_question.setText(
-                f"Delete {plural(count, 'post')} saved from {when} in r/{self.subreddit}, with their comments and "
-                "sentiment? The days show as not downloaded, ready to download again. Timeline notes stay. "
+                f"Delete {plural(count, 'post')} saved from {when} in r/{self.subreddit}, with their comments, every "
+                f"comment written on {'that day' if n == 1 else 'those days'}, and their sentiment? The days show as not "
+                "downloaded, ready to download again. Timeline notes stay. "
                 "This can't be undone.")
             self.delete_confirm.setText(f"Delete {plural(n, 'day')}")
         days = sorted(self.ticked) or self._day_rows

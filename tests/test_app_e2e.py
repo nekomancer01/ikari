@@ -1269,6 +1269,7 @@ def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
     while cov.count_job.busy and time.monotonic() < end:
         pump(20)
     pump(50)
+    read_in(w)  # what's saved is read again, on threads, once the count is in
     totals = cov.totals["python"]
     assert not any(cell.bar.waiting for _, cell, _ in rows())
     # Every day with posts to look for can be downloaded now; only past days the archive has none for can't.
@@ -1667,7 +1668,8 @@ def test_a_stopped_download_all_goes_on_from_where_it_got_to(env, monkeypatch):
     QTest.mouseClick(button(), Qt.MouseButton.LeftButton)
     end = time.monotonic() + 30
     in_day = lambda: {r["id"] for r in env.store().posts("bigday") if day <= r["created_utc"] < day + DAY}  # noqa: E731
-    while len(env.archive.paths()) < 6 and time.monotonic() < end:  # the first pages are in, the next asked for
+    # Two rounds of pages in and the next asked for. After only the first round, a slow runner had two pages saved.
+    while len(env.archive.paths()) < 9 and time.monotonic() < end:
         pump(20)
     QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
     wait_idle(w)

@@ -1564,10 +1564,13 @@ class Store:
 
     def delete_days(self, subreddit: str, days) -> tuple[int, int]:
         """Forget what's saved from some UTC days (their starts) of a subreddit: the posts created on them, the
-        comments on those posts, their text in the day packs, and every record of downloading them (complete
-        days and threads, read-through spans, removed posts seen), so each day shows as never downloaded and
-        a download reads it again in full. Timeline notes stay. One transaction. Returns the (posts, comments)
-        deleted that the app shows (image posts and their comments are deleted too, but never shown)."""
+        comments on those posts and every comment written on them (on a post of another day too: the timeline
+        counts a comment on its own day), their text in the day packs, and every record of downloading them
+        (complete days and threads, read-through spans, removed posts seen), so each day shows as never
+        downloaded and a download reads it again in full. Another day's post that loses replies keeps its
+        record of being downloaded, so the replies don't come back to the deleted days. Timeline notes stay.
+        One transaction. Returns the (posts, comments) deleted that the app shows (image posts and their
+        comments are deleted too, but never shown)."""
         sub, days = subreddit.lower(), sorted({int(d) // 86400 * 86400 for d in days})
         if not days:
             return 0, 0
@@ -1575,20 +1578,24 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.execute("CREATE TEMP TABLE gone (id TEXT PRIMARY KEY)")
+            self.db.execute("CREATE TEMP TABLE gone_comments (id TEXT PRIMARY KEY)")
             for d in days:
                 self.db.execute("INSERT OR IGNORE INTO temp.gone SELECT id FROM posts WHERE subreddit = ? COLLATE NOCASE "
                                 "AND created_utc >= ? AND created_utc < ?", (subreddit, d, d + 86400))
+                self.db.execute("INSERT OR IGNORE INTO temp.gone_comments SELECT id FROM comments WHERE subreddit = ? "
+                                "COLLATE NOCASE AND created_utc >= ? AND created_utc < ?", (subreddit, d, d + 86400))
+            self.db.execute("INSERT OR IGNORE INTO temp.gone_comments SELECT id FROM comments WHERE post_id IN temp.gone")
             shown = self.db.execute(
                 "SELECT (SELECT COUNT(*) FROM posts WHERE image = 0 AND id IN temp.gone), (SELECT COUNT(*) FROM comments "
-                "c WHERE c.post_id IN temp.gone AND " + NOT_IMAGE + ")").fetchone()
+                "c WHERE c.id IN temp.gone_comments AND " + NOT_IMAGE + ")").fetchone()
             # The comments' text sits in the packs of the days they were written, beside other posts' comments.
             repack: dict[int, set[str]] = {}
             for r in self.db.execute("SELECT id, CAST(created_utc / 86400 AS INTEGER) d FROM comments "
-                                     "WHERE packed != 0 AND post_id IN temp.gone"):
+                                     "WHERE packed != 0 AND id IN temp.gone_comments"):
                 repack.setdefault(r["d"], set()).add(r["id"])
-            self.search.drop("comments", [i for (i,) in self.db.execute("SELECT id FROM comments WHERE post_id IN temp.gone")])
+            self.search.drop("comments", [i for (i,) in self.db.execute("SELECT id FROM temp.gone_comments")])
             self.search.drop("posts", [i for (i,) in self.db.execute("SELECT id FROM temp.gone")])
-            self.db.execute("DELETE FROM comments WHERE post_id IN temp.gone")
+            self.db.execute("DELETE FROM comments WHERE id IN temp.gone_comments")
             self.db.execute("DELETE FROM comment_fetches WHERE post_id IN temp.gone")
             self.db.execute("DELETE FROM complete WHERE kind IN ('comments', 'comments_so_far', 'sampled') AND subreddit = ? "
                             "AND key IN temp.gone", (sub,))
@@ -1617,6 +1624,7 @@ class Store:
             raise
         finally:
             self.db.execute("DROP TABLE IF EXISTS temp.gone")
+            self.db.execute("DROP TABLE IF EXISTS temp.gone_comments")
         self._compact()  # (a cached pack is let go when it's next read: it was changed or removed since)
         return shown[0], shown[1]
 

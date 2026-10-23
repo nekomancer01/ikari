@@ -780,8 +780,14 @@ def test_a_slow_lot_of_fetched_rows_makes_the_next_one_wait_longer(make_window, 
     w = make_window()
     row = lambda i: {"id": f"q{i}", "sentiment": 0.1, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
                      "score": 1, "num_comments": 1, "author": "a", "created_utc": 1.0, "fetched_at": 1.0}
-    took = []
-    monkeypatch.setattr(w, "_add_rows", lambda kind, tab, rows: (took.append(len(rows)), time.sleep(0.008)))
+    took, now = [], [0.0]
+    # The window's clock moves only as a lot is added: on a busy runner even a quick lot took over the 1.6 ms that
+    # keeps the wait at its shortest.
+    monkeypatch.setattr(mw, "time", type("Clock", (), {"perf_counter": staticmethod(lambda: now[0])}))
+    def slow(kind, tab, rows):
+        took.append(len(rows))
+        now[0] += 0.008
+    monkeypatch.setattr(w, "_add_rows", slow)
     w._queued["posts"] = [row(i) for i in range(1000)]
     w._drip.start()
     w._release_rows()
