@@ -3,6 +3,7 @@ and memory are counted, not timed, so these hold on a slow runner too; tools/per
 on a real database."""
 import os
 import sqlite3
+import sys
 import threading
 import time
 import tracemalloc
@@ -167,16 +168,22 @@ def test_sorting_a_big_table_is_worked_out_between_frames(monkeypatch):
     real = sorted
     monkeypatch.setattr(tables, "sorted", lambda items, **k: (sorts.append(len(items)), real(items, **k))[1],
                         raising=False)
-    # The table's own threads: windows other tests left open start threads of their own as events are pumped.
+    # This table's own threads: tables other tests left open start threads of their own as events are pumped.
     threads, real_on_thread = [], tables.on_thread
-    monkeypatch.setattr(tables, "on_thread", lambda work: (threads.append(1), real_on_thread(work))[1])
+
+    def on_thread(work):
+        caller = sys._getframe(1)
+        if caller.f_locals.get("self") is tab.model:
+            threads.append(caller.f_code.co_name)
+        return real_on_thread(work)
+    monkeypatch.setattr(tables, "on_thread", on_thread)
     tab.view.sortByColumn(3, Qt.SortOrder.DescendingOrder)  # Score
     # Sorting all of the owner's 650,000 comments at the click held the window a second and a half; now numbers are
     # sorted by numpy on a thread, no frame sorting anything, and the table shows the rows in their new order
     # once it's worked out.
     assert max(sorts, default=0) <= tab.model.STEP and tab.model._slices.running()
     until(lambda: not tab.model._slices.running(), 30)
-    assert max(sorts, default=0) <= tab.model.STEP and len(threads) == 1
+    assert max(sorts, default=0) <= tab.model.STEP and len(threads) == 1, threads
     expected = real(before, key=lambda r: r["score"], reverse=True)
     assert [r["id"] for r in tab.model.rows] == [r["id"] for r in expected]  # as one stable sort orders them
 
