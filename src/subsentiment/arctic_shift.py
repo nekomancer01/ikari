@@ -64,7 +64,7 @@ WORKERS = 4  # requests in flight at once. The limiter still spaces out when eac
 TIMEOUT_TRIES = 3  # query timeouts on one request before the caller is asked to narrow it
 GARBLED_TRIES = 3  # answers that aren't the archive's JSON before a request gives up
 MIN_WINDOW = 600  # seconds; a timing-out window is halved down to this
-MAX_SKIPS = 2  # windows that still time out at MIN_WINDOW skipped in a row before the fetch gives up
+MAX_SKIPS = 2  # windows that still time out at MIN_WINDOW skipped in a row before the slice is left unread
 # A comment thread is one cheap lookup by post id; the archive answers it in 1-2.5 s and has never timed one out or
 # limited it (live, 21 Oct: 173 threads on r/AskReddit and r/Deltarune, 4 in flight and 0.4 s apart, no 422 or 429).
 # Spacing and in-flight count were what held "Download all comments" to about two posts a second, so threads go
@@ -773,13 +773,15 @@ class ArcticShiftClient:
                 return out, cursor, True
             except QueryTimeout:
                 # Even the narrowest window: skip it and say the range wasn't all read. Not for a keyword
-                # search, which times out whatever the window, nor when nothing near it answers either.
-                skipped += 1
-                if "query" in base or skipped > MAX_SKIPS:
+                # search, which times out whatever the window. When nothing near it answers either, the rest
+                # of the slice is left unread rather than failing the whole fetch: other slices and days may
+                # still answer, and a range that timed out isn't called read to its end, so it's asked again.
+                if "query" in base:
                     raise
+                skipped += 1
                 self.timed_out = True
                 cursor += MIN_WINDOW
-                if cursor >= hi - 1:
+                if cursor >= hi - 1 or skipped > MAX_SKIPS:
                     return out, cursor, False
                 continue
             skipped = 0
