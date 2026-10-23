@@ -889,14 +889,17 @@ def test_a_queued_button_turns_and_is_lighter_and_stays_still_with_motion_off(wi
     b = row_button(c, TODAY - 2 * DAY)
     still = b.grab().toImage()
     QTest.mouseClick(b, Qt.MouseButton.LeftButton)
-    shots = []
-    for _ in range(3):
-        shots.append(b.grab().toImage())
-        time.sleep(0.2)
-    assert shots[0] != still  # lighter
-    assert shots[0] != shots[1] or shots[1] != shots[2]  # turning
-    monkeypatch.setattr(coverage.motion, "enabled", lambda: False)
-    a, z = b.grab().toImage(), (time.sleep(0.2), b.grab().toImage())[1]
-    assert a == z and a != still
+    # The arrow's angle follows the shared throbber clock; set it rather than wait on it (CI runners may have
+    # the OS's animations off, which turns motion off).
+    for phase in (0.0, 0.25, None):
+        monkeypatch.setattr(coverage.motion, "throb", lambda _w, p=phase: p)
+        shot = b.grab().toImage()
+        if phase == 0.0:
+            upright = shot
+            assert shot != still  # lighter
+        elif phase:
+            assert shot != upright  # turned a quarter
+        else:
+            assert shot == upright and shot != still  # motion off: lighter, but still
     hold.set()
     settle(w, lambda: not c._queue)
