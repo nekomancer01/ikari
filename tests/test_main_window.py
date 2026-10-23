@@ -677,3 +677,33 @@ def test_short_titles_leave_room_for_the_comments_column(make_window):
         page.close()
     finally:
         app.setFont(before)
+
+
+def test_columns_that_fit_once_shrunk_are_not_hidden(make_window):
+    """At 1920x1200 150% the Comments table hid its Post and Author columns although shrinking them left the
+    comment its room: each shrunk width was rounded on its own, so the total ended up a pixel over."""
+    from subsentiment.gui.tables import COMMENT_COLUMNS, TablePage
+    make_window()
+    page = TablePage(COMMENT_COLUMNS, stretch_col=2)
+    page.resize(1117, 600)  # the table's width there, in logical pixels
+    page.show()
+    page.load([{"id": "c1", "sentiment": 0.5, "label": "positive", "body": "fine", "score": 3, "post_title": "a post",
+                "author": "someone", "created_utc": 1_700_000_000.0, "permalink": "", "link_id": "t3_p1"}])
+    QApplication.processEvents()
+    page.resize(page.width() + 1117 - page.view.viewport().width(), 600)  # whatever frame the style draws
+    QApplication.processEvents()
+    keys = [key for _, key, _ in COMMENT_COLUMNS]
+    room = page.view.viewport().width()
+    assert room == 1117
+    # The widths measured there: Post 437 (71 at least), Author 129 (84), the rest 180 together.
+    page._widths = {keys.index(k): wl for k, wl in {"sentiment": (45, 45), "label": (45, 45), "score": (45, 45),
+                                                     "created_utc": (45, 45), "post_title": (437, 71),
+                                                     "author": (129, 84)}.items()}
+    page._text_width = room  # the comments are long: the text column needs its third
+    page._share_width()
+    header = page.view.horizontalHeader()
+    assert not header.isSectionHidden(keys.index("post_title"))
+    assert not header.isSectionHidden(keys.index("author"))
+    used = sum(header.sectionSize(c) for c in page._widths)
+    assert room - used >= room / 3
+    page.close()
