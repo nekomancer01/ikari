@@ -21,6 +21,7 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton  # noqa: E402
 
 from subsentiment import arctic_shift, collect  # noqa: E402
+from subsentiment.reddit import Post  # noqa: E402
 from subsentiment.gui import coverage, days  # noqa: E402
 from subsentiment.gui import tables  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
@@ -110,9 +111,17 @@ def in_range(env, w, sub="Python") -> int:
 
 def fetched_before(env, w, sub="python", rng="month") -> None:
     """Record ``rng`` as asked for by an earlier fetch of ``sub``, which Download coverage then lists, without
-    downloading it all again here."""
+    downloading it all again here. It lists only days with something saved: each day with nothing gets a skipped
+    image post, which no page shows."""
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData(rng))
-    env.store().save_tried(sub, collect.days_in(*w.fetch_form.bounds()))
+    store, asked = env.store(), collect.days_in(*w.fetch_form.bounds())
+    store.save_tried(sub, asked)
+    have = set(store.downloaded_days(sub))
+    for day in asked:
+        if day not in have:
+            store.save_post(Post(f"img{day}", sub, "img", "", "a", 1, 0.0, 0, day + 60, "u", "", image=True),
+                            0.0, "neutral")
+    store.commit()
 
 
 def fetch(w, sub="python", comments=True, rng="week", timeout: float = 30, **extra):
@@ -1001,10 +1010,13 @@ def test_a_days_download_all_that_hits_a_window_the_archive_cant_answer_saves_th
     monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.2)  # timeout back-offs, shortened further
     w = env.window()
     fetch(w, comments=False, rng="day")  # the day below isn't saved whole, so it can't be complete yet
+    fetched_before(env, w, rng="week")
     cov = open_coverage(w)
-    row, day = next((r, d) for r, d in enumerate(cov.days) if cov.totals["python"].get(d) and d < coverage.today())
-    in_day = sorted(p["created_utc"] for p in env.archive.posts
-                    if p["subreddit"] == "Python" and day <= p["created_utc"] < day + DAY)
+    in_day_of = {d: sorted(p["created_utc"] for p in env.archive.posts
+                           if p["subreddit"] == "Python" and d <= p["created_utc"] < d + DAY) for d in cov.days}
+    row, day = next((r, d) for r, d in enumerate(cov.days)
+                    if cov.totals["python"].get(d) and d < coverage.today() and in_day_of[d])
+    in_day = in_day_of[day]
     env.archive.stuck = [in_day[len(in_day) // 2] - 1]
     QTest.mouseClick(cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     wait_idle(w)
@@ -1121,7 +1133,7 @@ def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
     # ticked; today (never counted) and complete days (no count needed) stay usable throughout.
     w = env.window()
     fetch(w, comments=False)
-    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
+    fetched_before(env, w, rng="month")
     complete = env.store().complete_keys("posts", "python")
     env.archive.clear()
     env.archive.delays[AGG] = 1.5
@@ -1165,19 +1177,26 @@ def test_coverage_lists_the_days_fetches_asked_for_not_the_sidebars_dates(env):
     # fetches before had tried and might have missed posts on.
     w = env.window()
     fetch(w, sub="rust", comments=False, rng="day")
-    rust_days = collect.days_in(*w.fetch_form.bounds())
+    store = env.store()
+
+    def with_posts(sub, asked):  # the asked days the archive had posts for: the only ones listed
+        have = store.posts_per_day(sub, min(asked), max(asked) + DAY)
+        return [d for d in asked if d in have]
+    rust_days = with_posts("rust", collect.days_in(*w.fetch_form.bounds()))
     fetch(w, comments=False)  # a week of python
     cov = open_coverage(w)
-    week = collect.days_in(*w.fetch_form.bounds())
+    asked = collect.days_in(*w.fetch_form.bounds())
+    week = with_posts("python", asked)
+    assert 0 < len(week) <= len(asked) and rust_days
     assert cov.days == week and cov.day_table.rowCount() == len(week)
-    assert "8\u00a0days fetched before" in cov.subtitle.text()
+    assert f"{len(week)}\u00a0days downloaded" in cov.subtitle.text()
     env.archive.clear()
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))  # dates set, nothing fetched
     w.fetch_form.date_from.setDate(w.fetch_form.date_to.date().addDays(-2))
     pump(500)
     cov.refresh_saved()
     assert cov.days == week and env.archive.paths() == []
-    # A fetch that's stopped or saves nothing still tried its days: they're listed, to download what it missed.
+    # A fetch that's stopped or saves nothing leaves no day with anything saved: none are added to the list.
     env.archive.fail(SEARCH, *[SLOW_DOWN] * 200)
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
@@ -1185,7 +1204,7 @@ def test_coverage_lists_the_days_fetches_asked_for_not_the_sidebars_dates(env):
     w.stop_btn.click()
     wait_idle(w)
     cov.refresh_saved()
-    assert cov.days == collect.days_in(*w.fetch_form.bounds()) and len(cov.days) == 31
+    assert cov.days == week
     rust = next(i for i in range(w.datasets.count())
                 if w.datasets.item(i).data(Qt.ItemDataRole.UserRole).lower() == "rust")
     w.datasets.setCurrentRow(rust)  # each subreddit lists its own
@@ -1193,8 +1212,9 @@ def test_coverage_lists_the_days_fetches_asked_for_not_the_sidebars_dates(env):
     assert cov.days == rust_days
 
 
-def test_coverage_of_data_saved_before_tried_days_were_kept_spans_the_saved_days(env):
-    # Databases from before ikari kept the days each fetch asked for: the first saved post's day to the last's.
+def test_coverage_lists_every_day_with_posts_saved_whether_or_not_a_fetch_asked_for_it(env):
+    # Data from an import or from before ikari kept the days each fetch asked for has days on the charts that
+    # no fetch recorded; they must be listed too, or they can't be downloaded again or deleted.
     w = env.window()
     fetch(w, comments=False)
     s = env.store()
@@ -1202,9 +1222,11 @@ def test_coverage_of_data_saved_before_tried_days_were_kept_spans_the_saved_days
     for table in ("posts", "removed_posts"):
         s.db.execute(f"DELETE FROM {table} WHERE created_utc >= ?", (NOW - 2 * DAY,))
     s.commit()
-    first, last = s.db.execute("SELECT MIN(created_utc), MAX(created_utc) FROM posts").fetchone()
+    saved = sorted({int(r[0] // DAY * DAY) for r in s.db.execute("SELECT created_utc FROM posts WHERE image = 0")},
+                   reverse=True)
+    assert saved and s.tried_days("python") != saved  # a saved day no fetch recorded: none are recorded at all
     cov = open_coverage(w)
-    assert cov.days == collect.days_in(first, last + 1)
+    assert cov.days == saved
 
 
 def test_closing_the_app_while_a_coverage_count_is_out_doesnt_freeze_it(env):

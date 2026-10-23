@@ -1,5 +1,6 @@
 """The fetch form and saved-data list survive a restart; the delete actions clear the store."""
 import os
+import subprocess
 import time
 from datetime import datetime, timedelta
 
@@ -335,6 +336,8 @@ def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypat
         for i in range(3):
             w.store.save_post(Post(f"y{day}{i}", "Python", "y", "", "a", None, None, None, day + 60 + i, "u", ""),
                               0, "neutral")
+    w.store.save_post(Post("img", "Python", "y", "", "a", None, None, None, older + 86400 + 60, "u", "", image=True),
+                      0, "neutral")  # a day between with only a skipped image: listed, with nothing else saved
     w.store.commit()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
@@ -348,7 +351,7 @@ def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypat
     cell = c.day_table.cellWidget(c.days.index(yesterday), 1)
     assert (cell.main.text(), cell.side.text()) == ("3 of 9", "33%")
     cell = c.day_table.cellWidget(c.days.index(older + 86400), 1)
-    assert (cell.main.text(), cell.side.text()) == ("0 of 9", "0%")  # a settled day keeps its total
+    assert (cell.main.text(), cell.side.text()) == ("0 saved", "11%")  # a settled day keeps its total, the skipped image checked
 
 
 def test_one_row_is_counted_as_one_row(make_window):
@@ -707,3 +710,13 @@ def test_columns_that_fit_once_shrunk_are_not_hidden(make_window):
     used = sum(header.sectionSize(c) for c in page._widths)
     assert room - used >= room / 3
     page.close()
+
+
+def test_window_title_has_the_commit_when_run_from_source_and_not_when_packaged(make_window, monkeypatch):
+    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert make_window().windowTitle() == f"ikari ({head})"
+    monkeypatch.setattr(mw.sys, "frozen", True, raising=False)
+    assert make_window().windowTitle() == "ikari"
+    monkeypatch.undo()
+    monkeypatch.setattr(mw.os.path, "exists", lambda p: False)  # no .git anywhere above the package
+    assert make_window().windowTitle() == "ikari"
