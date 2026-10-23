@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 from subsentiment import collect
 from subsentiment.arctic_shift import TREE_MAX
 from subsentiment.gui import theme
+from subsentiment.store import SAMPLED
 from subsentiment.gui.widgets import (
     Choice, CommentCap, ElidedLabel, ShareBar, VerticalScrollArea, label, panel, plural, section,
 )
@@ -388,6 +389,7 @@ class CoveragePage(VerticalScrollArea):
         self._rebuild = False  # the next days read in builds the rows again
         self._days_for = ""  # the subreddit (lowercased) self.days are of
         self._todo_comments: list[str] = []  # the opened day's posts whose threads aren't saved whole
+        self._sampled: set[int] = set()  # listed days a sample download was through, as last read
         self.ticked: set[int] = set()  # days ticked for Download N days or Delete N days
         self.delete_job = BackgroundJob(self)  # deletes ticked days on a connection of its own
         self.delete_job.ended.connect(self._on_delete_ended)
@@ -475,7 +477,8 @@ class CoveragePage(VerticalScrollArea):
             signal.connect(self.comment_cap.save)
             signal.connect(self._show_ticked)
         # A thread holding the cap is done at that cap, so the threads and the opened day's posts follow it.
-        self.comment_cap.count.valueChanged.connect(lambda _: self.subreddit and self.days and self.refresh_saved())
+        for signal in (self.comment_cap.count.valueChanged, self.comment_cap.pick.currentIndexChanged):
+            signal.connect(lambda _: self.subreddit and self.days and self.refresh_saved())
         bar_cap.addWidget(self.comment_cap.count)
         bar_cap.addWidget(self.comment_cap.pick)
         for lay in (bar_lay, bar_cap):
@@ -630,7 +633,7 @@ class CoveragePage(VerticalScrollArea):
             return
         self._rebuild = self._rebuild or rebuild
         if self.subreddit:
-            self.days_read.ask(self.subreddit, self.comment_cap.count.value(), today())
+            self.days_read.ask(self.subreddit, self._cap(), today())
         else:
             self._on_days((None, 0, 0), {"days": []})
 
@@ -654,6 +657,7 @@ class CoveragePage(VerticalScrollArea):
         rebuild, self._rebuild = self._rebuild or days != self.days, False
         self.days = days
         self._threads, self._threads_for = got["threads"], (sub.lower(), days[-1], days[0] + DAY, cap)
+        self._sampled = got["sampled"]
         self._days_for = sub.lower()
         totals = self._totals(got["counts"])
         self._count_missing()
@@ -816,8 +820,14 @@ class CoveragePage(VerticalScrollArea):
 
     def _kept(self) -> str:
         """What a thread needs saved to count as done, for the tooltips: the cap counts as done."""
+        if self.comment_cap.sampling:
+            return "Every comment, or its part of the day's sample, is"
         cap = self.comment_cap.count.value()
         return f"Every comment, or {cap:,} on a bigger thread, is" if cap else "Every comment is"
+
+    def _cap(self) -> int:
+        """What a thread needs to be done, for the store (thread_done): the cap, or SAMPLED."""
+        return SAMPLED if self.comment_cap.sampling else self.comment_cap.count.value()
 
     def _threads_on(self, day: int) -> tuple[int, int]:
         """(posts with every comment saved, saved posts) on a listed day, as last counted; (0, 0) until then."""
@@ -826,7 +836,8 @@ class CoveragePage(VerticalScrollArea):
 
     def _draw_day_threads(self, row: int, day: int) -> None:
         whole, posts = self._threads_on(day)
-        if not self._changed(("threads", day), whole, posts, self.busy):
+        if not self._changed(("threads", day), whole, posts, self.busy, self.comment_cap.sampling,
+                             day in self._sampled):
             return
         cell: Cell = self.day_table.cellWidget(row, 3)
         button: QPushButton = self.day_table.cellWidget(row, 4).findChild(QPushButton)
@@ -838,9 +849,12 @@ class CoveragePage(VerticalScrollArea):
             button.setToolTip("No posts from this day are saved yet")
             return
         done = whole == posts
-        cell.show_share(f"✓ {plural(posts, 'thread')}" if done else f"{whole:,} of {plural(posts, 'thread')}",
-                        f"✓ {posts:,}" if done else f"{whole:,} of {posts:,}",
-                        "" if done else f"{100 * whole // posts}%", whole / posts, done,
+        # Sampled is enough for this download, but not the green of every comment saved.
+        sampled = done and self.comment_cap.sampling and day in self._sampled
+        cell.show_share(f"Sampled · {plural(posts, 'thread')}" if sampled else f"✓ {plural(posts, 'thread')}"
+                        if done else f"{whole:,} of {plural(posts, 'thread')}",
+                        "Sampled" if sampled else f"✓ {posts:,}" if done else f"{whole:,} of {posts:,}",
+                        "" if done else f"{100 * whole // posts}%", whole / posts, done and not sampled,
                         f"{self._kept()} saved on {whole:,} of the {plural(posts, 'post')} saved from this "
                         "day. " + THREADS_TIP)
         button.setText(CHECK if done else DOWNLOAD)
@@ -907,7 +921,8 @@ class CoveragePage(VerticalScrollArea):
              "both": "Download every post from the ticked days, newest first, then every comment on them"}[what])
         self.estimate.setText("" if not n else {
             "posts": f"≈ {plural(posts, 'post')} to fetch" if posts else "Checks for posts added since",
-            "comments": f"{plural(threads, 'thread')} to fetch",
+            "comments": f"A sample from {plural(threads, 'thread')}" if self.comment_cap.sampling
+                        else f"{plural(threads, 'thread')} to fetch",
             "both": (f"≈ {plural(posts, 'post')} and their comments" if posts else "Checks for posts added since")
                     + (f", plus {plural(threads, 'saved thread')}" if threads else "")}[what])
         self.delete_ticked.setText(f"Delete {plural(n, 'day')}…" if n else "Delete selected")
@@ -928,7 +943,8 @@ class CoveragePage(VerticalScrollArea):
         days = sorted(self.ticked) or self._day_rows
         whole, total = (sum(self._threads_on(d)[i] for d in days) for i in (0, 1))
         where = "the ticked days" if self.ticked else f"these {plural(len(days), 'day')}"
-        self.threads_total.setText(f"Comments complete on {whole:,} of {plural(total, 'post')}" if total else "")
+        done = "sampled or complete" if self.comment_cap.sampling else "complete"
+        self.threads_total.setText(f"Comments {done} on {whole:,} of {plural(total, 'post')}" if total else "")
         self.threads_total.setToolTip(f"{self._kept()} saved on {whole:,} of the {plural(total, 'post')} saved "
                                       f"from {where}. " + THREADS_TIP if total else "")
         self.delete_question.setVisible(self._asking)
@@ -947,7 +963,7 @@ class CoveragePage(VerticalScrollArea):
         if day is None or not self.subreddit:
             self._show_posts(None)
         else:
-            self.posts_read.ask(self.subreddit, day, self.comment_cap.count.value())
+            self.posts_read.ask(self.subreddit, day, self._cap())
 
     @Slot(object, object)
     def _on_posts(self, asked: tuple, got: tuple) -> None:
@@ -1008,7 +1024,7 @@ class CoveragePage(VerticalScrollArea):
         t.setCellWidget(i, 0, title)
         t.setCellWidget(i, 1, Cell())
         button = row_button()
-        button.clicked.connect(lambda _=False, row=i: self._download_comments([self._post_rows[row]["id"]]))
+        button.clicked.connect(lambda _=False, row=i: self._download_comments([self._post_rows[row]["id"]], one=True))
         t.setCellWidget(i, 2, centred(button))
 
     def _draw_post_row(self, i: int) -> None:
@@ -1017,7 +1033,8 @@ class CoveragePage(VerticalScrollArea):
         so_far = r["num_comments"] is None and r["id"] in self._comments_so_far
         total = r["num_comments"]
         capped = bool(r["whole"]) and not (done or so_far or (bool(total) and r["saved_comments"] >= total))
-        state = (r["id"], r["title"], r["saved_comments"], r["num_comments"], done, so_far, capped, self.busy)
+        sampled = capped and self.comment_cap.sampling
+        state = (r["id"], r["title"], r["saved_comments"], r["num_comments"], done, so_far, capped, sampled, self.busy)
         if self._post_drawn.get(i) == state:
             return
         self._post_drawn[i] = state
@@ -1030,6 +1047,11 @@ class CoveragePage(VerticalScrollArea):
             cell.setToolTip("Every comment the archive had on this post when it was downloaded is saved. Arctic "
                             "Shift counts a post's comments when it re-checks the post, usually about 36 hours "
                             "after posting; Check again fetches any that came since.")
+        elif sampled:
+            cell.side.setText("sampled")
+            cell.bar.set(1.0, False)  # its part of the day's sample, not the green of a thread saved whole
+            cell.setToolTip(f"{plural(r['saved_comments'], 'comment')} saved: this post's part of the day's random "
+                            "sample, in proportion to its comments. Its ↓ downloads every comment.")
         elif capped:
             cap = self.comment_cap.count.value()
             cell.side.setText("at cap")
@@ -1040,7 +1062,7 @@ class CoveragePage(VerticalScrollArea):
             cell.side.setText("not counted yet")
             cell.setToolTip("Arctic Shift counts a post's comments when it re-checks the post, usually "
                             "about 36 hours after posting. Downloading still fetches what's there now.")
-        full = done or so_far or capped or (bool(total) and r["saved_comments"] >= total)
+        full = done or so_far or (capped and not sampled) or (bool(total) and r["saved_comments"] >= total)
         button: QPushButton = t.cellWidget(i, 2).findChild(QPushButton)
         button.setText(CHECK if full else DOWNLOAD)
         button.setToolTip("Check again: look for comments added since" if full else "Download all of its comments")
@@ -1173,7 +1195,7 @@ class CoveragePage(VerticalScrollArea):
         if not self.subreddit:
             return
         store = self.window_.store
-        cap = self.comment_cap.count.value()
+        cap = self._cap()
         self._download_comments(store.open_threads(self.subreddit, [day], cap=cap)
                                 or store.open_threads(self.subreddit, [day], every=True))
 
@@ -1185,7 +1207,7 @@ class CoveragePage(VerticalScrollArea):
     def _start(self, sub: str, what: str, days: tuple[int, ...]) -> bool:
         """Download ``what`` from these days of r/sub, newest first; False if there's nothing to start."""
         if what == "comments":
-            ids = self.window_.store.open_threads(sub, days, cap=self.comment_cap.count.value())
+            ids = self.window_.store.open_threads(sub, days, cap=self._cap())
             if not ids:
                 return False
             req = collect.FetchRequest(subreddit=sub, comment_posts=tuple(ids), fill_threads=True,
@@ -1249,13 +1271,17 @@ class CoveragePage(VerticalScrollArea):
         if not self._start(s["subreddit"], s["what"], days) and s["what"] == "comments" and not self.busy:
             self._remember_stopped(None)  # its threads were finished since: nothing is left to resume
 
-    def _download_comments(self, ids: list[str]) -> None:
+    def _download_comments(self, ids: list[str], one: bool = False) -> None:
+        """Comments on these posts, as the bar above says. ``one`` post's own button isn't sampled: asked for by
+        itself, it gets every comment."""
         if not self.subreddit or not ids:
             return
-        req = collect.FetchRequest(subreddit=self.subreddit, comment_posts=tuple(ids), fill_threads=True,
-                                   **self.comment_cap.request())
-        cap = self.comment_cap.count.value()
-        what = f"up to {plural(cap, 'comment')}" if cap else "every comment"
+        sampling = self.comment_cap.sampling and not one
+        asked = {"comments_per_post": 0, "comment_pick": "top"} if one and self.comment_cap.sampling else \
+            self.comment_cap.request()
+        req = collect.FetchRequest(subreddit=self.subreddit, comment_posts=tuple(ids), fill_threads=True, **asked)
+        cap = asked["comments_per_post"]
+        what = "a sample of the comments" if sampling else f"up to {plural(cap, 'comment')}" if cap else "every comment"
         self.window_.start_request(req, f"Downloading {what} on {plural(len(ids), 'post')}…")
 
     def _download_day_comments(self) -> None:

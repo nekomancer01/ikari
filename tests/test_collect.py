@@ -538,3 +538,64 @@ def test_a_days_comments_skip_posts_whose_recheck_finds_nothing_to_download(tmp_
     c.calls.clear()
     collect.run(c, s, collect.FetchRequest("python", comment_posts=("p1",)))
     assert [call[1] for call in c.calls if call[0] == "all"] == ["p1"]
+
+
+def test_a_days_sample_is_enough_for_five_points_and_gives_every_comment_the_same_chance():
+    # The textbook size: 1.96² · ¼ / 0.05² = 384.2, so 385 of a big day; the finite population correction asks
+    # fewer of a smaller one; a day of no more than 385 is kept whole.
+    assert collect.Sample.NEED == 385
+    assert collect.Sample({"a": 10 ** 7}).size == 385
+    assert collect.Sample({"a": 1000}).size == 278
+    small = collect.Sample({"a": 300, "b": 85, "c": None})
+    assert small.whole and small.quota("a") is None and small.quota("c") is None
+    # One busy thread among many small ones: its quota follows its share of the day's comments, so neither the
+    # busy thread nor the small ones are favoured. Over many days, each comment's chance is the same, size / N.
+    big_rate, small_rate = [], []
+    for day in range(200):
+        counts = {f"d{day}big": 3000, **{f"d{day}s{k}": 3 for k in range(1000)}}
+        s = collect.Sample(counts)
+        quotas = {pid: s.quota(pid) for pid in counts}
+        assert sum(quotas.values()) == s.size == 362  # exactly the size: the day's lowest draws
+        big_rate.append(quotas[f"d{day}big"] / 3000)
+        small_rate.append(sum(q for pid, q in quotas.items() if not pid.endswith("big")) / 3000)
+    rate = 362 / 6000
+    assert abs(sum(big_rate) / 200 - rate) < 0.004 and abs(sum(small_rate) / 200 - rate) < 0.004
+    # The same posts give the same sample.
+    assert collect.Sample({"x": 900, "y": 40}).quotas == collect.Sample({"y": 40, "x": 900}).quotas
+
+
+def test_a_threads_part_follows_its_tree_where_the_archive_counted_it_short():
+    s = collect.Sample({"a": 1000, "b": 1000})
+    q = s.quota("a")
+    tree = [Comment(f"c{j}", "a", "Python", "t3_a", "b", "ok", 1, T, 0, "u") for j in range(1250)]
+    kept = s.keep("a", tree)
+    assert len(kept) == round(q * 1.25)  # 1,250 in the tree: the same share of it
+    assert {c.id for c in kept} == {c.id for c in s.keep("a", list(reversed(tree)))}  # picked by id, not order
+
+
+def test_coverage_sample_reads_only_the_threads_holding_part_of_it_then_counts_the_day_done(tmp_path):
+    from subsentiment.store import SAMPLED
+    posts = [mk(i, num_comments=2000 if i == 0 else 4) for i in range(300)]  # 3,196 comments on one day
+    s = store_with(tmp_path, posts)
+
+    class Sized(FakeClient):
+        def fetch_all_comments(self, post, cap=0, pick="top"):
+            self.calls.append(("all", post.id, cap))
+            return [Comment(f"c{post.id}_{j}", post.id, "Python", "t3_" + post.id, "b", "ok", 1, T, 0, "u")
+                    for j in range(post.num_comments)], True
+    c = Sized()
+    day = int(T // collect.DAY * collect.DAY)
+    ids = tuple(s.open_threads("python", [day], cap=SAMPLED))
+    assert len(ids) == 300
+    req = collect.FetchRequest("python", comment_posts=ids, fill_threads=True, comment_pick=collect.SAMPLE)
+    result = collect.run(c, s, req)
+    sample = collect.Sample(s.comment_totals("python", day, day + collect.DAY))
+    asked = [call[1] for call in c.calls if call[0] == "all"]
+    assert result.comments == sample.size == 344 and len(s.comments("python")) == 344
+    assert "p0" in asked and 0 < len(asked) < 150  # the busy thread, and only some of the small ones
+    assert all(call[2] == 0 for call in c.calls if call[0] == "all")  # each thread asked for whole, then cut
+    assert s.whole_threads_per_day("python", day, day + collect.DAY, SAMPLED) == {day: (300, 300)}
+    assert s.whole_threads_per_day("python", day, day + collect.DAY)[day][0] < len(asked)  # sampled, not whole
+    assert s.open_threads("python", [day], cap=SAMPLED) == []
+    c.calls.clear()
+    assert collect.run(c, s, req).comments == 0 and not c.calls  # held already: nothing asked again
