@@ -138,11 +138,12 @@ class ShrinkingComboBox(QComboBox):
 
 class CommentCap(QObject):
     """How many comments to keep on each post, ``count`` (0 shows as "All"), and which ones, ``pick``: the
-    highest-scored or a random sample that stays the same for each post. The Fetch drawer and the Coverage
-    page each place one, remembered under their own QSettings prefix as "comments_per_post" and
+    highest-scored or a random sample that stays the same for each post; or, ignoring the count, "sample": a
+    random sample of each day's comments big enough to measure its sentiment (collect.Sample). The Fetch drawer
+    and the Coverage page each place one, remembered under their own QSettings prefix as "comments_per_post" and
     "comment_pick"."""
 
-    PICKS = {"top": "Top scoring", "random": "Random"}
+    PICKS = {"top": "Top scoring", "random": "Random", "sample": "Sample"}
 
     def __init__(self, settings, prefix: str, default: int, most: int, parent=None):
         super().__init__(parent)
@@ -161,19 +162,31 @@ class CommentCap(QObject):
         for key, text in self.PICKS.items():
             self.pick.addItem(text, key)
         self.pick.setToolTip("Which comments a post keeps when it has more than that: the highest-scored, or a "
-                             "random sample that stays the same each time the post is asked about")
-        self.count.valueChanged.connect(lambda _: self.set_enabled(self._enabled))
+                             "random sample that stays the same each time the post is asked about.\n"
+                             "Sample: enough of each day's comments, picked at random across its posts by how many "
+                             "each has, to measure the day's sentiment within ±5 points (95% confidence): 385 of "
+                             "a big day, fewer of a smaller one; a day of up to 385 comments is downloaded whole.")
+        for signal in (self.count.valueChanged, self.pick.currentIndexChanged):
+            signal.connect(lambda _: self.set_enabled(self._enabled))
         self.restore()
 
     def request(self) -> dict:
         """The FetchRequest fields this sets."""
         return {"comments_per_post": self.count.value(), "comment_pick": self.pick.currentData()}
 
+    @property
+    def sampling(self) -> bool:
+        return self.pick.currentData() == "sample"
+
     def set_enabled(self, on: bool) -> None:
-        """Both off with ``on`` False; the pick is off under All too, as nothing is left out to choose from."""
+        """Both off with ``on`` False. The count is off while sampling, which sets its own; under All, Top scoring
+        and Random are, as nothing is left out to choose between, leaving Sample to take."""
         self._enabled = on
-        self.count.setEnabled(on)
-        self.pick.setEnabled(on and self.count.value() > 0)
+        self.count.setEnabled(on and not self.sampling)
+        capped = self.count.value() > 0
+        for key in ("top", "random"):
+            self.pick.model().item(self.pick.findData(key)).setEnabled(capped)
+        self.pick.setEnabled(on)
 
     def restore(self) -> None:
         self.count.setValue(self.settings.value(f"{self.prefix}/comments_per_post", self.default, int))

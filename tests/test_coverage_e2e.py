@@ -341,7 +341,10 @@ def test_download_selected_keeps_the_picked_number_of_comments_per_thread_and_to
     w.show_page("coverage")
     c = w.coverage
     settle(w, lambda: c.totals)
-    assert c.comment_cap.count.text() == "All comments" and not c.comment_cap.pick.isEnabled()  # nothing left out to pick
+    assert c.comment_cap.count.text() == "All comments"
+    pick = c.comment_cap.pick
+    items = {pick.itemData(k): pick.model().item(k).isEnabled() for k in range(pick.count())}
+    assert items == {"top": False, "random": False, "sample": True}  # nothing left out to pick between; Sample is there
     c.comment_cap.count.setValue(2)
     c.comment_cap.pick.setCurrentIndex(c.comment_cap.pick.findData("random"))
     tick(c, TODAY - DAY)
