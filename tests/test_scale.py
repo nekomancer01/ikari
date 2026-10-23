@@ -167,7 +167,9 @@ def test_sorting_a_big_table_is_worked_out_between_frames(monkeypatch):
     real = sorted
     monkeypatch.setattr(tables, "sorted", lambda items, **k: (sorts.append(len(items)), real(items, **k))[1],
                         raising=False)
-    threads = count_calls(monkeypatch, threading.Thread, "start")
+    # The table's own threads: windows other tests left open start threads of their own as events are pumped.
+    threads, real_on_thread = [], tables.on_thread
+    monkeypatch.setattr(tables, "on_thread", lambda work: (threads.append(1), real_on_thread(work))[1])
     tab.view.sortByColumn(3, Qt.SortOrder.DescendingOrder)  # Score
     # Sorting all of the owner's 650,000 comments at the click held the window a second and a half; now numbers are
     # sorted by numpy on a thread, no frame sorting anything, and the table shows the rows in their new order
