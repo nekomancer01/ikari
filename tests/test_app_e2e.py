@@ -1,6 +1,7 @@
 """The whole app driven like a user would: the real main window, fetch threads, HTTP client and store,
 talking to a fake Arctic Shift server on localhost. The rule checked throughout: nothing is requested
 unless the user asked for it, and each action requests only what it says."""
+import faulthandler
 import os
 import re
 import shutil
@@ -48,7 +49,9 @@ def wait_idle(w, timeout: float = 30) -> None:
     """Until the fetch the window is running has finished and its thread is cleaned up."""
     end = time.monotonic() + timeout
     while w.fetch_job.busy:
-        assert time.monotonic() < end, "fetch didn't finish"
+        if time.monotonic() >= end:
+            faulthandler.dump_traceback(all_threads=True)  # where the fetch is stuck, in the failure's output
+            raise AssertionError("fetch didn't finish")
         QApplication.processEvents()
         time.sleep(0.01)
     pump(50)
