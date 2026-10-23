@@ -838,6 +838,7 @@ def test_row_buttons_sit_whole_and_centred_in_their_cells(window):
         assert t.cellWidget(0, cols[0]).width() < t.columnWidth(cols[0])  # the theme's item padding is off it
         for row in range(t.rowCount()):
             for col in cols:
+                t.scrollTo(t.model().index(row, col))  # a row gets its widgets as it comes near the view
                 box = t.cellWidget(row, col)
                 b = box.findChild(QPushButton)
                 assert box.rect().contains(b.geometry()), (row, col, box.rect(), b.geometry())
