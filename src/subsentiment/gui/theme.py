@@ -28,8 +28,9 @@ ASSETS = Path(__file__).parent / "assets"
 THEMES = {
     "light": {
         "bg0": "#f1f1f1",
-        # Panels and the cards on them are white; "soft" is the gray of a hover or a chosen row, "head" a table's.
-        "panel": "#ffffff", "soft": "#f5f5f5", "head": "#f6f6f6",
+        # Panels and the cards on them are white; "soft" is the gray of a hover or a chosen row, "head" a table's,
+        # "press" a button held down.
+        "panel": "#ffffff", "soft": "#f5f5f5", "head": "#f6f6f6", "press": "#e9e9eb",
         "edge": (0, 0, 0, 24),  # hairline borders and dividers, about #e8e8e8 on white
         "text": "#1f1f1f", "muted": "#737373", "faint": "#a3a3a3",
         "accent": "#0163ff", "on_accent": "#ffffff", "button": "#0163ff",
@@ -39,7 +40,7 @@ THEMES = {
     },
     "dark": {
         "bg0": "#0e0e10",
-        "panel": "#18181b", "soft": "#242428", "head": "#1f1f23",
+        "panel": "#18181b", "soft": "#242428", "head": "#1f1f23", "press": "#303036",
         "edge": (255, 255, 255, 24),
         "text": "#ededef", "muted": "#9d9da3", "faint": "#6c6c72",
         "accent": "#3d86ff", "on_accent": "#ffffff",
@@ -159,7 +160,7 @@ def _icons(t: dict) -> Path:
 
 def stylesheet(t: dict) -> str:
     icons = _icons(t).as_posix()  # forward slashes; urls are quoted below for paths with spaces
-    panel, soft, head = t["panel"], t["soft"], t["head"]
+    panel, soft, head, press = t["panel"], t["soft"], t["head"], t["press"]
     display = f'"{DISPLAY_FAMILY}"'
     edge, sel = _rgba(t["edge"]), _rgba(t["selection"])
     return f"""
@@ -236,19 +237,32 @@ QPushButton {{
     background: {panel}; border: 1px solid {edge}; border-radius: 14px; padding: 8px 16px; font-weight: 500;
 }}
 QPushButton:hover {{ background: {soft}; }}
-QPushButton:pressed {{ background: {head}; }}
+QPushButton:pressed {{ background: {press}; }}
 QPushButton:disabled {{ color: {t['faint']}; background: {panel}; border-color: {edge}; }}
 QPushButton:focus {{ border-color: {t['accent']}; }}
 QPushButton:checked {{ background: {sel}; border-color: {t['accent']}; }}  /* a toggle button that is on */
 QPushButton[primary="true"] {{ color: {t['on_accent']}; border: 1px solid {t['button']}; background: {t['button']}; }}
 QPushButton[primary="true"]:hover {{ background: {QColor(t['button']).darker(110).name()}; }}
+QPushButton[primary="true"]:pressed {{ background: {QColor(t['button']).darker(122).name()}; }}
 QPushButton[primary="true"]:focus {{ border-color: {QColor(t['button']).darker(125).name()}; }}
 QPushButton[primary="true"]:disabled {{ color: rgba(255, 255, 255, 190); background: {t['faint']}; border-color: {t['faint']}; }}
 QPushButton[flat="true"] {{ background: transparent; border: 1px solid transparent; color: {t['muted']}; }}
 QPushButton[flat="true"]:hover {{ background: {soft}; color: {t['text']}; }}
+QPushButton[flat="true"]:pressed {{ background: {press}; color: {t['text']}; }}
 QPushButton[flat="true"]:checked {{ background: {panel}; border-color: {edge}; color: {t['text']}; }}  /* like a chosen tab */
 QPushButton[flat="true"]:disabled {{ color: {t['faint']}; }}
 QPushButton[small="true"] {{ padding: 3px 9px; border-radius: 8px; font-size: 9pt; }}
+/* Pill sizes, each fully round: "compact" 28 px high, "bar" 32 px to sit level with the boxes and choices beside it,
+   "glyph" a one-character button 24 px high (a list row's download) */
+QPushButton[pill="compact"] {{ padding: 5px 12px; border-radius: 14px; }}
+QPushButton[pill="bar"] {{ padding: 7px 16px; border-radius: 16px; }}
+QPushButton[pill="glyph"] {{ padding: 3px 0; border-radius: 12px; }}
+/* A choice's words sit in its soft track, so a hover there tints rather than turning the track's own gray */
+QFrame[choice="true"] QPushButton {{ padding: 4px 12px; border-radius: 10px; }}
+QFrame[choice="true"][small="true"] QPushButton {{ padding: 3px 10px; }}
+QFrame[choice="true"] QPushButton[flat="true"]:hover {{ background: {edge}; color: {t['text']}; }}
+QFrame[choice="true"] QPushButton[flat="true"]:pressed {{ background: {_rgba((*t['edge'][:3], t['edge'][3] * 2))}; }}
+QFrame[choice="true"] QPushButton[flat="true"]:checked {{ background: {panel}; border-color: {edge}; color: {t['text']}; }}
 
 /* Tabs: plain words, the chosen one an outlined pill */
 QTabWidget::pane {{ border: none; top: 0; }}

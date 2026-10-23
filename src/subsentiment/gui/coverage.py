@@ -218,9 +218,9 @@ class Cell(QWidget):
         self.side.setVisible(bool(self.side.text()) and need <= room)
 
 
-def small_button(text: str) -> QPushButton:
-    b = QPushButton(text)
-    b.setStyleSheet("padding: 5px 12px;")
+def small_button(text: str, pill: str = "compact") -> QPushButton:
+    """``pill`` is the theme's size: "compact", "bar" (level with the action bar's boxes) or "glyph"."""
+    b = theme.mark(QPushButton(text), "pill", pill)
     # Downloads start from a click only: no Enter or Space on a button that kept focus after a click.
     b.setAutoDefault(False)
     b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -233,9 +233,8 @@ DOWNLOAD, CHECK = "↓", "↻"  # a row's buttons: download what's missing, or l
 
 def row_button() -> QPushButton:
     """A row's download (↓) or check again (↻) button; its tooltip says what it fetches."""
-    b = small_button(DOWNLOAD)
-    b.setStyleSheet("padding: 3px 0; border-radius: 9px;")
-    b.setFixedWidth(34)
+    b = small_button(DOWNLOAD, "glyph")
+    b.setFixedWidth(32)
     return b
 
 
@@ -333,10 +332,12 @@ class LazyRows(QObject):
 
 
 def centred(w: QWidget) -> QWidget:
+    """A row button in the middle of its cell. The cell is the column less the theme's item padding, so the
+    button keeps no margins of its own: they pushed its right edge out of a 44 px column."""
     box = QWidget()
     lay = QHBoxLayout(box)
-    lay.setContentsMargins(2, 0, 6, 0)
-    lay.addWidget(w, 0, Qt.AlignmentFlag.AlignVCenter)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.addWidget(w, 0, Qt.AlignmentFlag.AlignCenter)
     return box
 
 
@@ -423,7 +424,6 @@ class CoveragePage(VerticalScrollArea):
         self.resume_text = QLabel()
         lay.addWidget(self.resume_text)
         self.resume = theme.mark(small_button("Resume"), "primary", True)
-        self.resume.setStyleSheet("padding: 3px 12px; border-radius: 10px;")
         self.resume.clicked.connect(self._resume)
         lay.addWidget(self.resume)
         self.recount = mark_flat(small_button("Recount"))
@@ -480,7 +480,7 @@ class CoveragePage(VerticalScrollArea):
             lay.addStretch(1)  # on a line of its own, each part stays at the left
         self.estimate = ElidedLabel("", "muted")
         bar_end.addWidget(self.estimate, 1)
-        self.download_ticked = theme.mark(small_button("Download selected"), "primary", True)
+        self.download_ticked = theme.mark(small_button("Download selected", "bar"), "primary", True)
         self.download_ticked.clicked.connect(self._download_ticked)
         bar_end.addWidget(self.download_ticked)
         root.addWidget(bar)
