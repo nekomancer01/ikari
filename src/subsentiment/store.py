@@ -157,6 +157,12 @@ WHOLE_THREAD = (  # IFNULL: an uncounted post (num_comments NULL) would make "= 
     "AND k.subreddit = lower(p.subreddit) AND k.key = p.id)) "
     f"OR (p.num_comments > 0 AND {SAVED_COMMENTS} >= p.num_comments), 0)")
 
+
+def thread_done(cap: int = 0) -> str:
+    """SQL, 1 or 0: post p's thread needs no more comment downloads. Saved whole (WHOLE_THREAD), or with a
+    per-thread ``cap`` (Coverage's), holding that many comments: a download at that cap asks nothing more of it."""
+    return f"({WHOLE_THREAD} OR {SAVED_COMMENTS} >= {int(cap)})" if cap else WHOLE_THREAD
+
 # Comments on image posts are hidden along with the posts (``c`` is the comments table).
 NOT_IMAGE = "c.post_id NOT IN (SELECT id FROM posts WHERE image = 1)"
 
@@ -1317,9 +1323,8 @@ class Store:
         rows = self.db.execute(
             "SELECT p.id, CAST(p.created_utc / 86400 AS INTEGER) * 86400 d FROM posts p WHERE p.subreddit = ? "
             "COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? AND p.image = 0 "
-            + ("" if every else f"AND NOT {WHOLE_THREAD} ") + ("" if every or not cap else f"AND {SAVED_COMMENTS} < ? ")
-            + "ORDER BY p.created_utc DESC",
-            (subreddit, days[0], days[-1] + 86400) + (() if every or not cap else (cap,)))
+            + ("" if every else f"AND NOT {thread_done(cap)} ") + "ORDER BY p.created_utc DESC",
+            (subreddit, days[0], days[-1] + 86400))
         want = set(days)
         return [r["id"] for r in rows if r["d"] in want]
 
@@ -1332,12 +1337,13 @@ class Store:
             (subreddit, after, before, int(images)))
         return {r["d"]: r["n"] for r in rows}
 
-    def comment_coverage(self, subreddit: str, after: float, before: float) -> list[sqlite3.Row]:
+    def comment_coverage(self, subreddit: str, after: float, before: float, cap: int = 0) -> list[sqlite3.Row]:
         """Saved posts created in [after, before), newest first, each with saved_comments (how many of
-        its comments are saved) beside the post's own num_comments, and whole (see WHOLE_THREAD)."""
+        its comments are saved) beside the post's own num_comments, and whole: done at this ``cap`` (see
+        thread_done)."""
         return self._unpacked("posts", self.db.execute(
             "SELECT p.id, p.subreddit, p.title, p.num_comments, p.score, p.created_utc, p.permalink, p.packed, "
-            f"{SAVED_COMMENTS} AS saved_comments, {WHOLE_THREAD} AS whole "
+            f"{SAVED_COMMENTS} AS saved_comments, {thread_done(cap)} AS whole "
             "FROM posts p WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? "
             "AND p.image = 0 ORDER BY p.created_utc DESC", (subreddit, after, before)))
 
@@ -1349,11 +1355,12 @@ class Store:
             (subreddit, after if after is not None else float("-inf"),
              before if before is not None else float("inf"))).fetchall())
 
-    def whole_threads_per_day(self, subreddit: str, after: float, before: float) -> dict[int, tuple[int, int]]:
-        """Per UTC day in [after, before), {day start: (posts whose comment threads are saved whole, saved
-        posts)}, image posts left out as in posts_per_day. Counted in SQL: no post is read."""
+    def whole_threads_per_day(self, subreddit: str, after: float, before: float,
+                              cap: int = 0) -> dict[int, tuple[int, int]]:
+        """Per UTC day in [after, before), {day start: (posts whose comment threads are done at this ``cap``
+        (see thread_done), saved posts)}, image posts left out as in posts_per_day. Counted in SQL: no post is read."""
         rows = self.db.execute(
-            f"SELECT CAST(p.created_utc / 86400 AS INTEGER) * 86400 d, COUNT(*) n, SUM({WHOLE_THREAD}) whole "
+            f"SELECT CAST(p.created_utc / 86400 AS INTEGER) * 86400 d, COUNT(*) n, SUM({thread_done(cap)}) whole "
             "FROM posts p WHERE p.subreddit = ? COLLATE NOCASE AND p.created_utc >= ? AND p.created_utc < ? "
             "AND p.image = 0 GROUP BY d", (subreddit, after, before))
         return {r["d"]: (r["whole"], r["n"]) for r in rows}
