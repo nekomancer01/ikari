@@ -712,6 +712,77 @@ def test_columns_that_fit_once_shrunk_are_not_hidden(make_window):
     page.close()
 
 
+def test_a_new_progress_value_waits_for_the_next_frame_to_be_drawn(make_window):
+    # QProgressBar draws itself there and then, and with it everything else in the window waiting to be drawn,
+    # on every value a fetch sent: once for each comment thread it saved.
+    from PySide6.QtCore import QEvent, QObject
+    w = make_window()
+    w.show()
+    w.show_page("posts")
+    w._set_busy(True)
+    QApplication.processEvents()
+
+    class Paints(QObject):
+        seen = []
+
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.Type.Paint:
+                self.seen.append(obj)
+            return False
+    paints = Paints()
+    for widget in (w.progress, w.posts_tab.view.viewport()):
+        widget.installEventFilter(paints)
+    assert w.progress.isVisible() and w.posts_tab.view.viewport().isVisible()
+    w.posts_tab.view.viewport().update()
+    w._on_progress(3, 10, "All comments for post 3/10")
+    assert paints.seen == [] and w.progress.value() == 3
+    QApplication.processEvents()
+    assert w.posts_tab.view.viewport() in paints.seen
+    w._set_busy(False)
+
+
+def test_only_fading_rows_on_screen_are_drawn_again_as_they_fade():
+    from subsentiment.gui.tables import FADE_SECONDS, POST_COLUMNS, RowsModel
+    now = [0.0]
+    m = RowsModel(POST_COLUMNS, clock=lambda: now[0])
+    row = lambda i: {"id": f"p{i}", "sentiment": 0.1, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
+                     "score": 1, "num_comments": 1, "author": "a", "created_utc": 0.0}
+    m.set_rows([row(i) for i in range(100)])
+    m.append_rows([row(100), row(101)])  # rows 100 and 101, fading in
+    changed = []
+    m.dataChanged.connect(lambda a, b, roles: changed.append((a.row(), b.row())))
+    m.on_screen = lambda: (0, 30)  # scrolled to the top, away from them
+    m._tick()
+    assert changed == []
+    m.on_screen = lambda: (80, 101)
+    m._tick()
+    assert changed == [(100, 101)]
+    now[0] = FADE_SECONDS  # done: drawn once more, fully in, and the fade stops
+    m._tick()
+    assert changed[-1] == (100, 101) and not m._fade.isActive()
+
+
+def test_a_slow_lot_of_fetched_rows_makes_the_next_one_wait_longer(make_window, monkeypatch):
+    # Rows went into the tables 25 times a second however long each lot took, and each lot into a table of
+    # 100,000 rows took several ms and a redraw: most of the window's time while comments downloaded.
+    w = make_window()
+    row = lambda i: {"id": f"q{i}", "sentiment": 0.1, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
+                     "score": 1, "num_comments": 1, "author": "a", "created_utc": 1.0, "fetched_at": 1.0}
+    took = []
+    monkeypatch.setattr(w, "_add_rows", lambda kind, tab, rows: (took.append(len(rows)), time.sleep(0.008)))
+    w._queued["posts"] = [row(i) for i in range(1000)]
+    w._drip.start()
+    w._release_rows()
+    assert took == [40]  # 40 ms worth of draining it in a second
+    assert w._drip.interval() >= 200  # about 25 times the 8 ms it took
+    w._release_rows()
+    assert took[-1] >= 190  # a bigger share, so it still drains in about a second
+    monkeypatch.setattr(w, "_add_rows", lambda kind, tab, rows: took.append(len(rows)))
+    w._release_rows()
+    assert w._drip.interval() == mw.DRIP_MS[0]  # quick again: often again
+    w._drip.stop()
+
+
 def test_window_title_has_the_commit_when_run_from_source_and_not_when_packaged(make_window, monkeypatch):
     head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
     assert make_window().windowTitle() == f"ikari ({head})"
