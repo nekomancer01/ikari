@@ -1,15 +1,17 @@
 """One fetch job: pull posts (and optionally comments), score them, store them."""
 from __future__ import annotations
 
+import hashlib
 import math
 import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Collection
 
+import numpy as np
 import requests
 
-from subsentiment.arctic_shift import ArcticShiftClient, ArchiveDown, Stopped, in_parallel
+from subsentiment.arctic_shift import ArcticShiftClient, ArchiveDown, Stopped, in_parallel, keep
 from subsentiment.reddit import FetchError, Post, normalize_subreddit
 from subsentiment.sentiment import Lexicon
 from subsentiment.store import Store
@@ -33,7 +35,9 @@ class FetchRequest:
     query: str = ""
     include_comments: bool = True
     comments_per_post: int = 50  # 0: every comment on each post, as Download coverage's Download all comments
-    comment_pick: str = "top"  # which comments a cap keeps: "top" (highest-scored) or "random" (fixed per post)
+    # Which comments a cap keeps: "top" (highest-scored) or "random" (fixed per post). SAMPLE ignores the cap: each
+    # UTC day keeps a random sample of its comments big enough to measure its sentiment (see Sample).
+    comment_pick: str = "top"
     # With a cap, keep asking for a saved post's thread until it has that many comments saved or is whole, as
     # Download coverage's ticked days do; a later run with a bigger cap tops threads up. Without it, a capped
     # fetch asks about each post once. comments_per_post 0 always keeps asking until the thread is whole.
@@ -60,6 +64,57 @@ class FetchResult:
     already: int = 0  # posts picked that were already saved with settled scores
     comment_errors: int = 0  # posts whose comments couldn't be fetched (or were skipped after errors)
     timed_out: bool = False  # part of the range was skipped: the archive kept timing out on it
+
+
+SAMPLE = "sample"  # FetchRequest.comment_pick for a statistical sample of each day's comments
+
+
+class Sample:
+    """Which comments of one UTC day's saved posts make a simple random sample of the day's comments, big enough
+    that each share (positive, negative, neutral) it measures is within MARGIN of the whole day's 19 times in 20.
+    The day's comments are its posts' own counts (num_comments); the sample needs NEED of a big day, fewer of a
+    smaller one (the finite population correction), and a day with no more than NEED is kept whole.
+
+    The archive gives a thread whole or not at all (its tree can't sample or sort), so only threads holding part
+    of the sample are fetched, and each keeps its quota, picked at random by keep. A quota comes from one draw per
+    comment the post counts, from a generator seeded by the post's id, the day keeping its ``size`` lowest draws:
+    every comment of the day is as likely to be in as any other, so a busy thread gets its share and no more,
+    and the same posts give the same sample each time it's asked for."""
+
+    Z, MARGIN = 1.96, 0.05  # 95% confidence, ±5 points
+    EXACT = Z * Z * 0.25 / (MARGIN * MARGIN)  # a share of 50% is the hardest to pin down: 384.2 comments
+    NEED = math.ceil(EXACT)
+
+    def __init__(self, counts: dict[str, int | None]):
+        """``counts``: each of the day's saved posts (not image ones) with its num_comments, None if not counted yet."""
+        known = {pid: n for pid, n in counts.items() if n}
+        self.counts = counts
+        self.population = sum(known.values())
+        self.whole = self.population <= self.NEED
+        self.size = self.population if self.whole else math.ceil(
+            self.EXACT / (1 + (self.EXACT - 1) / self.population))
+        self.quotas: dict[str, int] = {}
+        if not self.whole:
+            draws = {pid: np.random.default_rng(int.from_bytes(
+                hashlib.blake2b(pid.encode(), digest_size=8).digest(), "little")).random(n) for pid, n in known.items()}
+            line = np.partition(np.concatenate(list(draws.values())), self.size - 1)[self.size - 1]
+            self.quotas = {pid: int(np.count_nonzero(d <= line)) for pid, d in draws.items()}
+
+    def quota(self, pid: str) -> int | None:
+        """How many of a post's comments the sample keeps; None for its whole thread: the day is small, or the post's
+        comments aren't counted yet (about its first 36 hours), so its share of the day isn't known."""
+        n = self.counts.get(pid)
+        if n is None or self.whole:
+            return None
+        return min(self.quotas.get(pid, 0), n)
+
+    def keep(self, pid: str, comments: list) -> list:
+        """The sample's share of a thread as it came back: its quota, scaled to the tree's real size, since the
+        archive's count lags it (1,078 counted, 1,264 in the tree, 22 Oct), so each comment keeps the same chance."""
+        q, n = self.quota(pid), self.counts.get(pid)
+        if q is None:
+            return comments
+        return keep(comments, min(len(comments), max(1, round(q * len(comments) / n))), "random", pid) if q else []
 
 
 def run(client: ArcticShiftClient, store: Store, req: FetchRequest,
@@ -90,8 +145,11 @@ class Download:
         self.stored: dict = {}  # saved posts of the range, id -> row
         self.streamed: set[str] = set()  # new posts saved as they were downloaded
         self.rechecked: set[str] = set()  # saved posts whose scores were re-fetched first
-        self.cap = req.comments_per_post
+        self.sample = req.comment_pick == SAMPLE
+        self.cap = 0 if self.sample else req.comments_per_post  # a sample asks for each thread whole, then cuts it
         self.fill = req.fill_threads or not self.cap  # keep asking for a thread until it's whole, or has cap saved
+        self.samples: dict[int, Sample] = {}  # each UTC day's sample, planned once its posts are saved
+        self.kept: dict[str, int] = {}  # threads read for the sample: how many comments each kept
         self.saved_whole: set[str] = set()  # saved posts whose whole thread is saved (when filling threads)
         self.saved_count: dict[str, int] = {}  # comments saved per post (when filling threads up to a cap)
         self.n_comments = self.errors = 0
@@ -286,15 +344,16 @@ class Download:
                 (r["comments_ok"] is not None and not r["comments_ok"])
                 or (pid in repicked and r["comments_ok"] is None and not r["has_comments"])  # picked, never asked
                 or (fill and pid not in self.saved_whole and not (cap and self.saved_count.get(pid, 0) >= cap)))]
-        todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up
+        todo = self.sampled([p for p in todo if p.num_comments != 0])  # None (not settled yet) still gets looked up
         if self.gave_up:
             tried: set[str] = set()
         else:
-            get = (lambda p: client.fetch_all_comments(p, cap, req.comment_pick)) if fill else (
-                lambda p: (client.fetch_comments(p, cap, req.comment_pick), False))
+            get = self.take_sample if self.sample else (lambda p: client.fetch_all_comments(p, cap, req.comment_pick)) \
+                if fill else (lambda p: (client.fetch_comments(p, cap, req.comment_pick), False))
             failed, tried, self.gave_up, added = self.each_thread(todo, get, cap=cap, progress=report)
             self.errors += failed
             self.n_comments += added
+            self.mark_sampled(tried)
         if self.gave_up:
             rest = [p for p in todo if p.id not in tried]  # not tried this time: retried on the next fetch
             self.errors += len(rest)
@@ -319,9 +378,10 @@ class Download:
                 store.save_post(p, *self.score(p.text))
             store.commit()
             posts = [fresh.get(p.id, p) for p in posts]
-        cap = req.comments_per_post if req.fill_threads else 0  # Download coverage's cap; 0: every comment
+        cap = self.cap if req.fill_threads else 0  # Download coverage's cap; 0: every comment
         if cap:  # a thread with its cap saved already is done for this cap
             posts = [p for p in posts if len(store.comment_ids(p.id)) < cap]
+        posts = self.sampled(posts)
         if len(posts) > 1:
             # A day's Download all comments offers posts whose comments weren't counted yet; once re-checked, the
             # ones with none, or with every one saved already, cost no request. They're done, so they aren't
@@ -338,14 +398,54 @@ class Download:
             skip = {p.id for p in empty}
             posts = [p for p in posts if p.id not in skip]
         errors, tried, gave_up, n_comments = self.each_thread(
-            posts, lambda p: self.client.fetch_all_comments(p, cap, req.comment_pick), cap=cap, progress=progress,
-            every=True)
+            posts, self.take_sample if self.sample else lambda p: self.client.fetch_all_comments(p, cap, req.comment_pick),
+            cap=cap, progress=progress, every=True)
+        self.mark_sampled(tried)
         if gave_up:
             errors += len([p for p in posts if p.id not in tried])  # not tried: retried next time
         if posts:
             progress(len(posts), len(posts), "Done")
         subreddit = posts[0].subreddit if posts else name
         return FetchResult(subreddit, 0, n_comments, self.should_stop(), updated=len(fresh), comment_errors=errors)
+
+    def sampled(self, posts: list[Post]) -> list[Post]:
+        """Of these saved posts, the ones whose threads the sample still wants comments from (every one, when not
+        sampling). The rest, with no part in their day's sample or holding it already, are marked done for the
+        sample ("sampled"), as Download coverage counts them."""
+        if not self.sample:
+            return posts
+        store, name, todo = self.store, self.name, []
+        held = store.complete_keys("sampled", name)
+        for p in posts:
+            day = int(p.created_utc // DAY * DAY)
+            if day not in self.samples:
+                self.samples[day] = Sample(store.comment_totals(name, day, day + DAY))
+                self.saved_count.update(store.comment_counts(name, day, day + DAY))
+            q = self.samples[day].quota(p.id)
+            if q is None or (p.id not in held and self.saved_count.get(p.id, 0) < q):
+                todo.append(p)
+            elif p.id not in held:
+                store.mark_complete("sampled", name, p.id)
+        store.commit()
+        return todo
+
+    def take_sample(self, p: Post) -> tuple[list, bool]:
+        """each_thread's get when sampling: the whole thread, cut to the post's part of its day's sample."""
+        comments, whole = self.client.fetch_all_comments(p)
+        sample = self.samples[int(p.created_utc // DAY * DAY)]
+        kept = sample.keep(p.id, comments)
+        if sample.quota(p.id) is not None and comments:  # a tree that came back empty is asked again next time
+            self.kept[p.id] = len(kept)
+        return kept, whole and len(kept) == len(comments)
+
+    def mark_sampled(self, tried: set[str]) -> None:
+        """Threads read for the sample and saved (``tried``, not ones dropped after Stop) whose part of it is saved
+        now: done for the sample."""
+        for pid in tried & self.kept.keys():
+            if len(self.store.comment_ids(pid)) >= self.kept[pid]:
+                self.store.mark_complete("sampled", self.name, pid)
+        self.kept.clear()
+        self.store.commit()
 
     def each_thread(self, posts: list[Post], get: Callable, *, cap: int, progress,
                     every: bool = False) -> tuple[int, set[str], bool, int]:
@@ -357,7 +457,7 @@ class Download:
         start, since the archive is struggling and shouldn't be hammered. Returns (posts that failed, ids of the
         posts tried, whether it gave up, new comments)."""
         store, name, client, should_stop = self.store, self.name, self.client, self.should_stop
-        what = "Comments for post" if cap else "All comments for post"
+        what = "Sampled comments for post" if self.sample else "Comments for post" if cap else "All comments for post"
         workers = getattr(client, "tree_workers", getattr(client, "workers", 1))
         gave_up = threading.Event()
         streak = [0]  # failures in a row, counted as they happen so no new requests start after the limit

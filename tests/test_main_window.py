@@ -336,6 +336,8 @@ def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypat
         for i in range(3):
             w.store.save_post(Post(f"y{day}{i}", "Python", "y", "", "a", None, None, None, day + 60 + i, "u", ""),
                               0, "neutral")
+    w.store.save_post(Post("img", "Python", "y", "", "a", None, None, None, older + 86400 + 60, "u", "", image=True),
+                      0, "neutral")  # a day between with only a skipped image: listed, with nothing else saved
     w.store.commit()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
@@ -349,7 +351,7 @@ def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypat
     cell = c.day_table.cellWidget(c.days.index(yesterday), 1)
     assert (cell.main.text(), cell.side.text()) == ("3 of 9", "33%")
     cell = c.day_table.cellWidget(c.days.index(older + 86400), 1)
-    assert (cell.main.text(), cell.side.text()) == ("0 of 9", "0%")  # a settled day keeps its total
+    assert (cell.main.text(), cell.side.text()) == ("0 saved", "11%")  # a settled day keeps its total, the skipped image checked
 
 
 def test_one_row_is_counted_as_one_row(make_window):
@@ -789,3 +791,23 @@ def test_window_title_has_the_commit_when_run_from_source_and_not_when_packaged(
     monkeypatch.undo()
     monkeypatch.setattr(mw.os.path, "exists", lambda p: False)  # no .git anywhere above the package
     assert make_window().windowTitle() == "ikari"
+
+
+def test_a_tables_model_and_its_fade_go_with_the_table():
+    # The fade's tick asks the table which rows are on screen: a model outliving its table kept ticking and asked
+    # a table that was gone (a crash in CI).
+    import shiboken6
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from subsentiment.gui.tables import POST_COLUMNS, TablePage
+    QApplication.instance() or QApplication([])
+    page = TablePage(POST_COLUMNS, 1)
+    page.show()
+    row = lambda i: {"id": f"p{i}", "sentiment": 0.1, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
+                     "score": 1, "num_comments": 1, "author": "a", "created_utc": 0.0}
+    model = page.model
+    model.set_rows([row(1)])
+    model.append_rows([row(2)])
+    assert model._fade.isActive()
+    page.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert not shiboken6.isValid(model)
