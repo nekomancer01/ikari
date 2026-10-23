@@ -21,20 +21,21 @@ def pytest_addoption(parser):
     parser.addoption("--shard", metavar="K/N", help="only every Nth test, starting at the Kth (1-based)")
 
 
+def pytest_ignore_collect(collection_path, config):
+    # Left out before they're imported, so the shared part runs where Qt's libraries aren't installed.
+    part, name = config.getoption("--part"), collection_path.name
+    if part and name.startswith("test_") and name.endswith(".py"):
+        kind = "shared" if name in SHARED else "layout" if name == "test_layout.py" else "other"
+        return kind != part or None
+
+
 def pytest_collection_modifyitems(config, items):
-    part, shard = config.getoption("--part"), config.getoption("--shard")
-    if not part and not shard:
+    shard = config.getoption("--shard")
+    if not shard:
         return
-
-    def kind(item):
-        name = item.path.name
-        return "shared" if name in SHARED else "layout" if name == "test_layout.py" else "other"
-
-    keep = [item for item in items if not part or kind(item) == part]
-    if shard:
-        # Every Nth test rather than every Nth file, so the long e2e file and the layout rows spread evenly.
-        k, n = map(int, shard.split("/"))
-        keep = keep[k - 1::n]
+    # Every Nth test rather than every Nth file, so the long e2e file and the layout rows spread evenly.
+    k, n = map(int, shard.split("/"))
+    keep = items[k - 1::n]
     kept = set(map(id, keep))
     config.hook.pytest_deselected(items=[item for item in items if id(item) not in kept])
     items[:] = keep
