@@ -1253,6 +1253,15 @@ class Store:
         spans = self._tried_spans(subreddit)
         return sorted({d for a, b in spans for d in range(a, b + 1, 86400)}, reverse=True)
 
+    def downloaded_days(self, subreddit: str) -> list[int]:
+        """UTC days (their starts, newest first) with a post saved, whether or not a fetch recorded asking for
+        them (imported or older data): Download coverage lists these, so every day on the charts can be
+        downloaded again or deleted. Skipped image posts count, they were downloaded; days asked for with
+        nothing saved don't."""
+        return [r["d"] for r in self.db.execute(
+            "SELECT DISTINCT CAST(created_utc / 86400 AS INTEGER) * 86400 d FROM posts "
+            "WHERE subreddit = ? COLLATE NOCASE ORDER BY d DESC", (subreddit,))]
+
     def save_tried(self, subreddit: str, days) -> None:
         """Record these UTC days (their starts) as asked for, joined to the ones before."""
         self._save_spans("posts_tried", subreddit, self._tried_spans(subreddit) + [(d, d) for d in days], 86400)
