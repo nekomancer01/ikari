@@ -652,7 +652,7 @@ class TablePage(QWidget):
 
     def __init__(self, columns, stretch_col: int):
         super().__init__()
-        self.model = RowsModel(columns)
+        self.model = RowsModel(columns, self)  # goes with the page: its fade timer asks the page what is on screen
         self.source: RowSource = RowList()
         self._base = np.zeros(0, np.int64)  # the positions of the rows given, before the label and text filters
         self._in_base = np.zeros(0, bool)  # by position: in _base
