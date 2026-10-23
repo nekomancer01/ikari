@@ -631,11 +631,35 @@ def test_all_comments_ask_for_the_whole_thread_and_say_whether_it_is_complete():
     assert len(comments) == 5 and whole
     assert c.session.calls[0][1] == {"link_id": "p1", "limit": arctic_shift.TREE_MAX}  # not the post's count
 
+
+
+def test_a_tree_that_comes_back_collapsed_is_read_in_full_from_the_comment_search():
+    # Asked for again whole, a collapsed tree came back the same way every time, so the thread never read complete.
+    p = Post("p1", "Python", "t", "", "a", 10, 0.9, 7, 1.0, "u", "")
+    tree = [node(comment(f"c{i}", "t3_p1", 10 + i)) for i in range(3)]
     collapsed = tree + [{"kind": "more", "data": {"count": 4, "children": ["x1", "x2"]}}]
-    assert client([ok(collapsed)]).fetch_all_comments(p)[1] is False
+    rest = [comment(f"c{i}", "t3_p1", 10 + i) for i in range(3)] + [
+        comment("x1", "t1_c2", 20), comment("x2", "t1_x1", 21), comment("x3", "t3_p1", 22),
+        comment("x4", "t1_x9", 23)]  # its parent was never archived
+    c = client([ok(collapsed), ok(rest)])
+    comments, whole = c.fetch_all_comments(p)
+    assert whole and [x.id for x in comments] == ["c0", "c1", "c2", "x1", "x2", "x3", "x4"]
+    assert {x.id: x.depth for x in comments}["x2"] == 2 and comments[-1].depth == 0
+    url, params = c.session.calls[1]
+    assert url.endswith("/api/comments/search") and params == {"link_id": "p1", "sort": "asc", "after": 0,
+                                                               "limit": arctic_shift.PAGE}
 
     full = [node(comment(f"c{i}", "t3_p1", i)) for i in range(arctic_shift.TREE_MAX)]
-    assert client([ok(full)]).fetch_all_comments(p)[1] is False  # a full tree may have been cut short
+    pages = [[comment(f"s{k}_{i}", "t3_p1", 1000 * k + i) for i in range(arctic_shift.PAGE)] for k in range(2)]
+    c = client([ok(full), ok(pages[0]), ok(pages[1]), ok([])])  # a full tree may have been cut short
+    comments, whole = c.fetch_all_comments(p)
+    assert whole and len(comments) == arctic_shift.TREE_MAX + 2 * arctic_shift.PAGE
+    assert [q["after"] for _, q in c.session.calls[1:]] == [0, 98, 1098]  # on from each page's last second, less one
+
+    same = [comment(f"z{i}", "t3_p1", 50) for i in range(arctic_shift.PAGE)]  # a page's worth in one second
+    c = client([ok(collapsed), ok(same), ok(same), ok([])])  # asked again from a second early: the same page
+    assert c.fetch_all_comments(p)[1] is False  # read past, so not called whole
+    assert [q["after"] for _, q in c.session.calls[1:]] == [0, 49, 50]
 
 
 def test_a_capped_thread_is_read_whole_then_picked_top_scoring_or_at_random_the_same_way_each_time():
