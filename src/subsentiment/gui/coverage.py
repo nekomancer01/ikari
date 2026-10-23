@@ -306,6 +306,9 @@ class LazyRows(QObject):
     def _make(self, row: int) -> None:
         if row not in self.built:
             self.build(row)
+            # Each cell widget set asks for a layout, and the ones set while it's pending are left at the table's
+            # corner, over the rows on screen, until it runs: it runs now.
+            self.table.executeDelayedItemsLayout()
             self.built.add(row)
             self.draw(row)
 
