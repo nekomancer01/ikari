@@ -1827,6 +1827,7 @@ def test_a_huge_thread_whose_tree_comes_back_collapsed_is_read_whole_from_the_co
     while cov.reading() and time.monotonic() < end:
         pump(20)
     pump(100)
+    row = cov.days.index(day)  # replies written on later days list those days above it
     assert day_cell(cov, row, 3).main.full_text() == "✓ 5\u00a0threads"
     saved = env.store().comments("hugethread")
     assert len([c for c in saved if c["post_id"] == "bd00002"]) == 1500

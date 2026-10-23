@@ -637,6 +637,35 @@ def test_a_deleted_day_leaves_the_timeline_with_the_late_comments_written_on_it(
     assert downloads() == []
 
 
+def test_a_day_with_only_replies_to_older_posts_is_listed_and_can_be_deleted(window):
+    """Every day on the timeline is listed, so it can be deleted: one with no post of its own, only replies
+    written on it to an older post, too (as days deleted before deleting took those replies left behind)."""
+    w = window
+    s = w.store
+    s.save_post(post("old", "rust", TODAY - 9 * DAY + 500), 0.0, "neutral")
+    s.save_comment(Comment("reply", "old", "rust", "t3_old", "b", "fine", 1, TODAY - 3 * DAY + 900, 0, "u"), 0.5,
+                   "positive")
+    s.commit()
+    w._refresh_datasets()
+    select(w, "rust")
+    assert TODAY - 3 * DAY in [d for d, _, _ in w.overview.timeline.points]
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    assert TODAY - 3 * DAY in c.days and TODAY - 2 * DAY not in c.days  # nothing saved on day -2
+    tick(c, TODAY - 3 * DAY)
+    QTest.mouseClick(c.delete_ticked, Qt.MouseButton.LeftButton)
+    settle(w)
+    asked = c.delete_question.text().replace("\u00a0", " ")
+    assert asked.startswith("Delete the comments written on") and "0 posts" not in asked
+    answer(c, True)
+    settle(w, lambda: not c.delete_job.busy)
+    assert TODAY - 3 * DAY not in [d for d, _, _ in w.overview.timeline.points]
+    assert TODAY - 3 * DAY not in c.days and w.comments == []
+    assert [r["id"] for r in s.posts("rust")] == ["r0", "old"]
+    assert downloads() == []
+
+
 def test_nothing_else_writes_while_days_are_deleted(window, monkeypatch):
     w = window
     select(w, "Python")
