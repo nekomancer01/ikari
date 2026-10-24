@@ -84,12 +84,10 @@ def window(tmp_path, monkeypatch):
     s.save_post(post("r0", "rust", TODAY - DAY + 500), 0.0, "neutral")
     for sub in ("Python", "rust"):  # each fetched for the past week before: the days the page lists
         s.save_tried(sub, range(TODAY - 7 * DAY, TODAY + DAY, DAY))
-    # The page lists only days with something saved: a skipped image post on each other day of the week (and
-    # today) stands for that, without adding a post to any page.
+    # The page lists only days with something saved: one post on each other day of the week (and today).
     for k in (0, 4, 5, 6, 7):
         for sub in ("Python", "rust"):
-            picture = post(f"{sub}{k}", sub, TODAY - k * DAY + 700)
-            s.save_post(replace(picture, image=True), 0.0, "neutral")
+            s.save_post(post(f"{sub}{k}", sub, TODAY - k * DAY + 700), 0.0, "neutral")
     s.commit()
     s.close()
     FakeArchive.calls = []
@@ -103,6 +101,17 @@ def window(tmp_path, monkeypatch):
     yield w
     w.close()
     QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
+
+
+MARKERS = {TODAY - k * DAY: 1 for k in (0, 4, 5, 6, 7)}  # the window's one post on each of the other tried days
+MARKER_IDS = [f"Python{k}" for k in (0, 4, 5, 6, 7)]
+
+
+def drop_markers(w) -> None:
+    """Leave only the posts a test is about: the window's one post on each of the other tried days goes."""
+    w.store.db.execute(f"DELETE FROM posts WHERE id IN ({','.join('?' * 10)})",
+                       MARKER_IDS + [i.replace("Python", "rust") for i in MARKER_IDS])
+    w.store.commit()
 
 
 def settle(w, until=lambda: True, timeout=5.0):
@@ -221,15 +230,14 @@ def test_each_day_says_how_many_comment_threads_are_saved_whole_and_follows_down
         return day_cell(c, c.days.index(day), 3).main
     day = TODAY - DAY  # p0 is on this day; p1 and p2 on the two before, each with 5 comments to get
     assert [line(TODAY - k * DAY).full_text() for k in (1, 2, 3)] == ["0 of 1\u00a0thread"] * 3
-    assert line(TODAY).full_text() == "No posts saved"  # nothing saved today: no threads to count
-    assert not day_cell(c, c.days.index(TODAY), 4).findChild(QPushButton).isEnabled()
-    assert c.threads_total.text() == "Comments complete on 0 of 3\u00a0posts"
+    assert line(TODAY).full_text() == "0 of 1\u00a0thread"  # the window's one post today
+    assert c.threads_total.text() == "Comments complete on 0 of 8\u00a0posts"
     c.day_table.selectRow(c.days.index(day))
     settle(w)
     click(c.post_table, 0)  # p0's comments, read to the end
     settle(w, lambda: not w.fetch_job.busy and line(day).full_text().startswith("\u2713"))
     assert line(day).full_text() == "\u2713 1\u00a0thread"
-    assert c.threads_total.text() == "Comments complete on 1 of 3\u00a0posts"
+    assert c.threads_total.text() == "Comments complete on 1 of 8\u00a0posts"
     tick(c, TODAY - 2 * DAY)  # the total covers the ticked days once any are
     assert c.threads_total.text() == "Comments complete on 0 of 1\u00a0post"
     assert downloads() == [("all_comments", "p0")]
@@ -597,7 +605,7 @@ def test_delete_selected_asks_then_forgets_only_the_ticked_days_and_they_downloa
     answer(c, False)  # nothing goes
     assert not c.delete_question.isVisible() and c.delete_ticked.isVisible()
     assert w.store.posts_per_day("Python", TODAY - 7 * DAY, TODAY + DAY) == {
-        TODAY - DAY: 1, TODAY - 2 * DAY: 1, TODAY - 3 * DAY: 5}
+        TODAY - DAY: 1, TODAY - 2 * DAY: 1, TODAY - 3 * DAY: 5} | MARKERS
 
     QTest.mouseClick(c.delete_ticked, Qt.MouseButton.LeftButton)
     settle(w)
@@ -605,16 +613,16 @@ def test_delete_selected_asks_then_forgets_only_the_ticked_days_and_they_downloa
     settle(w, lambda: not c.delete_job.busy)
     assert downloads() == []  # deleting fetches nothing
     store = w.store
-    assert store.posts_per_day("Python", TODAY - 7 * DAY, TODAY + DAY) == {TODAY - 2 * DAY: 1}  # the day between stays
+    assert store.posts_per_day("Python", TODAY - 7 * DAY, TODAY + DAY) == {TODAY - 2 * DAY: 1} | MARKERS  # the day between stays
     assert [r["post_id"] for r in store.comments("Python")] == []
     assert str(TODAY - 3 * DAY) not in store.complete_keys("posts", "Python")
     assert not store.complete_keys("comments", "Python")
     assert (store.posts("rust"), store.comments("rust")) == rust
     assert c.ticked == set()
     # Every page shows what's left, at once.
-    assert [r["id"] for r in w.posts] == ["p1"] and w.comments == []
-    assert w.posts_tab.model.rowCount() == 1 and w.comments_tab.model.rowCount() == 0
-    assert w._counted.counts and sum(w._counted.counts.values()) == 1
+    assert {r["id"] for r in w.posts} == {"p1", *MARKER_IDS} and w.comments == []
+    assert w.posts_tab.model.rowCount() == 6 and w.comments_tab.model.rowCount() == 0
+    assert w._counted.counts and sum(w._counted.counts.values()) == 6
     assert TODAY - 3 * DAY not in c.days  # nothing left saved on the day: it isn't listed
     assert "2 days" in w.statusBar().currentMessage().replace("\u00a0", " ")
 
@@ -627,6 +635,7 @@ def test_delete_selected_asks_then_forgets_only_the_ticked_days_and_they_downloa
 
 def test_deleting_every_saved_day_keeps_the_subreddit_on_screen_to_download_again(window):
     w = window
+    drop_markers(w)
     select(w, "rust")
     w.show_page("coverage")
     c = w.coverage
@@ -648,6 +657,7 @@ def test_a_deleted_day_leaves_the_timeline_with_the_late_comments_written_on_it(
     goes with the day: nothing of it stays on the timeline, tiles, tables or words. The older post's thread
     keeps its record of being downloaded, so the reply isn't fetched back onto the deleted day."""
     w = window
+    drop_markers(w)
     s = w.store
     s.save_comment(Comment("late", "p2", "Python", "t3_p2", "b", "zebrafish", 1, TODAY - DAY + 900, 0, "u"),
                    0.8, "positive")
@@ -679,6 +689,7 @@ def test_a_day_with_only_replies_to_older_posts_is_listed_and_can_be_deleted(win
     """Every day on the timeline is listed, so it can be deleted: one with no post of its own, only replies
     written on it to an older post, too (as days deleted before deleting took those replies left behind)."""
     w = window
+    drop_markers(w)
     s = w.store
     s.save_post(post("old", "rust", TODAY - 9 * DAY + 500), 0.0, "neutral")
     s.save_comment(Comment("reply", "old", "rust", "t3_old", "b", "fine", 1, TODAY - 3 * DAY + 900, 0, "u"), 0.5,
@@ -829,13 +840,17 @@ def test_the_filter_shows_only_days_missing_something_and_select_all_ticks_those
     select(w, "Python")
     w.show_page("coverage")
     c = w.coverage
+    w.store.mark_complete("comments", "Python", "Python0")  # today's one thread is done
+    w.store.commit()
+    select(w, "rust")
+    select(w, "Python")
     settle(w, lambda: c.totals and c._threads)
-    tick(c, TODAY)  # nothing saved today
+    tick(c, TODAY)
     QTest.mouseClick(c.filter.buttons["comments"], Qt.MouseButton.LeftButton)
-    assert c._shown_days() == [TODAY - k * DAY for k in (1, 2, 3)]  # the days with saved posts
+    assert c._shown_days() == [TODAY - k * DAY for k in range(1, 8)]  # every day but the done one
     assert c.ticked == set()  # a day the filter hides is ticked no longer
     c.tick_all.click()
-    assert c.ticked == {TODAY - k * DAY for k in (1, 2, 3)}
+    assert c.ticked == {TODAY - k * DAY for k in range(1, 8)}
     QTest.mouseClick(c.filter.buttons["all"], Qt.MouseButton.LeftButton)
     assert len(c._shown_days()) == len(c.days)
     assert downloads() == []
@@ -1063,11 +1078,11 @@ def test_a_download_starting_or_ending_only_marks_the_day_buttons(window, monkey
     select(w, "Python")
     w.show_page("coverage")
     c = w.coverage
-    settle(w, lambda: c.totals and c._threads)
+    settle(w, lambda: c.totals and c._threads and not c.reading())
     drawn = []
-    monkeypatch.setattr(coverage.Cell, "set", lambda self, *a: drawn.append(a))
-    monkeypatch.setattr(coverage.Cell, "set_open", lambda self, *a: drawn.append(a))
-    monkeypatch.setattr(coverage.Cell, "show_share", lambda self, *a: drawn.append(a))
+    monkeypatch.setattr(coverage.Cell, "set", lambda self, *a: c.day_table.isAncestorOf(self) and drawn.append(a))
+    monkeypatch.setattr(coverage.Cell, "set_open", lambda self, *a: c.day_table.isAncestorOf(self) and drawn.append(a))
+    monkeypatch.setattr(coverage.Cell, "show_share", lambda self, *a: c.day_table.isAncestorOf(self) and drawn.append(a))
     buttons = [c.day_table.cellWidget(row, col).findChild(coverage.RowButton)
                for row in sorted(c.day_rows.built) for col in (2, 4)]
     assert buttons
