@@ -505,6 +505,7 @@ def test_a_rescore_saves_on_a_thread_and_the_cloud_follows_once_it_is_done(tmp_p
     split again for the word counts, and the clouds and tint eased to every batch (the cloud drawn 900 times). Now
     a thread saves them, the words come split with the scores, and the timeline follows each batch while the
     clouds are counted once, at the end."""
+    import sqlite3
     import threading
 
     from subsentiment.gui import worker, words
@@ -567,6 +568,22 @@ def test_a_rescore_saves_on_a_thread_and_the_cloud_follows_once_it_is_done(tmp_p
             sum((set_to.score(t)[1] == "positive") - (set_to.score(t)[1] == "negative") for t in texts) / len(texts))
         assert {r["id"]: r["label"] for r in w.posts_tab.model.rows} == {
             r["id"]: r["label"] for r in w.store.posts("town")}
+        # Unset while another connection holds the database past every try: the run still ends, says so, and the
+        # pages keep what's saved.
+        monkeypatch.setattr(words.ScoreWriter, "TRIES", 1)
+        locked = sqlite3.OperationalError("database is locked")
+        monkeypatch.setattr(Store, "rescore", lambda self, *a: (_ for _ in ()).throw(locked))
+        saved = {r["id"]: r["label"] for r in w.store.posts("town")}
+        QTest.mouseClick(meanings.rows["grinding"].remove, Qt.MouseButton.LeftButton)
+        end = time.monotonic() + 30
+        while w.rescore.running():
+            assert time.monotonic() < end
+            app.processEvents()
+            time.sleep(0.005)
+        app.processEvents()
+        assert "couldn't be saved (database is locked)" in meanings.status.text() and not meanings.status.isHidden()
+        assert {r["id"]: r["label"] for r in w.store.posts("town")} == saved
+        assert {r["id"]: r["label"] for r in w.posts_tab.model.rows} == saved
     finally:
         w.close()
         QSettings.setDefaultFormat(QSettings.Format.NativeFormat)

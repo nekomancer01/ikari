@@ -79,10 +79,11 @@ def marked(mask, at: np.ndarray) -> np.ndarray:
     mask = np.asarray(mask)
     if mask.dtype != bool:
         positions = mask.astype(np.int64)
+        positions = positions[positions >= 0]
         mask = np.zeros(int(positions.max()) + 1 if len(positions) else 0, bool)
         mask[positions] = True
     out = np.zeros(len(at), bool)
-    fits = at < len(mask)
+    fits = (at >= 0) & (at < len(mask))  # (-1, where() for a row not there, isn't one)
     out[fits] = mask[at[fits]]
     return out
 

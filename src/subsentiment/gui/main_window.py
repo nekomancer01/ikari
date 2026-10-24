@@ -1302,12 +1302,15 @@ class MainWindow(QMainWindow):
         The word clouds and tint follow."""
         rescored, self._rescored = self._rescored, {k: (None, []) for k in KINDS}
         if self.current and self.current.lower() == sub:
+            took = False
             for kind, tab in self.tabs.items():
                 source, done = rescored[kind]
                 if source is self._saved[kind] and done:
                     at = np.unique(np.concatenate(done))
                     tab.took(at[marked(tab.all_rows.at, at)])
-            self._render_overview()
+                    took = True
+            if took:  # (the timeline and tiles have each batch already)
+                self._render_span()
 
     def days_deleted(self, subreddit: str, days: int, posts: int, comments: int) -> None:
         """Download coverage deleted some days of ``subreddit``: if it's still shown, show it again from the store

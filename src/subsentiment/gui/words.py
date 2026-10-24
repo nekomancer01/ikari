@@ -528,15 +528,18 @@ class ScoreWriter(QObject):
     """Saves Rescore's new scores on a thread of its own, on a connection of its own: saving a quarter second's
     and committing them (with SQLite's checkpoint now and then) held the window up for as much as half a second.
     ``saved`` brings each lot's tag back once it's committed, in the order they were given, with what went wrong
-    saving it ("" when nothing did)."""
+    saving it ("" when nothing did): a lot that can't be saved (another connection holding the database past
+    SQLite's timeout, each try) is tried TRIES times."""
 
     saved = Signal(object, str)
+    TRIES = 3
 
     def __init__(self, db_path: str, parent: QObject | None = None):
         super().__init__(parent)
         self.db_path = db_path
         self._lots: queue.SimpleQueue = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
+        self._stopping = threading.Event()
 
     def save(self, scores: dict, tag) -> None:
         """Save ``scores`` ({kind: [(id, sentiment, label)]}) after what's given before, then send ``tag``."""
@@ -548,28 +551,35 @@ class ScoreWriter(QObject):
     def stop(self) -> None:
         """Save what's been given, and end the thread (the window is closing)."""
         if self._thread is not None:
+            self._stopping.set()  # (tried once more each, not three times)
             self._lots.put(None)
             self._thread.join(10)
             self._thread = None
+            self._stopping.clear()
 
     def _run(self) -> None:
         store = None
         while (lot := self._lots.get()) is not None:
             scores, tag = lot
-            try:
-                store = store or Store(self.db_path)
-                for kind, rows in scores.items():
-                    if rows:
-                        store.rescore(kind, rows)
-                store.commit()
-                error = ""
-            except Exception as e:  # noqa: BLE001 - locked past its timeout, say: the run goes on, this lot unsaved
-                error = f"their new scores couldn't be saved ({e})"
-                if store is not None:
-                    try:
-                        store.db.rollback()
-                    except sqlite3.Error:
-                        pass
+            for tried in range(1, self.TRIES + 1):
+                try:
+                    store = store or Store(self.db_path)
+                    for kind, rows in scores.items():
+                        if rows:
+                            store.rescore(kind, rows)
+                    store.commit()
+                    error = ""
+                    break
+                except Exception as e:  # noqa: BLE001 - locked past its timeout, say
+                    error = f"their new scores couldn't be saved ({e})"
+                    if store is not None:
+                        try:
+                            store.db.rollback()
+                        except sqlite3.Error:
+                            pass
+                    if self._stopping.is_set() or tried == self.TRIES:
+                        break
+                    time.sleep(1.0)
             try:
                 self.saved.emit(tag, error)
             except RuntimeError:  # the window has closed
@@ -614,6 +624,7 @@ class Rescore(QObject):
         self.writer = ScoreWriter(db_path, self)
         self.writer.saved.connect(self._written)
         self._writing: Counter = Counter()  # batches with the writer, by subreddit
+        self._unsaved: dict[str, str] = {}  # subreddit -> what went wrong saving some of its run's scores
         self._todo: dict[str, set[str]] = {}  # subreddit -> words to rescore for, waiting their turn
         self._doing: tuple[str, set[str]] | None = None
         self._rows: dict[str, dict | None] = {}  # what start was given to go through, by subreddit
@@ -813,13 +824,18 @@ class Rescore(QObject):
         self._writing[sub] -= 1
         if not self._writing[sub]:
             del self._writing[sub]
-        if error:  # (the pages keep the scores saved before)
-            self.failed.emit(sub, error)
+        if error:  # the pages keep the scores those items had; told once the run is done
+            self._unsaved[sub] = error
         else:
             for kind, rows in batch.items():
                 if rows:
                     self.rescored.emit(sub, kind, rows)
-            if then is not None:
+        if then is not None:
+            error = self._unsaved.pop(sub, "")
+            if error:  # what it did isn't what's saved: the pages catch up on what is, and it says what went wrong
+                self.finished.emit(sub)
+                self.failed.emit(sub, error)
+            else:
                 then()
         self._next()
 
