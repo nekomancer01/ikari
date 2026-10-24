@@ -61,7 +61,7 @@ class FetchForm(QObject):
         self.range = QComboBox()
         for key, (text, _) in RANGES.items():
             self.range.addItem(text, key)
-        self.range.currentIndexChanged.connect(self._on_range_changed)
+        self.range.currentIndexChanged.connect(self.show_range)
         self.date_from = date_edit()
         self.date_to = date_edit()
         for edit in (self.date_from, self.date_to):
@@ -115,7 +115,7 @@ class FetchForm(QObject):
         """A fetch of every post in the range for ``name``, remembering the form for next time."""
         self.subreddit.setText(name)
         self.save()
-        self._on_range_changed()  # a preset counts back from now, not from when the app started
+        self.show_range()  # a preset counts back from now, not from when the app started
         after, before = range_bounds(self.range.currentData(), self.date_from.date(), self.date_to.date())
         return collect.FetchRequest(
             subreddit=name, after=after, before=before, limit=None, query=self.query.text().strip(),
@@ -135,7 +135,7 @@ class FetchForm(QObject):
         self.subreddit.setText(v["subreddit"])
         self.query.setText(v["query"])
         self.range.setCurrentIndex(max(self.range.findData(v["range"]), 0))
-        self._on_range_changed()
+        self.show_range()
         if self.range.currentData() == "custom":
             for edit, text in ((self.date_from, v["from"]), (self.date_to, v["to"])):
                 date = QDate.fromString(text, Qt.DateFormat.ISODate)
@@ -158,16 +158,18 @@ class FetchForm(QObject):
             self.settings.setValue(f"fetch/{k}", v)
         self.comment_cap.save()
 
-    def _on_range_changed(self) -> None:
-        """A preset fills in the dates it covers, so the From and To boxes always show the range."""
+    def show_range(self) -> None:
+        """A preset fills in the dates it covers, so the From and To boxes always show the range. Either way the
+        latest date that can be picked is today: kept from when the app started, a window left open past midnight
+        couldn't pick the new day in custom dates."""
         days = RANGES[self.range.currentData()][1]
-        if days is not None:
-            today = QDate.currentDate()
-            for edit, date in ((self.date_from, today.addDays(-days)), (self.date_to, today)):
-                edit.blockSignals(True)
-                edit.setMaximumDate(today)
+        today = QDate.currentDate()
+        for edit, date in ((self.date_from, today.addDays(-(days or 0))), (self.date_to, today)):
+            edit.blockSignals(True)
+            edit.setMaximumDate(today)
+            if days is not None:
                 edit.setDate(date)
-                edit.blockSignals(False)
+            edit.blockSignals(False)
 
     def _on_date_edited(self) -> None:
         """Typing or picking a date means a custom range."""

@@ -319,15 +319,20 @@ class LazyRows(QObject):
     5 ms to build, so building every one of two years of days took three seconds as the page opened, and a busy
     day has thousands of posts. ``build(row)`` gives a row its widgets and ``draw(row)`` fills them in; a row is
     drawn as it's built, and again by ``redraw``, so ``draw`` skips what it already shows. The rows on screen
-    are built at once, and a screenful either side a few milliseconds a frame after, ready for scrolling."""
+    are built at once, and a screenful either side a few milliseconds a frame after, ready for scrolling. Rows
+    scrolled further than KEEP screenfuls away lose their widgets again: kept, every row scrolled past made each
+    redraw, scroll and page switch slower, a third of a second with two years of days, so ``build`` starts a row
+    afresh."""
 
     NEAR_MS = 4  # building the rows near the view takes at most this much of a frame
+    KEEP = 3  # screenfuls either side of the view whose rows keep their widgets
 
     def __init__(self, table: QTableWidget, build, draw):
         super().__init__(table)
         self.table, self.build, self.draw = table, build, draw
         self.built: set[int] = set()
         self._near: list[int] = []  # rows near the view, nearest first, for _build_near
+        self._keep = range(0)  # the rows that keep their widgets, the others' go a few a frame (_build_near)
         self._timer = QTimer(self)
         self._timer.setInterval(16)  # once a frame
         self._timer.timeout.connect(self._build_near)
@@ -338,12 +343,15 @@ class LazyRows(QObject):
     def reset(self, rows: int) -> None:
         """``rows`` rows, none built yet: ``fill`` builds the ones on screen, once they're hidden or scrolled to as
         they're to be."""
+        self._timer.stop()  # what it was building and dropping was for the rows before
+        self._near, self._keep = [], range(0)
         self.table.setRowCount(0)
         self.table.setRowCount(rows)
         self.built.clear()
 
     def fill(self, *_) -> None:
-        """Build the rows on screen, and soon after the ones a screenful either side."""
+        """Build the rows on screen, and soon after the ones a screenful either side; the rows built more than KEEP
+        screenfuls away soon lose their widgets, so a widget of a row isn't to be held on to across a scroll."""
         t = self.table
         n = t.rowCount()
         if not n:
@@ -359,8 +367,21 @@ class LazyRows(QObject):
         t.executeDelayedItemsLayout()
         span = last - first + 1
         self._near = [r for k in range(1, span + 1) for r in (last + k, first - k) if 0 <= r < n]
-        if any(r not in self.built for r in self._near):
-            self._timer.start()
+        self._keep = range(first - self.KEEP * span, last + self.KEEP * span + 1)
+        if not self._timer.isActive() and (any(r not in self.built for r in self._near)
+                                           or any(r not in self._keep for r in self.built)):
+            self._timer.start()  # not started again while it runs: a scroll each frame kept putting it off
+
+    def release(self, rows) -> None:
+        """Take these rows' widgets away; ``fill`` builds them again once they're near the view."""
+        t = self.table
+        for row in rows:
+            for col in range(t.columnCount()):
+                w = t.cellWidget(row, col)
+                if w is not None:
+                    t.removeCellWidget(row, col)  # which only asks for it to be deleted later, with all the others:
+                    shiboken6.delete(w)  # deleted now instead, in this frame's few milliseconds (Qt drops the ask)
+            self.built.discard(row)
 
     def _make(self, row: int) -> None:
         if row not in self.built:
@@ -369,15 +390,20 @@ class LazyRows(QObject):
             self.draw(row)
 
     def _build_near(self) -> None:
-        end = time.perf_counter() + self.NEAR_MS / 1000
+        t, end = self.table, time.perf_counter() + self.NEAR_MS / 1000
+        # The far rows go first: every row kept slows each scroll down.
+        for row in [r for r in self.built if r not in self._keep]:
+            self.release((row,))
+            if time.perf_counter() > end:
+                return  # more after the next frame
         for row in self._near:
-            if row < self.table.rowCount() and not self.table.isRowHidden(row):
+            if row not in self.built and row < t.rowCount() and not t.isRowHidden(row):
                 self._make(row)
                 if time.perf_counter() > end:
                     break  # more after the next frame
         else:
             self._timer.stop()
-        self.table.executeDelayedItemsLayout()
+        t.executeDelayedItemsLayout()
 
     def redraw(self) -> None:
         for row in sorted(self.built):
@@ -778,6 +804,8 @@ class CoveragePage(VerticalScrollArea):
 
     def _build_day_row(self, row: int) -> None:
         t, day = self.day_table, self._day_rows[row]
+        self._drawn.pop(("posts", day), None)  # new widgets show nothing yet: drawn in full
+        self._drawn.pop(("threads", day), None)
         tick = QCheckBox()
         tick.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         tick.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1078,6 +1106,7 @@ class CoveragePage(VerticalScrollArea):
 
     def _build_post_row(self, i: int) -> None:
         t = self.post_table
+        self._post_drawn.pop(i, None)  # new widgets show nothing yet: drawn in full
         title = ElidedLabel()
         title.setContentsMargins(8, 0, 4, 0)
         t.setCellWidget(i, 0, title)
@@ -1411,7 +1440,7 @@ class CoveragePage(VerticalScrollArea):
         self._deleting = (sub, days, None)
         self.status.setText(f"Deleting {plural(len(days), 'day')} of r/{sub}…")
         self.delete_job.start(worker)
-        self.window_.set_deleting(True)
+        self.window_.set_writing()
         self._show_ticked()
 
     @Slot(object)
@@ -1426,7 +1455,7 @@ class CoveragePage(VerticalScrollArea):
     def _on_delete_ended(self) -> None:
         """Its thread is done, so the saved data can be written again; every page shows what's left."""
         sub, days, got = self._deleting
-        self.window_.set_deleting(False)
+        self.window_.set_writing()
         if isinstance(got, tuple):
             if (self.subreddit or "").lower() == sub.lower():
                 self.untick(days)

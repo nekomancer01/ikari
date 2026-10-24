@@ -584,13 +584,62 @@ def test_import_database_adds_its_subreddits_to_the_list(make_window, tmp_path, 
     warnings = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a))
     w = make_window()
+    w.upgrading.join()  # (import waits for it)
+    w._after_upgrade()
     assert w.import_act.isEnabled()
     w.import_act.trigger()
+    imported(w)
     assert sorted(w.datasets.item(i).text() for i in range(w.datasets.count())) == ["r/Deltarune", "r/Python", "r/rust"]
     assert "Imported 1\xa0new post" in w.statusBar().currentMessage()
     (tmp_path / "other.db").write_bytes(b"junk" * 1000)
+    w.upgrading.join()  # packing what it took
+    w._after_upgrade()
     w.import_act.trigger()
+    imported(w)
     assert len(warnings) == 1 and w.datasets.count() == 3
+
+
+def imported(w, timeout: float = 30) -> None:
+    """Until the import the window started on its thread has ended."""
+    end = time.monotonic() + timeout
+    while w.import_job.busy:
+        assert time.monotonic() < end, "the import didn't end"
+        QApplication.processEvents()
+        time.sleep(0.005)
+    QApplication.processEvents()
+
+
+def test_the_window_keeps_painting_while_a_database_is_imported_and_nothing_else_writes(make_window, tmp_path,
+                                                                                         monkeypatch):
+    # The owner's 230 MB database took 36 s to import, all of it with the window frozen.
+    other = Store(tmp_path / "other.db")
+    other.save_post(Post("q1", "Deltarune", "great", "", "a", 1, 0.9, 0, 1_700_000_000.0, "https://r", ""), 0.6,
+                    "positive")
+    other.commit()
+    other.close()
+    importing = Store.import_from
+
+    def slow(self, path):
+        time.sleep(1.0)
+        return importing(self, path)
+    monkeypatch.setattr(Store, "import_from", slow)
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", lambda *a, **k: (str(tmp_path / "other.db"), ""))
+    w = make_window()
+    w.show()
+    w.upgrading.join()
+    w._after_upgrade()
+    w.import_act.trigger()
+    assert w.import_job.busy and w.writing() and w.waiting() == "Importing saved data\u2026"  # on a thread
+    assert not (w.fetch_btn.isEnabled() or w.import_act.isEnabled() or w.delete_act.isEnabled()
+                or w.delete_all_act.isEnabled() or w.words_page.meanings.isEnabled())
+    w._edit_note(0)
+    assert not w.findChildren(mw.NoteDialog) and "once the import is done" in w.statusBar().currentMessage()
+    imported(w)
+    w.upgrading.join()  # what it took is packed there; import waits for it
+    w._after_upgrade()
+    assert w.fetch_btn.isEnabled() and w.import_act.isEnabled() and w.delete_all_act.isEnabled()
+    assert w.words_page.meanings.isEnabled()
+    assert "Imported 1\xa0new post" in w.statusBar().currentMessage() and w.datasets.count() == 3
 
 
 def test_score_filters_hide_low_posts_and_low_comments_everywhere_and_are_remembered(make_window, tmp_path):
@@ -829,3 +878,19 @@ def test_a_tables_model_and_its_fade_go_with_the_table():
     page.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     assert not shiboken6.isValid(model)
+
+
+def test_custom_dates_can_reach_a_day_begun_since_the_app_started(make_window):
+    # The latest date was set as the app started: a window left open past midnight couldn't pick the new day.
+    w = make_window()
+    form = w.fetch_form
+    yesterday = QDate.currentDate().addDays(-1)
+    form.date_from.setDate(yesterday.addDays(-3))  # a custom range
+    for edit in (form.date_from, form.date_to):
+        edit.setMaximumDate(yesterday)  # as it was set before midnight
+    assert form.range.currentData() == "custom"
+    w.set_drawer("fetch")
+    assert form.date_to.maximumDate() == form.date_from.maximumDate() == QDate.currentDate()
+    assert form.range.currentData() == "custom" and form.date_from.date() == yesterday.addDays(-3)  # left as picked
+    form.date_to.setDate(QDate.currentDate())
+    assert form.date_to.date() == QDate.currentDate()
