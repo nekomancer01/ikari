@@ -499,6 +499,79 @@ def test_a_big_rescore_is_scored_a_chunk_at_a_time_in_other_processes(tmp_path, 
         QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
 
 
+def test_a_rescore_saves_on_a_thread_and_the_cloud_follows_once_it_is_done(tmp_path, monkeypatch):
+    """Setting a word on a big subreddit janked the window for 40 s: every quarter second's scores were saved and
+    committed on its thread (up to half a second with SQLite's checkpoint), each packed item's text was read and
+    split again for the word counts, and the clouds and tint eased to every batch (the cloud drawn 900 times). Now
+    a thread saves them, the words come split with the scores, and the timeline follows each batch while the
+    clouds are counted once, at the end."""
+    import threading
+
+    from subsentiment.gui import worker, words
+    from subsentiment.index import RowIndex
+
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("subsentiment-test")
+    app.setApplicationName(tmp_path.name)
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path / "cfg"))
+    QSettings().setValue("updates/auto", False)
+    monkeypatch.setattr(words.Rescore, "CHUNK", 4)
+    monkeypatch.setattr(words.Rescore, "BATCH", 0.0)  # a batch an item: as many as a big subreddit has
+    monkeypatch.setattr(worker, "ProcessPoolExecutor", lambda *a, **k: (_ for _ in ()).throw(OSError("none here")))
+    s = Store(tmp_path / "w.db")
+    day = 1_700_000_000.0  # long settled: packed
+    texts = [f"Grinding {what} today" for what in ("is fun", "again", "is awful", "for hours", "the boss", "sucks",
+                                                    "with friends", "is broken", "forever", "is great")]
+    for i, title in enumerate(texts + ["Library reopened today"]):
+        s.save_post(Post(f"p{i}", "town", title, "", "a", 1, 0.9, 0, day - i * 3600, "https://r", ""), *sentiment.score(title))
+    s.commit()
+    assert s.pack_settled() > 0
+    s.close()
+    saving, split_here = [], []
+    rescore = Store.rescore
+    monkeypatch.setattr(Store, "rescore", lambda self, *a: (saving.append(threading.current_thread()), rescore(self, *a)))
+    words_of = RowIndex._words_of
+    monkeypatch.setattr(RowIndex, "_words_of", lambda self, t: (split_here.append(t), words_of(self, t))[1])
+    w = mw.MainWindow(str(tmp_path / "w.db"))
+    try:
+        w.show()
+        w._refresh_datasets("town")
+        w.show_page("words")
+        app.processEvents()
+        batches, counts = [], []
+        w.rescore.rescored.connect(lambda sub, kind, rows: batches.append(len(rows)))
+        tally = w.word_tally.count
+        monkeypatch.setattr(w.word_tally, "count", lambda *a: (counts.append(len(batches)), tally(*a)))
+        positive = w._counted.counts["positive"]
+        meanings = w.words_page.meanings
+        meanings.pick("grinding")
+        meanings.rows["grinding"].set(1.0)
+        meanings._save(meanings.rows["grinding"])
+        end = time.monotonic() + 30
+        while w.rescore.running():
+            assert time.monotonic() < end
+            app.processEvents()
+            time.sleep(0.005)
+        app.processEvents()
+        assert len(batches) >= 3 and saving and threading.main_thread() not in saving
+        assert split_here == []  # the words came with the scores
+        assert counts == [len(batches)]  # once, after the last batch
+        set_to = sentiment.Lexicon({"grinding": 1.0})
+        assert {r["id"]: r["label"] for r in w.store.posts("town")} == {
+            f"p{i}": set_to.score(t)[1] for i, t in enumerate(texts + ["Library reopened today"])}
+        assert w._counted.counts["positive"] == positive + sum(
+            set_to.score(t)[1] == "positive" and sentiment.score(t)[1] != "positive" for t in texts) - sum(
+            set_to.score(t)[1] != "positive" and sentiment.score(t)[1] == "positive" for t in texts)
+        assert dict((word, lean) for word, _, lean in w.word_tally.top(KINDS))["grinding"] == pytest.approx(
+            sum((set_to.score(t)[1] == "positive") - (set_to.score(t)[1] == "negative") for t in texts) / len(texts))
+        assert {r["id"]: r["label"] for r in w.posts_tab.model.rows} == {
+            r["id"]: r["label"] for r in w.store.posts("town")}
+    finally:
+        w.close()
+        QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
+
+
 def test_a_setting_that_changes_no_label_says_why():
     """The owner set "zenless" to Neutral and read "None of 61 saved items changed label", which looked broken:
     neither scorer knows the word, so it read as neutral already."""

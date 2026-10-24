@@ -218,16 +218,24 @@ class Lexicon:
     _made: dict = {}  # the last lexicons ``compare`` made, by their words, so each process makes them once
 
     @classmethod
-    def compare(cls, weights: dict[str, float], words: frozenset[str], texts: list[str]) -> list[tuple[float, str, str]]:
+    def compare(cls, weights: dict[str, float], words: frozenset[str], texts: list[str],
+                split: bool = False) -> list[tuple]:
         """Each of ``texts`` as (score, label) by ``weights``, and the label it gets with ``words`` meaning what
-        they usually do instead, to tell what setting them changed. Rescoring runs it in other processes."""
+        they usually do instead, to tell what setting them changed. Rescoring runs it in other processes, with
+        ``split``: each also has the words it uses (analysis.words_in), so the word cloud's counts move to its
+        new label without its text being read and split again on the window's thread."""
+        from subsentiment.analysis import words_in
         key = (tuple(sorted(weights.items())), words)
         made = cls._made.get(key)
         if made is None:
             cls._made.clear()
             made = cls._made[key] = (cls(weights), cls({w: v for w, v in weights.items() if w not in words}))
         lexicon, without = made
-        return [(*(got := lexicon.score(t)), without.score(t)[1] if words else got[1]) for t in texts]
+        out = []
+        for t in texts:
+            got = lexicon.score(t)
+            out.append((*got, without.score(t)[1] if words else got[1], *((words_in(t),) if split else ())))
+        return out
 
     def blanked(self, cleaned: str) -> str:
         """Cleaned text with each set word as BLANK: as if it were a word neither scorer knows."""
