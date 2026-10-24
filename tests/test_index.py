@@ -252,13 +252,19 @@ def test_a_text_column_reads_as_the_rows_have_it_a_few_rows_at_a_time(saved, kin
     path, s = saved
     rows = s.rows(kind, "deltarune")
     index = RowIndex(path, kind, "deltarune")
-    names = list(PACKED[kind]) + (["post_title"] if kind == "comments" else [])
+    # The packed text, and columns kept in the rows (a table sorts posts by their comment count).
+    names = list(PACKED[kind]) + (["post_title"] if kind == "comments" else ["num_comments"]) + ["score"]
     for name in names:
         whole = [r[name] for r in rows]
         assert index.column(name) == whole, name
         assert [v for k in range(0, len(index), 7) for v in index.column(name, k, k + 7)] == whole, name
     with pytest.raises(ValueError):
-        index.column("score")
+        index.column("no such column")
+    with pytest.raises(ValueError):
+        index.column("post_title" if kind == "posts" else "num_comments")
+    if kind == "comments":
+        with pytest.raises(ValueError):  # rebuilt from its post's as it's read
+            index.column("permalink")
     index.close()
 
 

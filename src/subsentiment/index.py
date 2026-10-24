@@ -386,13 +386,15 @@ class RowIndex:
         return (reader or self._reader).text(pack, int(self._at[i]), self.ids[i].decode(), float(self.created[i]))
 
     def column(self, name: str, start: int = 0, stop: int | None = None) -> list[str | None]:
-        """One text column (of store.PACKED[kind], or "post_title" for comments) of rows ``start`` to ``stop``, in
-        order: for sorting or filtering a table by it. Each frame is decoded once (about 5 ms per thousand
-        comments), so ask for a few thousand rows at a time. It reads on a connection of its own, so a thread can
-        run it while the window draws `rows`."""
+        """One column of rows ``start`` to ``stop``, in order: for sorting or filtering a table by it. Any saved
+        column, or "post_title" for comments, but not a comment's permalink (`rows` rebuilds it from its post's).
+        Text in packs is read from their frames, each decoded once (about 5 ms per thousand comments), so ask for a
+        few thousand rows at a time; other columns from the rows. It reads on a connection of its own, so a thread
+        can run it while the window draws `rows`."""
         stop = len(self.ids) if stop is None else min(stop, len(self.ids))
-        if name != "post_title" and name not in PACKED[self.kind] or name == "post_title" and self.kind != "comments":
-            raise ValueError(f"{name} isn't a text column of {self.kind}")
+        readable = POST_COLUMNS if self.kind == "posts" else (*COMMENT_COLUMNS, "post_title")
+        if name not in readable or name == "permalink" and self.kind == "comments":
+            raise ValueError(f"{name} isn't a column of {self.kind} read as it's saved")
         with self._lock:
             if self._bulk is CLOSED:
                 raise ValueError("the index is closed")
@@ -404,6 +406,8 @@ class RowIndex:
         ids = [i.decode() for i in ids]
         if name == "post_title":
             return reader.post_titles(ids)
+        if name not in PACKED[self.kind]:
+            return [value for _, value in reader.by_id(name, ids, created)]
         out: list = [None] * len(ids)
         unread = np.flatnonzero(packs < 0).tolist()  # read from their row, or their whole pack
         for pack in np.unique(packs[packs >= 0]):
@@ -700,17 +704,17 @@ class PackReader:
             return out
 
     def by_id(self, name: str, ids: list[str], created: np.ndarray):
-        """(k, value) of column ``name`` of rows ``ids``, from their rows, or their whole packs once packed."""
+        """(k, value) of column ``name`` of rows ``ids``, from their rows, or their whole packs for packed text."""
         with self.lock:
             got = {}
             for k in range(0, len(ids), 500):
                 chunk = ids[k:k + 500]
                 got.update((i, (packed, v)) for i, packed, v in self.db.execute(
                     f"SELECT id, packed, {name} FROM {self.kind} WHERE id IN ({', '.join('?' * len(chunk))})", chunk))
-            at, checked = PACKED[self.kind].index(name), set()
+            at, checked = PACKED[self.kind].index(name) if name in PACKED[self.kind] else None, set()
             for k, rid in enumerate(ids):
                 packed, value = got.get(rid, (0, None))
-                if packed:
+                if packed and at is not None:
                     value = (self.whole(self.kind, float(created[k]), checked).get(rid) or [None] * len(PACKED[self.kind]))[at]
                 yield k, value
 
