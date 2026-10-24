@@ -878,3 +878,19 @@ def test_a_tables_model_and_its_fade_go_with_the_table():
     page.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     assert not shiboken6.isValid(model)
+
+
+def test_custom_dates_can_reach_a_day_begun_since_the_app_started(make_window):
+    # The latest date was set as the app started: a window left open past midnight couldn't pick the new day.
+    w = make_window()
+    form = w.fetch_form
+    yesterday = QDate.currentDate().addDays(-1)
+    form.date_from.setDate(yesterday.addDays(-3))  # a custom range
+    for edit in (form.date_from, form.date_to):
+        edit.setMaximumDate(yesterday)  # as it was set before midnight
+    assert form.range.currentData() == "custom"
+    w.set_drawer("fetch")
+    assert form.date_to.maximumDate() == form.date_from.maximumDate() == QDate.currentDate()
+    assert form.range.currentData() == "custom" and form.date_from.date() == yesterday.addDays(-3)  # left as picked
+    form.date_to.setDate(QDate.currentDate())
+    assert form.date_to.date() == QDate.currentDate()

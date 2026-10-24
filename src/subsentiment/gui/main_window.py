@@ -569,6 +569,7 @@ class MainWindow(QMainWindow):
         self.drawer.setVisible(bool(key))
         self._place_drawer()
         if key == "fetch":
+            self.fetch_form.show_range()  # dates up to today, which may have begun since it last opened
             self.fetch_form.subreddit.setFocus()
 
     def _place_drawer(self) -> None:
