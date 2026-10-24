@@ -152,6 +152,8 @@ def test_a_window_edge_dragged_places_the_word_cloud_once_the_size_holds_still(w
 
 def test_a_range_button_eases_the_chart_before_the_tables_and_words_catch_up(window, monkeypatch):
     w = window
+    monkeypatch.setattr(motion, "_os_allows", True)  # CI's Windows runner has animations off
+    monkeypatch.setattr(motion, "_wanted", True)
     chart = w.overview.timeline
     easing = []  # whether the chart was still easing as each table load or word count started
     for cls, name in ((type(w.comments_tab), "set_rows_steps"), (WordTally, "count")):
