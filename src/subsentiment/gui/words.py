@@ -159,7 +159,7 @@ class WordCloud(theme.OnCard):
     PULL = 0.06  # of the way to the middle, a step a word takes each update where that's free
     FAR = 0.3  # of the widget's shorter side: a word moved further fades out and in rather than sliding
     RESHAPE = 0.15  # a change of width or height up to this share keeps the words where they are
-    RESIZE_HOLD_MS = 200  # a size still changing (a window edge dragged) is let settle this long before placing
+    RESIZE_HOLD_MS = 120  # a size still changing (a window edge dragged) is let settle this long before placing
 
     word_clicked = Signal(str)
 
@@ -228,7 +228,8 @@ class WordCloud(theme.OnCard):
         """Start placing the words if they or the size changed; they go down a few each frame, the biggest
         first, so a new layout never holds up the window. Words changed while one is placed are placed next."""
         key, before = (self.width(), self.height(), self._version), self._placed_for
-        if self._placing is None and before != key and not self._resizing.isActive():
+        held = self._resizing.isActive() and before is not None and before[2] == key[2]  # (new words aren't)
+        if self._placing is None and before != key and not held:
             # A small change of size (a strip appearing above, a window edge dragged) keeps the words where they
             # are, moved with it; a big one lays the cloud out afresh to fill its new shape.
             near = before is not None and all(abs(a - b) <= self.RESHAPE * b for a, b in zip(key[:2], before[:2]))
@@ -304,7 +305,7 @@ class WordCloud(theme.OnCard):
             return
         if len(self._sprites) > 2000:  # pictures of words long gone, and of sizes they had
             self._sprites.clear()
-        w, h = self.width(), self.height()
+        w, h = self._placing_for[0][:2]  # the size placed for, though it may change while they're placed
         most, least = self._words[0][1], self._words[-1][1]
         # Narrow (the Words page beside its meanings card) caps it too, so a word of up to nine letters fits across
         # at the biggest size: words used as often stay the same size, and only longer ones are shrunk below.
@@ -394,14 +395,15 @@ class WordCloud(theme.OnCard):
             if word in self._shown:
                 self._sprite(word, px, colors[self.hue(self._shown[word].lean)[0]], dpr)
             yield
-        steps = self._draw(self._next, colors, dpr)
+        steps = self._draw(self._next, colors, dpr, QSize(w, h))
         picture = next(steps)
         yield from steps
         self._next_drawn = (picture, (self._placing_for[0], dpr, tuple(colors.values())))
 
-    def _draw(self, placed: list, colors: dict, dpr: float):
-        """Draw the words at rest into a picture: yields the picture, then once after each word."""
-        picture = QPixmap(self.size() * dpr)
+    def _draw(self, placed: list, colors: dict, dpr: float, size: QSize):
+        """Draw the words at rest, placed for ``size``, into a picture: yields the picture, then once after each
+        word."""
+        picture = QPixmap(size * dpr)
         picture.setDevicePixelRatio(dpr)
         picture.fill(Qt.GlobalColor.transparent)
         yield picture
@@ -491,7 +493,7 @@ class WordCloud(theme.OnCard):
         # word again.
         key = (self._placed_for, dpr, tuple(colors.values()))
         if self._drawn_for != key:  # drawn as the words were placed, unless the theme or screen changed since
-            steps = self._draw(self._placed, colors, dpr)
+            steps = self._draw(self._placed, colors, dpr, QSize(*self._placed_for[:2]))
             self._drawn, self._drawn_for = next(steps), key
             for _ in steps:
                 pass
