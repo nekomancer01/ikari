@@ -532,11 +532,13 @@ class RowIndex:
             return tuple(words_in(row["body"] or ""))
         return tuple(words_in(f"{row['title'] or ''} {row['selftext'] or ''}"))
 
-    def _words_at(self, i: int) -> np.ndarray:
-        """Row ``i``'s word ids, as it's counted now: split again from its pack's text when it's packed."""
+    def _words_at(self, i: int, split=None) -> np.ndarray:
+        """Row ``i``'s word ids, as it's counted now: when it's packed, those of ``split`` (its words, as they were
+        split from its text elsewhere), or else split again from its pack's text."""
         got = self._loose.get(self.ids[i])
         if got is None:
-            got = np.array([self._word_id(w) for w in self._words_of(self.text(i))], np.int64)
+            words = self._words_of(self.text(i)) if split is None else split
+            got = np.array([self._word_id(w) for w in words], np.int64)
         return got
 
     def reorder(self) -> np.ndarray:
@@ -556,16 +558,18 @@ class RowIndex:
         self._sorted_ids = None
         return order
 
-    def rescore(self, scores) -> None:
-        """New scores, [(id, sentiment, label)], as store.Store.rescore saves them. A packed row's words are split
-        again from its text to move them to its new label, so rescoring most of a subreddit is quicker as a new
-        index."""
+    def rescore(self, scores, split=None) -> np.ndarray:
+        """New scores, [(id, sentiment, label)], as store.Store.rescore saves them; returns their positions (-1 for
+        one not here). A row's words move to its new label: a packed one's are ``split``'s (each one's words, as
+        analysis.words_in split its text elsewhere), or else split again from its text, so rescoring most of a
+        subreddit that way is quicker as a new index."""
         scores = list(scores)
         at = self.where([i for i, _, _ in scores])
         known = at >= 0
         positions = at[known]
         self._count(positions, -1)
-        words = [self._words_at(int(a)) for a in positions] if self.with_words else []
+        split = [None] * len(scores) if split is None else split
+        words = [self._words_at(a, w) for a, w, k in zip(at.tolist(), split, known) if k] if self.with_words else []
         if words:
             self._change(words, self.created[positions], self.label[positions], self.score[positions], -1)
         self.sentiment[positions] = [s for (_, s, _), k in zip(scores, known) if k]
@@ -573,6 +577,7 @@ class RowIndex:
         self._count(positions, 1)
         if words:
             self._change(words, self.created[positions], self.label[positions], self.score[positions], 1)
+        return at
 
     def close(self) -> None:
         with self._lock:

@@ -193,6 +193,35 @@ def test_days_packed_again_count_only_what_changed_and_still_match(saved, kind):
     index.close()
 
 
+@pytest.mark.parametrize("kind", ["posts", "comments"])
+def test_rescoring_with_the_words_split_elsewhere_moves_them_without_reading_any_text(saved, kind, monkeypatch):
+    """A word's meaning set on a big subreddit rescored tens of thousands of packed rows, and each one's text was
+    read from its pack and split again on the window's thread (17 s of 40 janky ones). The rescore's own worker
+    processes split it now: the counts come out as a fresh index has them, and no text is read."""
+    from subsentiment.analysis import words_in
+    from subsentiment.sentiment import Lexicon
+
+    path, s = saved
+    index = RowIndex(path, kind, "deltarune")
+    rows = s.rows(kind, "deltarune")[::3] + [{"id": "nope", "title": "", "selftext": "", "body": ""}]
+    texts = [(r["body"] or "") if kind == "comments" else f"{r['title'] or ''}\n\n{r['selftext'] or ''}".strip()
+             for r in rows]
+    got = Lexicon.compare({"boss": -1.0}, frozenset({"boss"}), texts, split=True)
+    assert [g[3] for g in got] == [words_in(t) for t in texts]
+    scores = [(r["id"], score, label) for r, (score, label, *_) in zip(rows, got)]
+    s.rescore(kind, scores)
+    s.commit()
+    monkeypatch.setattr(RowIndex, "text", lambda *a, **k: pytest.fail("text read again"))
+    at = index.rescore(scores, [g[3] for g in got])
+    assert at[-1] == -1 and [index.ids[a].decode() for a in at[:-1]] == [r["id"] for r in rows[:-1]]
+    monkeypatch.undo()
+    fresh = RowIndex(path, kind, "deltarune")
+    assert [a.tolist() for a in index.word_counts()] == [a.tolist() for a in fresh.word_counts()]
+    assert index.label.tolist() == fresh.label.tolist() and index.sentiment.tolist() == fresh.sentiment.tolist()
+    index.close()
+    fresh.close()
+
+
 def test_an_id_longer_than_every_saved_one_is_not_mistaken_for_one_it_starts_with(saved):
     path, s = saved
     index = RowIndex(path, "posts", "deltarune")

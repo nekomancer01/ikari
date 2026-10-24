@@ -121,9 +121,10 @@ class RowSource:
         yield
         return got
 
-    def changed(self, positions, rows=None) -> None:
+    def changed(self, positions, rows=None, text: bool = True) -> None:
         """Rows at ``positions`` were saved again (or added): what's kept of them is read again, or taken from
-        ``rows`` (them as they are now)."""
+        ``rows`` (them as they are now). Without ``text`` only their numbers changed (they were scored again):
+        the text columns read stay as they are."""
         positions = [int(p) for p in positions]
         self.version += 1
         self._changes.append((self.version, positions))
@@ -131,7 +132,7 @@ class RowSource:
             self._drawn.pop(p, None)
         if rows is not None:
             self.keep(positions, rows)
-        if (self._values or self._reading) and positions:
+        if (self._values or self._reading) and positions and text:
             fresh = dict(zip(positions, self._read(positions) if rows is None else rows))
             for saved in self._reading:
                 saved.update(fresh)
@@ -250,11 +251,12 @@ class Saved(RowSource):
             self.index.add(rows)
             self.changed(self.where([r["id"] for r in rows]), rows)
 
-    def rescore(self, scores) -> None:
-        """New scores, [(id, sentiment, label)]."""
-        scores = list(scores)
-        self.index.rescore(scores)
-        self.changed(self.where([i for i, _, _ in scores]))
+    def rescore(self, scores, split=None) -> np.ndarray:
+        """New scores, [(id, sentiment, label)], and ``split``, each one's words when known (RowIndex.rescore).
+        Returns their positions."""
+        at = self.index.rescore(scores, split)
+        self.changed(at[at >= 0], text=False)
+        return at
 
     def analysis(self, min_score: int | None) -> Analysis:
         return self.index.analysis(min_score)
