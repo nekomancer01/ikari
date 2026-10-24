@@ -516,7 +516,7 @@ class Outline(QProxyStyle):
         again under every fade, scroll and resize step), so only the corners are drawn that way: once per
         radius and colours, then copied, with the straight edges and the fill as plain rectangles. The pixels
         are the ones drawing the whole box gives. A small box (the tables' chips, the buttons) is kept whole,
-        by size."""
+        by size; a long pill is drawn whole each time."""
         p.save()
         d = p.deviceTransform()  # the device pixel ratio and the widget's offset, often half a pixel at 150%
         dpr = d.m11()
@@ -538,8 +538,10 @@ class Outline(QProxyStyle):
             pass
         elif whole:
             cls._box(p, QRectF(left, top, w, h), r, width, edge, fill)
-        elif w * h <= 40000 or w <= 2 * corner or h <= 2 * corner:
+        elif w * h <= 20000:
             p.drawImage(left, top, cls._image(w, h, r, width, edge, fill))
+        elif w <= 2 * corner or h <= 2 * corner:  # a long pill: too many sizes to keep
+            cls._box(p, QRectF(left, top, w, h), r, width, edge, fill)
         else:
             side = 2 * corner + 1
             cut = cls._image(side, side, r, width, edge, fill)
@@ -561,7 +563,7 @@ class Outline(QProxyStyle):
         key = (w, h, r, width, edge.rgba(), None if fill is None else fill.rgba())
         image = cls._cut.get(key)
         if image is None:
-            if len(cls._cut) > 512:  # a chip's edge is faded with its row, so the colours vary
+            if len(cls._cut) > 256:  # a chip's edge is faded with its row, so the colours vary (at most ~20 MB)
                 cls._cut.clear()
             image = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
             image.fill(Qt.GlobalColor.transparent)

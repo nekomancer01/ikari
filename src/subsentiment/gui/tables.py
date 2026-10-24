@@ -646,9 +646,12 @@ class Table(QTableView):
     scroll, only higher or lower. Qt moves them only for an opaque viewport, and this one is see-through
     (the box's rounded corners and outline are drawn under it), so it is opaque just for the move. The rows
     coming into view are then drawn over what's under them as before, and so are the bottom corners, where
-    the box's outline curves in under the last row."""
+    the box's outline curves in under the last row. Sideways it is all drawn again, as before."""
 
     def scrollContentsBy(self, dx: int, dy: int) -> None:
+        if dx:  # sideways the corners would move along the bottom row: drawn again whole, as before
+            super().scrollContentsBy(dx, dy)
+            return
         viewport, was = self.viewport(), self.verticalOffset()
         viewport.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
         super().scrollContentsBy(dx, dy)  # dy counts rows here, not pixels

@@ -114,9 +114,12 @@ class _Snapshot(QLabel):
         if whole or parts:
             window, target = self.window(), self.parentWidget()
             origin = target.mapTo(window, QPoint(0, 0)) - self._lead
-            # Grabbed with this still left out of the picture (hiding it would repaint all under it again).
-            self._grabbing = True
-            self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+            # Grabbed with this still left out of the picture (hiding it would repaint all under it again), and
+            # any fade over it too (one started around this one, late in its own fade); fades inside it stay in.
+            left_out = [s for s in window.findChildren(_Snapshot) if s is self or not target.isAncestorOf(s)]
+            for s in left_out:
+                s._grabbing = True
+                s.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
             if whole:
                 self._under = window.grab(QRect(origin, self._still.deviceIndependentSize().toSize()))
                 self._grabbed = time.monotonic()
@@ -126,8 +129,9 @@ class _Snapshot(QLabel):
                     piece = QRect(w.mapTo(window, QPoint(0, 0)), w.size()).adjusted(-2, -2, 2, 2)
                     window.render(p, piece.topLeft() - origin, QRegion(piece))
                 p.end()
-            self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
-            self._grabbing = False
+            for s in left_out:
+                s.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+                s._grabbing = False
         self.update()
 
     def _moving(self) -> list[QWidget]:
