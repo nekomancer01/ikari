@@ -294,13 +294,18 @@ class Download:
         return n
 
     def save_streamed(self, batch: list[Post]) -> None:
-        """New posts, saved and announced the moment they're downloaded, so a UI can show them right away."""
+        """New posts, saved and announced the moment they're downloaded, so a UI can show them right away. One
+        commit for the batch: a commit each, hundreds after Stop (what slices still running had), took over 30 s
+        on a Windows runner, each one written through to disk."""
+        new = False
         for p in batch:
             if p.id not in self.stored and p.id not in self.streamed:
                 self.store.save_post(p, *self.score(p.text))
-                self.store.commit()
                 self.streamed.add(p.id)
-                self.saved()
+                new = True
+        if new:
+            self.store.commit()
+            self.saved()
 
     def read(self, after, before, limit: int, everything: bool, say,
              skip: Collection[str] | None = None) -> list[Post]:

@@ -216,6 +216,23 @@ def test_each_post_and_comment_is_saved_and_announced_as_it_arrives(tmp_path):
     assert counts[:3] == [1, 2, 3]  # the table grows one post at a time
 
 
+def test_a_batch_of_posts_is_saved_in_one_commit(tmp_path):
+    # After Stop, the posts slices still running had come as one batch of hundreds, each saved in a commit of its
+    # own: on a Windows runner that took over 30 s, so Stop seemed not to work.
+    class Batch(FakeClient):
+        def fetch_posts(self, *a, on_posts=None, **kw):
+            on_posts(self.posts)
+            self.exhausted = True
+            return self.posts
+    s = store_with(tmp_path, [])
+    commits, real = [], s.commit
+    s.commit = lambda: (commits.append(len(s.posts("python"))), real())[1]
+    announced = []
+    collect.run(Batch(posts=[mk(i) for i in range(300)]), s, collect.FetchRequest("python", include_comments=False),
+                saved=lambda: announced.append(len(s.posts("python"))))
+    assert announced[0] == 300 and commits.count(300) <= 3
+
+
 def test_a_fetch_does_not_download_comments_for_saved_posts_nobody_asked_about(tmp_path):
     s = store_with(tmp_path, [mk(1), mk(2)])  # saved earlier, comments never requested
     c = FakeClient(posts=[mk(3)])
