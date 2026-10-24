@@ -14,7 +14,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QSettings, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSettings, Qt  # noqa: E402
 from PySide6.QtGui import QMouseEvent, QWheelEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
@@ -129,6 +129,76 @@ def test_new_points_from_a_fetch_dont_crossfade_the_chart(window):
     chart = window.overview.timeline
     chart.set_points([(d, mean + 0.1, n) for d, mean, n in chart.points])
     assert not motion.fading(chart)
+
+
+def test_a_window_edge_dragged_places_the_word_cloud_once_the_size_holds_still(window, monkeypatch):
+    w = window
+    cloud = w.overview.words
+    cloud.repaint()
+    places = count_calls(monkeypatch, WordCloud, "_place")
+    before = cloud.size()
+    for i in range(1, 11):  # a step a frame
+        w.resize(1280 - 12 * i, 760 - 6 * i)
+        QApplication.processEvents()
+        w.repaint()
+    assert places == [] and cloud.size() != before  # the words as placed, centred in the cloud meanwhile
+    box, word = cloud._placed[0][:2]
+    assert cloud.word_at(box.center() + QPointF(*cloud._offset())) == word
+    until(lambda: not cloud._resizing.isActive() and cloud._placing is None
+          and cloud._placed_for[:2] == (cloud.width(), cloud.height()))
+    assert len(places) == 1 and cloud._offset() == (0, 0)
+    assert all(QRectF(cloud.rect()).contains(b[0]) for b in cloud.placed())
+
+
+def test_a_range_button_eases_the_chart_before_the_tables_and_words_catch_up(window, monkeypatch):
+    w = window
+    chart = w.overview.timeline
+    easing = []  # whether the chart was still easing as each table load or word count started
+    for cls, name in ((type(w.comments_tab), "set_rows_steps"), (WordTally, "count")):
+        real = getattr(cls, name)
+        monkeypatch.setattr(cls, name, lambda self, *a, real=real, **k: easing.append(chart.zoom.running())
+                            or real(self, *a, **k))
+    key = next(k for k, b in chart.presets.items() if b.isEnabled() and k not in ("All", chart.preset))
+    chart.presets[key].click()
+    assert chart.zoom.running()
+    until(lambda: len(easing) >= 3 and not w._span_slices.running() and w.word_tally.ready)
+    assert not any(easing)
+
+
+def test_the_charts_and_clouds_paint_their_own_card_so_a_frame_of_one_paints_nothing_under_it(window):
+    w = window
+    charts = (w.overview.timeline, w.overview.distribution, w.overview.words)
+    painted = []
+
+    class Painted(QObject):
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.Type.Paint:
+                painted.append(obj)
+            return False
+    seen = Painted()
+    under, x = [], charts[0].parentWidget()
+    while x is not None:  # the card, the page, the panel and the window
+        under.append(x)
+        x.installEventFilter(seen)
+        x = x.parentWidget()
+    charts[0].installEventFilter(seen)
+    charts[0].update()
+    QApplication.processEvents()
+    assert painted == [charts[0]]
+    # The same pixels as when the card under it is painted.
+    store, dpr = w.backingStore().paintDevice(), w.devicePixelRatioF()
+
+    def pixels():
+        w.repaint()
+        image = store.copy()
+        return [image.copy(QRect(round(c.mapTo(w, QPoint(0, 0)).x() * dpr), round(c.mapTo(w, QPoint(0, 0)).y() * dpr),
+                                 int(c.width() * dpr), int(c.height() * dpr))) for c in charts]
+    own = pixels()
+    for c in charts:
+        c.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+    assert pixels() == own
+    for c in charts:
+        c.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
 
 
 def reads_of(monkeypatch, store) -> list:

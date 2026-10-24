@@ -292,6 +292,10 @@ class Tween(QObject):
     def running(self) -> bool:
         return self._anim.state() == QVariantAnimation.State.Running
 
+    def left(self) -> int:
+        """Milliseconds until it's at its target (0 when it isn't easing)."""
+        return self._anim.duration() - self._anim.currentTime() if self.running() else 0
+
     def _step(self, v) -> None:
         self.value = float(v)
         self._apply(self.value)

@@ -38,7 +38,7 @@ def _ui_font(point_size: float) -> QFont:
     return f
 
 
-class DistributionChart(QWidget):
+class DistributionChart(theme.OnCard):
     """How the items split across the labels: one segmented bar for the whole, and a row per label with
     its count and share. The segments and the rows' bars ease to new counts instead of jumping."""
 
@@ -94,7 +94,7 @@ class DistributionChart(QWidget):
     def paintEvent(self, event) -> None:
         colors = palette()
         t = theme.tokens()
-        p = QPainter(self)
+        p = self.painter()
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         segments, rows = self._layout()
         total = sum(self._shown)
@@ -195,7 +195,7 @@ def _signed(v: float) -> str:
     return "0" if abs(v) < 1e-9 else f"{v:+.1f}".replace("-", "−")
 
 
-class TimelineChart(QWidget):
+class TimelineChart(theme.OnCard):
     """Mean compound sentiment per day (UTC) on a dated axis, laid out like SteamDB's charts: a plot with a
     crosshair and a hover box for the day under the pointer, faint bars for how many items each day has, range
     buttons (`toolbar`, which the overview puts beside the card's caption) and a navigator strip underneath
@@ -231,7 +231,7 @@ class TimelineChart(QWidget):
         a, b = self.domain()
         self._screen = (a, b, TIMELINE_BOUNDS[0])  # the (lo, hi, y bound) drawn now, eased towards _to
         self._from = self._to = self._screen
-        self._zoom = motion.Tween(self._zoom_step, self)
+        self.zoom = motion.Tween(self._zoom_step, self)
         self._hover: tuple | None = None  # the (unit, start, end, mean, items) under the pointer
         self._pointer: QPointF | None = None  # where the pointer is over the chart
         self._drag: tuple | None = None  # (what, x where it started, view then)
@@ -397,14 +397,14 @@ class TimelineChart(QWidget):
         _, shown = self.groups(lo, hi, self._areas()[0].width())
         old, self._to = self._to, (lo, hi, timeline_bound([(g[0], g[2], g[3]) for g in shown]))
         self._sync_buttons()
-        if follow and self._zoom.running():
+        if follow and self.zoom.running():
             self._from = tuple(f + (b - a) for f, a, b in zip(self._from, old, self._to))
         elif animate and motion.enabled():
             self._from = self._screen
-            self._zoom.value = 0.0
-            self._zoom.set(1.0)
+            self.zoom.value = 0.0
+            self.zoom.set(1.0)
         else:
-            self._zoom.stop()
+            self.zoom.stop()
             self._screen = self._to
             self.update()
         if self._pointer is not None:  # the box follows new means and a new grouping under a still pointer
@@ -486,7 +486,7 @@ class TimelineChart(QWidget):
         dpr = self.devicePixelRatioF()
         lead = motion.lead(self)  # the picture starts on a whole device pixel, so it matches painting directly
         key = (self.size(), dpr, lead, self._screen, self._version, tuple(colors.values()), t["accent"], t["soft"])
-        p = QPainter(self)
+        p = self.painter()
         if key == self._drawn_for:
             p.drawPixmap(-lead, self._drawn)
         # Painted like this once already, so it holds still: keep a picture. New points do too (a running fetch's,
@@ -612,8 +612,10 @@ class TimelineChart(QWidget):
         self._pills = []
         for point in shown:
             marked = self.notes_in(point[0], point[1])
+            if not marked:
+                continue
             at = self._spot(point, plot)
-            if not marked or not plot.left() - 1 <= at.x() <= plot.right() + 1:
+            if not plot.left() - 1 <= at.x() <= plot.right() + 1:
                 continue
             text = marked[0][0] + ("+" if len(marked) > 1 else "")
             h = fm.height() + 4
