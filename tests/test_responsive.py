@@ -565,9 +565,10 @@ def test_scrolling_a_table_moves_its_rows_and_draws_only_the_new_ones(tmp_path):
     screen = tmp_path / "screen.json"  # 150% as Windows sets it: a screen of 144 dpi
     screen.write_text('{"screens": [{"name": "s", "x": 0, "y": 0, "width": 1920, "height": 1200, "logicalDpi": 144, '
                       '"logicalBaseDpi": 96, "dpr": 1}]}')
-    run = subprocess.run([sys.executable, "-c", SCROLL_AT_150, db, str(tmp_path / "cfg150")],
-                         capture_output=True, text=True, timeout=180,
-                         env=dict(os.environ, QT_QPA_PLATFORM=f"offscreen:configfile={screen}"))
+    # Named from the folder it's in: Qt splits the platform's options at colons, which a Windows path has.
+    run = subprocess.run([sys.executable, "-X", "faulthandler", "-c", SCROLL_AT_150, db, str(tmp_path / "cfg150")],
+                         capture_output=True, text=True, timeout=180, cwd=tmp_path,
+                         env=dict(os.environ, QT_QPA_PLATFORM=f"offscreen:configfile={screen.name}"))
     assert run.returncode == 0, run.stderr[-2000:]
     out = dict(line.split(" ", 1) for line in run.stdout.splitlines() if " " in line)
     assert out["dpr"] == "1.5", run.stdout
