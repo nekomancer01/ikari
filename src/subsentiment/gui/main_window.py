@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import sqlite3
 import sys
 import threading
 import time
@@ -10,7 +9,7 @@ from datetime import datetime
 from functools import partial
 
 import numpy as np
-from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThread, QTimer, QUrl
+from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThread, QTimer, QUrl, Slot
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QFontMetrics, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QListWidget, QListWidgetItem,
@@ -35,8 +34,9 @@ from subsentiment.gui.widgets import (
     ElidedLabel, ProgressBar, QuietScrollBars, ShrinkingComboBox, StatusLabel, Throbber, fit_to_screen, label, panel,
     plural, section,
 )
-from subsentiment.gui.worker import (BackgroundJob, Collector, FetchWorker, LoadWorker, Slices, StoreRead, ThreadScorer,
-                                     finish)
+from subsentiment.gui.worker import (
+    BackgroundJob, Collector, FetchWorker, LoadWorker, Slices, StoreRead, StoreWorker, ThreadScorer, finish,
+)
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, scoring_at_least
 
@@ -203,6 +203,9 @@ class MainWindow(QMainWindow):
         self.fetch_job = BackgroundJob(self)
         self.fetch_job.ended.connect(self._on_fetch_ended)
         self.load_job = BackgroundJob(self)  # reads a big saved subreddit
+        self.import_job = BackgroundJob(self)  # merges another database in, on a connection of its own
+        self.import_job.ended.connect(self._on_import_ended)
+        self._importing: tuple = ()  # (the file being imported, what import_from returned or the error)
         self.load_job.ended.connect(self._load_wanted)
         self._wanted: str | None = None  # the subreddit (lowercased) being read on load_job's thread, to show then
         self._stopping = False  # Stop was pressed on the running fetch
@@ -687,6 +690,8 @@ class MainWindow(QMainWindow):
             return "Scoring saved items\u2026"
         if self.coverage.delete_job.busy:
             return "Deleting days\u2026"
+        if self.import_job.busy:
+            return "Importing saved data\u2026"
         if self.coverage.reading() and self.coverage.isVisible():
             return "Reading saved days\u2026"
         if not (self.fetch_job.busy and self._showing_fetch()):
@@ -698,15 +703,18 @@ class MainWindow(QMainWindow):
             return "Shrinking saved data\u2026"
         return None
 
-    def set_deleting(self, on: bool) -> None:
-        """Download coverage is deleting days on a thread: nothing else writes until it's done."""
-        self.fetch_btn.setEnabled(not on and not self.fetch_job.busy)
+    def set_writing(self) -> None:
+        """Download coverage's deletion or an import started or ended on its thread: nothing else writes while one
+        runs. An import holds the database for its one transaction (36 s for the owner's), so words' meanings and
+        notes, saved from this thread, wait for it too."""
+        self.fetch_btn.setEnabled(not self.writing())
         self._update_delete_enabled()
-        self.coverage.set_busy(on or self.fetch_job.busy)
+        self.coverage.set_busy(self.writing())
+        self.words_page.meanings.setEnabled(not self.import_job.busy)
 
     def writing(self) -> bool:
-        """A fetch or a deletion is changing the saved data."""
-        return self.fetch_job.busy or self.coverage.delete_job.busy
+        """A fetch, a deletion or an import is changing the saved data."""
+        return self.fetch_job.busy or self.coverage.delete_job.busy or self.import_job.busy
 
     def _update_delete_enabled(self) -> None:
         idle = not self.writing()
@@ -714,7 +722,8 @@ class MainWindow(QMainWindow):
         self.delete_act.setEnabled(idle and bool(self.current))
         self.delete_all_btn.setEnabled(idle and self.datasets.count() > 0)
         self.delete_all_act.setEnabled(idle and self.datasets.count() > 0)
-        self.import_act.setEnabled(idle)
+        # Not beside the upgrade either: it packs what an import took, and the two would wait on each other.
+        self.import_act.setEnabled(idle and not self.rescore.running() and not self.upgrading.is_alive())
 
     # -- fetching -------------------------------------------------------------
 
@@ -739,6 +748,7 @@ class MainWindow(QMainWindow):
 
     def _launch(self, req: collect.FetchRequest, message: str) -> None:
         worker = FetchWorker(req, self.db_path)
+        worker.pack = not self.upgrading.is_alive()
         self.request = req
         self._since = worker.since
         self._read_to = {"posts": self._since, "comments": self._since}
@@ -1094,6 +1104,7 @@ class MainWindow(QMainWindow):
         if self.upgrading.is_alive():
             return
         self._upgraded.stop()
+        self._update_delete_enabled()
         for key in [k for k, (_, saved) in self._loaded.items() if not all(getattr(s, "words", True) for s in saved.values())]:
             del self._loaded[key]
         wordless = not all(getattr(s, "words", True) for s in self._saved.values())
@@ -1245,6 +1256,9 @@ class MainWindow(QMainWindow):
         """Add, change or remove the note on a day the timeline's dot was clicked on."""
         if not self.current:
             return
+        if self.import_job.busy:
+            self.statusBar().showMessage("Notes can be added once the import is done.", 5000)
+            return
         dialog = NoteDialog(day, *self.store.notes(self.current).get(day, ("", "")), parent=self)
         dialog.chosen.connect(partial(self._save_note, self.current, day))
         dialog.open()
@@ -1368,22 +1382,41 @@ class MainWindow(QMainWindow):
 
     def _import_database(self) -> None:
         """Merge another ikari database (one saved under another account or computer) into this one."""
-        if self.writing():
+        if not self.import_act.isEnabled():
             return
         path, _ = QFileDialog.getOpenFileName(self, "Import database", str(self.store.path.parent),
                                               "ikari databases (*.db);;All files (*)")
         if not path:
             return
-        try:
-            posts, comments = self.store.import_from(path)
-            self._loaded.clear()
-        except (sqlite3.DatabaseError, OSError, ValueError) as e:
-            QMessageBox.warning(self, "Import failed", f"Couldn't import {path}.\n\n{e}")
+        # On a thread: the owner's 230 MB database took 36 s, with the window frozen.
+        worker = StoreWorker(self.db_path, "import_from", path)
+        worker.finished.connect(self._imported)
+        worker.failed.connect(self._imported)
+        self._importing = (path, None)
+        self.import_job.start(worker)
+        self.set_writing()
+        self.statusBar().showMessage(f"Importing {path}\u2026")
+
+    @Slot(object)
+    def _imported(self, got) -> None:
+        """What import_from returned, or the error it raised."""
+        self._importing = (self._importing[0], got)
+
+    def _on_import_ended(self) -> None:
+        path, got = self._importing
+        self.set_writing()
+        if not isinstance(got, tuple):
+            self.statusBar().clearMessage()
+            QMessageBox.warning(self, "Import failed", f"Couldn't import {path}.\n\n{got or 'It stopped unfinished.'}")
             return
+        self._loaded.clear()
         self.statusBar().showMessage(
-            f"Imported {plural(posts, 'new post')} and {plural(comments, 'new comment')} from {path}", 8000)
-        self._refresh_datasets()
-        self.coverage.refresh_saved()
+            f"Imported {plural(got[0], 'new post')} and {plural(got[1], 'new comment')} from {path}", 8000)
+        # What it took is packed there, as an older database's rows are (import is off till it's done).
+        self.upgrading = threading.Thread(target=Store.upgrade, args=(self.db_path, self._upgrade_stop), daemon=True)
+        self.upgrading.start()
+        self._upgraded.start()
+        self._refresh_datasets()  # (Download coverage read what's saved again as set_writing let it go)
 
     def _show_about(self) -> None:
         QMessageBox.about(self, "About ikari", (
@@ -1428,13 +1461,15 @@ class MainWindow(QMainWindow):
             # runs), and Qt aborts the process if the thread is still going when the window goes.
             self.load_job.qthread.wait()
         self.rescore.stop()
-        deleting = self.coverage.delete_job
-        if deleting.busy:  # one transaction: let it end, rather than cut it short, but show nothing of it
-            deleting.worker.finished.disconnect()
-            deleting.worker.failed.disconnect()
-            deleting.ended.disconnect()
-            deleting.qthread.quit()
-            deleting.qthread.wait(10000)
+        # Each is one transaction, of which nothing is shown now. A deletion is let end, rather than cut short; an
+        # import can take a minute, so app.main ends the process instead and SQLite rolls it back.
+        for writing, wait in ((self.coverage.delete_job, 10000), (self.import_job, 0)):
+            if writing.busy:
+                writing.worker.finished.disconnect()
+                writing.worker.failed.disconnect()
+                writing.ended.disconnect()
+                writing.qthread.quit()
+                writing.qthread.wait(wait)
         self._upgrade_stop.set()  # it stops after the day it's packing
         self.upgrading.join()
         self.store.close()
@@ -1445,5 +1480,5 @@ class MainWindow(QMainWindow):
         closed."""
         return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job,
                                     self.coverage.days_read.job, self.coverage.posts_read.job, self.load_job,
-                                    self.rescore.job)
+                                    self.rescore.job, self.import_job)
                 if j.running()]

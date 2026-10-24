@@ -306,6 +306,7 @@ class FetchWorker(Worker):
         super().__init__()
         self.request = request
         self.db_path = db_path
+        self.pack = True  # pack the days that have settled as it ends (not while Store.upgrade is packing them)
         self.since = time.time() - 1.0  # rows saved from now on are this fetch's
         self._read_to = {"posts": self.since, "comments": self.since}
         self._last: dict[str, str] = {}  # the id of the last row of each kind sent
@@ -346,7 +347,8 @@ class FetchWorker(Worker):
             LIMITER.on_wait = None  # collect.run pointed it at this worker, which is about to go
             if store is not None:
                 try:
-                    store.pack_settled(stop=self._closing)  # days that have settled since get their text compressed
+                    if self.pack:
+                        store.pack_settled(stop=self._closing)  # days that have settled since get their text compressed
                 except Exception:  # never worth failing a fetch for: the rows stay as they are, packed next time
                     pass
                 store.close()
