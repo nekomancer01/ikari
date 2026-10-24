@@ -22,6 +22,9 @@ MAX_DAY_POSTS = 10000  # cap on one UTC day when downloading everything (busy su
 # Days in a row the archive timed out on without giving a single post before a download stops reading days:
 # it's struggling with every query, and each such day costs dozens of requests that come to nothing.
 TIMED_OUT_DAYS = 2
+# Days in a row whose threads kept failing (GIVE_UP_AFTER in a row) before no later day's comments are asked for:
+# the archive can't give comments just now, and each day would only add more failing requests.
+GAVE_UP_DAYS = 2
 
 
 @dataclass
@@ -153,7 +156,7 @@ class Download:
         self.saved_whole: set[str] = set()  # saved posts whose whole thread is saved (when filling threads)
         self.saved_count: dict[str, int] = {}  # comments saved per post (when filling threads up to a cap)
         self.n_comments = self.errors = 0
-        self.gave_up = False  # the archive kept failing comment requests; the rest are left for the next fetch
+        self.gave_up = 0  # parts (days) in a row whose threads kept failing
         self.timed_out = False  # some part of the range was skipped, as the archive kept timing out on it
 
     def progress(self, done: int, total: int, msg: str) -> None:  # remembered, to come back to after a wait
@@ -345,16 +348,20 @@ class Download:
                 or (pid in repicked and r["comments_ok"] is None and not r["has_comments"])  # picked, never asked
                 or (fill and pid not in self.saved_whole and not (cap and self.saved_count.get(pid, 0) >= cap)))]
         todo = self.sampled([p for p in todo if p.num_comments != 0])  # None (not settled yet) still gets looked up
-        if self.gave_up:
-            tried: set[str] = set()
-        else:
+        # Threads failing one after another stop this part's (its day's): the rest are left for the next fetch. The
+        # next day tries again, so one bad stretch of a year's download doesn't leave every day after it without;
+        # after GAVE_UP_DAYS such days, no more are tried.
+        tried: set[str] = set()
+        gave_up = self.gave_up >= GAVE_UP_DAYS
+        if not gave_up:
             get = self.take_sample if self.sample else (lambda p: client.fetch_all_comments(p, cap, req.comment_pick)) \
                 if fill else (lambda p: (client.fetch_comments(p, cap, req.comment_pick), False))
-            failed, tried, self.gave_up, added = self.each_thread(todo, get, cap=cap, progress=report)
+            failed, tried, gave_up, added = self.each_thread(todo, get, cap=cap, progress=report)
             self.errors += failed
             self.n_comments += added
             self.mark_sampled(tried)
-        if self.gave_up:
+            self.gave_up = self.gave_up + 1 if gave_up else 0
+        if gave_up:
             rest = [p for p in todo if p.id not in tried]  # not tried this time: retried on the next fetch
             self.errors += len(rest)
             for p in rest:
@@ -454,7 +461,7 @@ class Download:
         ``self.saved`` is told once it's committed, if it brought comments (``every``: whatever it brought).
         ``cap`` is the comments asked for per thread, 0 for all. A post whose comments couldn't be fetched is
         recorded as failed, so the next fetch retries it; after GIVE_UP_AFTER failures in a row no new ones
-        start, since the archive is struggling and shouldn't be hammered. Returns (posts that failed, ids of the
+        start, since the archive is struggling and shouldn't be hammered (by a whole range: see comments). Returns (posts that failed, ids of the
         posts tried, whether it gave up, new comments)."""
         store, name, client, should_stop = self.store, self.name, self.client, self.should_stop
         what = "Sampled comments for post" if self.sample else "Comments for post" if cap else "All comments for post"
