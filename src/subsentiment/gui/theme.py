@@ -18,8 +18,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRectF, Qt, QVariantAnimation
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QLinearGradient, QPainter, QPalette, QPen
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRect, QRectF, Qt, QVariantAnimation
+from PySide6.QtGui import (QColor, QFont, QFontDatabase, QGuiApplication, QImage, QLinearGradient, QPainter, QPalette,
+                           QPen)
 from PySide6.QtWidgets import (QApplication, QCalendarWidget, QComboBox, QDateEdit, QLineEdit, QPlainTextEdit, QProxyStyle,
                                QPushButton, QSpinBox, QTableView, QWidget)
 
@@ -505,13 +506,23 @@ class Outline(QProxyStyle):
                 return QColor(t["accent"])
         return QColor(*t["edge"])
 
-    @staticmethod
-    def draw(p: QPainter, rect: QRectF, radius: float, edge: QColor, fill: QColor | None = None) -> None:
-        """``rect`` (logical) outlined in ``edge``, filled with ``fill`` if given, snapped to device pixels."""
+    _cut: dict = {}  # (width, height, radius, pen, edge, fill) in device pixels -> that box, drawn once
+
+    @classmethod
+    def draw(cls, p: QPainter, rect: QRectF, radius: float, edge: QColor, fill: QColor | None = None) -> None:
+        """``rect`` (logical) outlined in ``edge``, filled with ``fill`` if given, snapped to device pixels.
+
+        A big anti-aliased rounded rect is the slowest thing in a window's paint (every panel is one, painted
+        again under every fade, scroll and resize step), so only the corners are drawn that way: once per
+        radius and colours, then copied, with the straight edges and the fill as plain rectangles. The pixels
+        are the ones drawing the whole box gives. A small box (the tables' chips, the buttons) is kept whole,
+        by size; a long pill is drawn whole each time."""
         p.save()
         d = p.deviceTransform()  # the device pixel ratio and the widget's offset, often half a pixel at 150%
         dpr = d.m11()
         dev = (p.worldTransform() * d).mapRect(rect)
+        # Cut corners are for the plain case, a widget painting itself: drawn at full opacity, not moved.
+        whole = p.opacity() < 1 or not p.worldTransform().isIdentity()
         # The whole device pixels inside the rect; drawn in device pixels from here on.
         left, top = math.ceil(dev.left() - 0.01), math.ceil(dev.top() - 0.01)
         right, bottom = math.floor(dev.right() + 0.01), math.floor(dev.bottom() + 0.01)
@@ -521,7 +532,50 @@ class Outline(QProxyStyle):
             edge = QColor(edge)
             edge.setAlpha(min(255, round(edge.alpha() * dpr / width)))
         r = radius * dpr
-        box = QRectF(left, top, right - left, bottom - top)
+        w, h = right - left, bottom - top
+        corner = math.ceil(r) + 1  # every curved or blended pixel of a corner is inside this square
+        if w <= 0 or h <= 0:
+            pass
+        elif whole:
+            cls._box(p, QRectF(left, top, w, h), r, width, edge, fill)
+        elif w * h <= 20000:
+            p.drawImage(left, top, cls._image(w, h, r, width, edge, fill))
+        elif w <= 2 * corner or h <= 2 * corner:  # a long pill: too many sizes to keep
+            cls._box(p, QRectF(left, top, w, h), r, width, edge, fill)
+        else:
+            side = 2 * corner + 1
+            cut = cls._image(side, side, r, width, edge, fill)
+            for x, y in ((0, 0), (1, 0), (0, 1), (1, 1)):
+                p.drawImage(QRectF(left + x * (w - corner), top + y * (h - corner), corner, corner), cut,
+                            QRectF(x * (side - corner), y * (side - corner), corner, corner))
+            inner_w, inner_h = w - 2 * corner, h - 2 * corner
+            if fill is not None:
+                p.fillRect(QRect(left + corner, top, inner_w, h), fill)
+                p.fillRect(QRect(left, top + corner, corner, inner_h), fill)
+                p.fillRect(QRect(right - corner, top + corner, corner, inner_h), fill)
+            for line in (QRect(left + corner, top, inner_w, width), QRect(left + corner, bottom - width, inner_w, width),
+                         QRect(left, top + corner, width, inner_h), QRect(right - width, top + corner, width, inner_h)):
+                p.fillRect(line, edge)
+        p.restore()
+
+    @classmethod
+    def _image(cls, w: int, h: int, r: float, width: int, edge: QColor, fill: QColor | None) -> QImage:
+        key = (w, h, r, width, edge.rgba(), None if fill is None else fill.rgba())
+        image = cls._cut.get(key)
+        if image is None:
+            if len(cls._cut) > 256:  # a chip's edge is faded with its row, so the colours vary (at most ~20 MB)
+                cls._cut.clear()
+            image = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+            image.fill(Qt.GlobalColor.transparent)
+            p = QPainter(image)
+            cls._box(p, QRectF(0, 0, w, h), r, width, edge, fill)
+            p.end()
+            cls._cut[key] = image
+        return image
+
+    @staticmethod
+    def _box(p: QPainter, box: QRectF, r: float, width: int, edge: QColor, fill: QColor | None) -> None:
+        """The whole box, in device pixels."""
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         if fill is not None:
             p.setPen(Qt.PenStyle.NoPen)
@@ -531,7 +585,6 @@ class Outline(QProxyStyle):
         p.setPen(QPen(edge, width))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(box.adjusted(half, half, -half, -half), r - half, r - half)
-        p.restore()
 
 
 def paint_popup(widget: QWidget, shadow: int) -> None:

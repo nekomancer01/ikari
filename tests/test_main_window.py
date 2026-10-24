@@ -857,6 +857,10 @@ def test_a_new_progress_value_waits_for_the_next_frame_to_be_drawn(make_window):
     w.show()
     w.show_page("posts")
     w._set_busy(True)
+    from subsentiment.gui import motion
+    end = time.monotonic() + 5
+    while motion.fading(w.content) and time.monotonic() < end:  # a fade holds the page as a picture until it ends
+        QApplication.processEvents()
     QApplication.processEvents()
 
     class Paints(QObject):

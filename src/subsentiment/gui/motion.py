@@ -11,16 +11,18 @@ motion off (View > Reduce motion, or Windows' Animation effects turned off) each
 - `throb(widget)`: where a waiting widget's throbber is, for a widget that paints one while it waits.
 
 Fading a still picture, rather than the live widgets, means charts and tables aren't repainted on every frame
-and no widget moves, so layouts stay exactly as they are.
+and no widget moves, so layouts stay exactly as they are. The new look under it is held as a picture too, and
+grabbed again only while something there moves (a count easing, a throbber) or changes view.
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Callable
 
 import shiboken6
 from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation
-from PySide6.QtGui import QGuiApplication, QImage, QPainter, QPixmap
+from PySide6.QtGui import QGuiApplication, QImage, QPainter, QPixmap, QRegion
 from PySide6.QtWidgets import QApplication, QGraphicsOpacityEffect, QLabel, QWidget
 
 from subsentiment.gui import native
@@ -30,6 +32,7 @@ THEME_MS = 320  # light to dark and back
 DATA_MS = 420   # numbers and bars easing to new values
 APPEAR_MS = 200  # a status line or window appearing
 THROB_MS = 1400  # one sweep of a throbber
+REGRAB_MS = 80  # how stale the new look under a fade's still may get
 
 _wanted = True  # the View > Reduce motion setting, inverted
 _os_allows: bool | None = None
@@ -66,12 +69,18 @@ class _Snapshot(QLabel):
     """A still of a widget's old look, laid over it and fading out. Gone at once if the widget is resized,
     so a stale picture never sits over a new layout.
 
+    The new look is held as a picture too and the fade blends the two: the still is opaque, so nothing under
+    it repaints on every frame (a whole page takes 10-25 ms to paint at 150%, more than a frame with the
+    fade's own drawing). The new look is grabbed whole every ``regrab_ms`` (REGRAB_MS for a view change),
+    so whatever changes under the fade shows within a few frames, and on every frame the parts that are animating or changing view are grabbed
+    again, so a count easing or a page switching mid-fade moves as smoothly as without it.
+
     The still lines up with the window's own pixels. At 150% a widget at x=105 starts at device pixel 157.5,
     and a grab from there is rounded to 157 or 158: the old look then sat a pixel off and everything under a
     fade jumped sideways and back. So the grab starts a little up and left, at a whole device pixel, and is
     drawn back at that same pixel."""
 
-    def __init__(self, target: QWidget, ms: int, still_under: bool = False):
+    def __init__(self, target: QWidget, ms: int, regrab_ms: int | None):
         super().__init__(target)
         self.setObjectName("motion-snapshot")
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -82,12 +91,13 @@ class _Snapshot(QLabel):
         self._lead = lead(target)
         self._still = _picture(window, QRect(origin - self._lead, target.size() + QSize(self._lead.x(), self._lead.y())))
         self.opacity = 1.0
-        # With still_under, the new look is grabbed once too and the fade blends the two pictures: an opaque
-        # still means nothing under it repaints on each frame (a whole window takes ~40 ms to paint at 150%),
-        # at the cost of what changes under it showing once the fade is done.
-        self._still_under = still_under
-        self._under = None
+        self._under: QPixmap | None = None  # the new look, grabbed on the first frame
+        self._grabbed = 0.0  # when it was last grabbed whole
+        self._regrab = math.inf if regrab_ms is None else regrab_ms / 1000
+        self.changed: list[QWidget] = []  # parts under it whose view changed, to grab again on the next frame
+        self._grabbing = False
         self.setGeometry(target.rect())
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)  # the still covers all of it until the first frame
         self.anim = _ease(QVariantAnimation(self, duration=ms, startValue=1.0, endValue=0.0))
         self.anim.valueChanged.connect(self._fade)
         self.anim.finished.connect(self.deleteLater)
@@ -98,16 +108,50 @@ class _Snapshot(QLabel):
 
     def _fade(self, value: float) -> None:
         self.opacity = value
-        if self._still_under and self._under is None:
+        whole = self._under is None or time.monotonic() - self._grabbed >= self._regrab
+        parts = [] if whole else [w for w in self.changed + self._moving() if shiboken6.isValid(w) and w.isVisible()]
+        self.changed = []
+        if whole or parts:
             window, target = self.window(), self.parentWidget()
-            self.hide()
-            self._under = window.grab(QRect(target.mapTo(window, QPoint(0, 0)) - self._lead,
-                                            self._still.deviceIndependentSize().toSize()))
-            self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
-            self.show()
+            origin = target.mapTo(window, QPoint(0, 0)) - self._lead
+            # Grabbed with this still left out of the picture (hiding it would repaint all under it again), and
+            # any fade over it too (one started around this one, late in its own fade); fades inside it stay in.
+            left_out = [s for s in window.findChildren(_Snapshot) if s is self or not target.isAncestorOf(s)]
+            for s in left_out:
+                s._grabbing = True
+                s.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+            if whole:
+                self._under = window.grab(QRect(origin, self._still.deviceIndependentSize().toSize()))
+                self._grabbed = time.monotonic()
+            else:
+                p = QPainter(self._under)
+                for w in parts:  # a little past the part's edges, which fall between device pixels at 150%
+                    piece = QRect(w.mapTo(window, QPoint(0, 0)), w.size()).adjusted(-2, -2, 2, 2)
+                    window.render(p, piece.topLeft() - origin, QRegion(piece))
+                p.end()
+            for s in left_out:
+                s.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+                s._grabbing = False
         self.update()
 
+    def _moving(self) -> list[QWidget]:
+        """The widgets under the still that are animating: a count or bar easing (Tween), a widget fading in,
+        another fade, a throbber."""
+        target, moving = self.parentWidget(), []
+        for a in target.findChildren(QVariantAnimation):
+            if a is not self.anim and a.state() == QVariantAnimation.State.Running:
+                owner = a.parent()
+                while owner is not None and not isinstance(owner, QWidget):
+                    owner = owner.parent()
+                if owner is not None:
+                    moving.append(owner)
+        if _throbbers is not None:
+            moving += [w for w in _throbbers.moving() if shiboken6.isValid(w) and target.isAncestorOf(w)]
+        return moving
+
     def paintEvent(self, event) -> None:
+        if self._grabbing:
+            return
         p = QPainter(self)
         if self._under is not None:
             p.drawPixmap(-self._lead, self._under)
@@ -154,15 +198,17 @@ def _to_whole_pixel(at: int, dpr: float) -> int:
     return next((k for k in range(8) if abs((at - k) * dpr - round((at - k) * dpr)) < 1e-6), 0)
 
 
-def crossfade(target: QWidget, ms: int = VIEW_MS, still_under: bool = False) -> None:
-    """Call just before changing what target shows: its current look fades out over the new one. With
-    ``still_under`` the new one is held as a picture during the fade too (see _Snapshot), for a change that
-    repaints all of a big area, like the theme."""
+def crossfade(target: QWidget, ms: int = VIEW_MS, regrab_ms: int | None = REGRAB_MS) -> None:
+    """Call just before changing what target shows: its current look fades out over the new one. The new look
+    is grabbed whole again every ``regrab_ms`` during the fade; with None only once (the theme, which repaints
+    every widget and changes nothing more while it fades)."""
     if not enabled() or not target.isVisible() or target.width() <= 0 or target.height() <= 0:
         return
     parent = target.parentWidget()
     while parent is not None:
-        if fading(parent, early=True):  # a fade over a whole area already covers this part: don't grab again
+        if fading(parent, early=True):  # a fade over a whole area already covers this part: don't grab again,
+            for over in _snapshots(parent):  # but show the change in its new look
+                over.changed.append(target)
             return
         parent = parent.parentWidget()
     if target.window().testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground):
@@ -172,21 +218,24 @@ def crossfade(target: QWidget, ms: int = VIEW_MS, still_under: bool = False) -> 
         if not target.isWindow():
             fade_in(target, ms)
         return
-    # A fade already running: start from what's on screen now, not from the picture before it. A still new look
-    # would hold any fade inside target at its current frame too, so those go as well.
-    deep = Qt.FindChildOption.FindChildrenRecursively if still_under else Qt.FindChildOption.FindDirectChildrenOnly
-    for old in target.findChildren(_Snapshot, options=deep):
+    # A fade already running: start from what's on screen now, not from the picture before it. The new look is
+    # held as a picture, which would hold any fade inside target at its current frame too, so those go as well.
+    for old in target.findChildren(_Snapshot):
         old.anim.stop()
         old.hide()
         old.deleteLater()
-    _Snapshot(target, ms, still_under)
+    _Snapshot(target, ms, regrab_ms)
 
 
 def fading(target: QWidget, early: bool = False) -> bool:
     """Whether a crossfade is running over target; with early, only one in its first half, whose picture
     still mostly hides what changes under it."""
-    return any(s.isVisible() and (not early or s.anim.currentTime() < s.anim.duration() / 2)
-               for s in target.findChildren(_Snapshot, options=Qt.FindChildOption.FindDirectChildrenOnly))
+    return any(not early or s.anim.currentTime() < s.anim.duration() / 2 for s in _snapshots(target))
+
+
+def _snapshots(target: QWidget) -> list[_Snapshot]:
+    return [s for s in target.findChildren(_Snapshot, options=Qt.FindChildOption.FindDirectChildrenOnly)
+            if s.isVisible()]
 
 
 # -- fade in ------------------------------------------------------------------------------------------------
@@ -258,6 +307,7 @@ class _Throbbers(QObject):
     def __init__(self):
         super().__init__()
         self._painted: list[QWidget] = []
+        self._ticked: list[QWidget] = []  # the ones repainted on the last tick
         self._timer = QTimer(self)
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
@@ -271,8 +321,12 @@ class _Throbbers(QObject):
             self._timer.start()
         return time.monotonic() * 1000 % THROB_MS / THROB_MS
 
+    def moving(self) -> list[QWidget]:
+        return self._painted + self._ticked
+
     def _tick(self) -> None:
         painted, self._painted = self._painted, []
+        self._ticked = painted
         for w in painted:
             if shiboken6.isValid(w):  # a table row rebuilt since deletes its widgets
                 w.update()

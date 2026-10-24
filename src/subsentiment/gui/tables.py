@@ -9,8 +9,8 @@ from itertools import islice
 from typing import Any, Callable
 
 import numpy as np
-from PySide6.QtCore import (QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRectF, QSize, Qt, QTimer,
-                            QUrl, Signal)
+from PySide6.QtCore import (QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRect, QRectF, QSize, Qt,
+                            QTimer, QUrl, Signal)
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QHeaderView, QLineEdit, QStyle, QStyledItemDelegate,
@@ -680,6 +680,30 @@ class RowsModel(QAbstractTableModel):
         return self.source.row(p, around=self.order[max(0, i - RowSource.READ // 4):i + RowSource.READ].tolist())
 
 
+class Table(QTableView):
+    """A table that scrolls by moving the rows it has drawn and drawing only the rows that come into view.
+
+    Its rows sit on the box's own plain panel colour, so the rows still on screen look the same after a
+    scroll, only higher or lower. Qt moves them only for an opaque viewport, and this one is see-through
+    (the box's rounded corners and outline are drawn under it), so it is opaque just for the move. The rows
+    coming into view are then drawn over what's under them as before, and so are the bottom corners, where
+    the box's outline curves in under the last row. Sideways it is all drawn again, as before."""
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:
+        if dx:  # sideways the corners would move along the bottom row: drawn again whole, as before
+            super().scrollContentsBy(dx, dy)
+            return
+        viewport, was = self.viewport(), self.verticalOffset()
+        viewport.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        super().scrollContentsBy(dx, dy)  # dy counts rows here, not pixels
+        viewport.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        corner = 12  # the box's radius and its outline (Outline.shape), and a pixel's rounding
+        moved = corner + abs(self.verticalOffset() - was)
+        bottom = viewport.height() - moved
+        viewport.update(QRect(0, bottom, corner, moved))
+        viewport.update(QRect(viewport.width() - corner, bottom, corner, moved))
+
+
 class TablePage(QWidget):
     """Filterable, sortable table in an outlined box; double-click opens the item on Reddit.
 
@@ -720,7 +744,7 @@ class TablePage(QWidget):
         self.label_filter.currentTextChanged.connect(lambda _: self._apply_filters())
         self.count = label("", "muted")
 
-        self.view = QTableView()
+        self.view = Table()
         self.view.setModel(self.model)
         self.view.setSortingEnabled(True)
         self.view.sortByColumn(0, Qt.SortOrder.AscendingOrder)
