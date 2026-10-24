@@ -1015,3 +1015,24 @@ def test_a_queued_button_turns_and_is_lighter_and_stays_still_with_motion_off(wi
     assert b.grab().toImage() == upright  # a wheel in place of either arrow
     hold.set()
     settle(w, lambda: not c._queue)
+
+
+def test_a_download_starting_or_ending_only_marks_the_day_buttons(window, monkeypatch):
+    # Every listed day's cells were drawn again then: a quarter of a second for two years of days, as a big
+    # download ended.
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals and c._threads)
+    drawn = []
+    monkeypatch.setattr(coverage.Cell, "set", lambda self, *a: drawn.append(a))
+    monkeypatch.setattr(coverage.Cell, "set_open", lambda self, *a: drawn.append(a))
+    monkeypatch.setattr(coverage.Cell, "show_share", lambda self, *a: drawn.append(a))
+    buttons = [c.day_table.cellWidget(row, col).findChild(coverage.RowButton)
+               for row in sorted(c.day_rows.built) for col in (2, 4)]
+    assert buttons
+    c.set_busy(True)
+    assert drawn == [] and all(b.later for b in buttons)
+    c.set_busy(False)
+    assert drawn == [] and not any(b.later for b in buttons)
