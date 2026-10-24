@@ -17,7 +17,7 @@ import numpy as np
 from subsentiment.analysis import LABEL_AT, Analysis
 from subsentiment.gui.worker import on_thread
 from subsentiment.index import RowIndex
-from subsentiment.store import NO_SCORE, PACKED, column, scoring_at_least
+from subsentiment.store import NO_SCORE, column, scoring_at_least
 
 # The values a source keeps as arrays, by column: missing ones sort first (NO_SCORE, -inf), as the tables had them.
 ARRAYS = {"sentiment": "sentiment", "score": "score", "created_utc": "created", "label": "label"}
@@ -37,6 +37,7 @@ class RowSource:
 
     KEEP = 8192  # rows kept read for drawing
     READ = 128  # rows read at once around one a table asks for
+    COLUMN_STEP = 2000  # rows of a column `_column` reads at once
     lazy = False  # whether reading rows takes long enough that a table reads them on a thread (`kept`, `keep`)
 
     def __init__(self):
@@ -44,6 +45,7 @@ class RowSource:
         self._values: dict[str, list] = {}  # column -> every row's value, once read
         self.version = 0  # counts changes to its rows
         self._changes: deque = deque(maxlen=64)  # (version, positions changed then), the latest
+        self._reading: list[dict] = []  # each column being read's rows saved again meanwhile (`read_values`)
 
     def __len__(self) -> int:
         return len(self.ids)
@@ -95,16 +97,29 @@ class RowSource:
             return np.where(np.isnan(got), -np.inf, got) if key == "created_utc" else got
         return self._values.get(key)
 
-    def read_values(self, key: str, step: int = 2000):
-        """Read every row's ``key``, ``step`` rows between two yields, and keep it for `values`."""
+    def read_values(self, key: str):
+        """Read every row's ``key``, a step at a time (`_column`), and keep it for `values`. Rows a running fetch
+        adds meanwhile are read too, and rows it saves again are taken as they are now: the column is kept whole."""
         if key in ARRAYS or key in self._values:
             return
-        got, n = [], len(self)
-        for a in range(0, n, step):
-            got += column(self._read(range(a, min(a + step, n))), key)
-            yield
-        if len(self) == n:  # (rows added meanwhile: read it again next time)
-            self._values[key] = got
+        got, saved = [], {}  # saved: position -> its row, saved again since its step was read
+        self._reading.append(saved)
+        try:
+            while len(got) < len(self):
+                got += yield from self._column(key, len(got), min(len(got) + self.COLUMN_STEP, len(self)))
+                for p, row in saved.items():
+                    if p < len(got):
+                        got[p] = row[key]
+                saved.clear()  # (the rest are read as they are now)
+        finally:
+            self._reading = [s for s in self._reading if s is not saved]
+        self._values[key] = got
+
+    def _column(self, key: str, start: int, stop: int):
+        """Rows ``start`` to ``stop``'s ``key``, read here between two frames (a generator, for Slices)."""
+        got = list(column(self._read(range(start, stop)), key))
+        yield
+        return got
 
     def changed(self, positions, rows=None, text: bool = True) -> None:
         """Rows at ``positions`` were saved again (or added): what's kept of them is read again, or taken from
@@ -117,8 +132,10 @@ class RowSource:
             self._drawn.pop(p, None)
         if rows is not None:
             self.keep(positions, rows)
-        if self._values and positions and text:
+        if (self._values or self._reading) and positions and text:
             fresh = dict(zip(positions, self._read(positions) if rows is None else rows))
+            for saved in self._reading:
+                saved.update(fresh)
             for key, got in list(self._values.items()):
                 for p in sorted(fresh):
                     if p < len(got):
@@ -190,7 +207,7 @@ class Saved(RowSource):
     ``words`` their words aren't counted: a database still being upgraded has to split every row's text for them,
     half a minute for 650,000 comments, where its upgraded packs have them counted."""
 
-    TEXT_STEP = 50_000  # rows of a text column read at once, on a thread: a quarter of a second
+    COLUMN_STEP = 50_000  # read on a thread: a quarter of a second
     lazy = True  # 128 rows' text took 70 ms to read from their days' packs, 400 the first time
 
     def __init__(self, db_path: str | Path, kind: str, subreddit: str, words: bool = True):
@@ -220,18 +237,12 @@ class Saved(RowSource):
     def search(self, typed: str) -> np.ndarray | None:
         return self.index.search(typed)
 
-    def read_values(self, key: str, step: int = 2000):
-        """As RowSource's; a text column the index keeps in its packs is read on a thread, a big step at a time."""
-        if key in ARRAYS or key in self._values:
-            return
-        if key not in PACKED[self.kind] and not (key == "post_title" and self.kind == "comments"):
-            yield from super().read_values(key, step)
-            return
-        got, n = [], len(self)
-        for a in range(0, n, self.TEXT_STEP):
-            got += yield from on_thread(lambda a=a: self.index.column(key, a, min(a + self.TEXT_STEP, n)))
-        if len(self) == n:
-            self._values[key] = got
+    def _column(self, key: str, start: int, stop: int):
+        """As RowSource's, read on a thread from the index (text from its packs, other columns by id); a comment's
+        permalink, rebuilt from its post's as it's read, from the rows here."""
+        if key == "permalink" and self.kind == "comments":
+            return (yield from super()._column(key, start, stop))
+        return (yield from on_thread(lambda: self.index.column(key, start, stop)))
 
     def add(self, rows) -> None:
         """Count in rows a running fetch saved (new, or saved again): new ones go at the end."""

@@ -257,30 +257,46 @@ class RowsModel(QAbstractTableModel):
                 order = yield from on_thread(lambda: np.argsort(keys, kind="stable"))
             return at[order], keys[order]
         missing = self._missing(column)
-        keys = [missing if (v := values[p]) is None else v for p in at.tolist()]
         if step is None or len(at) < self.BIG:
+            keys = [missing if (v := values[p]) is None else v for p in at.tolist()]
             order = sorted(range(len(keys)), key=keys.__getitem__, reverse=descending)
-        else:
-            runs = []
-            for a in range(0, len(keys), step):
-                runs.append(sorted(range(a, min(a + step, len(keys))), key=keys.__getitem__, reverse=descending))
-                yield
-            merged, order = heapq.merge(*runs, key=keys.__getitem__, reverse=descending), []
-            while part := list(islice(merged, step // 4)):  # merging is a microsecond a row, sorting a run far less
-                order += part
-                yield
-        return at[np.array(order, np.int64)], [keys[i] for i in order]
+            return at[np.array(order, np.int64)], [keys[i] for i in order]
+        # Every step here is a step of rows: getting 650,000 comments' keys took 60 ms in one go, and as long again
+        # putting them in their new order.
+        # Runs of a quarter step: sorting 20,000 comments' text took 20 ms (merging as many, 5).
+        keys, runs, part = [], [], step // 4
+        for a in range(0, len(at), step):
+            keys += [missing if (v := values[p]) is None else v for p in at[a:a + step].tolist()]
+            yield
+        for a in range(0, len(keys), part):
+            runs.append(iter(sorted(range(a, min(a + part, len(keys))), key=keys.__getitem__, reverse=descending)))
+            yield
+        # Each run is let go once it's merged: freeing all 650,000 of their numbers at the end took 90 ms. The new
+        # order is written a step at a time too, into an array made at the start (filling a new one took 20 ms).
+        merged, placed, ordered = heapq.merge(*runs, key=keys.__getitem__, reverse=descending), np.empty_like(at), []
+        runs.clear()
+        while got := list(islice(merged, part)):
+            placed[len(ordered):len(ordered) + len(got)] = at[got]
+            ordered += map(keys.__getitem__, got)
+            yield
+        return placed, ordered
 
     def sorting(self) -> bool:
         """A big table's new order is being worked out away from the frames."""
         return self._slices.running()
+
+    def here(self, source: RowSource, n: int) -> bool:
+        """Whether ``n`` rows of ``source`` are put in sort order here and now: fewer than BIG, and the column sorted
+        by read already (a lazy source reads its text on a thread: 17,000 post titles took a tenth of a second)."""
+        return n < self.BIG and not (source.lazy and self._sort is not None
+                                     and source.values(self.columns[self._sort[0]][1]) is None)
 
     def sort(self, column: int, order=Qt.SortOrder.AscendingOrder) -> None:
         """Called by the view when a header is clicked. Selected rows stay selected."""
         wanted = (column, order == Qt.SortOrder.DescendingOrder)
         if wanted != self._sort:  # the view asks twice for one sortByColumn
             self._sort = wanted
-            if len(self.order) < self.BIG:
+            if self.here(self.source, len(self.order)):
                 self._slices.stop()
                 self._resort()
             else:
@@ -333,10 +349,12 @@ class RowsModel(QAbstractTableModel):
         old = self.persistentIndexList()
         was = [int(self.order[i.row()]) for i in old]
         self.order, self._keys = order, keys
-        self._shown = np.zeros(len(self.source), bool)
-        self._shown[order] = True
+        if len(self._shown) != len(self.source):  # (the same rows, else: as they were)
+            self._shown = np.zeros(len(self.source), bool)
+            self._shown[order] = True
         if len(old) <= 20:  # looked for in C, a millisecond each
-            where = {p: (int(hit[0]) if len(hit := np.flatnonzero(order == p)) else None) for p in was}
+            same = np.empty(len(order), bool)
+            where = {p: (int(hit[0]) if len(hit := np.flatnonzero(np.equal(order, p, out=same))) else None) for p in was}
         else:
             back = np.full(len(self.source), -1, np.int64)
             back[order] = np.arange(len(order))
@@ -988,7 +1006,7 @@ class TablePage(QWidget):
         selected = {int(self.model.order[i.row()]) for i in chosen}
         current = self.view.currentIndex()
         current_at = int(self.model.order[current.row()]) if current.isValid() else None
-        if step is None or len(picked) < self.model.BIG:
+        if step is None or self.model.here(source, len(picked)):
             self.model.show(source, picked)
         else:
             order = yield from self.model.show_steps(source, picked)
