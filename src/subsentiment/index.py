@@ -770,19 +770,28 @@ def top_words(parts, days: tuple[int, int] | None = None, n: int = 100) -> list[
         every, positive, negative = (a + c[:shared] for a, c in zip((every, positive, negative), counts))
         counted.append((ix.vocab, counts))
     vocab = parts[0][0].vocab if parts else []
+    # Only words that can be among the n biggest are gone through one by one: at least as many as the n-th biggest
+    # count of a set of words each counted no more than it really is (the words every index has, with one index's
+    # others). A new subreddit's words are all past the vocab table, and going through each of them, every time the
+    # word cloud was counted during a fetch, kept the window waiting.
     used = np.flatnonzero(every)
     least = 1
-    if len(used) > n:  # the words with at least the n-th biggest count, ties and all
-        least = np.partition(every[used], len(used) - n)[len(used) - n]
-        used = used[every[used] >= least]
+    for _, counts in counted:
+        known = np.concatenate([every[used], counts[0][shared:][counts[0][shared:] > 0]])
+        if len(known) > n:
+            least = max(least, int(np.partition(known, len(known) - n)[len(known) - n]))
+    used = used[every[used] >= least]
     words = [(vocab[i], int(every[i]), int(positive[i]), int(negative[i])) for i in used]
-    # The rest, by word: only ones some index counts at least least / len(parts) times can add up to least, and a
-    # fetch's new words were thousands, each gone through every time the word cloud was counted.
-    extra: dict[str, list[int]] = {}
-    for names, counts in counted:
-        for i in np.flatnonzero(counts[0][shared:] * len(parts) >= least) + shared:
-            got = extra.setdefault(names[i], [0, 0, 0])
-            for k in range(3):
-                got[k] += int(counts[k][i])
+    # The rest, by word: only ones some index counts at least least / len(parts) times can add up to least, each
+    # then counted in every index.
+    maybe = {names[i] for names, counts in counted
+             for i in np.flatnonzero(counts[0][shared:] * len(parts) >= least) + shared}
+    extra: dict[str, list[int]] = {w: [0, 0, 0] for w in maybe}
+    for (ix, _), (_, counts) in zip(parts, counted):
+        for w, got in extra.items():
+            i = ix._word_ids.get(w, -1)
+            if i >= shared and i < len(counts[0]):
+                for k in range(3):
+                    got[k] += int(counts[k][i])
     words += [(w, a, p, q) for w, (a, p, q) in extra.items() if a]
     return sorted(((w, a, (p - q) / a) for w, a, p, q in words), key=lambda w: (-w[1], w[0]))[:n]

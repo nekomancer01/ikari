@@ -401,3 +401,55 @@ def test_rows_a_fetch_adds_are_found_by_id_without_sorting_every_id_again(saved,
     assert len(at) == len(every) and index.where(every).tolist() == [at[i] for i in every]
     assert index.where(["more9c0_0", "c3_1x"]).tolist() == [-1, -1]
     index.close()
+
+
+@pytest.mark.parametrize("n", [5, 30, 400])
+def test_the_top_words_of_a_new_subreddit_whose_words_are_all_new(tmp_path, n):
+    # Downloading a subreddit saved nowhere yet: every word is past the vocab table, in each index numbered on its
+    # own, and only those that can make the top n are gone through one by one.
+    path = tmp_path / "x.db"
+    s = Store(path)
+    posts, comments = RowIndex(path, "posts", "deltarune"), RowIndex(path, "comments", "deltarune")
+    rng = random.Random(7)
+    vocab = [f"w{k}" for k in range(300)]
+    chat = lambda: " ".join(rng.choices(vocab, weights=[1 / (k + 1) for k in range(300)], k=rng.randint(1, 12)))  # noqa: E731
+    for i in range(60):
+        link = f"https://www.reddit.com/r/Deltarune/comments/p{i}/x/"
+        s.save_post(Post(f"p{i}", "Deltarune", chat(), chat(), "u", rng.choice(SCORES), 0.9, 8, DAY0 + i * 600, link,
+                         link), rng.uniform(-1, 1), rng.choice(LABELS))
+        s.save_comments([Comment(f"c{i}_{j}", f"p{i}", "Deltarune", f"t3_p{i}", "v", chat(), rng.choice(SCORES),
+                                 DAY0 + i * 600 + j, 0, None) for j in range(8)],
+                        [(rng.uniform(-1, 1), rng.choice(LABELS)) for _ in range(8)])
+    s.commit()
+    posts.add(s.rows("posts", "deltarune", words=True))
+    comments.add(s.rows("comments", "deltarune", words=True))
+    assert posts._shared == comments._shared == 0
+    for min_post, min_comment in ((None, None), (10, 1)):
+        expected = WordCounts.top(WordCounts("posts", scoring_at_least(s.rows("posts", "deltarune", words=True), min_post)),
+                                  WordCounts("comments", scoring_at_least(s.rows("comments", "deltarune", words=True), min_comment)),
+                                  n=n)
+        assert top_words([(posts, min_post), (comments, min_comment)], n=n) == expected
+    posts.close()
+    comments.close()
+    s.close()
+
+
+def test_a_new_word_counts_in_every_index_even_where_it_is_rare(saved):
+    # A new word used often in comments and a little in posts: its posts were left out of its count once the
+    # comments alone could put it among the top words.
+    path, s = saved
+    posts, comments = RowIndex(path, "posts", "deltarune"), RowIndex(path, "comments", "deltarune")
+    day = int(clock.time()) // 86400 * 86400 - 3600
+    link = "https://www.reddit.com/r/Deltarune/comments/zp/x/"
+    s.save_post(Post("zp", "Deltarune", "zebraquokka", "", "u", 5, 0.9, 1, day, link, link), 0.5, "positive")
+    s.save_comments([Comment(f"zc{j}", "zp", "Deltarune", "t3_zp", "v", "zebraquokka " * 3, 5, day + j, 0, None)
+                     for j in range(400)], [(0.5, "positive")] * 400)
+    s.commit()
+    posts.add(s.rows("posts", "deltarune", words=True))
+    comments.add(s.rows("comments", "deltarune", words=True))
+    expected = WordCounts.top(WordCounts("posts", s.rows("posts", "deltarune", words=True)),
+                              WordCounts("comments", s.rows("comments", "deltarune", words=True)), n=5)
+    got = top_words([(posts, None), (comments, None)], n=5)
+    assert got == expected and dict((w, k) for w, k, _ in got)["zebraquokka"] == 401
+    posts.close()
+    comments.close()
