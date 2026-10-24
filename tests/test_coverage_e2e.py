@@ -286,6 +286,44 @@ def test_a_long_history_opens_with_the_rows_on_screen_and_reads_off_the_window_t
     assert on_window == [] and downloads() == []
 
 
+def test_rows_scrolled_far_away_give_their_widgets_back_and_are_drawn_again_when_they_return(window):
+    """Two years of days scrolled through. Every row built stayed built, so ticking a day, a download starting or
+    ending, and opening the page again went through every row scrolled past: a fifth to a third of a second with
+    two years. Rows a few screenfuls from the view now lose their widgets, and are built and drawn again as
+    they come back."""
+    w = window
+    for d in range(TODAY - 729 * DAY, TODAY - DAY, DAY):
+        w.store.save_post(post(f"old{d}", "Python", d + 300), 0.0, "neutral")
+    w.store.commit()
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    t, first = c.day_table, c.days[0]
+    tick(c, first)
+    shown = t.cellWidget(0, 1).main.full_text()
+    bar = t.verticalScrollBar()
+    for value in range(0, bar.maximum() + 1, 120):  # a wheel step a frame, to the oldest day
+        bar.setValue(value)
+        QApplication.processEvents()
+    settle(w)
+    built = [row for row in range(t.rowCount()) if t.cellWidget(row, 1) is not None]
+    assert len(built) == len(c.day_rows.built) < 120, len(built)  # before: all 730
+    assert t.cellWidget(0, 1) is None
+    drawn = []
+    real_draw = c.day_rows.draw
+    c.day_rows.draw = lambda row: (drawn.append(row), real_draw(row))
+    c.set_busy(True)  # a download starting redraws the rows still built, not every row scrolled past
+    c.set_busy(False)
+    assert drawn and set(drawn) <= set(built), len(set(drawn))
+    bar.setValue(0)  # back to the newest day: built again, still ticked, its numbers drawn
+    settle(w)
+    assert t.cellWidget(0, 0).findChild(QCheckBox).isChecked()
+    assert t.cellWidget(0, 1).main.full_text() == shown
+    assert c.download_ticked.text() == "Download 1\u00a0day"
+    assert downloads() == []
+
+
 def tick(c, day, shift=False):
     """A real click on a day's tick box, with Shift held for a run of days."""
     box = day_cell(c, c.days.index(day), 0).findChild(QCheckBox)
