@@ -356,14 +356,16 @@ class Collector(QObject):
     """Python's garbage collector, run on the window's thread only. Left to itself it collects whenever enough
     objects have been made, on whichever thread made them: a table reading rows on a thread then deleted the
     widgets of a window closed earlier, there, and Qt crashed (a segfault in Linux CI). So the automatic one is
-    off, and every TICK this collects here instead. Its older generations take long with a big subreddit open (a
-    tenth of a second each), so they wait while the mouse is moving or held, up to DEFER: a scroll or a drag doesn't
-    catch one.
+    off, and every TICK this collects here instead. A pass through every object took 0.15-0.2 s with a big
+    subreddit open, and asked for by name every ten seconds or so it held up a frame each time (live, a year's
+    download). So, as Python's own collector does, it goes through them all only once the objects that have
+    lasted since make a quarter as many again, and then not while the mouse is moving or held, unless that has
+    gone on for DEFER: a scroll or a drag doesn't catch one.
     `start` once a QApplication is up; `lasting` holds it off."""
 
     TICK = 100  # ms
-    STILL = 1.0  # seconds the mouse has been left alone before an older generation is collected
-    DEFER = 10.0  # seconds an older generation waits for that at most
+    STILL = 1.0  # seconds the mouse has been left alone before the whole pass
+    DEFER = 10.0  # seconds the whole pass waits for that at most
     _one: Collector | None = None
     _held = 0  # `lasting` reads going on
     _lock = threading.Lock()
@@ -376,7 +378,9 @@ class Collector(QObject):
         self._timer.timeout.connect(self.collect)
         self._timer.start()
         self._mouse = None  # where the mouse was at the last tick
-        self._moved = self._due = 0.0  # when it last moved or was held; since when an older generation is due
+        self._moved = self._due = 0.0  # when it last moved or was held; since when the whole pass is due
+        self._lasting = 0  # objects in the oldest generation after the last whole pass
+        self._since = 0  # objects moved into it since
 
     @classmethod
     def start(cls) -> None:
@@ -389,17 +393,20 @@ class Collector(QObject):
         # The youngest generation every time (the objects made since, however many were let go meanwhile), and an
         # older one, with those younger, once that many collections of the one below it have gone by.
         counts, limits = gc.get_count(), gc.get_threshold()
-        generation = 2 if counts[2] >= limits[2] else 1 if counts[1] >= limits[1] else 0
-        now, mouse = time.monotonic(), QCursor.pos()
-        if mouse != self._mouse or QGuiApplication.mouseButtons() != Qt.MouseButton.NoButton:
-            self._mouse, self._moved = mouse, now
-        if generation:
+        generation = 1 if counts[1] >= limits[1] else 0
+        if counts[2] >= limits[2] and self._since >= self._lasting // 4:
+            now, mouse = time.monotonic(), QCursor.pos()
+            if mouse != self._mouse or QGuiApplication.mouseButtons() != Qt.MouseButton.NoButton:
+                self._mouse, self._moved = mouse, now
             self._due = self._due or now
-            if now - self._moved < self.STILL and now - self._due < self.DEFER:
-                generation = 0  # the youngest only, which takes no time
-            else:
-                self._due = 0.0
-        gc.collect(generation)
+            if now - self._moved >= self.STILL or now - self._due >= self.DEFER:
+                generation, self._due = 2, 0.0
+        young = len(gc.get_objects(0)) + len(gc.get_objects(1)) if generation == 1 else 0
+        freed = gc.collect(generation)
+        if generation == 1:
+            self._since += max(0, young - freed)  # what's left moved on to the oldest
+        elif generation == 2:
+            self._lasting, self._since = len(gc.get_objects(2)), 0
 
     @classmethod
     @contextmanager
