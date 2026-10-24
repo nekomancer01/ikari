@@ -598,7 +598,8 @@ def _split(texts: list[str]) -> list[tuple[str, ...]]:
 
 
 class _Stopping:
-    """A big Store.upgrade's ``stop`` as its process sees it: set by the window's thread, or that window gone."""
+    """A big Store.upgrade's or export's ``stop`` as its process sees it: set by the window's thread, or that window
+    gone."""
 
     def __init__(self, event):
         self.event = event
@@ -606,6 +607,23 @@ class _Stopping:
     def is_set(self) -> bool:
         parent = multiprocessing.parent_process()
         return self.event.is_set() or parent is not None and not parent.is_alive()
+
+
+def _export_all(path: str, args: tuple, stop, answer) -> None:
+    """Store.export_csv in a process of its own (Store.export): it sends ``answer`` (a Pipe's end) how many
+    rows it wrote, None if ``stop`` (a multiprocessing Event, or the app gone) cut it short, or what stopped it as
+    an OSError of its words alone ("Permission denied", not the .part file's path)."""
+    store = Store(path)
+    try:
+        got = store.export_csv(*args, stop=_Stopping(stop))
+    except OSError as e:  # (the file is open in another program, a folder gone)
+        got = OSError(e.strerror or str(e))
+    finally:
+        store.close()
+    try:
+        answer.send(got)
+    except OSError:  # the app has ended
+        pass
 
 
 def _pack_all(path: str, pack: bool, stop, index: bool = True) -> None:
@@ -1774,10 +1792,52 @@ class Store:
                 days.setdefault(r["d"], [0, 0])[i] = r["n"]
         return {d: (p, c) for d, (p, c) in days.items()}
 
+    def export(self, subreddit: str, kind: str, path: str | Path, days: set[int] | None = None,
+               min_score: int | None = None, stop: threading.Event | None = None, apart: bool = True) -> int | None:
+        """`export_csv`, with ``apart`` in a process of its own: it's Python through and through (24 s for 650,000
+        comments), so on a thread it held the interpreter from the window as much as it gave it (half-second
+        freezes), and the garbage it made was collected on the window's thread. ``stop`` ends it, leaving no file.
+        Written here without ``apart``, if no process can be started, or if one ends without an answer (a build
+        missing a module, say). An OSError comes out with its words alone ("Permission denied"), for the user."""
+        args = (subreddit, kind, str(path), days, min_score)
+        try:
+            if apart:
+                context = multiprocessing.get_context("spawn")
+                try:
+                    stopping = context.Event()
+                    got, sent = context.Pipe(duplex=False)
+                    worker = context.Process(target=_export_all, args=(str(self.path), args, stopping, sent), daemon=True)
+                    worker.start()
+                except Exception:  # noqa: BLE001
+                    return self.export_csv(*args, stop=stop)
+                sent.close()
+                answer = no_answer = object()
+                try:
+                    while worker.is_alive() or got.poll():
+                        if stop is not None and stop.is_set():
+                            stopping.set()
+                        if got.poll(0.2):
+                            answer = got.recv()
+                            break
+                except (EOFError, OSError):  # it ended without an answer (on Windows, polling a closed pipe says so)
+                    pass
+                worker.join()
+                got.close()
+                if isinstance(answer, OSError):
+                    raise answer
+                if answer is not no_answer:
+                    return answer
+                if stopping.is_set():
+                    return None
+            return self.export_csv(*args, stop=stop)
+        except OSError as e:
+            raise OSError(e.strerror or str(e)) from None
+
     def export_csv(self, subreddit: str, kind: str, path: str | Path, days: set[int] | None = None,
-                   min_score: int | None = None) -> int:
+                   min_score: int | None = None, stop: threading.Event | None = None) -> int | None:
         """Write a subreddit's posts or comments to a CSV file: only those created on ``days`` (UTC day
-        starts) when given, and only rows scoring ``min_score`` or more (see `scoring_at_least`). Returns how many rows were written."""
+        starts) when given, and only rows scoring ``min_score`` or more (see `scoring_at_least`). Returns how many rows
+        were written, or None when ``stop`` was set before it finished (no file is written then)."""
         rows = scoring_at_least(self.posts(subreddit) if kind == "posts" else self.comments(subreddit), min_score)
         if days is not None:
             rows = [r for r in rows if r["created_utc"] is not None and int(r["created_utc"] // 86400 * 86400) in days]
@@ -1789,7 +1849,9 @@ class Store:
             with open(part, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
                 w.writerow(columns)
-                for r in rows:
+                for i, r in enumerate(rows):
+                    if i % 5000 == 0 and stop is not None and stop.is_set():
+                        return None
                     w.writerow([_csv_cell(r[c]) for c in columns])
             os.replace(part, path)
         finally:

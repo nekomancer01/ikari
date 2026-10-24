@@ -140,6 +140,7 @@ def when_text(ts: float | None) -> str:
 
 class MainWindow(QMainWindow):
     LOAD_THREAD_FROM = 10_000  # saved posts and comments; a subreddit this big is read on a thread
+    EXPORT_APART_FROM = 10_000  # rows; an export this big is written in a process of its own (Store.export)
     # A big saved subreddit to show at the start is read before the window is made. The app sets it False, so the
     # window shows at once and the subreddit fills in once it's read on a thread.
     wait_for_data = True
@@ -188,7 +189,9 @@ class MainWindow(QMainWindow):
         self.db_path = db_path
         self.store = Store(db_path)
         # Packs the text of data saved before day packs existed, without holding up the window (store.PACKED).
-        # A database from before packs counted their words (version 3) has every row's text split for them.
+        # A database from before packs counted their words (version 3) has every row's text split for them, and so
+        # do an import's rows (_on_import_ended): read meanwhile, a subreddit's words would be split row by row on
+        # the reading thread, holding up the window (a second at a time over 36 s for 650,000 imported comments).
         self._wordless = self.store.db.execute("PRAGMA user_version").fetchone()[0] < 3
         self._upgrade_stop = threading.Event()
         self.upgrading = threading.Thread(target=Store.upgrade, args=(db_path, self._upgrade_stop), daemon=True)
@@ -206,6 +209,12 @@ class MainWindow(QMainWindow):
         self.import_job = BackgroundJob(self)  # merges another database in, on a connection of its own
         self.import_job.ended.connect(self._on_import_ended)
         self._importing: tuple = ()  # (the file being imported, what import_from returned or the error)
+        # Writes a CSV file in a process of its own (Store.export): 650,000 comments took 23 s, with the
+        # window frozen.
+        self.export_job = BackgroundJob(self)
+        self.export_job.ended.connect(self._on_export_ended)
+        self._exporting: tuple = ()  # (kind, file, what it kept, what export returned or the error)
+        self._export_stop = threading.Event()  # the window is closing: the file isn't finished
         self.load_job.ended.connect(self._load_wanted)
         self._wanted: str | None = None  # the subreddit (lowercased) being read on load_job's thread, to show then
         self._stopping = False  # Stop was pressed on the running fetch
@@ -694,6 +703,8 @@ class MainWindow(QMainWindow):
             return "Deleting days\u2026"
         if self.import_job.busy:
             return "Importing saved data\u2026"
+        if self.export_job.busy:
+            return f"Exporting {self._exporting[0]}\u2026"
         if self.coverage.reading() and self.coverage.isVisible():
             return "Reading saved days\u2026"
         if not (self.fetch_job.busy and self._showing_fetch()):
@@ -882,8 +893,8 @@ class MainWindow(QMainWindow):
         self._queued_ids.clear()
 
     def _update_dataset_labels(self) -> None:
-        self.export_posts.setEnabled(bool(self.posts))
-        self.export_comments.setEnabled(bool(self.comments))
+        self.export_posts.setEnabled(bool(self.posts) and not self.export_job.busy)
+        self.export_comments.setEnabled(bool(self.comments) and not self.export_job.busy)
         if not self.current:
             self.heading.setText("No data yet")
             self.subheading.setText(NO_DATA)
@@ -1106,6 +1117,7 @@ class MainWindow(QMainWindow):
         if self.upgrading.is_alive():
             return
         self._upgraded.stop()
+        self._wordless = False
         self._update_delete_enabled()
         for key in [k for k, (_, saved) in self._loaded.items() if not all(getattr(s, "words", True) for s in saved.values())]:
             del self._loaded[key]
@@ -1373,25 +1385,45 @@ class MainWindow(QMainWindow):
         self._refresh_datasets()
 
     def _export(self, kind: str) -> None:
-        if not self.current:
+        if not self.current or self.export_job.busy:
             return
         self._apply_span()  # the span in view now, not as it was before the last zoom settled
         path, _ = QFileDialog.getSaveFileName(self, f"Export {kind}", f"{self.current}_{kind}.csv", "CSV files (*.csv)")
-        if path:
-            try:
-                chosen = None if self._table_days is None else {
-                    d for d in range(*self._table_days, days.DAY)}
-                n = self.store.export_csv(self.current, kind, path, days=chosen, min_score=self.min_scores[kind == "comments"])
-            except OSError as e:  # on Windows, usually the file is still open in Excel
-                QMessageBox.warning(self, "Export failed",
-                                    f"Couldn't save {path}.\n\n{e.strerror or e}\n\n"
-                                    "If the file is open in another program, close it and try again.")
-                return
-            on = "" if chosen is None else (f" from {days.short_date(self._table_days[0], True)} to "
-                                            f"{days.short_date(self._table_days[1] - days.DAY, True)}")
-            if self.min_scores[kind == "comments"] is not None:
-                on += f" scoring {self.min_scores[kind == 'comments']:,}+"
-            self.statusBar().showMessage(f"Exported {n:,} {kind}{on} to {path}", 8000)
+        if not path:
+            return
+        chosen = None if self._table_days is None else {d for d in range(*self._table_days, days.DAY)}
+        min_score = self.min_scores[kind == "comments"]
+        on = "" if chosen is None else (f" from {days.short_date(self._table_days[0], True)} to "
+                                        f"{days.short_date(self._table_days[1] - days.DAY, True)}")
+        if min_score is not None:
+            on += f" scoring {min_score:,}+"
+        apart = len(self.tabs[kind].all_rows) >= self.EXPORT_APART_FROM  # (a process takes a moment to start)
+        worker = StoreWorker(self.db_path, "export", self.current, kind, path, chosen, min_score, self._export_stop, apart)
+        worker.finished.connect(self._exported)
+        worker.failed.connect(self._exported)
+        self._exporting = (kind, path, on, None)
+        self.export_job.start(worker)
+        self.export_posts.setEnabled(False)
+        self.export_comments.setEnabled(False)
+        self.statusBar().showMessage(f"Exporting {kind}{on} to {path}\u2026")
+
+    @Slot(object)
+    def _exported(self, got) -> None:
+        """How many rows export wrote, or the error it raised."""
+        self._exporting = (*self._exporting[:3], got)
+
+    def _on_export_ended(self) -> None:
+        kind, path, on, got = self._exporting
+        self.export_posts.setEnabled(bool(self.posts))
+        self.export_comments.setEnabled(bool(self.comments))
+        if isinstance(got, int):
+            self.statusBar().showMessage(f"Exported {got:,} {kind}{on} to {path}", 8000)
+            return
+        self.statusBar().clearMessage()
+        # On Windows, usually the file is still open in Excel.
+        why = got.removeprefix("OSError: ") if got else "It stopped unfinished."
+        QMessageBox.warning(self, "Export failed", f"Couldn't save {path}.\n\n{why}\n\n"
+                                                    "If the file is open in another program, close it and try again.")
 
     def _import_database(self) -> None:
         """Merge another ikari database (one saved under another account or computer) into this one."""
@@ -1423,6 +1455,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Import failed", f"Couldn't import {path}.\n\n{got or 'It stopped unfinished.'}")
             return
         self._loaded.clear()
+        self._wordless = True  # what it took is read without its words until it's packed (_after_upgrade)
         self.statusBar().showMessage(
             f"Imported {plural(got[0], 'new post')} and {plural(got[1], 'new comment')} from {path}", 8000)
         # What it took is packed there, as an older database's rows are (import is off till it's done).
@@ -1476,7 +1509,10 @@ class MainWindow(QMainWindow):
         self.rescore.stop()
         # Each is one transaction, of which nothing is shown now. A deletion is let end, rather than cut short; an
         # import can take a minute, so app.main ends the process instead and SQLite rolls it back.
-        for writing, wait in ((self.coverage.delete_job, 10000), (self.import_job, 0)):
+        # An export writing its file stops within a few thousand rows and leaves none; one still reading the rows
+        # (half its time) hasn't started the file, so app.main can end the process under it.
+        self._export_stop.set()
+        for writing, wait in ((self.coverage.delete_job, 10000), (self.import_job, 0), (self.export_job, 1000)):
             if writing.busy:
                 writing.worker.finished.disconnect()
                 writing.worker.failed.disconnect()
@@ -1493,5 +1529,5 @@ class MainWindow(QMainWindow):
         closed."""
         return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job,
                                     self.coverage.days_read.job, self.coverage.posts_read.job, self.load_job,
-                                    self.rescore.job, self.import_job)
+                                    self.rescore.job, self.import_job, self.export_job)
                 if j.running()]
