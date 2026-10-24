@@ -27,7 +27,7 @@ from subsentiment.gui.overview import OverviewPage, WordsPage
 from subsentiment.gui.rows import RowList, Rows, Saved, chosen
 from subsentiment.gui.words import KINDS, Rescore, WordTally
 from subsentiment.gui.rail import DRAWERS, PAGES, NavRail
-from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
+from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage, marked
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.widgets import (
@@ -35,7 +35,7 @@ from subsentiment.gui.widgets import (
     plural, section,
 )
 from subsentiment.gui.worker import (
-    BackgroundJob, Collector, FetchWorker, LoadWorker, Slices, StoreWorker, ThreadScorer, finish,
+    BackgroundJob, Collector, FetchWorker, LoadWorker, Slices, StoreRead, StoreWorker, ThreadScorer, finish,
 )
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, scoring_at_least
@@ -224,6 +224,10 @@ class MainWindow(QMainWindow):
         self._live.setSingleShot(True)
         self._live.setInterval(1000)
         self._live.timeout.connect(self._live_refresh)
+        # The saved-data list's counts, read on a thread while a fetch runs: counting a big subreddit's comments took
+        # a tenth of a second, once a second, on this one.
+        self._sets_read = StoreRead(db_path, "datasets", self)
+        self._sets_read.got.connect(self._on_sets_read)
         self._drip = QTimer(self)  # releases fetched rows into the tables a few at a time, so each is seen
         self._drip.setInterval(DRIP_MS[0])
         self._drip.timeout.connect(self._release_rows)
@@ -525,7 +529,8 @@ class MainWindow(QMainWindow):
         self.rescore.finished.connect(self._on_rescore_finished)
         self.rescore.failed.connect(self.words_page.meanings.show_failed)
         self._set_mid_fetch: set[str] = set()  # words set in the subreddit a fetch is saving, scored again after it
-        self._rescored: dict[str, set] = {k: set() for k in KINDS}  # ids rescored, for the tables once it's done
+        # The positions rescored (in the rows they're of), for the tables once it's done.
+        self._rescored: dict[str, tuple] = {k: (None, []) for k in KINDS}
         self.words_page.meanings.changed.connect(self._set_word)
         self.overview.words.word_clicked.connect(self._pick_word)
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
@@ -906,13 +911,15 @@ class MainWindow(QMainWindow):
         # follows the rows as they're counted instead (_count_new).
         if not self.fetch_job.busy or self.request is None:
             return
-        if self._showing_fetch():
-            self._refresh_datasets(reload=False)
-        elif self._follow:
+        if self._follow and not self._showing_fetch():
             self._open_fetched()
         else:
-            self._refresh_datasets(reload=False)
+            self._sets_read.ask()
         self.coverage.refresh_saved()
+
+    def _on_sets_read(self, _asked, sets: list[dict]) -> None:
+        if self.fetch_job.busy:  # (once it's over, the list is read here again)
+            self._refresh_datasets(reload=False, sets=sets)
 
     def _on_finished(self, result: collect.FetchResult) -> None:
         self._loaded.clear()  # what it saved (scores too) is read again, not shown from memory
@@ -975,10 +982,13 @@ class MainWindow(QMainWindow):
 
     # -- datasets -------------------------------------------------------------
 
-    def _refresh_datasets(self, select: str | None = None, reload: bool = True) -> None:
+    def _refresh_datasets(self, select: str | None = None, reload: bool = True, sets: list[dict] | None = None) -> None:
         """Reload the saved-data list, selecting select, else the current dataset, else the newest.
-        With reload=False only the list and storage line change, not the dataset on screen."""
-        sets = self.store.datasets()
+        With reload=False only the list and storage line change, not the dataset on screen. ``sets``: the list as
+        read on a thread (Store.datasets)."""
+        if sets is None:
+            self._sets_read.forget()  # older than this
+            sets = self.store.datasets()
         self._stats = {d["name"].lower(): (d["posts"], d["comments"], d["last_fetched"]) for d in sets}
         names = [d["name"] for d in sets]
         if names != [self.datasets.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.datasets.count())]:
@@ -1208,9 +1218,10 @@ class MainWindow(QMainWindow):
         self._render_overview()
         self._render_words()
 
-    def _render_overview(self, restore: bool = False) -> None:
+    def _render_overview(self, restore: bool = False, moving: bool = False) -> None:
         """Show every saved day on the timeline, and the span's days on the tiles and distribution. With
-        restore, the timeline shows the span the window holds (another subreddit's, as remembered)."""
+        restore, the timeline shows the span the window holds (another subreddit's, as remembered); with moving,
+        the tint and word clouds are left to catch up later (`_render_span`)."""
         scope = self.scope.currentText()
         self._analysis = {k: self._saved[k].analysis(least) for k, least in zip(KINDS, self.min_scores)}
         self._counted = Analysis.combined(
@@ -1225,7 +1236,7 @@ class MainWindow(QMainWindow):
                 chart.set_points(self._counted.daily_means)
             finally:
                 self._following = False
-        self._render_span(ease=restore)
+        self._render_span(moving=moving, ease=restore)
 
     def _render_span(self, moving: bool = False, ease: bool = False) -> None:
         """The tiles and distribution for the span's days. The background's tint (eased to another subreddit's)
@@ -1295,23 +1306,33 @@ class MainWindow(QMainWindow):
             self._set_mid_fetch = set()
 
     def _on_rescored(self, sub: str, kind: str, rows: list) -> None:
-        """Saved items scored again by a subreddit's words: the pages showing it follow, as with a fetch's rows."""
+        """Saved items scored again by a subreddit's words: the timeline and tiles follow, as with a fetch's rows.
+        The word clouds and the background's tint catch up once it's done: easing them to every batch had the
+        cloud drawn over a thousand times."""
         mine = self.current and self.current.lower() == sub
         if not mine:
             self._loaded.pop(sub, None)  # read again when next shown
             return
-        self._saved[kind].rescore([(r["id"], r["sentiment"], r["label"]) for r in rows])
-        self._rescored[kind].update(r["id"] for r in rows)
-        self._render_overview()
+        saved = self._saved[kind]
+        at = saved.rescore([(r["id"], r["sentiment"], r["label"]) for r in rows], [r["words"] for r in rows])
+        source, done = self._rescored[kind]
+        self._rescored[kind] = (saved, (done if source is saved else []) + [at[at >= 0]])
+        self._render_overview(moving=True)
 
     def _on_rescore_finished(self, sub: str) -> None:
-        """The tables (and what export writes) take the rescored rows in one go: each update sorts a table again."""
-        ids, self._rescored = self._rescored, {k: set() for k in KINDS}
+        """The tables (and what export writes) take the rescored rows in one go: each update sorts a table again.
+        The word clouds and tint follow."""
+        rescored, self._rescored = self._rescored, {k: (None, []) for k in KINDS}
         if self.current and self.current.lower() == sub:
+            took = False
             for kind, tab in self.tabs.items():
-                if ids[kind]:
-                    at = self._saved[kind].where(list(ids[kind]))
-                    tab.took(at[np.isin(at, tab.all_rows.at)])
+                source, done = rescored[kind]
+                if source is self._saved[kind] and done:
+                    at = np.unique(np.concatenate(done))
+                    tab.took(at[marked(tab.all_rows.at, at)])
+                    took = True
+            if took:  # (the timeline and tiles have each batch already)
+                self._render_span()
 
     def days_deleted(self, subreddit: str, days: int, posts: int, comments: int) -> None:
         """Download coverage deleted some days of ``subreddit``: if it's still shown, show it again from the store
@@ -1469,6 +1490,7 @@ class MainWindow(QMainWindow):
             QCoreApplication.removePostedEvents(self, QEvent.Type.MetaCall)
         ThreadScorer.close()  # its idle processes would keep the app from exiting
         self._live.stop()  # both read the store
+        self._sets_read.close()
         self._drip.stop()
         self._shown_live.stop()
         self._span_settled.stop()
