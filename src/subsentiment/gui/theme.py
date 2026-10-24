@@ -20,8 +20,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRectF, Qt, QVariantAnimation
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QLinearGradient, QPainter, QPalette, QPen
-from PySide6.QtWidgets import (QApplication, QCalendarWidget, QComboBox, QDateEdit, QLineEdit, QPlainTextEdit, QPushButton,
-                               QSpinBox, QTableView, QWidget)
+from PySide6.QtWidgets import (QApplication, QCalendarWidget, QComboBox, QDateEdit, QLineEdit, QPlainTextEdit, QProxyStyle,
+                               QPushButton, QSpinBox, QTableView, QWidget)
 
 from subsentiment.gui import native
 
@@ -337,9 +337,9 @@ def apply(app: QApplication, requested: str = "system", reduce_transparency: boo
     _mode = system_mode() if requested == "system" else requested
     _reduce = reduce_transparency
     t = tokens()
-    if app.property("fusion") is not True:  # setting it again restyles every widget for nothing
-        app.setStyle("Fusion")
-        app.setProperty("fusion", True)
+    if app.property("outline") is not True:  # setting it again restyles every widget for nothing
+        app.setStyle(Outline("Fusion"))
+        app.setProperty("outline", True)
     pal = QPalette()
     for role, color in [
         (QPalette.ColorRole.Window, t["bg0"]), (QPalette.ColorRole.WindowText, t["text"]),
@@ -353,9 +353,12 @@ def apply(app: QApplication, requested: str = "system", reduce_transparency: boo
         pal.setColor(role, QColor(color))
     for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
         pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(t["faint"]))
-    app.setPalette(pal)
-    Outline.install(app)
-    (window or app).setStyleSheet(stylesheet(t))
+    if app.palette() != pal:  # each change reaches every widget, like a new style sheet
+        app.setPalette(pal)
+    target = window or app
+    sheet = stylesheet(t)
+    if (target.styleSheet() or app.styleSheet()) != sheet:  # Reduce transparency only changes the backdrop's paint
+        target.setStyleSheet(sheet)
 
 
 def mark(widget: QWidget, prop: str, value) -> QWidget:
@@ -435,28 +438,30 @@ class MoodTint(QObject):
         self._window.update()
 
 
-class Outline(QObject):
+class Outline(QProxyStyle):
     """Rounded outlines on whole device pixels: the panels' cards, the tables' boxes and the inputs' edges.
 
     A style sheet border is 1 logical px, 1.5 device pixels at 150% scaling, so it landed as a solid pixel and
     a half-toned one beside it, and its corner arcs and straight sides were drawn apart and met in a nub: the
     fuzzy edge. Outline strokes one path a whole number of device pixels wide on pixel centres, with the
-    same amount of ink as the theme's 1 px edge. One filter on the app paints it after the widget's own paint
-    event, under its children; the style sheet keeps those borders transparent, so layouts don't move.
+    same amount of ink as the theme's 1 px edge. It is the app's style (Fusion underneath), and as it polishes
+    a widget that can take an outline it filters that widget's events, painting the outline after the widget's
+    own paint event, under its children; the style sheet keeps those borders transparent, so layouts don't move.
+    A filter on the whole app ran in Python for every event of every widget: about a quarter of a theme switch.
     """
 
     RADII = {"true": 16, "tile": 10, "solid": 10}  # the panels' "glass" kinds
     INPUTS = (QLineEdit, QSpinBox, QComboBox, QDateEdit, QPlainTextEdit)
     BUTTON_RADII = {"compact": 14, "bar": 16, "glyph": 12}  # the style sheet's QPushButton[pill] sizes
+    KINDS = (QTableView, QPushButton, *INPUTS)
 
-    @classmethod
-    def install(cls, app: QApplication) -> None:
-        if app.property("outline") is not True:
-            app.installEventFilter(cls(app))
-            app.setProperty("outline", True)
+    def polish(self, target):
+        if isinstance(target, self.KINDS) or (isinstance(target, QWidget) and target.property("glass") is not None):
+            target.installEventFilter(self)  # installing it again on a repolish keeps one
+        return super().polish(target)  # (a QPalette or the app too)
 
     def eventFilter(self, obj, event) -> bool:
-        if event.type() != QEvent.Type.Paint or not isinstance(obj, QWidget):
+        if event.type() != QEvent.Type.Paint:
             return False
         shape = self.shape(obj)
         if shape is None:
