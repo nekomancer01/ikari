@@ -35,7 +35,7 @@ from subsentiment.gui.widgets import (
     plural, section,
 )
 from subsentiment.gui.worker import (
-    BackgroundJob, Collector, FetchWorker, LoadWorker, Slices, StoreWorker, ThreadScorer, finish,
+    BackgroundJob, Collector, FetchWorker, LoadWorker, Slices, StoreRead, StoreWorker, ThreadScorer, finish,
 )
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, scoring_at_least
@@ -215,6 +215,10 @@ class MainWindow(QMainWindow):
         self._live.setSingleShot(True)
         self._live.setInterval(1000)
         self._live.timeout.connect(self._live_refresh)
+        # The saved-data list's counts, read on a thread while a fetch runs: counting a big subreddit's comments took
+        # a tenth of a second, once a second, on this one.
+        self._sets_read = StoreRead(db_path, "datasets", self)
+        self._sets_read.got.connect(self._on_sets_read)
         self._drip = QTimer(self)  # releases fetched rows into the tables a few at a time, so each is seen
         self._drip.setInterval(DRIP_MS[0])
         self._drip.timeout.connect(self._release_rows)
@@ -896,13 +900,15 @@ class MainWindow(QMainWindow):
         # follows the rows as they're counted instead (_count_new).
         if not self.fetch_job.busy or self.request is None:
             return
-        if self._showing_fetch():
-            self._refresh_datasets(reload=False)
-        elif self._follow:
+        if self._follow and not self._showing_fetch():
             self._open_fetched()
         else:
-            self._refresh_datasets(reload=False)
+            self._sets_read.ask()
         self.coverage.refresh_saved()
+
+    def _on_sets_read(self, _asked, sets: list[dict]) -> None:
+        if self.fetch_job.busy:  # (once it's over, the list is read here again)
+            self._refresh_datasets(reload=False, sets=sets)
 
     def _on_finished(self, result: collect.FetchResult) -> None:
         self._loaded.clear()  # what it saved (scores too) is read again, not shown from memory
@@ -965,10 +971,13 @@ class MainWindow(QMainWindow):
 
     # -- datasets -------------------------------------------------------------
 
-    def _refresh_datasets(self, select: str | None = None, reload: bool = True) -> None:
+    def _refresh_datasets(self, select: str | None = None, reload: bool = True, sets: list[dict] | None = None) -> None:
         """Reload the saved-data list, selecting select, else the current dataset, else the newest.
-        With reload=False only the list and storage line change, not the dataset on screen."""
-        sets = self.store.datasets()
+        With reload=False only the list and storage line change, not the dataset on screen. ``sets``: the list as
+        read on a thread (Store.datasets)."""
+        if sets is None:
+            self._sets_read.forget()  # older than this
+            sets = self.store.datasets()
         self._stats = {d["name"].lower(): (d["posts"], d["comments"], d["last_fetched"]) for d in sets}
         names = [d["name"] for d in sets]
         if names != [self.datasets.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.datasets.count())]:
@@ -1448,6 +1457,7 @@ class MainWindow(QMainWindow):
             QCoreApplication.removePostedEvents(self, QEvent.Type.MetaCall)
         ThreadScorer.close()  # its idle processes would keep the app from exiting
         self._live.stop()  # both read the store
+        self._sets_read.close()
         self._drip.stop()
         self._shown_live.stop()
         self._span_settled.stop()

@@ -221,3 +221,57 @@ def test_a_fetch_reads_back_what_it_saved_and_sends_it_to_the_window(monkeypatch
     assert sent[0]["posts"][0] == w.since  # each from where the one before left off
     assert all(got[k][0] <= later[k][0] for got, later in zip(sent, sent[1:]) for k in ("posts", "comments"))
     assert all(r.words is not None for got in sent for r in got["comments"][1])  # split there, not in the window
+
+
+def test_the_garbage_collectors_whole_pass_waits_for_enough_new_objects_and_for_the_mouse(monkeypatch):
+    """A pass through every object took 0.15-0.2 s with a big subreddit open, on the window's thread, and ran every
+    ten seconds or so (live, a year's download). It waits until the objects lasting since make a quarter as many
+    again, as Python's own collector does; then, while the mouse moves or is held, up to DEFER. The younger
+    generations go on every tick."""
+    import types
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    asked, clock, mouse = [], [100.0], [QPoint(0, 0)]
+    sizes = {0: 3000, 1: 0, 2: 1_000_000}  # objects in each generation
+
+    def collect(generation):
+        asked.append(generation)
+        if generation == 1:
+            sizes[2] += sizes[0] + sizes[1]
+            sizes[1] = 0
+        return 0
+    fake_gc = types.SimpleNamespace(disable=lambda: None, collect=collect, get_count=lambda: (5, 10, 10),
+                                    get_threshold=lambda: (700, 10, 10), get_objects=lambda g: [None] * sizes[g])
+    monkeypatch.setattr(worker_mod, "gc", fake_gc)
+    monkeypatch.setattr(worker_mod, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(worker_mod, "QCursor", types.SimpleNamespace(pos=lambda: mouse[0]))
+    monkeypatch.setattr(worker_mod.QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.MouseButton.NoButton))
+    collector = worker_mod.Collector()
+    collector._timer.stop()
+
+    def tick(moving=False):
+        if moving:
+            mouse[0] = mouse[0] + QPoint(3, 1)
+        clock[0] += 0.1
+        collector.collect()
+    tick()
+    clock[0] += 2
+    tick()
+    assert asked[-1] == 2  # the first: nothing is known yet about what lasts
+    asked.clear()
+    for _ in range(80):  # 80 x 3,000 objects lasting: under a quarter of the million there
+        tick()
+    assert 2 not in asked and set(asked) == {1}
+    for _ in range(20):  # past it, but the mouse is dragging across a table
+        tick(moving=True)
+    assert 2 not in asked
+    clock[0] += 1.1  # let go of: the whole pass runs
+    tick()
+    assert asked[-1] == 2
+    asked.clear()
+    sizes[0] = 400_000  # a big lot made at once: due again at the next tick
+    for _ in range(int(collector.DEFER / 0.1) + 5):  # due again, and the mouse moves on and on: it runs once DEFER
+        tick(moving=True)                            # has gone by
+    assert asked.count(2) == 1 and asked.index(2) >= collector.DEFER / 0.1 - 1
+    collector.deleteLater()
