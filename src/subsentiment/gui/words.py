@@ -12,6 +12,9 @@ scores the saved posts and comments using it again, a slice at a time, and every
 from __future__ import annotations
 
 import math
+import queue
+import sqlite3
+import threading
 import time
 from collections import Counter
 
@@ -31,6 +34,7 @@ from subsentiment.gui.rows import RowSource, Saved
 from subsentiment.gui.worker import BackgroundJob, LoadWorker, ScorePool, Slices, on_thread
 from subsentiment.index import top_words
 from subsentiment.sentiment import Lexicon
+from subsentiment.store import Store
 
 KINDS = ("posts", "comments")
 _CELL = 2  # px; the word cloud's grid of taken space
@@ -520,26 +524,91 @@ def meaning(weight: float) -> str:
     return f"Slightly {way}" if abs(weight) < 0.35 else f"Very {way}" if abs(weight) > 0.7 else way.capitalize()
 
 
+class ScoreWriter(QObject):
+    """Saves Rescore's new scores on a thread of its own, on a connection of its own: saving a quarter second's
+    and committing them (with SQLite's checkpoint now and then) held the window up for as much as half a second.
+    ``saved`` brings each lot's tag back once it's committed, in the order they were given, with what went wrong
+    saving it ("" when nothing did): a lot that can't be saved (another connection holding the database past
+    SQLite's timeout, each try) is tried TRIES times."""
+
+    saved = Signal(object, str)
+    TRIES = 3
+
+    def __init__(self, db_path: str, parent: QObject | None = None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self._lots: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread: threading.Thread | None = None
+        self._stopping = threading.Event()
+
+    def save(self, scores: dict, tag) -> None:
+        """Save ``scores`` ({kind: [(id, sentiment, label)]}) after what's given before, then send ``tag``."""
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="ScoreWriter", daemon=True)
+            self._thread.start()
+        self._lots.put((scores, tag))
+
+    def stop(self) -> None:
+        """Save what's been given, and end the thread (the window is closing)."""
+        if self._thread is not None:
+            self._stopping.set()  # (tried once more each, not three times)
+            self._lots.put(None)
+            self._thread.join(10)
+            self._thread = None
+            self._stopping.clear()
+
+    def _run(self) -> None:
+        store = None
+        while (lot := self._lots.get()) is not None:
+            scores, tag = lot
+            for tried in range(1, self.TRIES + 1):
+                try:
+                    store = store or Store(self.db_path)
+                    for kind, rows in scores.items():
+                        if rows:
+                            store.rescore(kind, rows)
+                    store.commit()
+                    error = ""
+                    break
+                except Exception as e:  # noqa: BLE001 - locked past its timeout, say
+                    error = f"their new scores couldn't be saved ({e})"
+                    if store is not None:
+                        try:
+                            store.db.rollback()
+                        except sqlite3.Error:
+                            pass
+                    if self._stopping.is_set() or tried == self.TRIES:
+                        break
+                    time.sleep(1.0)
+            try:
+                self.saved.emit(tag, error)
+            except RuntimeError:  # the window has closed
+                break
+        if store is not None:
+            store.close()
+
+
 class Rescore(QObject):
     """Scores a subreddit's saved posts and comments again by its words as they're set now, once some words'
     meanings there changed: only the items using one of those words. They're the rows the window has of it (whose
     text is read on a thread), or else read on a thread (the window's LoadWorker). They're searched for the
     words a slice at a time between frames, and what's found is scored by a ScorePool in other processes, a
-    chunk at a time, or here between frames when there's little of it or the processes can't run. Each is saved
-    as it's scored. Every quarter second what's done is committed and sent out with ``rescored``, so the pages
-    follow as it goes. A change while one runs starts it again with every word it was doing."""
+    chunk at a time, or here between frames when there's little of it or the processes can't run, along with the
+    words each uses. Every quarter second what's been scored is saved by a ScoreWriter on its thread, then sent
+    out with ``rescored``, so the pages follow as it goes. A change while one runs starts it again with every word
+    it was doing."""
 
-    rescored = Signal(str, str, object)  # subreddit (lowercased), "posts" or "comments", [{id, sentiment, label}]
+    # subreddit (lowercased), "posts" or "comments", [{id, sentiment, label, words}]: saved by then
+    rescored = Signal(str, str, object)
     progress = Signal(str, int, int)  # subreddit, thousandths done, 1000
     finished = Signal(str)  # subreddit: every item using the words is scored again and saved
     # Just before finished: subreddit, the words, how many items use them, how many labels the words changed
     # each way ({(label without them, label with them): items}), and how many others' scores were only out of
     # date (scored by an older version).
     scored = Signal(str, object, int, object, int)
-    failed = Signal(str, str)  # subreddit, what went wrong reading its items
+    failed = Signal(str, str)  # subreddit, what went wrong reading its items or saving their scores
 
-    BATCH = 0.25  # seconds between two batches sent out
-    COMMIT = 0.05  # seconds between two commits: other connections (a fetch) wait while one is open
+    BATCH = 0.25  # seconds between two batches saved and sent out
     CHUNK = 200  # items found sent to the processes at once; fewer than this in all are scored here
     SCORE_COST = 400  # scoring an item found takes about as long as searching this many, for the progress
 
@@ -552,6 +621,10 @@ class Rescore(QObject):
         self.pool = ScorePool(self)
         self.pool.scored.connect(self._pooled)
         self.pool.failed.connect(self._unpooled)
+        self.writer = ScoreWriter(db_path, self)
+        self.writer.saved.connect(self._written)
+        self._writing: Counter = Counter()  # batches with the writer, by subreddit
+        self._unsaved: dict[str, str] = {}  # subreddit -> what went wrong saving some of its run's scores
         self._todo: dict[str, set[str]] = {}  # subreddit -> words to rescore for, waiting their turn
         self._doing: tuple[str, set[str]] | None = None
         self._rows: dict[str, dict | None] = {}  # what start was given to go through, by subreddit
@@ -566,7 +639,7 @@ class Rescore(QObject):
         self._lexicon: tuple[dict, frozenset] = ({}, frozenset())  # the run's weights, and the words it's for
         self._counts = [0, 0, 0, 0]  # the run's items to search, searched, found and scored
         self._shown = 0  # how far it's got, in thousandths, as last sent
-        self._sent_at = self._committed_at = 0.0
+        self._sent_at = 0.0
 
     def start(self, subreddit: str, words, rows: dict | None = None) -> None:
         """Rescore for ``words``; ``rows`` ({kind: rows, or a rows.RowSource}) are every saved post and comment of
@@ -582,15 +655,18 @@ class Rescore(QObject):
         self._next()
 
     def running(self, subreddit: str | None = None) -> bool:
+        """Whether a subreddit (any) is being rescored, or what's been is still being saved."""
         doing = [self._doing[0]] if self._doing else []
-        return any(subreddit is None or s == subreddit.lower() for s in [*doing, *self._todo])
+        return any(subreddit is None or s == subreddit.lower() for s in [*doing, *self._todo, *self._writing])
 
     def stop(self) -> None:
-        """Save what's been rescored and stop (the window is closing); its read's thread is waited for."""
+        """Save what's been rescored and stop (the window is closing); its read's and writer's threads are
+        waited for."""
         self._todo.clear()
         self._rows.clear()
         self._drop()
         self.pool.close()
+        self.writer.stop()
         if self.job.busy:
             self.job.worker.finished.disconnect()
             self.job.worker.failed.disconnect()
@@ -609,8 +685,8 @@ class Rescore(QObject):
         self._out, self._retry = 0, []
 
     def _next(self) -> None:
-        if self._doing is not None or self.job.busy or not self._todo:
-            return
+        if self._doing is not None or self.job.busy or not self._todo or self._writing:
+            return  # (the next run reads the scores saved: once they all are)
         sub = next(iter(self._todo))
         self._doing = (sub, self._todo.pop(sub))
         self._run += 1
@@ -638,7 +714,7 @@ class Rescore(QObject):
                 for key in TEXT[kind]:
                     yield from rows[kind].read_values(key)
         self._counts, self._shown = [sum(map(len, rows.values())), 0, 0, 0], 0
-        self._sent_at = self._committed_at = time.perf_counter()
+        self._sent_at = time.perf_counter()
         chunk, sent = [], False
         for kind in KINDS:
             for r, text in self._texts(kind, rows[kind]):
@@ -658,19 +734,19 @@ class Rescore(QObject):
 
     @staticmethod
     def _texts(kind: str, rows):
-        """(a call giving the row, its text) for each of ``rows`` (a list, or a rows.RowSource): what a source has
-        of a row found is its id, score and label."""
+        """(a call giving the row's (id, sentiment, label), its text) for each of ``rows`` (a list, or a
+        rows.RowSource). As a tuple, a row found waiting to be scored is let alone by the garbage collector: as dicts,
+        those waiting doubled how long each of its passes held up the window."""
         def text(*parts):
             return (parts[0] or "") if kind == "comments" else f"{parts[0] or ''}\n\n{parts[1] or ''}".strip()
         if not isinstance(rows, RowSource):
             for r in rows:
-                yield (lambda r=r: r), text(*(r[k] for k in TEXT[kind]))
+                yield (lambda r=r: (r["id"], r["sentiment"], r["label"])), text(*(r[k] for k in TEXT[kind]))
             return
         ids, sentiment, label = rows.ids, rows.sentiment, rows.label
         for i, parts in enumerate(zip(*(rows.values(k) for k in TEXT[kind]))):
-            yield (lambda i=i: {"id": ids[i].decode() if isinstance(ids[i], bytes) else ids[i],
-                                "sentiment": float(sentiment[i]), "label": LABELS[label[i]] if label[i] >= 0 else None}
-                   ), text(*parts)
+            yield (lambda i=i: (ids[i].decode() if isinstance(ids[i], bytes) else ids[i], float(sentiment[i]),
+                                LABELS[label[i]] if label[i] >= 0 else None)), text(*parts)
 
     def _submit(self, sub: str, chunk: list) -> None:
         self._out += 1
@@ -679,7 +755,7 @@ class Rescore(QObject):
     def _score_here(self, sub: str, chunks: list[list]):
         for chunk in chunks:
             for item in chunk:
-                self._apply(sub, [item], Lexicon.compare(*self._lexicon, [item[2]]))
+                self._apply(sub, [item], Lexicon.compare(*self._lexicon, [item[2]], split=True))
                 yield
 
     def _pooled(self, tag, results: list) -> None:
@@ -707,59 +783,70 @@ class Rescore(QObject):
             self._finished()
 
     def _apply(self, sub: str, items: list, results: list) -> None:
-        """Keep and save the scores ``results`` of ``items`` [(kind, row, text)], and tell what they changed."""
+        """Keep the scores ``results`` of ``items`` [(kind, (id, sentiment, label), text)] to save, and tell what
+        they changed."""
         using, changed, stale = self._tally.setdefault(sub, (set(), {}, set()))
-        saves = {k: [] for k in KINDS}
-        for (kind, r, _), (s, label, usual) in zip(items, results):
-            item = (kind, r["id"])
+        for (kind, (rid, was, was_label), _), (s, label, usual, words) in zip(items, results):
+            item = (kind, rid)
             using.add(item)
             if label != usual:
                 changed[item] = (usual, label)
             else:
                 changed.pop(item, None)
-                if label != r["label"]:
+                if label != was_label:
                     stale.add(item)
-            if (s, label) != (r["sentiment"], r["label"]):
-                self._batch[kind].append({"id": r["id"], "sentiment": s, "label": label})
-                saves[kind].append((r["id"], s, label))
-        for kind, scores in saves.items():
-            if scores:
-                self.store.rescore(kind, scores)
+            if (s, label) != (was, was_label):
+                self._batch[kind].append({"id": rid, "sentiment": s, "label": label, "words": words})
         self._counts[3] += len(items)
         self._tick(sub)
 
     def _tick(self, sub: str) -> None:
-        """Commit now and then, and send out what's done every BATCH seconds, with how far it's got."""
-        now = time.perf_counter()
-        if now - self._sent_at > self.BATCH:
+        """Save what's done every BATCH seconds, and tell how far it's got."""
+        if time.perf_counter() - self._sent_at > self.BATCH:
             self._save(sub)
             total, searched, found, scored = self._counts
             likely = found * total / max(searched, 1)  # found by the end, at this rate
             done = (searched + self.SCORE_COST * scored) / max(total + self.SCORE_COST * likely, 1)
             self._shown = max(self._shown, round(1000 * done))  # an estimate that grew doesn't take it back
             self.progress.emit(sub, self._shown, 1000)
-            self._sent_at = self._committed_at = time.perf_counter()
-        elif now - self._committed_at > self.COMMIT:
-            self.store.commit()
-            self._committed_at = now
+            self._sent_at = time.perf_counter()
 
-    def _save(self, sub: str) -> None:
-        self.store.commit()
-        for kind, rows in self._batch.items():
-            if rows:
-                self.rescored.emit(sub, kind, rows)
-        self._batch = {k: [] for k in KINDS}
+    def _save(self, sub: str, then=None) -> None:
+        """Hand what's been rescored to the writer; it's sent out once saved, and ``then`` called."""
+        batch, self._batch = self._batch, {k: [] for k in KINDS}
+        if any(batch.values()) or then is not None:
+            self._writing[sub] += 1
+            self.writer.save({k: [(r["id"], r["sentiment"], r["label"]) for r in rows] for k, rows in batch.items()},
+                             (sub, batch, then))
+
+    def _written(self, tag, error: str) -> None:
+        sub, batch, then = tag
+        self._writing[sub] -= 1
+        if not self._writing[sub]:
+            del self._writing[sub]
+        if error:  # the pages keep the scores those items had; told once the run is done
+            self._unsaved[sub] = error
+        else:
+            for kind, rows in batch.items():
+                if rows:
+                    self.rescored.emit(sub, kind, rows)
+        if then is not None:
+            error = self._unsaved.pop(sub, "")
+            if error:  # what it did isn't what's saved: the pages catch up on what is, and it says what went wrong
+                self.finished.emit(sub)
+                self.failed.emit(sub, error)
+            else:
+                then()
+        self._next()
 
     def _finished(self) -> None:
         sub, words = self._doing
-        self._save(sub)
         self._doing = None
         if not self._todo:
             self.pool.rest()
         using, changed, stale = self._tally.pop(sub, (set(), {}, set()))
-        self.scored.emit(sub, words, len(using), Counter(changed.values()), len(stale - changed.keys()))
-        self.finished.emit(sub)
-        self._next()
+        self._save(sub, lambda: (self.scored.emit(sub, words, len(using), Counter(changed.values()),
+                                                  len(stale - changed.keys())), self.finished.emit(sub)))
 
 
 class MeaningSlider(QSlider):
