@@ -141,7 +141,7 @@ class _Word:
         self.tint = t0 + (WordCloud.hue(self.lean)[1] - t0) * move
 
 
-class WordCloud(QWidget):
+class WordCloud(theme.OnCard):
     """Words placed outward from the middle along a spiral, the most used first and biggest, each where it
     overlaps none placed before it. Words that don't fit are left out. Hovering one says how many items use
     it and how they split.
@@ -159,6 +159,7 @@ class WordCloud(QWidget):
     PULL = 0.06  # of the way to the middle, a step a word takes each update where that's free
     FAR = 0.3  # of the widget's shorter side: a word moved further fades out and in rather than sliding
     RESHAPE = 0.15  # a change of width or height up to this share keeps the words where they are
+    RESIZE_HOLD_MS = 120  # a size still changing (a window edge dragged) is let settle this long before placing
 
     word_clicked = Signal(str)
 
@@ -192,6 +193,10 @@ class WordCloud(QWidget):
         self._drawn: QPixmap | None = None  # the words at rest, and what for
         self._drawn_for = None
         self._next_drawn = (None, None)  # the same for the words being placed
+        # While the size keeps changing the words stay as they were placed, centred (_offset), and are placed for
+        # the size it ends at: placing them again at every step of a resize took longer than the frame.
+        self._resizing = QTimer(self, singleShot=True, interval=self.RESIZE_HOLD_MS)
+        self._resizing.timeout.connect(self.update)
 
     def set_words(self, words: list[tuple[str, int, float]], busy: bool = False,
                   meant: dict[str, float] | None = None) -> None:
@@ -209,6 +214,7 @@ class WordCloud(QWidget):
 
     def placed(self) -> list[tuple[QRectF, str, int, float, float]]:
         """Where each shown word is drawn (for tests and the tooltip), placing any still to place."""
+        self._resizing.stop()
         self._layout()
         while self._placing is not None:
             self._slices.stop()
@@ -222,7 +228,8 @@ class WordCloud(QWidget):
         """Start placing the words if they or the size changed; they go down a few each frame, the biggest
         first, so a new layout never holds up the window. Words changed while one is placed are placed next."""
         key, before = (self.width(), self.height(), self._version), self._placed_for
-        if self._placing is None and before != key:
+        held = self._resizing.isActive() and before is not None and before[2] == key[2]  # (new words aren't)
+        if self._placing is None and before != key and not held:
             # A small change of size (a strip appearing above, a window edge dragged) keeps the words where they
             # are, moved with it; a big one lays the cloud out afresh to fill its new shape.
             near = before is not None and all(abs(a - b) <= self.RESHAPE * b for a, b in zip(key[:2], before[:2]))
@@ -234,6 +241,9 @@ class WordCloud(QWidget):
         """Ease every word to where it was just placed, from where it is on screen; straight there after a big
         resize or with motion off, and popping in on a page just opened."""
         key, painted, near = self._placing_for
+        dx, dy = self._offset(key)  # where the words were drawn while they waited, so they ease on from there
+        for w in self._shown.values():
+            w.x, w.y = w.x + dx, w.y + dy
         self._placing, self._placed_for, self._placed = None, key, self._next
         self._drawn, self._drawn_for = self._next_drawn
         # Placed for a cloud that wasn't on screen (a page just opened): the words pop in instead.
@@ -263,6 +273,13 @@ class WordCloud(QWidget):
             self._step(1.0)
             self._settled()
 
+    def _offset(self, size: tuple | None = None) -> tuple[int, int]:
+        """How far the words placed for another size (the size before a resize) are moved to stay centred in
+        ``size`` (by default the cloud's own)."""
+        w, h = size[:2] if size else (self.width(), self.height())
+        placed = self._placed_for
+        return (0, 0) if placed is None else ((w - placed[0]) // 2, (h - placed[1]) // 2)
+
     def _step(self, t: float) -> None:
         move, grow = self._move.valueForProgress(t), self._grow.valueForProgress(t)
         self._moved = move
@@ -288,7 +305,7 @@ class WordCloud(QWidget):
             return
         if len(self._sprites) > 2000:  # pictures of words long gone, and of sizes they had
             self._sprites.clear()
-        w, h = self.width(), self.height()
+        w, h = self._placing_for[0][:2]  # the size placed for, though it may change while they're placed
         most, least = self._words[0][1], self._words[-1][1]
         # Narrow (the Words page beside its meanings card) caps it too, so a word of up to nine letters fits across
         # at the biggest size: words used as often stay the same size, and only longer ones are shrunk below.
@@ -378,14 +395,15 @@ class WordCloud(QWidget):
             if word in self._shown:
                 self._sprite(word, px, colors[self.hue(self._shown[word].lean)[0]], dpr)
             yield
-        steps = self._draw(self._next, colors, dpr)
+        steps = self._draw(self._next, colors, dpr, QSize(w, h))
         picture = next(steps)
         yield from steps
         self._next_drawn = (picture, (self._placing_for[0], dpr, tuple(colors.values())))
 
-    def _draw(self, placed: list, colors: dict, dpr: float):
-        """Draw the words at rest into a picture: yields the picture, then once after each word."""
-        picture = QPixmap(self.size() * dpr)
+    def _draw(self, placed: list, colors: dict, dpr: float, size: QSize):
+        """Draw the words at rest, placed for ``size``, into a picture: yields the picture, then once after each
+        word."""
+        picture = QPixmap(size * dpr)
         picture.setDevicePixelRatio(dpr)
         picture.fill(Qt.GlobalColor.transparent)
         yield picture
@@ -444,7 +462,7 @@ class WordCloud(QWidget):
     def paintEvent(self, event) -> None:
         self._layout()
         colors = palette()
-        p = QPainter(self)
+        p = self.painter()
         if self._placing is not None and not self._placing_for[1]:
             return  # the words that were here before it was shown aren't shown again; the new ones pop in shortly
         if not self._shown:
@@ -454,6 +472,7 @@ class WordCloud(QWidget):
             self._painted = True
             return
         dpr = self.devicePixelRatioF()
+        p.translate(*self._offset())
         if self._anim.state() == QVariantAnimation.State.Running:
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             for w in self._shown.values():
@@ -474,7 +493,7 @@ class WordCloud(QWidget):
         # word again.
         key = (self._placed_for, dpr, tuple(colors.values()))
         if self._drawn_for != key:  # drawn as the words were placed, unless the theme or screen changed since
-            steps = self._draw(self._placed, colors, dpr)
+            steps = self._draw(self._placed, colors, dpr, QSize(*self._placed_for[:2]))
             self._drawn, self._drawn_for = next(steps), key
             for _ in steps:
                 pass
@@ -482,11 +501,17 @@ class WordCloud(QWidget):
         p.drawPixmap(0, 0, self._drawn)
         self._painted = True
 
+    def resizeEvent(self, event) -> None:
+        if self._placed_for is not None and self._painted and self.isVisible():
+            self._resizing.start()  # placed again once the size holds still
+        super().resizeEvent(event)
+
     def hideEvent(self, event) -> None:
         self._painted = False  # shown again, it starts from its new words rather than easing from old ones
         super().hideEvent(event)
 
     def word_at(self, pos: QPointF) -> str | None:
+        pos = pos - QPointF(*self._offset())
         return next((b[1] for b in self._placed if b[0].contains(pos)), None)
 
     def mouseMoveEvent(self, e) -> None:

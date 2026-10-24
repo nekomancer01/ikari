@@ -587,6 +587,25 @@ class Outline(QProxyStyle):
         p.drawRoundedRect(box.adjusted(half, half, -half, -half), r - half, r - half)
 
 
+class OnCard(QWidget):
+    """A widget that fills a card ("tile" or "true" panel, whose fill is the opaque panel colour) and paints that
+    colour under itself first (``painter``), so Qt paints nothing under it: a frame of it alone (a zoom's, a word
+    cloud easing) then repaints just it, not the window's backdrop, its wash, the page and the card again under it,
+    and a whole window (a resize step) paints that much less. Its pixels are the same either way."""
+
+    def event(self, e) -> bool:
+        done = super().event(e)
+        if e.type() in (QEvent.Type.Polish, QEvent.Type.StyleChange):  # the style sheet's polish turns it off
+            self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        return done
+
+    def painter(self) -> QPainter:
+        """A painter for paintEvent, on the card's colour (every pixel is painted, as Qt now counts on)."""
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(tokens()["panel"]))
+        return p
+
+
 def paint_popup(widget: QWidget, shadow: int) -> None:
     """A popup's card: the menu color in a rounded hairline outline, inset by ``shadow`` px for a soft shadow
     around it. The popup window needs WA_TranslucentBackground so the corners and shadow show through."""
