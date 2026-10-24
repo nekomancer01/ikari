@@ -245,6 +245,37 @@ def test_a_running_fetch_counts_its_rows_into_the_overview_without_reading_every
         writer.close()
 
 
+def test_a_running_fetch_counts_the_saved_data_list_on_a_thread(window, monkeypatch):
+    """Counting a big subreddit's comments for the saved-data list took a tenth of a second, once a second, on the
+    window's thread for as long as a fetch ran."""
+    import threading
+    window.fetch_job.qthread = object()  # a fetch is "running" on the subreddit shown
+    window.request = mw.collect.FetchRequest("Big")
+    window._since = time.time() - 1
+    window._read_to = {"posts": window._since, "comments": window._since}
+    on = []
+    real = Store.datasets
+    monkeypatch.setattr(Store, "datasets", lambda self: on.append(threading.current_thread()) or real(self))
+    writer = Store(window.db_path)
+    writer.db.execute(f"INSERT INTO comments ({','.join(COMMENT_COLUMNS)}) SELECT 'fresh', post_id, subreddit, parent_id, "
+                      "author, 'hi', 1, created_utc, depth, permalink, 0.1, 'neutral', ? FROM comments WHERE id = 'c1'",
+                      (time.time(),))
+    writer.commit()
+    try:
+        window._live_refresh()
+        end = time.monotonic() + 10
+        while getattr(window, "_sets_read", None) and window._sets_read.busy and time.monotonic() < end:
+            QApplication.processEvents()
+            time.sleep(0.005)
+        QApplication.processEvents()
+        assert on and threading.main_thread() not in on
+        assert window._stats["big"][1] == COMMENTS + 1  # the list counts the new comment
+        assert f"{COMMENTS + 1:,}\xa0comments" in window.storage_info.text()
+    finally:
+        window.fetch_job.qthread = None
+        writer.close()
+
+
 def test_typing_a_filter_keeps_the_selected_row_selected(window):
     tab = window.comments_tab
     pick = next(i for i in range(tab.model.rowCount()) if tab.model.row_at(i)["body"].startswith("Great work"))

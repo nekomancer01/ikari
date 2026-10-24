@@ -386,13 +386,15 @@ class RowIndex:
         return (reader or self._reader).text(pack, int(self._at[i]), self.ids[i].decode(), float(self.created[i]))
 
     def column(self, name: str, start: int = 0, stop: int | None = None) -> list[str | None]:
-        """One text column (of store.PACKED[kind], or "post_title" for comments) of rows ``start`` to ``stop``, in
-        order: for sorting or filtering a table by it. Each frame is decoded once (about 5 ms per thousand
-        comments), so ask for a few thousand rows at a time. It reads on a connection of its own, so a thread can
-        run it while the window draws `rows`."""
+        """One column of rows ``start`` to ``stop``, in order: for sorting or filtering a table by it. Any saved
+        column, or "post_title" for comments, but not a comment's permalink (`rows` rebuilds it from its post's).
+        Text in packs is read from their frames, each decoded once (about 5 ms per thousand comments), so ask for a
+        few thousand rows at a time; other columns from the rows. It reads on a connection of its own, so a thread
+        can run it while the window draws `rows`."""
         stop = len(self.ids) if stop is None else min(stop, len(self.ids))
-        if name != "post_title" and name not in PACKED[self.kind] or name == "post_title" and self.kind != "comments":
-            raise ValueError(f"{name} isn't a text column of {self.kind}")
+        readable = POST_COLUMNS if self.kind == "posts" else (*COMMENT_COLUMNS, "post_title")
+        if name not in readable or name == "permalink" and self.kind == "comments":
+            raise ValueError(f"{name} isn't a column of {self.kind} read as it's saved")
         with self._lock:
             if self._bulk is CLOSED:
                 raise ValueError("the index is closed")
@@ -404,6 +406,8 @@ class RowIndex:
         ids = [i.decode() for i in ids]
         if name == "post_title":
             return reader.post_titles(ids)
+        if name not in PACKED[self.kind]:
+            return [value for _, value in reader.by_id(name, ids, created)]
         out: list = [None] * len(ids)
         unread = np.flatnonzero(packs < 0).tolist()  # read from their row, or their whole pack
         for pack in np.unique(packs[packs >= 0]):
@@ -528,11 +532,13 @@ class RowIndex:
             return tuple(words_in(row["body"] or ""))
         return tuple(words_in(f"{row['title'] or ''} {row['selftext'] or ''}"))
 
-    def _words_at(self, i: int) -> np.ndarray:
-        """Row ``i``'s word ids, as it's counted now: split again from its pack's text when it's packed."""
+    def _words_at(self, i: int, split=None) -> np.ndarray:
+        """Row ``i``'s word ids, as it's counted now: when it's packed, those of ``split`` (its words, as they were
+        split from its text elsewhere), or else split again from its pack's text."""
         got = self._loose.get(self.ids[i])
         if got is None:
-            got = np.array([self._word_id(w) for w in self._words_of(self.text(i))], np.int64)
+            words = self._words_of(self.text(i)) if split is None else split
+            got = np.array([self._word_id(w) for w in words], np.int64)
         return got
 
     def reorder(self) -> np.ndarray:
@@ -552,16 +558,18 @@ class RowIndex:
         self._sorted_ids = None
         return order
 
-    def rescore(self, scores) -> None:
-        """New scores, [(id, sentiment, label)], as store.Store.rescore saves them. A packed row's words are split
-        again from its text to move them to its new label, so rescoring most of a subreddit is quicker as a new
-        index."""
+    def rescore(self, scores, split=None) -> np.ndarray:
+        """New scores, [(id, sentiment, label)], as store.Store.rescore saves them; returns their positions (-1 for
+        one not here). A row's words move to its new label: a packed one's are ``split``'s (each one's words, as
+        analysis.words_in split its text elsewhere), or else split again from its text, so rescoring most of a
+        subreddit that way is quicker as a new index."""
         scores = list(scores)
         at = self.where([i for i, _, _ in scores])
         known = at >= 0
         positions = at[known]
         self._count(positions, -1)
-        words = [self._words_at(int(a)) for a in positions] if self.with_words else []
+        split = [None] * len(scores) if split is None else split
+        words = [self._words_at(a, w) for a, w, k in zip(at.tolist(), split, known) if k] if self.with_words else []
         if words:
             self._change(words, self.created[positions], self.label[positions], self.score[positions], -1)
         self.sentiment[positions] = [s for (_, s, _), k in zip(scores, known) if k]
@@ -569,6 +577,7 @@ class RowIndex:
         self._count(positions, 1)
         if words:
             self._change(words, self.created[positions], self.label[positions], self.score[positions], 1)
+        return at
 
     def close(self) -> None:
         with self._lock:
@@ -695,17 +704,17 @@ class PackReader:
             return out
 
     def by_id(self, name: str, ids: list[str], created: np.ndarray):
-        """(k, value) of column ``name`` of rows ``ids``, from their rows, or their whole packs once packed."""
+        """(k, value) of column ``name`` of rows ``ids``, from their rows, or their whole packs for packed text."""
         with self.lock:
             got = {}
             for k in range(0, len(ids), 500):
                 chunk = ids[k:k + 500]
                 got.update((i, (packed, v)) for i, packed, v in self.db.execute(
                     f"SELECT id, packed, {name} FROM {self.kind} WHERE id IN ({', '.join('?' * len(chunk))})", chunk))
-            at, checked = PACKED[self.kind].index(name), set()
+            at, checked = PACKED[self.kind].index(name) if name in PACKED[self.kind] else None, set()
             for k, rid in enumerate(ids):
                 packed, value = got.get(rid, (0, None))
-                if packed:
+                if packed and at is not None:
                     value = (self.whole(self.kind, float(created[k]), checked).get(rid) or [None] * len(PACKED[self.kind]))[at]
                 yield k, value
 

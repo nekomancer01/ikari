@@ -4,6 +4,7 @@ settles, a step a frame. Work is counted (paints, recounts, reads), not timed, s
 runner too; tools/perf.py measures the frame times themselves."""
 import os
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -13,9 +14,9 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QPointF, QSettings, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QSettings, Qt  # noqa: E402
 from PySide6.QtGui import QMouseEvent, QWheelEvent  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from subsentiment import analysis  # noqa: E402
 from subsentiment.analysis import WordCounts  # noqa: E402
@@ -439,3 +440,137 @@ def test_opening_a_big_subreddit_on_a_thread_leaves_the_garbage_collector_to_fre
     until(lambda: w.current == "Other" and not w.load_job.busy)
     until(lambda: gone() is None)  # collected by the window's collector
     assert gc.get_freeze_count() == frozen
+
+
+class Paints(QObject):
+    """Counts a widget's paint events."""
+
+    def __init__(self, widget):
+        super().__init__()
+        self.count = 0
+        widget.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        self.count += event.type() == QEvent.Type.Paint
+        return False
+
+
+def test_a_page_fade_holds_the_new_page_as_a_picture_but_shows_what_eases_on_it(window, monkeypatch):
+    # Every frame of a page's 220 ms fade repainted the whole page under the old look's still (25-100 ms a
+    # click, 6-12 frames over budget). The new look is a picture now, grabbed again whole only now and then.
+    w = window
+    monkeypatch.setattr(motion, "_os_allows", True)
+    monkeypatch.setattr(motion, "_wanted", True)
+    w.show_page("posts")
+    until(lambda: not motion.fading(w.content))
+    paints = Paints(w.overview.timeline)
+    w.show_page("overview")
+    fade = w.content.findChild(QWidget, "motion-snapshot")
+    for t in range(16, motion.VIEW_MS, 16):  # a frame at a time, quicker than the fade's own clock
+        fade.anim.setCurrentTime(t)
+        QApplication.processEvents()
+    assert paints.count <= 3  # grabbed whole on the first frame, and again only once REGRAB_MS has passed
+    until(lambda: not motion.fading(w.content))
+
+    # A count easing under a fade is grabbed again on every frame, so it eases as it would without the fade:
+    # the picture matches the window drawn afresh there.
+    def drawn(widget, picture=None):
+        window_ = widget.window()
+        at = widget.mapTo(window_, QPoint(0, 0))
+        if picture is None:  # the window drawn afresh, without the fade
+            fade.hide()
+            picture = window_.grab(fade.rect().translated(fade.parentWidget().mapTo(window_, QPoint(0, 0))
+                                                          - fade._lead))
+            fade.show()
+        origin = fade.parentWidget().mapTo(window_, QPoint(0, 0)) - fade._lead
+        dpr = picture.devicePixelRatio()
+        return picture.copy(QRect((at - origin) * dpr, widget.size() * dpr)).toImage()
+    w.show_page("words")
+    until(lambda: not motion.fading(w.content))
+    w.show_page("overview")
+    fade = w.content.findChild(QWidget, "motion-snapshot")
+    fade.anim.setCurrentTime(16)  # the first frame grabs the new look whole
+    fade._grabbed = time.monotonic()  # and no whole grab after: only what moves
+    count = w.overview.tiles["count"].value
+    count._count.set(count._count.value + 5000)  # as a new span's count eases in
+    count._count._anim.setCurrentTime(motion.DATA_MS // 2)
+    fade.anim.setCurrentTime(32)
+    assert drawn(count, fade._under) == drawn(count)
+
+
+SCROLL_AT_150 = """
+import sys, time
+import numpy as np
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QSettings, Qt
+from PySide6.QtGui import QWheelEvent
+from PySide6.QtWidgets import QApplication
+from subsentiment.gui import main_window as mw, motion, theme
+app = QApplication([])
+app.setOrganizationName("subsentiment-test")
+app.setApplicationName("scroll-150")
+theme.load_fonts(app)
+theme.apply(app, "light")  # as the app starts: the style sheet makes the table see-through
+QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, sys.argv[2])
+QSettings().setValue("updates/auto", False)
+motion.set_enabled(False)
+w = mw.MainWindow(sys.argv[1])
+w.resize(1280, 760)  # 1920x1200 at 150%, restored
+w.show()
+def pump(done, seconds=20):
+    end = time.monotonic() + seconds
+    while not done() and time.monotonic() < end:
+        app.processEvents()
+        time.sleep(0.005)
+w.show_page("posts")
+view, model = w.posts_tab.view, w.posts_tab.model
+viewport = view.viewport()
+pump(lambda: view.verticalScrollBar().maximum() > 6 and not w.posts_tab.busy())
+pump(lambda: False, 1.5)  # the counts and the mood tint have eased in
+class Paints(QObject):
+    area = 0
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Paint:
+            self.area += sum(r.width() * r.height() for r in event.region())
+        return False
+paints, under = Paints(), Paints()
+viewport.installEventFilter(paints)
+w.installEventFilter(under)  # the window's backdrop, under the table
+pixels = lambda i: np.frombuffer(i.constBits(), np.uint8).reshape(i.height(), -1).astype(int)
+print("dpr", w.devicePixelRatioF())
+worst, shares = 0, []
+for dy in (-120,) * 4 + (120,) * 2:
+    paints.area = under.area = 0
+    QApplication.sendEvent(viewport, QWheelEvent(QPointF(200, 60), QPointF(viewport.mapToGlobal(QPoint(200, 60))),
+                                                 QPoint(), QPoint(0, dy), Qt.MouseButton.NoButton,
+                                                 Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False))
+    app.processEvents()
+    # Before rows read on a thread are drawn: what the notch drew of the table, and of the window under it.
+    shares.append(max(paints.area, under.area) / (viewport.width() * viewport.height()))
+    pump(lambda: not model._reads.running() and not model._asked)
+    app.processEvents()
+    moved = pixels(w.backingStore().paintDevice().copy())
+    w.repaint()  # all of it drawn again
+    worst = max(worst, int(np.abs(moved - pixels(w.backingStore().paintDevice().copy())).max()))
+print("worst", worst)
+print("drawn", max(shares))
+"""
+
+
+def test_scrolling_a_table_moves_its_rows_and_draws_only_the_new_ones(tmp_path):
+    # A wheel notch repainted the whole table, and the window under it (35-51 ms a notch at 150%): Qt moves the
+    # pixels of a see-through widget only where it starts on a whole device pixel.
+    db = str(tmp_path / "big.db")
+    fill(db)
+    screen = tmp_path / "screen.json"  # 150% as Windows sets it: a screen of 144 dpi
+    screen.write_text('{"screens": [{"name": "s", "x": 0, "y": 0, "width": 1920, "height": 1200, "logicalDpi": 144, '
+                      '"logicalBaseDpi": 96, "dpr": 1}]}')
+    # Named from the folder it's in: Qt splits the platform's options at colons, which a Windows path has.
+    run = subprocess.run([sys.executable, "-X", "faulthandler", "-c", SCROLL_AT_150, db, str(tmp_path / "cfg150")],
+                         capture_output=True, text=True, timeout=180, cwd=tmp_path,
+                         env=dict(os.environ, QT_QPA_PLATFORM=f"offscreen:configfile={screen.name}"))
+    assert run.returncode == 0, run.stderr[-2000:]
+    out = dict(line.split(" ", 1) for line in run.stdout.splitlines() if " " in line)
+    assert out["dpr"] == "1.5", run.stdout
+    assert int(out["worst"]) <= 1, run.stdout  # the same pixels as drawing it all again, but for a gradient's rounding
+    assert float(out["drawn"]) < 0.5, run.stdout  # only the rows that came into view, not the whole table

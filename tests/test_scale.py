@@ -466,3 +466,71 @@ def test_a_subreddit_opened_while_the_database_is_upgraded_has_its_words_counted
     finally:
         w.close()
         QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
+
+
+def test_a_text_column_read_while_a_fetch_adds_and_saves_rows_again_takes_them_in(tmp_path, monkeypatch):
+    """Switching subreddit during a download raised TypeError in _ordering: the table was sorted by a text column,
+    a fetch added rows while that column was read on a thread, and the read was let go, leaving no values."""
+    QApplication.instance() or QApplication([])
+    db = str(tmp_path / "big.db")
+    fill(db)
+    saved = Saved(db, "comments", "Big")
+    monkeypatch.setattr(tables.RowsModel, "BIG", 5000)  # as big as the owner's, for these 20,000
+    tab = TablePage(TABLE_COMMENTS, stretch_col=2)
+    tab.view.sortByColumn(2, Qt.SortOrder.AscendingOrder)  # Comment
+    first = saved.rows([0])[0]
+    again = dict(first, body="000 saved again")  # the fetch saves a comment that was already read
+    added = dict(again, id="new1", body="zzz added")  # and one that's new
+    db_ = sqlite3.connect(db)
+    db_.execute("UPDATE comments SET body = ? WHERE id = ?", (again["body"], again["id"]))
+    db_.execute(f"INSERT INTO comments ({', '.join(store_module.COMMENT_COLUMNS)}) "
+                f"SELECT {', '.join('?' if c in ('id', 'body') else c for c in store_module.COMMENT_COLUMNS)} "
+                "FROM comments WHERE id = ?", (added["id"], added["body"], again["id"]))
+    db_.commit()
+    db_.close()
+    real, read, taken = saved.index.column, threading.Event(), threading.Event()
+
+    def column(name, start=0, stop=None):
+        got = real(name, start, stop)
+        read.set()
+        taken.wait(10)
+        return got
+    monkeypatch.setattr(saved.index, "column", column)
+    steps = tab.set_rows_steps(saved, np.arange(len(saved)))  # as the window's span loads a subreddit
+    for item in steps:
+        if read.is_set() and not taken.is_set():  # the column is read: the fetch saves before it's taken
+            saved.add([again, added])
+            taken.set()
+        if item is tables.Slices.WAIT:
+            time.sleep(0.001)
+    assert len(saved) == COMMENTS + 1 and saved.values("body")[-1] == "zzz added"
+    assert saved.values("body")[0] == "000 saved again"
+    bodies = [r["body"] for r in tab.model.rows]
+    assert len(bodies) == COMMENTS and bodies == sorted(bodies) and bodies[0] == "000 saved again"
+    saved.close()
+
+
+@pytest.mark.parametrize("column", [2, 4])  # Title, Comments
+def test_sorting_saved_posts_by_a_column_not_read_yet_reads_it_on_a_thread(tmp_path, monkeypatch, column):
+    """Sorting the owner's 17,000 posts by Title held the window 130 ms while the titles were read, and by Comments
+    270 ms: those were read as whole rows, here, 2,000 at a time."""
+    QApplication.instance() or QApplication([])
+    db = str(tmp_path / "big.db")
+    fill(db)
+    Store(db).pack_settled()
+    saved = Saved(db, "posts", "Big")
+    tab = TablePage(tables.POST_COLUMNS, stretch_col=2)
+    tab.set_rows(saved, np.arange(len(saved)))
+    until(lambda: not tab.model._reads.running(), 30)
+    key = tables.POST_COLUMNS[column][1]
+    expected = sorted((r[key] for r in saved.rows(range(len(saved)))), reverse=True)
+    here = []
+    real = Saved._read
+    monkeypatch.setattr(Saved, "_read", lambda self, at: (here.append(len(at)) if threading.current_thread()
+                                                          is threading.main_thread() else None, real(self, at))[1])
+    tab.view.sortByColumn(column, Qt.SortOrder.DescendingOrder)
+    assert tab.model.sorting()  # worked out between frames, though there are fewer than RowsModel.BIG
+    until(lambda: not tab.model.sorting(), 30)
+    assert not here
+    assert [r[key] for r in tab.model.rows] == expected
+    saved.close()

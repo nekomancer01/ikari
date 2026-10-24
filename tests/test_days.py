@@ -127,6 +127,10 @@ def test_every_view_counts_the_days_the_timeline_shows(window, tmp_path, monkeyp
     out = tmp_path / "posts.csv"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(out), ""))
     w._export("posts")
+    end = time.monotonic() + 60
+    while w.export_job.busy:  # written on a thread of its own
+        assert time.monotonic() < end, "the export didn't end"
+        QApplication.processEvents()
     assert sorted(r["id"] for r in csv.DictReader(open(out, encoding="utf-8-sig"))) == ["p0", "p1", "p2"]
     assert "from 5 Oct 2026 to " in w.statusBar().currentMessage()
 

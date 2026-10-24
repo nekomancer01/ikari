@@ -2,12 +2,13 @@
 one beside it (a 1 px style sheet border is 1.5 device pixels there, which looked fuzzy)."""
 import os
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint  # noqa: E402
-from PySide6.QtGui import QColor, QImage  # noqa: E402
+from PySide6.QtCore import QPoint, QRectF  # noqa: E402
+from PySide6.QtGui import QColor, QImage, QPainter  # noqa: E402
 from PySide6.QtWidgets import QApplication, QComboBox, QLineEdit, QPushButton, QTableView, QWidget  # noqa: E402
 
 from subsentiment.gui import theme, widgets  # noqa: E402
@@ -49,3 +50,29 @@ def test_edges_are_one_crisp_device_pixel(make, at, mode):
     for line in (left, top):
         inked = [c for c in line if c != panel]
         assert len(inked) == 1, [hex(c) for c in line]  # one pixel of edge, nothing half-toned beside it
+
+
+@pytest.mark.parametrize("dpr", [1.0, 1.25, 1.5, 2.0])
+def test_cut_corners_give_the_pixels_of_drawing_the_whole_box(dpr):
+    # Outline.draw copies corners it drew once and fills the rest with plain rectangles (a big anti-aliased
+    # rounded rect was the slowest part of painting a window); that must look like drawing the box whole.
+    QApplication.instance() or QApplication([])
+    edge, fills = QColor(0, 0, 0, 24), (None, QColor("#ffffff"), QColor(28, 28, 30))
+
+    def draw(whole: bool, rect: QRectF, radius: float, fill) -> QImage:
+        image = QImage(round(420 * dpr), round(300 * dpr), QImage.Format.Format_ARGB32_Premultiplied)
+        image.setDevicePixelRatio(dpr)
+        image.fill(QColor("#f1f1f1"))
+        p = QPainter(image)
+        if whole:
+            p.setOpacity(0.999999)  # not full opacity: drawn whole
+        theme.Outline.draw(p, rect, radius, edge, fill)
+        p.end()
+        return image
+
+    for rect, radius in ((QRectF(20, 20, 380, 250), 16), (QRectF(21, 21.5, 200.5, 90), 10),
+                         (QRectF(7, 3, 120, 30), 15), (QRectF(30, 40, 90, 26), 6)):
+        for fill in fills:
+            images = [draw(w, rect, radius, fill) for w in (False, True)]
+            cut, whole = (np.frombuffer(i.constBits(), np.uint8).astype(int) for i in images)
+            assert np.abs(cut - whole).max() <= 3, (rect, radius, fill)  # rounding where premultiplied colours meet, not a visible change

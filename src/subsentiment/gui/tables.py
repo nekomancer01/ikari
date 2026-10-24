@@ -9,8 +9,8 @@ from itertools import islice
 from typing import Any, Callable
 
 import numpy as np
-from PySide6.QtCore import (QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRectF, QSize, Qt, QTimer,
-                            QUrl, Signal)
+from PySide6.QtCore import (QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRect, QRectF, QSize, Qt,
+                            QTimer, QUrl, Signal)
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QHeaderView, QLineEdit, QStyle, QStyledItemDelegate,
@@ -64,6 +64,28 @@ COMMENT_COLUMNS: list[Column] = [
     ("Author", "author", str),
     ("Posted", "created_utc", _fmt_time),
 ]
+
+
+def once(positions) -> np.ndarray:
+    """Positions as an array, each once, in the order they first come in."""
+    at = np.asarray(positions, np.int64)
+    return at if len(at) < 2 else at[np.sort(np.unique(at, return_index=True)[1])]
+
+
+def marked(mask, at: np.ndarray) -> np.ndarray:
+    """Which of the positions ``at`` are set in ``mask`` (one past its end isn't), or are among ``mask`` when it's
+    positions: for thousands of rows at once, where asking for each, or np.isin over a whole table's, took a tenth
+    of a second."""
+    mask = np.asarray(mask)
+    if mask.dtype != bool:
+        positions = mask.astype(np.int64)
+        positions = positions[positions >= 0]
+        mask = np.zeros(int(positions.max()) + 1 if len(positions) else 0, bool)
+        mask[positions] = True
+    out = np.zeros(len(at), bool)
+    fits = (at >= 0) & (at < len(mask))  # (-1, where() for a row not there, isn't one)
+    out[fits] = mask[at[fits]]
+    return out
 
 
 class ChipDelegate(QStyledItemDelegate):
@@ -235,30 +257,46 @@ class RowsModel(QAbstractTableModel):
                 order = yield from on_thread(lambda: np.argsort(keys, kind="stable"))
             return at[order], keys[order]
         missing = self._missing(column)
-        keys = [missing if (v := values[p]) is None else v for p in at.tolist()]
         if step is None or len(at) < self.BIG:
+            keys = [missing if (v := values[p]) is None else v for p in at.tolist()]
             order = sorted(range(len(keys)), key=keys.__getitem__, reverse=descending)
-        else:
-            runs = []
-            for a in range(0, len(keys), step):
-                runs.append(sorted(range(a, min(a + step, len(keys))), key=keys.__getitem__, reverse=descending))
-                yield
-            merged, order = heapq.merge(*runs, key=keys.__getitem__, reverse=descending), []
-            while part := list(islice(merged, step // 4)):  # merging is a microsecond a row, sorting a run far less
-                order += part
-                yield
-        return at[np.array(order, np.int64)], [keys[i] for i in order]
+            return at[np.array(order, np.int64)], [keys[i] for i in order]
+        # Every step here is a step of rows: getting 650,000 comments' keys took 60 ms in one go, and as long again
+        # putting them in their new order.
+        # Runs of a quarter step: sorting 20,000 comments' text took 20 ms (merging as many, 5).
+        keys, runs, part = [], [], step // 4
+        for a in range(0, len(at), step):
+            keys += [missing if (v := values[p]) is None else v for p in at[a:a + step].tolist()]
+            yield
+        for a in range(0, len(keys), part):
+            runs.append(iter(sorted(range(a, min(a + part, len(keys))), key=keys.__getitem__, reverse=descending)))
+            yield
+        # Each run is let go once it's merged: freeing all 650,000 of their numbers at the end took 90 ms. The new
+        # order is written a step at a time too, into an array made at the start (filling a new one took 20 ms).
+        merged, placed, ordered = heapq.merge(*runs, key=keys.__getitem__, reverse=descending), np.empty_like(at), []
+        runs.clear()
+        while got := list(islice(merged, part)):
+            placed[len(ordered):len(ordered) + len(got)] = at[got]
+            ordered += map(keys.__getitem__, got)
+            yield
+        return placed, ordered
 
     def sorting(self) -> bool:
         """A big table's new order is being worked out away from the frames."""
         return self._slices.running()
+
+    def here(self, source: RowSource, n: int) -> bool:
+        """Whether ``n`` rows of ``source`` are put in sort order here and now: fewer than BIG, and the column sorted
+        by read already (a lazy source reads its text on a thread: 17,000 post titles took a tenth of a second)."""
+        return n < self.BIG and not (source.lazy and self._sort is not None
+                                     and source.values(self.columns[self._sort[0]][1]) is None)
 
     def sort(self, column: int, order=Qt.SortOrder.AscendingOrder) -> None:
         """Called by the view when a header is clicked. Selected rows stay selected."""
         wanted = (column, order == Qt.SortOrder.DescendingOrder)
         if wanted != self._sort:  # the view asks twice for one sortByColumn
             self._sort = wanted
-            if len(self.order) < self.BIG:
+            if self.here(self.source, len(self.order)):
                 self._slices.stop()
                 self._resort()
             else:
@@ -311,10 +349,12 @@ class RowsModel(QAbstractTableModel):
         old = self.persistentIndexList()
         was = [int(self.order[i.row()]) for i in old]
         self.order, self._keys = order, keys
-        self._shown = np.zeros(len(self.source), bool)
-        self._shown[order] = True
+        if len(self._shown) != len(self.source):  # (the same rows, else: as they were)
+            self._shown = np.zeros(len(self.source), bool)
+            self._shown[order] = True
         if len(old) <= 20:  # looked for in C, a millisecond each
-            where = {p: (int(hit[0]) if len(hit := np.flatnonzero(order == p)) else None) for p in was}
+            same = np.empty(len(order), bool)
+            where = {p: (int(hit[0]) if len(hit := np.flatnonzero(np.equal(order, p, out=same))) else None) for p in was}
         else:
             back = np.full(len(self.source), -1, np.int64)
             back[order] = np.arange(len(order))
@@ -391,10 +431,10 @@ class RowsModel(QAbstractTableModel):
     def update_rows(self, rows: list) -> None:
         """Rows (a list) saved again replace the ones shown; rows not shown yet are added and fade in. The view
         keeps its place."""
-        at = self._take(rows)
-        shown = [p for p in at if self._is_shown(p)]
-        self.refresh(shown)
-        self.insert([p for p in at if not self._is_shown(p)])
+        at = np.array(self._take(rows), np.int64)
+        shown = marked(self._shown, at)
+        self.refresh(at[shown])
+        self.insert(at[~shown])
 
     def append_rows(self, rows: list) -> int:
         """Add rows (a list) not shown yet, each fading in from now; returns how many were new."""
@@ -406,13 +446,11 @@ class RowsModel(QAbstractTableModel):
             self.source.add(rows)
         return [int(p) for p in self.source.where([r["id"] for r in rows]) if p >= 0]
 
-    def _is_shown(self, p: int) -> bool:
-        return p < len(self._shown) and bool(self._shown[p])
-
     def insert(self, positions, fade: bool = True) -> int:
         """Show the rows at these positions too (ones shown already are skipped), each where the current sort
         puts it (at the end when unsorted); they fade in. Returns how many were new."""
-        added = [p for p in dict.fromkeys(int(p) for p in positions) if not self._is_shown(p)]
+        at = once(positions)
+        added = at[~marked(self._shown, at)].tolist()
         if not added:
             return 0
         if len(self._shown) < len(self.source):
@@ -488,12 +526,14 @@ class RowsModel(QAbstractTableModel):
 
     def remove(self, positions) -> None:
         """Stop showing the rows at these positions."""
-        gone = np.array([p for p in (int(p) for p in positions) if self._is_shown(p)], np.int64)
+        at = np.asarray(positions, np.int64)
+        gone = at[marked(self._shown, at)]
         if not len(gone):
             return
-        keep = ~np.isin(self.order, gone)
+        keep = ~marked(gone, self.order)
         self._edits += 1
-        self._late = [p for p in self._late if p not in set(gone.tolist())]
+        out = set(gone.tolist())
+        self._late = [p for p in self._late if p not in out]
         # Moved to the end, then taken off there: a layout change can't take rows away.
         moved, keys = np.concatenate([self.order[keep], self.order[~keep]]), self._keys
         if keys is not None and len(keys) == len(self.order):
@@ -512,13 +552,14 @@ class RowsModel(QAbstractTableModel):
     def refresh(self, positions) -> None:
         """Rows at these positions changed (saved again, scored again): they're drawn as they are now, and the rows
         are put back in order when a sort key changed."""
-        changed = [p for p in (int(p) for p in positions) if self._is_shown(p)]
-        if not changed:
+        at = np.asarray(positions, np.int64)
+        changed = at[marked(self._shown, at)]
+        if not len(changed):
             return
         self._edits += 1
         moved = False
         if self._sort is not None and not self._sorting and self._keys is not None:
-            rows = np.flatnonzero(np.isin(self.order, changed)).tolist()
+            rows = np.flatnonzero(marked(changed, self.order)).tolist()
             for i, k in zip(rows, self._keys_at(self.source, self.order[rows])):
                 if k != self._keys[i]:
                     self._keys[i], moved = k, True
@@ -639,6 +680,30 @@ class RowsModel(QAbstractTableModel):
         return self.source.row(p, around=self.order[max(0, i - RowSource.READ // 4):i + RowSource.READ].tolist())
 
 
+class Table(QTableView):
+    """A table that scrolls by moving the rows it has drawn and drawing only the rows that come into view.
+
+    Its rows sit on the box's own plain panel colour, so the rows still on screen look the same after a
+    scroll, only higher or lower. Qt moves them only for an opaque viewport, and this one is see-through
+    (the box's rounded corners and outline are drawn under it), so it is opaque just for the move. The rows
+    coming into view are then drawn over what's under them as before, and so are the bottom corners, where
+    the box's outline curves in under the last row. Sideways it is all drawn again, as before."""
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:
+        if dx:  # sideways the corners would move along the bottom row: drawn again whole, as before
+            super().scrollContentsBy(dx, dy)
+            return
+        viewport, was = self.viewport(), self.verticalOffset()
+        viewport.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        super().scrollContentsBy(dx, dy)  # dy counts rows here, not pixels
+        viewport.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        corner = 12  # the box's radius and its outline (Outline.shape), and a pixel's rounding
+        moved = corner + abs(self.verticalOffset() - was)
+        bottom = viewport.height() - moved
+        viewport.update(QRect(0, bottom, corner, moved))
+        viewport.update(QRect(viewport.width() - corner, bottom, corner, moved))
+
+
 class TablePage(QWidget):
     """Filterable, sortable table in an outlined box; double-click opens the item on Reddit.
 
@@ -679,7 +744,7 @@ class TablePage(QWidget):
         self.label_filter.currentTextChanged.connect(lambda _: self._apply_filters())
         self.count = label("", "muted")
 
-        self.view = QTableView()
+        self.view = Table()
         self.view.setModel(self.model)
         self.view.setSortingEnabled(True)
         self.view.sortByColumn(0, Qt.SortOrder.AscendingOrder)
@@ -772,9 +837,6 @@ class TablePage(QWidget):
         self._in_base = np.zeros(len(self.source), bool)
         self._in_base[at] = True
 
-    def _in(self, p: int) -> bool:
-        return p < len(self._in_base) and bool(self._in_base[p])
-
     def _add_base(self, positions: list[int]) -> None:
         if len(self._in_base) < len(self.source):
             self._in_base = np.concatenate([self._in_base, np.zeros(len(self.source) - len(self._in_base), bool)])
@@ -798,7 +860,8 @@ class TablePage(QWidget):
         if self._waiting is not None:
             self._waiting.append(lambda: self.add_rows(rows))
             return len(rows)
-        new = [p for p in dict.fromkeys(self._positions(rows)) if not self._in(p)]
+        at = once(self._positions(rows))
+        new = at[~marked(self._in_base, at)].tolist()
         if new:
             self._add_base(new)
             self._last = None
@@ -810,7 +873,8 @@ class TablePage(QWidget):
 
     def _show_unshown(self) -> None:
         unshown, self._unshown = self._unshown, []
-        at = np.array([p for p in unshown if self._in(p)], np.int64)
+        at = np.array(unshown, np.int64)
+        at = at[marked(self._in_base, at)]
         if len(at):
             self.model.insert(self._picked(at, *self._wanted()))
 
@@ -829,17 +893,17 @@ class TablePage(QWidget):
         if self._waiting is not None:
             self._waiting.append(lambda: self.took(at))
             return 0
-        at = list(dict.fromkeys(int(p) for p in at))
-        old = [p for p in at if self._in(p)]
-        new = [p for p in at if not self._in(p)]
-        if new:
+        at = once(at)
+        inside = marked(self._in_base, at)
+        old, new = at[inside], at[~inside]
+        if len(new):
             self._add_base(new)
         self._last = None
         # A row saved again can change its label (and so leave the label filter) or text.
-        passing = set(self._picked(np.array(at, np.int64), *self._wanted()).tolist())
-        self.model.remove([p for p in old if p not in passing])
-        self.model.refresh([p for p in old if p in passing])
-        self.model.insert([p for p in at if p in passing])
+        passing = marked(self._picked(at, *self._wanted()), at)
+        self.model.remove(at[inside & ~passing])
+        self.model.refresh(at[inside & passing])
+        self.model.insert(at[passing])
         self._update_count()
         return len(old)
 
@@ -942,7 +1006,7 @@ class TablePage(QWidget):
         selected = {int(self.model.order[i.row()]) for i in chosen}
         current = self.view.currentIndex()
         current_at = int(self.model.order[current.row()]) if current.isValid() else None
-        if step is None or len(picked) < self.model.BIG:
+        if step is None or self.model.here(source, len(picked)):
             self.model.show(source, picked)
         else:
             order = yield from self.model.show_steps(source, picked)

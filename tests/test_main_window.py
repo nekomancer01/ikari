@@ -1,6 +1,8 @@
 """The fetch form and saved-data list survive a restart; the delete actions clear the store."""
+import csv
 import os
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -382,21 +384,66 @@ def test_posts_without_a_score_yet_sort_below_every_real_score(make_window):
     assert sorted(range(4), key=lambda r: keys[r]) == [1, 0, 2, 3]  # pending first, then -5, -1, 0
 
 
+def exported(w, timeout: float = 60) -> None:
+    """Until the export the window started has ended."""
+    end = time.monotonic() + timeout
+    while w.export_job.busy:
+        assert time.monotonic() < end, "the export didn't end"
+        QApplication.processEvents()
+        time.sleep(0.005)
+    QApplication.processEvents()
+
+
 def test_an_export_that_cant_be_saved_says_so(make_window, monkeypatch, tmp_path):
     # On Windows the usual cause is the CSV still being open in Excel. The error used to escape the slot:
-    # no message at all, and in the packaged app no console to show it either.
+    # no message at all, and in the packaged app no console to show it either. Here the file can't take the
+    # place of a folder of that name (as a locked one can't be replaced), in the process the export runs in.
     w = make_window()
+    monkeypatch.setattr(mw.MainWindow, "EXPORT_APART_FROM", 0)
     target = tmp_path / "out.csv"
+    target.mkdir()
     monkeypatch.setattr(mw.QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), ""))
-
-    def locked(*a, **k):
-        raise PermissionError(13, "Permission denied", str(target))
-    monkeypatch.setattr(w.store, "export_csv", locked)
     warned = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a[1:3]))
     w._export("posts")
+    exported(w)
     assert warned and warned[0][0] == "Export failed"
-    assert "close it and try again" in warned[0][1]
+    assert "close it and try again" in warned[0][1] and "OSError" not in warned[0][1] and ".part" not in warned[0][1]
+    assert target.is_dir() and not (tmp_path / "out.csv.part").exists()
+
+
+def test_an_export_is_written_in_another_process_while_the_window_carries_on(make_window, monkeypatch, tmp_path):
+    # Written on the window's thread, the owner's 657,574 comments froze it for 23 s (posts 1.2 s); on a thread
+    # of its own, Python for all of it, the window still stopped for half a second at a time.
+    w = make_window()
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
+    target = tmp_path / "out.csv"
+    monkeypatch.setattr(mw.QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), ""))
+
+    def here(*a, **k):
+        raise AssertionError("exported in the window's process")
+    monkeypatch.setattr(Store, "export_csv", here)
+    monkeypatch.setattr(mw.MainWindow, "EXPORT_APART_FROM", 1)  # (one row: as an export of thousands is)
+    w._export("posts")
+    assert w.export_job.busy and w.waiting() == "Exporting posts\u2026"
+    assert not (w.export_posts.isEnabled() or w.export_comments.isEnabled())
+    w._export("posts")  # (the menu item is off meanwhile; nothing else starts)
+    exported(w)
+    assert [r["id"] for r in csv.DictReader(open(target, encoding="utf-8-sig"))] == ["p0"]
+    assert w.statusBar().currentMessage().startswith("Exported 1 posts to ")
+    assert w.export_posts.isEnabled() and w.waiting() is None
+
+
+def test_an_export_stopped_as_the_window_closes_leaves_no_file(tmp_path):
+    s = Store(tmp_path / "s.db")
+    s.save_post(Post("p1", "Python", "nice", "", "a", 1, 0.9, 0, 1_700_000_000.0, "https://r", ""), 0.5, "positive")
+    s.commit()
+    stop = threading.Event()
+    stop.set()
+    assert s.export("Python", "posts", tmp_path / "out.csv", stop=stop) is None
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("out")) == []
+    assert s.export("Python", "posts", tmp_path / "out.csv") == 1
+    s.close()
 
 
 def test_bundled_fonts_are_weights_of_the_families_the_theme_asks_for():
@@ -599,6 +646,35 @@ def test_import_database_adds_its_subreddits_to_the_list(make_window, tmp_path, 
     assert len(warnings) == 1 and w.datasets.count() == 3
 
 
+def test_a_subreddit_opened_while_an_import_is_packed_is_read_without_its_words_until_then(make_window, tmp_path,
+                                                                                            monkeypatch):
+    # An import's rows come in unpacked, and Store.upgrade packs them afterwards (a minute and a half for the
+    # owner's). Read meanwhile with their words, every row's text was split on the reading thread: r/classicwow took
+    # 36 s to open, and the window stopped for up to a second at a time (376 frames late). Their words are counted
+    # once they're packed, as an older database's are.
+    other = Store(tmp_path / "other.db")
+    other.save_post(Post("q1", "Deltarune", "great game", "", "a", 1, 0.9, 0, 1_700_000_000.0, "https://r", ""), 0.6,
+                    "positive")
+    other.commit()
+    other.close()
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", lambda *a, **k: (str(tmp_path / "other.db"), ""))
+    w = make_window()
+    w.upgrading.join()
+    w._after_upgrade()
+    packed, upgrade = threading.Event(), Store.upgrade
+    monkeypatch.setattr(Store, "upgrade", lambda path, stop=None: packed.wait(30) and upgrade(path, stop))
+    w.import_act.trigger()
+    imported(w)
+    assert w.upgrading.is_alive()
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Deltarune"))
+    assert w.current == "Deltarune" and len(w.posts) == 1
+    assert not any(s.words for s in w._saved.values())
+    packed.set()
+    w.upgrading.join()
+    w._after_upgrade()
+    assert w.current == "Deltarune" and all(s.words for s in w._saved.values())
+
+
 def imported(w, timeout: float = 30) -> None:
     """Until the import the window started on its thread has ended."""
     end = time.monotonic() + timeout
@@ -781,6 +857,10 @@ def test_a_new_progress_value_waits_for_the_next_frame_to_be_drawn(make_window):
     w.show()
     w.show_page("posts")
     w._set_busy(True)
+    from subsentiment.gui import motion
+    end = time.monotonic() + 5
+    while motion.fading(w.content) and time.monotonic() < end:  # a fade holds the page as a picture until it ends
+        QApplication.processEvents()
     QApplication.processEvents()
 
     class Paints(QObject):
