@@ -644,7 +644,7 @@ class MainWindow(QMainWindow):
             self._style_native_frame()
 
     def _apply_theme(self) -> None:
-        motion.crossfade(self, motion.THEME_MS, still_under=True)
+        motion.crossfade(self, motion.THEME_MS, regrab_ms=None)
         requested = self.settings.value("ui/theme", "system", str)
         native.set_appearance(requested)
         theme.apply(QApplication.instance(), requested, self.settings.value("ui/reduce_transparency", False, bool),
