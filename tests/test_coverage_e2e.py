@@ -869,7 +869,8 @@ def test_a_stopped_download_offers_resume_even_after_a_restart(window, monkeypat
         assert c.resume_bar.isVisible()
         QTest.mouseClick(c.resume, Qt.MouseButton.LeftButton)
         settle(again, lambda: not again.fetch_job.busy)
-        assert [d[2] for d in downloads() if d[0] == "posts"] == [TODAY - k * DAY for k in (1, 2, 3)]
+        # Every one again, as none was read to its end: the first alone, then the two after it as one run.
+        assert [d[2:] for d in downloads() if d[0] == "posts"] == [(TODAY - DAY, TODAY), (TODAY - 3 * DAY, TODAY - DAY)]
         assert not c.resume_bar.isVisible() and c.ticked == set()
     finally:
         again.close()

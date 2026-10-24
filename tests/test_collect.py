@@ -178,15 +178,16 @@ def test_a_cut_short_or_unsettled_thread_is_not_marked_complete(tmp_path):
 
 
 def test_downloading_a_whole_day_marks_it_complete_only_when_the_archive_ran_out(tmp_path):
+    day = T // 86400 * 86400  # the UTC day the posts are on
     s = store_with(tmp_path, [mk(1)])
     c = FakeClient(posts=[mk(1), mk(2), mk(3)])
-    collect.run(c, s, collect.FetchRequest("python", after=T, before=T + 86400, limit=5, everything=True,
+    collect.run(c, s, collect.FetchRequest("python", after=day, before=day + 86400, limit=5, everything=True,
                                            include_comments=False))
-    assert s.complete_keys("posts", "python") == {str(int(T))}
+    assert s.complete_keys("posts", "python") == {str(int(day))}
 
     s2 = store_with(tmp_path / "b", [])
     collect.run(FakeClient(posts=[mk(1), mk(2), mk(3)]), s2,
-                collect.FetchRequest("python", after=T, before=T + 86400, limit=2, everything=True,
+                collect.FetchRequest("python", after=day, before=day + 86400, limit=2, everything=True,
                                      include_comments=False))
     assert s2.complete_keys("posts", "python") == set()  # it may have had more than the 2 asked for
 
@@ -345,9 +346,10 @@ def test_a_whole_range_is_downloaded_a_day_at_a_time_like_download_all(tmp_path)
     result = collect.run(c, s, collect.FetchRequest("python", after=D0 + 7200, before=D0 + 4 * 86400, limit=None,
                                                     include_comments=False),
                          progress=lambda done, total, msg: shown.append((done, total, msg)))
-    # Newest day first, every post of each (to Download all's cap), the first day only from 02:00.
-    assert c.windows == [(D0 + d * 86400, D0 + (d + 1) * 86400, collect.MAX_DAY_POSTS, True) for d in (3, 2, 1)] \
-        + [(D0 + 7200, D0 + 86400, collect.MAX_DAY_POSTS, True)]
+    # Newest day first, every post of each (to Download all's cap), the first day only from 02:00. Three posts a day
+    # is quiet, so once the newest day says so, the rest are read together.
+    assert c.windows == [(D0 + 3 * 86400, D0 + 4 * 86400, collect.MAX_DAY_POSTS, True),
+                         (D0 + 7200, D0 + 3 * 86400, 3 * collect.MAX_DAY_POSTS, True)]
     assert result.posts == 11 and len(s.posts("python")) == 11  # all but d0p0, posted at 01:00
     # The three whole days read to their end show as complete in Download coverage; the cut one doesn't.
     assert s.complete_keys("posts", "python") == {str(D0 + d * 86400) for d in (1, 2, 3)}
@@ -458,13 +460,51 @@ def test_a_capped_fill_asks_until_each_thread_has_its_cap_and_a_bigger_cap_tops_
 
 def test_a_whole_range_gets_each_days_comments_before_the_next_days_posts(tmp_path):
     # Live on r/AskReddit: a week's fetch read ~31k posts before asking for one comment, so Stop in the first
-    # minutes left none. Now each day's comments follow its posts, newest day first.
+    # minutes left none. Now each day's comments follow its posts, newest day first; quiet days read together have
+    # their comments together.
     s = store_with(tmp_path, [])
     c = DayClient(days=3, num_comments=2)
     collect.run(c, s, collect.FetchRequest("python", after=D0, before=D0 + 3 * 86400, limit=None))
     steps = [("posts", (call[1] - D0) // 86400) if call[0] == "posts" else ("comments", int(call[1][1]))
              for call in c.calls if call[0] in ("posts", "comments")]
-    assert steps == [step for d in (2, 1, 0) for step in [("posts", d)] + [("comments", d)] * 3]
+    assert steps == [("posts", 2)] + [("comments", 2)] * 3 + [("posts", 0)] + [("comments", d) for d in (0, 1)
+                                                                               for _ in range(3)]
+
+
+def test_quiet_days_are_read_together_and_busy_ones_a_day_at_a_time(tmp_path, monkeypatch):
+    # A quiet week took four searches a day, whatever the day held. Days in a row are read as one range when the
+    # days read so far say they hold about BATCH_POSTS between them; a busy day keeps its own read.
+    quiet = DayClient(per_day=3, days=6)
+    collect.run(quiet, store_with(tmp_path, []), collect.FetchRequest(
+        "python", after=D0, before=D0 + 6 * 86400, limit=None, include_comments=False))
+    assert [(a, b) for a, b, *_ in quiet.windows] == [(D0 + 5 * 86400, D0 + 6 * 86400), (D0, D0 + 5 * 86400)]
+    monkeypatch.setattr(collect, "BATCH_POSTS", 5)  # so three posts a day is busy: two days would be six
+    busy = DayClient(per_day=3, days=3)
+    collect.run(busy, store_with(tmp_path / "b", []), collect.FetchRequest(
+        "python", after=D0, before=D0 + 3 * 86400, limit=None, include_comments=False))
+    assert [(a, b) for a, b, *_ in busy.windows] == [(D0 + d * 86400, D0 + (d + 1) * 86400) for d in (2, 1, 0)]
+    monkeypatch.undo()
+    # Days that aren't one after another (complete ones between are left out) aren't read together.
+    gap = DayClient(per_day=3, days=4)
+    s = store_with(tmp_path / "c", [])
+    s.mark_complete("posts", "python", str(D0 + 2 * 86400))
+    collect.run(gap, s, collect.FetchRequest("python", after=D0, before=D0 + 4 * 86400, limit=None,
+                                             include_comments=False))
+    assert [(a, b) for a, b, *_ in gap.windows] == [(D0 + 3 * 86400, D0 + 4 * 86400), (D0, D0 + 2 * 86400)]
+
+
+def test_days_read_together_are_each_complete_unless_part_of_that_day_went_unread(tmp_path):
+    # One stretch the archive kept timing out on leaves its own day not complete, not every day read with it.
+    class Patchy(DayClient):
+        def fetch_posts(self, *a, **kw):
+            got = super().fetch_posts(*a, **kw)
+            if a[1] == D0:  # the run of the three older days: an hour of the middle one went unread
+                self.exhausted, self.unread = False, [(D0 + 86400 + 7200, D0 + 86400 + 10800)]
+            return got
+    s = store_with(tmp_path, [])
+    collect.run(Patchy(per_day=3, days=4), s, collect.FetchRequest(
+        "python", after=D0, before=D0 + 4 * 86400, limit=None, include_comments=False))
+    assert s.complete_keys("posts", "python") == {str(D0 + d * 86400) for d in (0, 2, 3)}
 
 
 def test_a_day_whose_threads_keep_failing_leaves_only_that_days_comments_for_the_next_fetch(tmp_path):

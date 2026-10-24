@@ -5,7 +5,7 @@ import pytest
 import requests
 
 from subsentiment.arctic_shift import (
-    BASE_URL, SETTLE_SECONDS, TOP_PAGES, ArcticShiftClient, QueryTimeout, RateLimiter, Stopped, quotas, slices, slot_count,
+    BASE_URL, SETTLE_SECONDS, SLOTS_PER_DAY, TOP_PAGES, ArcticShiftClient, QueryTimeout, RateLimiter, Stopped, quotas, slices, slot_count,
 )
 from subsentiment import arctic_shift
 from subsentiment.reddit import FetchError, Post
@@ -573,6 +573,27 @@ def test_a_stretch_that_times_out_whatever_is_asked_leaves_its_slice_unread_not_
     assert all(T0 + h * 3600 + 100 in got for h in (0, 2, 5, 12, 20))
     assert not [t for t in got if T0 + 6 * 3600 <= t < T0 + 12 * 3600]
     assert not c.exhausted and c.timed_out and not c.reached
+
+
+def test_reading_every_post_of_quiet_days_takes_as_many_searches_as_one_day():
+    # Five quiet days in one range: four searches, one a slice, rather than four for each day.
+    items = [at(T0 + d * DAY + 3600 * (k + 1), d * 10 + k) for d in range(5) for k in range(3)]
+    c = archive(items)
+    posts = c.fetch_posts("python", after=T0, before=T0 + 5 * DAY, limit=50000, exhaust=True)
+    assert len(posts) == 15 and c.exhausted and c.unread == []
+    assert len(c.session.calls) == SLOTS_PER_DAY
+
+
+def test_a_stretch_skipped_for_timing_out_is_said_so_the_other_days_still_count_as_read():
+    # Read with other days, a stretch that times out however narrow leaves only its own day unread.
+    items = [at(T0 + d * DAY + 3600 * (k + 1), d * 10 + k) for d in range(3) for k in range(6)]
+    clock = FakeClock()
+    stuck = T0 + DAY + 3 * 3600 + 50
+    c = ArcticShiftClient(session=StuckArchive(items, stuck), limiter=RateLimiter(0.0, clock, clock.sleep))
+    c.fetch_posts("python", after=T0, before=T0 + 3 * DAY, limit=50000, exhaust=True)
+    assert not c.exhausted and c.timed_out and c.unread
+    assert all(lo <= stuck < hi for lo, hi in c.unread[:1])
+    assert all(T0 + DAY <= lo and hi <= T0 + 2 * DAY for lo, hi in c.unread)
 
 
 def test_other_errors_are_reported():
