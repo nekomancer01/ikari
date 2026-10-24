@@ -221,3 +221,36 @@ def test_a_fetch_reads_back_what_it_saved_and_sends_it_to_the_window(monkeypatch
     assert sent[0]["posts"][0] == w.since  # each from where the one before left off
     assert all(got[k][0] <= later[k][0] for got, later in zip(sent, sent[1:]) for k in ("posts", "comments"))
     assert all(r.words is not None for got in sent for r in got["comments"][1])  # split there, not in the window
+
+
+def test_the_garbage_collectors_slow_passes_wait_while_the_mouse_is_in_use(monkeypatch):
+    """An older generation's pass took a tenth of a second with a big subreddit open, on the window's thread: while
+    the mouse moves or is held it waits, up to DEFER, then runs anyway; the youngest's goes on every tick."""
+    import types
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    asked, clock, mouse = [], [100.0], [QPoint(0, 0)]
+    fake_gc = types.SimpleNamespace(disable=lambda: None, collect=asked.append, get_count=lambda: (5, 10, 10),
+                                    get_threshold=lambda: (700, 10, 10))  # the oldest generation is due
+    monkeypatch.setattr(worker_mod, "gc", fake_gc)
+    monkeypatch.setattr(worker_mod, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(worker_mod, "QCursor", types.SimpleNamespace(pos=lambda: mouse[0]))
+    monkeypatch.setattr(worker_mod.QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.MouseButton.NoButton))
+    collector = worker_mod.Collector()
+    collector._timer.stop()
+    for _ in range(20):  # dragging across a table: the mouse moves at every tick, for two seconds
+        mouse[0] = mouse[0] + QPoint(3, 1)
+        clock[0] += 0.1
+        collector.collect()
+    assert asked == [0] * 20
+    clock[0] += 1.1  # let go of: the slow pass runs
+    collector.collect()
+    assert asked[-1] == 2
+    asked.clear()
+    for _ in range(int(collector.DEFER / 0.1) + 5):  # moving on and on: it runs anyway, once it's waited DEFER
+        mouse[0] = mouse[0] + QPoint(3, 1)
+        clock[0] += 0.1
+        collector.collect()
+    assert asked.count(2) == 1 and asked.index(2) >= collector.DEFER / 0.1 - 1 and set(asked) == {0, 2}
+    collector.deleteLater()

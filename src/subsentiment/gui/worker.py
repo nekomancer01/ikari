@@ -16,7 +16,8 @@ from contextlib import contextmanager
 from typing import Callable, Iterator
 
 import requests
-from PySide6.QtCore import QCoreApplication, QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QCoreApplication, QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QCursor, QGuiApplication
 
 from subsentiment import collect
 from subsentiment.arctic_shift import ArcticShiftClient, RateLimiter
@@ -355,10 +356,14 @@ class Collector(QObject):
     """Python's garbage collector, run on the window's thread only. Left to itself it collects whenever enough
     objects have been made, on whichever thread made them: a table reading rows on a thread then deleted the
     widgets of a window closed earlier, there, and Qt crashed (a segfault in Linux CI). So the automatic one is
-    off, and every TICK this collects here instead.
+    off, and every TICK this collects here instead. Its older generations take long with a big subreddit open (a
+    tenth of a second each), so they wait while the mouse is moving or held, up to DEFER: a scroll or a drag doesn't
+    catch one.
     `start` once a QApplication is up; `lasting` holds it off."""
 
     TICK = 100  # ms
+    STILL = 1.0  # seconds the mouse has been left alone before an older generation is collected
+    DEFER = 10.0  # seconds an older generation waits for that at most
     _one: Collector | None = None
     _held = 0  # `lasting` reads going on
     _lock = threading.Lock()
@@ -370,6 +375,8 @@ class Collector(QObject):
         self._timer.setInterval(self.TICK)
         self._timer.timeout.connect(self.collect)
         self._timer.start()
+        self._mouse = None  # where the mouse was at the last tick
+        self._moved = self._due = 0.0  # when it last moved or was held; since when an older generation is due
 
     @classmethod
     def start(cls) -> None:
@@ -382,7 +389,17 @@ class Collector(QObject):
         # The youngest generation every time (the objects made since, however many were let go meanwhile), and an
         # older one, with those younger, once that many collections of the one below it have gone by.
         counts, limits = gc.get_count(), gc.get_threshold()
-        gc.collect(2 if counts[2] >= limits[2] else 1 if counts[1] >= limits[1] else 0)
+        generation = 2 if counts[2] >= limits[2] else 1 if counts[1] >= limits[1] else 0
+        now, mouse = time.monotonic(), QCursor.pos()
+        if mouse != self._mouse or QGuiApplication.mouseButtons() != Qt.MouseButton.NoButton:
+            self._mouse, self._moved = mouse, now
+        if generation:
+            self._due = self._due or now
+            if now - self._moved < self.STILL and now - self._due < self.DEFER:
+                generation = 0  # the youngest only, which takes no time
+            else:
+                self._due = 0.0
+        gc.collect(generation)
 
     @classmethod
     @contextmanager
@@ -546,6 +563,7 @@ class StoreRead(QObject):
         self._asked: tuple | None = None
         self._next: tuple | None = None
         self._answer = None
+        self._forgot = False  # the read under way was asked before `forget`
 
     @property
     def busy(self) -> bool:
@@ -556,6 +574,12 @@ class StoreRead(QObject):
         if not self.job.busy:
             self._start()
 
+    def forget(self) -> None:
+        """Reads asked for so far give no answer: what they'd bring has been read some other way since."""
+        self._next = None
+        self._answer = None
+        self._forgot = True
+
     def close(self) -> None:
         """As the app closes: a read under way is waited for, and its answer dropped."""
         self._next = None
@@ -565,14 +589,15 @@ class StoreRead(QObject):
             self.job.qthread.wait(3000)
 
     def _start(self) -> None:
-        self._asked, self._next, self._answer = self._next, None, None
+        self._asked, self._next, self._answer, self._forgot = self._next, None, None, False
         worker = StoreWorker(self.db_path, self.method, *self._asked)
         worker.finished.connect(self._on_answer)  # a bound method, so it's handled on this object's thread
         self.job.start(worker)
 
     @Slot(object)
     def _on_answer(self, answer) -> None:
-        self._answer = answer
+        if not self._forgot:
+            self._answer = answer
 
     @Slot()
     def _ended(self) -> None:
