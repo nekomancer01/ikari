@@ -481,6 +481,15 @@ def test_a_day_whose_threads_keep_failing_leaves_only_that_days_comments_for_the
     failed = {r["id"] for r in s.posts_between("python", None, None) if r["comments_ok"] == 0}
     assert failed == c.failing  # retried on the next fetch
 
+    # The archive failing every thread: GAVE_UP_DAYS days are tried, then none, rather than five more a day.
+    s = Store(tmp_path / "all.db")
+    c = DayClient(per_day=collect.GIVE_UP_AFTER + 2, days=5, num_comments=2)
+    c.failing = {p.id for p in c.posts}
+    result = collect.run(c, s, collect.FetchRequest("python", after=D0, before=D0 + 5 * 86400, limit=None))
+    assert sum(call[0] == "comments" for call in c.calls) == collect.GAVE_UP_DAYS * collect.GIVE_UP_AFTER
+    assert result.comment_errors == len(c.posts)
+    assert all(r["comments_ok"] == 0 for r in s.posts_between("python", None, None))
+
 
 def test_stopping_after_a_day_keeps_its_comments(tmp_path):
     s = store_with(tmp_path, [])

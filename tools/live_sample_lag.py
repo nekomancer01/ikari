@@ -1,6 +1,7 @@
 """Live: the real MainWindow downloads a range with Keep: Sample into a throwaway DB; reports UI gaps, what the
 window's thread was doing in each stall, request sizes/timings/failures, and how the fetch ended.
-  QT_QPA_PLATFORM=offscreen python live_sample_lag.py SUB RANGE MINUTES PAGE   (e.g. linux_gaming year 20 overview)"""
+From the repo root:  QT_QPA_PLATFORM=offscreen python tools/live_sample_lag.py SUB RANGE MINUTES PAGE
+(e.g. linux_gaming year 20 overview). NO_STALLS=1 turns the stall dumps off. The throwaway data folder is printed at the end, kept to look at."""
 import collections, faulthandler, os, re, sys, tempfile, threading, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 import requests

@@ -215,8 +215,7 @@ class MainWindow(QMainWindow):
         # The saved-data list's counts, read on a thread while a fetch runs: counting a big subreddit's comments took
         # a tenth of a second, once a second, on this one.
         self._sets_read = StoreRead(db_path, "datasets", self)
-        self._sets_read.got.connect(lambda _asked, sets: self.fetch_job.busy and self._refresh_datasets(
-            reload=False, sets=sets))
+        self._sets_read.got.connect(self._on_sets_read)
         self._drip = QTimer(self)  # releases fetched rows into the tables a few at a time, so each is seen
         self._drip.setInterval(DRIP_MS[0])
         self._drip.timeout.connect(self._release_rows)
@@ -894,6 +893,10 @@ class MainWindow(QMainWindow):
         else:
             self._sets_read.ask()
         self.coverage.refresh_saved()
+
+    def _on_sets_read(self, _asked, sets: list[dict]) -> None:
+        if self.fetch_job.busy:  # (once it's over, the list is read here again)
+            self._refresh_datasets(reload=False, sets=sets)
 
     def _on_finished(self, result: collect.FetchResult) -> None:
         self._loaded.clear()  # what it saved (scores too) is read again, not shown from memory
