@@ -126,15 +126,14 @@ def in_range(env, w, sub="Python") -> int:
 
 def fetched_before(env, w, sub="python", rng="month") -> None:
     """Record ``rng`` as asked for by an earlier fetch of ``sub``, which Download coverage then lists, without
-    downloading it all again here. It lists only days with something saved: each day with nothing gets a skipped
-    image post, which no page shows."""
+    downloading it all again here. It lists only days with something saved: each day with nothing gets one post."""
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData(rng))
     store, asked = env.store(), collect.days_in(*w.fetch_form.bounds())
     store.save_tried(sub, asked)
     have = set(store.downloaded_days(sub))
     for day in asked:
         if day not in have:
-            store.save_post(Post(f"img{day}", sub, "img", "", "a", 1, 0.0, 0, day + 60, "u", "", image=True),
+            store.save_post(Post(f"img{day}", sub, "img", "", "a", 1, 0.0, 0, day + 60, "u", ""),
                             0.0, "neutral")
     store.commit()
 
@@ -1271,9 +1270,12 @@ def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
     pump(50)
     read_in(w)  # what's saved is read again, on threads, once the count is in
     totals = cov.totals["python"]
-    assert not any(cell.bar.waiting for _, cell, _ in rows())
-    # Every day with posts to look for can be downloaded now; only past days the archive has none for can't.
-    assert all(button.isEnabled() == (totals.get(day) != 0 or str(day) in complete or day == cov.days[0])
+    assert not any(cell.bar.waiting and not cell.bar.isHidden() for _, cell, _ in rows())  # (a day whose count is
+    # below what's saved shows no bar)
+    # Every day with posts to look for can be downloaded now; only past days the archive has none for can't
+    # (a day with one saved and none counted has a count that can't be right, and is downloaded whole).
+    assert all(button.isEnabled() == (totals.get(day) != 0 or str(day) in complete or day == cov.days[0]
+                                      or cov._day_state[day][0] > 0)
                for day, _, button in rows())
     assert cov.download_ticked.isEnabled()
     assert set(env.archive.paths()) == {AGG}  # waiting downloaded nothing
@@ -1667,7 +1669,7 @@ def test_a_stopped_download_all_goes_on_from_where_it_got_to(env, monkeypatch):
     env.archive.clear()
     QTest.mouseClick(button(), Qt.MouseButton.LeftButton)
     end = time.monotonic() + 30
-    in_day = lambda: {r["id"] for r in env.store().posts("bigday") if day <= r["created_utc"] < day + DAY}  # noqa: E731
+    in_day = lambda: {r["id"] for r in env.store().posts("bigday") if day <= r["created_utc"] < day + DAY and not r["id"].startswith("img")}  # noqa: E731
     # Two rounds of pages in and the next asked for. After only the first round, a slow runner had two pages saved.
     while len(env.archive.paths()) < 9 and time.monotonic() < end:
         pump(20)
