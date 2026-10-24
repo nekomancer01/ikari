@@ -347,9 +347,10 @@ def test_a_whole_range_is_downloaded_a_day_at_a_time_like_download_all(tmp_path)
                                                     include_comments=False),
                          progress=lambda done, total, msg: shown.append((done, total, msg)))
     # Newest day first, every post of each (to Download all's cap), the first day only from 02:00. Three posts a day
-    # is quiet, so once the newest day says so, the rest are read together.
+    # is quiet, so once the newest day says so, the next ones are read together, two, then up to four.
     assert c.windows == [(D0 + 3 * 86400, D0 + 4 * 86400, collect.MAX_DAY_POSTS, True),
-                         (D0 + 7200, D0 + 3 * 86400, 3 * collect.MAX_DAY_POSTS, True)]
+                         (D0 + 86400, D0 + 3 * 86400, 2 * collect.MAX_DAY_POSTS, True),
+                         (D0 + 7200, D0 + 86400, collect.MAX_DAY_POSTS, True)]
     assert result.posts == 11 and len(s.posts("python")) == 11  # all but d0p0, posted at 01:00
     # The three whole days read to their end show as complete in Download coverage; the cut one doesn't.
     assert s.complete_keys("posts", "python") == {str(D0 + d * 86400) for d in (1, 2, 3)}
@@ -477,7 +478,14 @@ def test_quiet_days_are_read_together_and_busy_ones_a_day_at_a_time(tmp_path, mo
     quiet = DayClient(per_day=3, days=6)
     collect.run(quiet, store_with(tmp_path, []), collect.FetchRequest(
         "python", after=D0, before=D0 + 6 * 86400, limit=None, include_comments=False))
-    assert [(a, b) for a, b, *_ in quiet.windows] == [(D0 + 5 * 86400, D0 + 6 * 86400), (D0, D0 + 5 * 86400)]
+    assert [(a, b) for a, b, *_ in quiet.windows] == [(D0 + 5 * 86400, D0 + 6 * 86400), (D0 + 3 * 86400, D0 + 5 * 86400),
+                                                      (D0, D0 + 3 * 86400)]
+    # Runs grow a step at a time, at most twice the last one: today, or a day the archive has nothing for yet,
+    # reads as quiet even on a busy subreddit, and a month in one run would keep every comment back until it's read.
+    month = DayClient(per_day=3, days=40)
+    collect.run(month, store_with(tmp_path / "m", []), collect.FetchRequest(
+        "python", after=D0, before=D0 + 40 * 86400, limit=None, include_comments=False))
+    assert [round((b - a) / 86400) for a, b, *_ in month.windows] == [1, 2, 4, 8, 16, 9]
     monkeypatch.setattr(collect, "BATCH_POSTS", 5)  # so three posts a day is busy: two days would be six
     busy = DayClient(per_day=3, days=3)
     collect.run(busy, store_with(tmp_path / "b", []), collect.FetchRequest(
@@ -498,7 +506,7 @@ def test_days_read_together_are_each_complete_unless_part_of_that_day_went_unrea
     class Patchy(DayClient):
         def fetch_posts(self, *a, **kw):
             got = super().fetch_posts(*a, **kw)
-            if a[1] == D0:  # the run of the three older days: an hour of the middle one went unread
+            if a[1] == D0 + 86400:  # the run of the two days before the newest: an hour of the older one went unread
                 self.exhausted, self.unread = False, [(D0 + 86400 + 7200, D0 + 86400 + 10800)]
             return got
     s = store_with(tmp_path, [])

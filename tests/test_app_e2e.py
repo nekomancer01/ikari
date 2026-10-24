@@ -1366,7 +1366,8 @@ def test_a_months_download_of_a_quiet_subreddit_reads_its_days_together(env):
     fetch(w, sub="rust", comments=False, rng="month")
     after, before = w.fetch_form.bounds()
     assert len(collect.days_in(after, before)) > 28
-    assert env.archive.paths().count(SEARCH) <= 4 * arctic_shift.SLOTS_PER_DAY  # today alone, then a run or two
+    # Today alone, then runs of 2, 4, 8 and 16 days, each as many searches as one day (it was 124).
+    assert env.archive.paths().count(SEARCH) <= 6 * arctic_shift.SLOTS_PER_DAY
     assert len(env.store().posts("rust")) == in_range(env, w, "rust")
     whole = {str(d) for d in range(int(after // DAY * DAY) + DAY, coverage.today(), DAY)}
     assert env.store().complete_keys("posts", "rust") == whole

@@ -244,11 +244,11 @@ class Download:
         seen: set[str] = set()  # saved posts on the days read, whose comments those days took care of
         fruitless = 0  # runs in a row the archive timed out on without giving a post
         rate = None  # posts a second on the days read last, saved ones too; None: not known, or it timed out
-        k = 0
+        k = n = 0
         while k < len(days):
             if self.should_stop() or fruitless >= TIMED_OUT_DAYS:
                 break
-            n = self.batch(days, k, rate)
+            n = self.batch(days, k, rate, 2 * n)
             lo, hi = days[k + n - 1][0], days[k][1]
             when = " to ".join(dict.fromkeys(time.strftime("%a %d %b", time.gmtime(t)) for t in (lo, hi - 1)))
             which = f"Day {k + 1}" if n == 1 else f"Days {k + 1}-{k + n}"
@@ -280,12 +280,15 @@ class Download:
         return picked, new, settled
 
     @staticmethod
-    def batch(days: list[tuple[float, float]], k: int, rate: float | None) -> int:
+    def batch(days: list[tuple[float, float]], k: int, rate: float | None, most: int) -> int:
         """How many of ``days`` (newest first) from the k-th to read together: the ones right before it, one after
-        another, that ``rate`` (posts a second, from the days read last) says hold about BATCH_POSTS between them.
-        One while the rate isn't known: the first day, and after a stretch the archive timed out on."""
+        another, that ``rate`` (posts a second, from the days read last) says hold about BATCH_POSTS between them,
+        and no more than ``most`` (twice the last run): today, or a day the archive has nothing for yet, can read
+        as quiet on a busy subreddit, so runs grow a step at a time. One while the rate isn't known: the first
+        day, and after a stretch the archive timed out on."""
         n = 1
-        while (rate is not None and n < BATCH_DAYS and k + n < len(days) and days[k + n][1] == days[k + n - 1][0]
+        while (rate is not None and n < min(most, BATCH_DAYS) and k + n < len(days)
+               and days[k + n][1] == days[k + n - 1][0]
                and rate * (days[k][1] - days[k + n][0]) <= BATCH_POSTS):
             n += 1
         return n
