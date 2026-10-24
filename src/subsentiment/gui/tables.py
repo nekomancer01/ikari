@@ -66,6 +66,28 @@ COMMENT_COLUMNS: list[Column] = [
 ]
 
 
+def once(positions) -> np.ndarray:
+    """Positions as an array, each once, in the order they first come in."""
+    at = np.asarray(positions, np.int64)
+    return at if len(at) < 2 else at[np.sort(np.unique(at, return_index=True)[1])]
+
+
+def marked(mask, at: np.ndarray) -> np.ndarray:
+    """Which of the positions ``at`` are set in ``mask`` (one past its end isn't), or are among ``mask`` when it's
+    positions: for thousands of rows at once, where asking for each, or np.isin over a whole table's, took a tenth
+    of a second."""
+    mask = np.asarray(mask)
+    if mask.dtype != bool:
+        positions = mask.astype(np.int64)
+        positions = positions[positions >= 0]
+        mask = np.zeros(int(positions.max()) + 1 if len(positions) else 0, bool)
+        mask[positions] = True
+    out = np.zeros(len(at), bool)
+    fits = (at >= 0) & (at < len(mask))  # (-1, where() for a row not there, isn't one)
+    out[fits] = mask[at[fits]]
+    return out
+
+
 class ChipDelegate(QStyledItemDelegate):
     """Draws a cell's value in an outlined chip: a pill with a coloured dot for the Label column, a box for
     the Sentiment column. The row's background, hover, selection and rule are drawn as for any cell, and
@@ -391,10 +413,10 @@ class RowsModel(QAbstractTableModel):
     def update_rows(self, rows: list) -> None:
         """Rows (a list) saved again replace the ones shown; rows not shown yet are added and fade in. The view
         keeps its place."""
-        at = self._take(rows)
-        shown = [p for p in at if self._is_shown(p)]
-        self.refresh(shown)
-        self.insert([p for p in at if not self._is_shown(p)])
+        at = np.array(self._take(rows), np.int64)
+        shown = marked(self._shown, at)
+        self.refresh(at[shown])
+        self.insert(at[~shown])
 
     def append_rows(self, rows: list) -> int:
         """Add rows (a list) not shown yet, each fading in from now; returns how many were new."""
@@ -406,13 +428,11 @@ class RowsModel(QAbstractTableModel):
             self.source.add(rows)
         return [int(p) for p in self.source.where([r["id"] for r in rows]) if p >= 0]
 
-    def _is_shown(self, p: int) -> bool:
-        return p < len(self._shown) and bool(self._shown[p])
-
     def insert(self, positions, fade: bool = True) -> int:
         """Show the rows at these positions too (ones shown already are skipped), each where the current sort
         puts it (at the end when unsorted); they fade in. Returns how many were new."""
-        added = [p for p in dict.fromkeys(int(p) for p in positions) if not self._is_shown(p)]
+        at = once(positions)
+        added = at[~marked(self._shown, at)].tolist()
         if not added:
             return 0
         if len(self._shown) < len(self.source):
@@ -488,12 +508,14 @@ class RowsModel(QAbstractTableModel):
 
     def remove(self, positions) -> None:
         """Stop showing the rows at these positions."""
-        gone = np.array([p for p in (int(p) for p in positions) if self._is_shown(p)], np.int64)
+        at = np.asarray(positions, np.int64)
+        gone = at[marked(self._shown, at)]
         if not len(gone):
             return
-        keep = ~np.isin(self.order, gone)
+        keep = ~marked(gone, self.order)
         self._edits += 1
-        self._late = [p for p in self._late if p not in set(gone.tolist())]
+        out = set(gone.tolist())
+        self._late = [p for p in self._late if p not in out]
         # Moved to the end, then taken off there: a layout change can't take rows away.
         moved, keys = np.concatenate([self.order[keep], self.order[~keep]]), self._keys
         if keys is not None and len(keys) == len(self.order):
@@ -512,13 +534,14 @@ class RowsModel(QAbstractTableModel):
     def refresh(self, positions) -> None:
         """Rows at these positions changed (saved again, scored again): they're drawn as they are now, and the rows
         are put back in order when a sort key changed."""
-        changed = [p for p in (int(p) for p in positions) if self._is_shown(p)]
-        if not changed:
+        at = np.asarray(positions, np.int64)
+        changed = at[marked(self._shown, at)]
+        if not len(changed):
             return
         self._edits += 1
         moved = False
         if self._sort is not None and not self._sorting and self._keys is not None:
-            rows = np.flatnonzero(np.isin(self.order, changed)).tolist()
+            rows = np.flatnonzero(marked(changed, self.order)).tolist()
             for i, k in zip(rows, self._keys_at(self.source, self.order[rows])):
                 if k != self._keys[i]:
                     self._keys[i], moved = k, True
@@ -772,9 +795,6 @@ class TablePage(QWidget):
         self._in_base = np.zeros(len(self.source), bool)
         self._in_base[at] = True
 
-    def _in(self, p: int) -> bool:
-        return p < len(self._in_base) and bool(self._in_base[p])
-
     def _add_base(self, positions: list[int]) -> None:
         if len(self._in_base) < len(self.source):
             self._in_base = np.concatenate([self._in_base, np.zeros(len(self.source) - len(self._in_base), bool)])
@@ -798,7 +818,8 @@ class TablePage(QWidget):
         if self._waiting is not None:
             self._waiting.append(lambda: self.add_rows(rows))
             return len(rows)
-        new = [p for p in dict.fromkeys(self._positions(rows)) if not self._in(p)]
+        at = once(self._positions(rows))
+        new = at[~marked(self._in_base, at)].tolist()
         if new:
             self._add_base(new)
             self._last = None
@@ -810,7 +831,8 @@ class TablePage(QWidget):
 
     def _show_unshown(self) -> None:
         unshown, self._unshown = self._unshown, []
-        at = np.array([p for p in unshown if self._in(p)], np.int64)
+        at = np.array(unshown, np.int64)
+        at = at[marked(self._in_base, at)]
         if len(at):
             self.model.insert(self._picked(at, *self._wanted()))
 
@@ -829,17 +851,17 @@ class TablePage(QWidget):
         if self._waiting is not None:
             self._waiting.append(lambda: self.took(at))
             return 0
-        at = list(dict.fromkeys(int(p) for p in at))
-        old = [p for p in at if self._in(p)]
-        new = [p for p in at if not self._in(p)]
-        if new:
+        at = once(at)
+        inside = marked(self._in_base, at)
+        old, new = at[inside], at[~inside]
+        if len(new):
             self._add_base(new)
         self._last = None
         # A row saved again can change its label (and so leave the label filter) or text.
-        passing = set(self._picked(np.array(at, np.int64), *self._wanted()).tolist())
-        self.model.remove([p for p in old if p not in passing])
-        self.model.refresh([p for p in old if p in passing])
-        self.model.insert([p for p in at if p in passing])
+        passing = marked(self._picked(at, *self._wanted()), at)
+        self.model.remove(at[inside & ~passing])
+        self.model.refresh(at[inside & passing])
+        self.model.insert(at[passing])
         self._update_count()
         return len(old)
 

@@ -27,7 +27,7 @@ from subsentiment.gui.overview import OverviewPage, WordsPage
 from subsentiment.gui.rows import RowList, Rows, Saved, chosen
 from subsentiment.gui.words import KINDS, Rescore, WordTally
 from subsentiment.gui.rail import DRAWERS, PAGES, NavRail
-from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
+from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage, marked
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.widgets import (
@@ -520,7 +520,8 @@ class MainWindow(QMainWindow):
         self.rescore.finished.connect(self._on_rescore_finished)
         self.rescore.failed.connect(self.words_page.meanings.show_failed)
         self._set_mid_fetch: set[str] = set()  # words set in the subreddit a fetch is saving, scored again after it
-        self._rescored: dict[str, set] = {k: set() for k in KINDS}  # ids rescored, for the tables once it's done
+        # The positions rescored (in the rows they're of), for the tables once it's done.
+        self._rescored: dict[str, tuple] = {k: (None, []) for k in KINDS}
         self.words_page.meanings.changed.connect(self._set_word)
         self.overview.words.word_clicked.connect(self._pick_word)
         self.posts_tab = TablePage(POST_COLUMNS, stretch_col=2)
@@ -1205,9 +1206,10 @@ class MainWindow(QMainWindow):
         self._render_overview()
         self._render_words()
 
-    def _render_overview(self, restore: bool = False) -> None:
+    def _render_overview(self, restore: bool = False, moving: bool = False) -> None:
         """Show every saved day on the timeline, and the span's days on the tiles and distribution. With
-        restore, the timeline shows the span the window holds (another subreddit's, as remembered)."""
+        restore, the timeline shows the span the window holds (another subreddit's, as remembered); with moving,
+        the tint and word clouds are left to catch up later (`_render_span`)."""
         scope = self.scope.currentText()
         self._analysis = {k: self._saved[k].analysis(least) for k, least in zip(KINDS, self.min_scores)}
         self._counted = Analysis.combined(
@@ -1222,7 +1224,7 @@ class MainWindow(QMainWindow):
                 chart.set_points(self._counted.daily_means)
             finally:
                 self._following = False
-        self._render_span(ease=restore)
+        self._render_span(moving=moving, ease=restore)
 
     def _render_span(self, moving: bool = False, ease: bool = False) -> None:
         """The tiles and distribution for the span's days. The background's tint (eased to another subreddit's)
@@ -1292,23 +1294,33 @@ class MainWindow(QMainWindow):
             self._set_mid_fetch = set()
 
     def _on_rescored(self, sub: str, kind: str, rows: list) -> None:
-        """Saved items scored again by a subreddit's words: the pages showing it follow, as with a fetch's rows."""
+        """Saved items scored again by a subreddit's words: the timeline and tiles follow, as with a fetch's rows.
+        The word clouds and the background's tint catch up once it's done: easing them to every batch had the
+        cloud drawn over a thousand times."""
         mine = self.current and self.current.lower() == sub
         if not mine:
             self._loaded.pop(sub, None)  # read again when next shown
             return
-        self._saved[kind].rescore([(r["id"], r["sentiment"], r["label"]) for r in rows])
-        self._rescored[kind].update(r["id"] for r in rows)
-        self._render_overview()
+        saved = self._saved[kind]
+        at = saved.rescore([(r["id"], r["sentiment"], r["label"]) for r in rows], [r["words"] for r in rows])
+        source, done = self._rescored[kind]
+        self._rescored[kind] = (saved, (done if source is saved else []) + [at[at >= 0]])
+        self._render_overview(moving=True)
 
     def _on_rescore_finished(self, sub: str) -> None:
-        """The tables (and what export writes) take the rescored rows in one go: each update sorts a table again."""
-        ids, self._rescored = self._rescored, {k: set() for k in KINDS}
+        """The tables (and what export writes) take the rescored rows in one go: each update sorts a table again.
+        The word clouds and tint follow."""
+        rescored, self._rescored = self._rescored, {k: (None, []) for k in KINDS}
         if self.current and self.current.lower() == sub:
+            took = False
             for kind, tab in self.tabs.items():
-                if ids[kind]:
-                    at = self._saved[kind].where(list(ids[kind]))
-                    tab.took(at[np.isin(at, tab.all_rows.at)])
+                source, done = rescored[kind]
+                if source is self._saved[kind] and done:
+                    at = np.unique(np.concatenate(done))
+                    tab.took(at[marked(tab.all_rows.at, at)])
+                    took = True
+            if took:  # (the timeline and tiles have each batch already)
+                self._render_span()
 
     def days_deleted(self, subreddit: str, days: int, posts: int, comments: int) -> None:
         """Download coverage deleted some days of ``subreddit``: if it's still shown, show it again from the store

@@ -120,7 +120,7 @@ class ScorePool(QObject):
     holds up the window (a thread would, by the interpreter lock) nor waits for room between its frames. The
     processes start at the first ``submit`` and end a minute after ``rest`` (so setting words one after another
     doesn't start them each time), or at ``close``. ``scored`` brings (tag, [(score, label, label without the
-    words)]) back on the GUI thread, or ``failed`` the tag of texts they couldn't score. Once processes can't
+    words, the words each text uses)]) back on the GUI thread, or ``failed`` the tag of texts they couldn't score. Once processes can't
     run here, every later submit fails at once rather than starting more."""
 
     scored = Signal(object, object)
@@ -148,7 +148,7 @@ class ScorePool(QObject):
             if self._pool is None:
                 self._pool = ProcessPoolExecutor(self.WORKERS, mp_context=multiprocessing.get_context("spawn"))
             pool = self._pool
-            future = pool.submit(Lexicon.compare, weights, words, texts)
+            future = pool.submit(Lexicon.compare, weights, words, texts, True)
         except Exception:  # none allowed, or they died: the caller scores them itself
             self.broken = True
             self.close()
