@@ -81,8 +81,8 @@ r/riverton, whose new tram line breaks down for a week, at 1920x1200 and 150% sc
 
 - 📥 **Fetch** any subreddit for a date range (a preset like "Past week", or your own From and To
   dates), optionally narrowed by keywords. A fetch saves every post in the range, one day at a time,
-  and comments come along by default: keep the top-scoring or a random few per post, or all of them.
-  No Reddit account or API key is needed. Every page updates live while a fetch runs.
+  and comments come along by default: keep the top-scoring or a random few per post, all of them, or
+  a statistical sample of each day. No Reddit account or API key is needed. Every page updates live while a fetch runs.
 - 🧠 **Score sentiment offline** with a small bundled classifier (TF-IDF plus
   [VADER](https://github.com/cjhutto/vaderSentiment) features) trained on GoEmotions Reddit
   comments. Nothing leaves your machine for scoring.
@@ -97,7 +97,8 @@ r/riverton, whose new tram line breaks down for a week, at 1920x1200 and 150% sc
   row to open it on Reddit.
 - 🗓️ **Coverage** shows, for each day you've fetched, how many of the archive's posts and comment
   threads are saved. Tick days to download what's missing (posts, comments or both, with a comment
-  cap), check a day again, or delete days to fetch them afresh.
+  cap), queue more rows while one downloads, check a day again, or delete days (and their comments) to
+  fetch them afresh.
 - 💾 **Keep your data** in one local SQLite database, compressed into one pack per day, so a big
   subreddit opens with its overview in about a second and its tables scroll smoothly. File menu:
   export CSV, import another database, open the data folder, or delete saved data. Saved (bottom of
@@ -233,9 +234,12 @@ Things to know about the archive:
   your own **From** and **To** dates. The range is read one UTC day at a time, and each day read to its
   end is recorded, so Coverage knows which days are complete. Fetching the same range again only adds
   what's new. The archive can only search by date and keywords; sorting by score happens in ikari.
-- **Comments are capped per post.** **Keep** sets how many comments each post keeps (50 by default, or
-  All) and whether those are the top-scoring or a random sample that stays the same for each post.
-  Coverage has its own cap for its downloads.
+- **Comments are capped per post, or sampled per day.** **Keep** sets how many comments each post keeps
+  (50 by default, or All) and whether those are the top-scoring or a random sample that stays the same
+  for each post. **Sample** instead keeps a random sample of each UTC day's comments, big enough for
+  every sentiment share to be within 5 points at 95% confidence (385 comments on a busy day, fewer on a
+  quiet one; a day with fewer is saved whole), and fetches only the threads that hold part of it.
+  Coverage has its own cap for its downloads and shows sampled days as Sampled.
 - **Scores and comment counts arrive late.** The archive saves each post within seconds, then fetches
   it again later, usually about 36 hours after posting and sometimes up to a week. Until then
   Reddit's numbers aren't known, so the Score and Comments columns show a dash. The next fetch of that
