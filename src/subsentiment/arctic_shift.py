@@ -410,8 +410,12 @@ def quotas(total: int, n: int) -> list[int]:
     return [(total * (i + 1)) // n - (total * i) // n for i in range(n)]
 
 
-def slot_count(after: float, before: float, limit: int, top: bool) -> int:
+def slot_count(after: float, before: float, limit: int, top: bool, exhaust: bool = False) -> int:
     days = max(1, math.ceil((before - after) / 86400))
+    if exhaust and not top:
+        # Every post is read, so slices only share the work among the workers rather than spread a sample: a run of
+        # quiet days is read in as many requests as one day, not four for each of its days.
+        return max(1, min(limit, SLOTS_PER_DAY))
     if top:
         return max(1, min(limit, days, TOP_SLOTS))
     return max(1, min(limit, days * SLOTS_PER_DAY, max(days, MIN_SLOTS)))
@@ -439,7 +443,10 @@ class ArcticShiftClient:
         # Stretches the last fetch_posts read through, as (first, last) seconds: every post created in them
         # was returned, skipped as saved, or noted as removed or an image (see there).
         self.reached: list[tuple[int, int]] = []
-        self._skipped_posts = False  # a slice moved past posts it couldn't page through (see _earliest)
+        # Stretches it didn't read to their end, as [first, end) seconds: windows skipped as the archive kept timing
+        # out on them, seconds holding more posts than a page, and what's left of slices that stopped short. A day
+        # of the range clear of them was read in full, though the range as a whole wasn't (see exhausted).
+        self.unread: list[tuple[int, int]] = []
 
     # -- HTTP ---------------------------------------------------------------
 
@@ -593,10 +600,10 @@ class ArcticShiftClient:
         """Up to ``limit`` posts created in [after, before), spread evenly over the range, oldest first.
 
         The range is cut into equal slices (several per day for short ranges, about one a day for
-        long ones) and each slice gets an equal share of ``limit``. Without ``top``, a slice's share
-        is its earliest posts not in ``skip``, so a repeat fetch picks up posts it didn't have. With
-        ``top``, each slice's share is the highest-scored posts from a pool pulled from across the
-        slice; only settled posts have scores, so in a range that is all recent posts, nothing ranks.
+        long ones, SLOTS_PER_DAY with ``exhaust``) and each slice gets an equal share of ``limit``. Without
+        ``top``, a slice's share is its earliest posts not in ``skip``, so a repeat fetch picks up posts it
+        didn't have. With ``top``, each slice's share is the highest-scored posts from a pool pulled from across
+        the slice; only settled posts have scores, so in a range that is all recent posts, nothing ranks.
 
         ``on_posts`` is given each batch of posts as soon as it is downloaded (each slice's, outside top
         mode, where posts can only be ranked at the end), so a caller can show them while the rest comes.
@@ -608,6 +615,7 @@ class ArcticShiftClient:
 
         A stretch the archive keeps timing out on, even narrowed to MIN_WINDOW, is skipped rather than
         failing the whole fetch; ``self.timed_out`` then says so, and the range isn't ``exhausted``.
+        ``self.unread`` says which stretches weren't read to their end, so a day clear of them was.
 
         ``read`` is the stretches an earlier fetch read through (``self.reached`` after it, as (first, last)
         seconds), whose posts are all in ``skip``: each slice starts after what was read of it, so a download
@@ -624,10 +632,10 @@ class ArcticShiftClient:
             base["query"] = query
         skip = set(skip)
         self._page_cap = PAGE
-        self.exhausted = self.timed_out = self._skipped_posts = False
-        self.reached = []
+        self.exhausted = self.timed_out = False
+        self.reached, self.unread = [], []
 
-        n = slot_count(after, before, limit, top)
+        n = slot_count(after, before, limit, top, exhaust)
         windows = slices(after, before, n)
         picked: list[list[Post]] = [[] for _ in windows]
         spare: list[list] = [[] for _ in windows]  # top mode: ranked candidates not picked yet, best first
@@ -729,7 +737,7 @@ class ArcticShiftClient:
                 on_posts(extra)
             # Read in order, so it's read through the second before its newest post (more may share that one).
             cursors[i] = max([cursors[i]] + [int(p.created_utc) for p in extra])
-        if not (top or query or self.timed_out or self._skipped_posts):
+        if not (top or query or self.unread):
             # Not past a while ago: the archive takes in new posts within seconds, but not always.
             now = int(time.time()) - INGEST_LAG
             self.reached = [(start, min(hi - 1 if not m else c - 1, now))
@@ -737,7 +745,9 @@ class ArcticShiftClient:
             self.reached = [(a, b) for a, b in self.reached if b >= a]
         posts = [p for group in picked for p in group]
         posts.sort(key=lambda p: p.created_utc)
-        self.exhausted = not top and not any(more) and not self._skipped_posts and not self.timed_out
+        if not top:
+            self.unread += [(c, hi) for c, m, (_, hi) in zip(cursors, more, windows) if m]
+        self.exhausted = not top and not any(more) and not self.unread
         return posts
 
     def _page(self, base: dict, lo: int, hi: int, size) -> tuple[list[dict], int, int]:
@@ -780,8 +790,11 @@ class ArcticShiftClient:
                     raise
                 skipped += 1
                 self.timed_out = True
+                self.unread.append((cursor + 1, min(cursor + 1 + MIN_WINDOW, hi)))
                 cursor += MIN_WINDOW
                 if cursor >= hi - 1 or skipped > MAX_SKIPS:
+                    if cursor < hi - 1:
+                        self.unread.append((cursor + 1, hi))
                     return out, cursor, False
                 continue
             skipped = 0
@@ -798,7 +811,7 @@ class ArcticShiftClient:
                 return out, cursor, True
             if end < hi and (len(page) < size or not new):  # only part of the window was searched
                 if len(page) >= size and not new:  # a full page of repeats: more may share its second
-                    self._skipped_posts = True
+                    self.unread.append((cursor + 1, end + 1))
                 cursor = end - 1
                 continue
             if len(page) < size:
@@ -813,7 +826,7 @@ class ArcticShiftClient:
                 # More than a page in one second (never seen): move past it rather than ask forever, and
                 # don't call the range read to its end.
                 cursor = int(max(_number(d.get("created_utc"), 0) for d in page))
-                self._skipped_posts = True
+                self.unread.append((cursor, cursor + 1))
                 continue
             # The next page starts a second before this one ended, so posts sharing that timestamp
             # aren't lost; `seen` drops the repeats.
