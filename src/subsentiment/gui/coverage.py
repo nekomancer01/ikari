@@ -814,9 +814,10 @@ class CoveragePage(VerticalScrollArea):
         n, total, gone, done = self._day_state.get(day, (0, None, 0, False))
         opened = no_total(day, n, total, done)
         waiting = day in self._waiting
-        # A download starting or ending only marks the buttons (_draw_day_row): every day's cell drawn again then
-        # took a quarter of a second.
-        if not self._changed(("posts", day), n, total, gone, done, waiting, current, self.days[0]):
+        # A download starting or ending only marks the buttons (_draw_day_row); a delete turns them off. Every
+        # day's cell drawn again as a download ended took a quarter of a second.
+        if not self._changed(("posts", day), n, total, gone, done, waiting, self.delete_job.busy, current,
+                             self.days[0]):
             return
         cell: Cell = t.cellWidget(row, 1)
         button: RowButton = t.cellWidget(row, 2).findChild(RowButton)
@@ -895,7 +896,8 @@ class CoveragePage(VerticalScrollArea):
 
     def _draw_day_threads(self, row: int, day: int) -> None:
         whole, posts = self._threads_on(day)
-        if not self._changed(("threads", day), whole, posts, self.comment_cap.sampling, day in self._sampled):
+        if not self._changed(("threads", day), whole, posts, self.delete_job.busy, self.comment_cap.sampling,
+                             day in self._sampled):
             return
         cell: Cell = self.day_table.cellWidget(row, 3)
         button: RowButton = self.day_table.cellWidget(row, 4).findChild(RowButton)
