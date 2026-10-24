@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import re
 import sqlite3
+import sys
 import threading
 import time
 from datetime import datetime
@@ -11,7 +14,7 @@ from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QSize, Qt, QThre
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QFontMetrics, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
+    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
     QVBoxLayout, QWidget,
 )
 
@@ -29,9 +32,10 @@ from subsentiment.gui.tables import COMMENT_COLUMNS, POST_COLUMNS, TablePage
 from subsentiment.gui.theme import mark, paint_backdrop
 from subsentiment.gui.update_flow import UpdateFlow
 from subsentiment.gui.widgets import (
-    ElidedLabel, QuietScrollBars, ShrinkingComboBox, StatusLabel, Throbber, fit_to_screen, label, panel, plural, section,
+    ElidedLabel, ProgressBar, QuietScrollBars, ShrinkingComboBox, StatusLabel, Throbber, fit_to_screen, label, panel,
+    plural, section,
 )
-from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices, ThreadScorer, finish
+from subsentiment.gui.worker import BackgroundJob, Collector, FetchWorker, LoadWorker, Slices, ThreadScorer, finish
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, scoring_at_least
 
@@ -41,6 +45,7 @@ SCOPES = ["Posts and comments", "Posts only", "Comments only"]
 MIN_SCORES = {"Any score": None, "Score 1+": 1, "Score 10+": 10, "Score 50+": 50, "Score 100+": 100,
               "Score 500+": 500, "Score 1,000+": 1000}
 DRAWER_WIDTH = 318
+DRIP_MS = (40, 250)  # the shortest and longest wait between lots of a fetch's rows put into the tables
 NO_DATA = "Open Fetch on the left, enter a subreddit and press Fetch and analyse."
 
 
@@ -50,7 +55,7 @@ class FetchStrip(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.progress = QProgressBar()
+        self.progress = ProgressBar()
         self.progress.setFixedWidth(160)
         self.progress.setVisible(False)
         self.message = StatusLabel()
@@ -138,9 +143,46 @@ class MainWindow(QMainWindow):
     # window shows at once and the subreddit fills in once it's read on a thread.
     wait_for_data = True
 
+    @staticmethod
+    def title_text() -> str:
+        """"ikari", plus the checked-out commit in brackets when run from source (not a packaged build).
+
+        Reads .git/HEAD and the ref it names rather than starting git, so it costs microseconds.
+        """
+        if getattr(sys, "frozen", False):
+            return "ikari"
+        folder = os.path.dirname(os.path.abspath(__file__))
+        try:
+            while not os.path.exists(os.path.join(folder, ".git")):
+                if os.path.dirname(folder) == folder:
+                    return "ikari"
+                folder = os.path.dirname(folder)
+            git = os.path.join(folder, ".git")
+            if os.path.isfile(git):  # a worktree: ".git" is a file holding "gitdir: <path>"
+                with open(git, encoding="utf-8") as f:
+                    git = os.path.join(folder, f.read().split(":", 1)[1].strip())
+            with open(os.path.join(git, "HEAD"), encoding="utf-8") as f:
+                head = f.read().strip()
+            if head.startswith("ref:"):
+                ref = head.split(":", 1)[1].strip()
+                common = git
+                if os.path.exists(os.path.join(git, "commondir")):  # worktree refs live in the main repo
+                    with open(os.path.join(git, "commondir"), encoding="utf-8") as f:
+                        common = os.path.join(git, f.read().strip())
+                try:
+                    with open(os.path.join(common, ref), encoding="utf-8") as f:
+                        head = f.read().strip()
+                except FileNotFoundError:  # packed by git gc
+                    with open(os.path.join(common, "packed-refs"), encoding="utf-8") as f:
+                        head = next(line.split()[0] for line in f if line.rstrip().endswith(" " + ref))
+        except (OSError, IndexError, StopIteration):
+            return "ikari"
+        return f"ikari ({head[:7]})" if re.fullmatch(r"[0-9a-f]{40}", head) else "ikari"
+
     def __init__(self, db_path: str):
         super().__init__()
-        self.setWindowTitle("ikari")
+        Collector.start()  # garbage is collected on this thread from here on, never on a reading thread
+        self.setWindowTitle(self.title_text())
         self.resize(fit_to_screen(QSize(1320, 860), QGuiApplication.primaryScreen()))
         self.db_path = db_path
         self.store = Store(db_path)
@@ -170,7 +212,7 @@ class MainWindow(QMainWindow):
         self._live.setInterval(1000)
         self._live.timeout.connect(self._live_refresh)
         self._drip = QTimer(self)  # releases fetched rows into the tables a few at a time, so each is seen
-        self._drip.setInterval(40)
+        self._drip.setInterval(DRIP_MS[0])
         self._drip.timeout.connect(self._release_rows)
         # The overview follows the rows a running fetch saves, a few times a second: often enough to read as
         # live, rarely enough that each change has time to ease in.
@@ -640,6 +682,8 @@ class MainWindow(QMainWindow):
             return "Scoring saved items\u2026"
         if self.coverage.delete_job.busy:
             return "Deleting days\u2026"
+        if self.coverage.reading() and self.coverage.isVisible():
+            return "Reading saved days\u2026"
         if not (self.fetch_job.busy and self._showing_fetch()):
             if self._span_slices.running():
                 return "Filling the tables\u2026"
@@ -711,6 +755,7 @@ class MainWindow(QMainWindow):
     def _stop_fetch(self) -> None:
         if self.fetch_job.busy:
             self.fetch_job.stop()
+            self.coverage.clear_queue()  # Stop stops the downloads queued after it too
             self._stopping = True
             self.progress_msg.setText("Stopping…")
             self.stop_btn.setEnabled(False)
@@ -773,7 +818,7 @@ class MainWindow(QMainWindow):
                     self._queued_ids.add(r["id"])
                     self._queued[kind].append(r)
         if any(self._queued.values()) and not self._drip.isActive():  # start() would restart it, and
-            self._drip.start()  # comments saved every few ms would then hold every row back
+            self._drip.start(DRIP_MS[0])  # comments saved every few ms would then hold every row back
 
     def _count_new(self, kind: str, rows) -> None:
         """Count rows the running fetch saved into the subreddit shown, whatever their day or score: the timeline
@@ -790,15 +835,21 @@ class MainWindow(QMainWindow):
                 self._shown_live.start()
 
     def _release_rows(self) -> None:
-        """Show the next few queued rows; a long backlog is released faster so it never lags far behind."""
+        """Show the next few queued rows, the share of the backlog that drains it in about a second, so a long one
+        never lags far behind. Rows put into a table of 100,000 take several ms, and the table is drawn again
+        after, so the next lot waits about 25 times as long as this one took (from 25 lots a second for small
+        tables to 4 for big ones): the window keeps its time for frames."""
+        started = time.perf_counter()
         for kind, tab in self.tabs.items():
             queue = self._queued[kind]
-            batch, self._queued[kind] = queue[:max(1, len(queue) // 25)], queue[max(1, len(queue) // 25):]
+            n = max(1, round(len(queue) * self._drip.interval() / 1000))
+            batch, self._queued[kind] = queue[:n], queue[n:]
             if batch:
                 self._add_rows(kind, tab, batch)
         if not any(self._queued.values()):
             self._drip.stop()
         self._update_dataset_labels()
+        self._drip.setInterval(min(DRIP_MS[1], max(DRIP_MS[0], round((time.perf_counter() - started) * 25_000))))
 
     def _add_rows(self, kind: str, tab: TablePage, rows) -> None:
         tab.add_rows(rows)
@@ -886,6 +937,7 @@ class MainWindow(QMainWindow):
         self._live.stop()
         self._flush_rows()
         self.coverage.fetch_ended(self.request, True)
+        self.coverage.clear_queue()  # the archive is likely failing the ones queued too
         # Show anything stored before the error, unless the user went to look at another subreddit.
         self._refresh_datasets(select=self.request.subreddit if self._follow else None)
         kept = self.current and self.current.lower() == self.request.subreddit.lower()
@@ -1381,5 +1433,6 @@ class MainWindow(QMainWindow):
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
         return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job,
-                                    self.coverage.threads_job, self.load_job, self.rescore.job)
+                                    self.coverage.days_read.job, self.coverage.posts_read.job, self.load_job,
+                                    self.rescore.job)
                 if j.running()]

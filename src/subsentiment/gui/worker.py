@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from typing import Callable, Iterator
 
 import requests
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QCoreApplication, QObject, QThread, QTimer, Signal, Slot
 
 from subsentiment import collect
 from subsentiment.arctic_shift import ArcticShiftClient, RateLimiter
@@ -351,20 +351,61 @@ class FetchWorker(Worker):
                 store.close()
 
 
-@contextmanager
-def lasting():
-    """Read rows that stay for as long as their subreddit is open: the garbage collector went through every one of
-    them again and again, a third of a second each time with 650,000 comments, while they were read and after,
-    holding up the window's frames. They never make a cycle, so they're read with it off, then left out of its
-    passes (gc.freeze); their refcounts still let them go."""
-    collecting = gc.isenabled()
-    gc.disable()
-    try:
-        yield
-    finally:
-        if collecting:
-            gc.freeze()
-            gc.enable()
+class Collector(QObject):
+    """Python's garbage collector, run on the window's thread only. Left to itself it collects whenever enough
+    objects have been made, on whichever thread made them: a table reading rows on a thread then deleted the
+    widgets of a window closed earlier, there, and Qt crashed (a segfault in Linux CI). So the automatic one is
+    off, and every TICK this collects here instead.
+    `start` once a QApplication is up; `lasting` holds it off."""
+
+    TICK = 100  # ms
+    _one: Collector | None = None
+    _held = 0  # `lasting` reads going on
+    _lock = threading.Lock()
+
+    def __init__(self):
+        super().__init__(QCoreApplication.instance())
+        gc.disable()
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.TICK)
+        self._timer.timeout.connect(self.collect)
+        self._timer.start()
+
+    @classmethod
+    def start(cls) -> None:
+        if cls._one is None:
+            cls._one = cls()
+
+    def collect(self) -> None:
+        if Collector._held:
+            return
+        # The youngest generation every time (the objects made since, however many were let go meanwhile), and an
+        # older one, with those younger, once that many collections of the one below it have gone by.
+        counts, limits = gc.get_count(), gc.get_threshold()
+        gc.collect(2 if counts[2] >= limits[2] else 1 if counts[1] >= limits[1] else 0)
+
+    @classmethod
+    @contextmanager
+    def lasting(cls, freeze: bool = True):
+        """Read rows that stay for as long as their subreddit is open: the garbage collector went through every
+        one of them again and again, a third of a second each time with 650,000 comments, while they were read and
+        after, holding up the window's frames. They never make a cycle, so they're read with it held off, then
+        left out of its passes (gc.freeze); their refcounts still let them go. Without ``freeze`` it's only held
+        off: freezing keeps whatever is alive then out of every later pass, so what it holds that goes in a cycle
+        (a subreddit's sqlite connections once let go, a closed window's widgets) would never be freed."""
+        collecting = gc.isenabled()
+        gc.disable()
+        with cls._lock:
+            cls._held += 1
+        try:
+            yield
+        finally:
+            if freeze:
+                gc.freeze()
+            with cls._lock:
+                cls._held -= 1
+            if collecting:
+                gc.enable()
 
 
 class LoadWorker(Worker):
@@ -396,14 +437,15 @@ class LoadWorker(Worker):
                 store = self.store = Store(self.db_path)
                 if self.stopping:
                     raise sqlite3.OperationalError("interrupted")
-                with store.snapshot(), lasting():
+                with store.snapshot(), Collector.lasting():
                     got = {k: store.rows(k, self.subreddit) for k in ("posts", "comments")}
             else:
                 got = {}
-                for kind in ("posts", "comments"):
-                    if self.stopping:
-                        raise sqlite3.OperationalError("interrupted")
-                    got[kind] = Saved(self.db_path, kind, self.subreddit, self.words)
+                with Collector.lasting(freeze=False):
+                    for kind in ("posts", "comments"):
+                        if self.stopping:
+                            raise sqlite3.OperationalError("interrupted")
+                        got[kind] = Saved(self.db_path, kind, self.subreddit, self.words)
             self.read.emit((self.tag, got))
             self.finished.emit((self.tag,))
         finally:
@@ -487,3 +529,55 @@ class BackgroundJob(QObject):
         self.worker.deleteLater()
         self.qthread = self.worker = None
         self.ended.emit()
+
+
+class StoreRead(QObject):
+    """Reads saved data with a Store method on a thread of its own (a StoreWorker), so the window paints meanwhile.
+    ``got`` emits (what was asked, the answer) for each read. Asked again while a read runs, it reads once more
+    when that one ends, with the newest ask; the answer in hand is still given, so asks coming faster than reads
+    never hold every answer back. A failed read gives nothing."""
+    got = Signal(object, object)
+
+    def __init__(self, db_path: str, method: str, parent: QObject | None = None):
+        super().__init__(parent)
+        self.db_path, self.method = db_path, method
+        self.job = BackgroundJob(self)
+        self.job.ended.connect(self._ended)
+        self._asked: tuple | None = None
+        self._next: tuple | None = None
+        self._answer = None
+
+    @property
+    def busy(self) -> bool:
+        return self.job.busy
+
+    def ask(self, *args) -> None:
+        self._next = args
+        if not self.job.busy:
+            self._start()
+
+    def close(self) -> None:
+        """As the app closes: a read under way is waited for, and its answer dropped."""
+        self._next = None
+        if self.job.busy:
+            self.job.ended.disconnect()
+            self.job.qthread.quit()
+            self.job.qthread.wait(3000)
+
+    def _start(self) -> None:
+        self._asked, self._next, self._answer = self._next, None, None
+        worker = StoreWorker(self.db_path, self.method, *self._asked)
+        worker.finished.connect(self._on_answer)  # a bound method, so it's handled on this object's thread
+        self.job.start(worker)
+
+    @Slot(object)
+    def _on_answer(self, answer) -> None:
+        self._answer = answer
+
+    @Slot()
+    def _ended(self) -> None:
+        asked, answer = self._asked, self._answer
+        if self._next is not None:  # asked again meanwhile
+            self._start()
+        if answer is not None:
+            self.got.emit(asked, answer)

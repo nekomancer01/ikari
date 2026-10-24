@@ -1,5 +1,6 @@
 """The fetch form and saved-data list survive a restart; the delete actions clear the store."""
 import os
+import subprocess
 import time
 from datetime import datetime, timedelta
 
@@ -15,6 +16,15 @@ from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui.fetch_form import range_bounds  # noqa: E402
 from subsentiment.reddit import Post  # noqa: E402
 from subsentiment.store import Store  # noqa: E402
+
+
+def read_in(page) -> None:
+    """Download coverage reads what's saved on threads: wait until what it read is drawn."""
+    end = time.monotonic() + 10
+    while page.reading() and time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.005)
+    QApplication.processEvents()
 
 
 @pytest.fixture
@@ -247,6 +257,7 @@ def test_coverage_page_lists_days_and_downloads_through_the_fetch_job(make_windo
     w.show_page("coverage")
     c = w.coverage
     c.refresh_saved()
+    read_in(c)
     day = 1_699_920_000  # 14 Nov 2023 00:00 UTC
     assert day in c.days and c.days == sorted(c.days, reverse=True)
     row = c.days.index(day)
@@ -311,6 +322,7 @@ def test_today_shows_what_is_saved_so_far_without_a_total(make_window, monkeypat
     w.show_page("coverage")
     c = w.coverage
     c.refresh_saved()
+    read_in(c)
     row = c.days.index(today)
     cell = c.day_table.cellWidget(row, 1)
     assert (cell.main.text(), cell.note.text()) == ("1 saved so far", "Today")
@@ -335,6 +347,8 @@ def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypat
         for i in range(3):
             w.store.save_post(Post(f"y{day}{i}", "Python", "y", "", "a", None, None, None, day + 60 + i, "u", ""),
                               0, "neutral")
+    w.store.save_post(Post("img", "Python", "y", "", "a", None, None, None, older + 86400 + 60, "u", "", image=True),
+                      0, "neutral")  # a day between with only a skipped image: listed, with nothing else saved
     w.store.commit()
     w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/Python"))
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
@@ -342,13 +356,14 @@ def test_today_and_counts_below_whats_saved_show_no_total(make_window, monkeypat
     w.show_page("coverage")
     c = w.coverage
     c.refresh_saved()
+    read_in(c)
     # The older day's count (1) can't be right; yesterday's is whole and shown.
     cell = c.day_table.cellWidget(c.days.index(older), 1)
     assert (cell.main.text(), cell.note.text()) == ("3 saved so far", "No usable count")
     cell = c.day_table.cellWidget(c.days.index(yesterday), 1)
     assert (cell.main.text(), cell.side.text()) == ("3 of 9", "33%")
     cell = c.day_table.cellWidget(c.days.index(older + 86400), 1)
-    assert (cell.main.text(), cell.side.text()) == ("0 of 9", "0%")  # a settled day keeps its total
+    assert (cell.main.text(), cell.side.text()) == ("0 saved", "11%")  # a settled day keeps its total, the skipped image checked
 
 
 def test_one_row_is_counted_as_one_row(make_window):
@@ -707,3 +722,110 @@ def test_columns_that_fit_once_shrunk_are_not_hidden(make_window):
     used = sum(header.sectionSize(c) for c in page._widths)
     assert room - used >= room / 3
     page.close()
+
+
+def test_a_new_progress_value_waits_for_the_next_frame_to_be_drawn(make_window):
+    # QProgressBar draws itself there and then, and with it everything else in the window waiting to be drawn,
+    # on every value a fetch sent: once for each comment thread it saved.
+    from PySide6.QtCore import QEvent, QObject
+    w = make_window()
+    w.show()
+    w.show_page("posts")
+    w._set_busy(True)
+    QApplication.processEvents()
+
+    class Paints(QObject):
+        seen = []
+
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.Type.Paint:
+                self.seen.append(obj)
+            return False
+    paints = Paints()
+    for widget in (w.progress, w.posts_tab.view.viewport()):
+        widget.installEventFilter(paints)
+    assert w.progress.isVisible() and w.posts_tab.view.viewport().isVisible()
+    w.posts_tab.view.viewport().update()
+    w._on_progress(3, 10, "All comments for post 3/10")
+    assert paints.seen == [] and w.progress.value() == 3
+    QApplication.processEvents()
+    assert w.posts_tab.view.viewport() in paints.seen
+    w._set_busy(False)
+
+
+def test_only_fading_rows_on_screen_are_drawn_again_as_they_fade():
+    from subsentiment.gui.tables import FADE_SECONDS, POST_COLUMNS, RowsModel
+    now = [0.0]
+    m = RowsModel(POST_COLUMNS, clock=lambda: now[0])
+    row = lambda i: {"id": f"p{i}", "sentiment": 0.1, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
+                     "score": 1, "num_comments": 1, "author": "a", "created_utc": 0.0}
+    m.set_rows([row(i) for i in range(100)])
+    m.append_rows([row(100), row(101)])  # rows 100 and 101, fading in
+    changed = []
+    m.dataChanged.connect(lambda a, b, roles: changed.append((a.row(), b.row())))
+    m.on_screen = lambda: (0, 30)  # scrolled to the top, away from them
+    m._tick()
+    assert changed == []
+    m.on_screen = lambda: (80, 101)
+    m._tick()
+    assert changed == [(100, 101)]
+    now[0] = FADE_SECONDS  # done: drawn once more, fully in, and the fade stops
+    m._tick()
+    assert changed[-1] == (100, 101) and not m._fade.isActive()
+
+
+def test_a_slow_lot_of_fetched_rows_makes_the_next_one_wait_longer(make_window, monkeypatch):
+    # Rows went into the tables 25 times a second however long each lot took, and each lot into a table of
+    # 100,000 rows took several ms and a redraw: most of the window's time while comments downloaded.
+    w = make_window()
+    row = lambda i: {"id": f"q{i}", "sentiment": 0.1, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
+                     "score": 1, "num_comments": 1, "author": "a", "created_utc": 1.0, "fetched_at": 1.0}
+    took, now = [], [0.0]
+    # The window's clock moves only as a lot is added: on a busy runner even a quick lot took over the 1.6 ms that
+    # keeps the wait at its shortest.
+    monkeypatch.setattr(mw, "time", type("Clock", (), {"perf_counter": staticmethod(lambda: now[0])}))
+    def slow(kind, tab, rows):
+        took.append(len(rows))
+        now[0] += 0.008
+    monkeypatch.setattr(w, "_add_rows", slow)
+    w._queued["posts"] = [row(i) for i in range(1000)]
+    w._drip.start()
+    w._release_rows()
+    assert took == [40]  # 40 ms worth of draining it in a second
+    assert w._drip.interval() >= 200  # about 25 times the 8 ms it took
+    w._release_rows()
+    assert took[-1] >= 190  # a bigger share, so it still drains in about a second
+    monkeypatch.setattr(w, "_add_rows", lambda kind, tab, rows: took.append(len(rows)))
+    w._release_rows()
+    assert w._drip.interval() == mw.DRIP_MS[0]  # quick again: often again
+    w._drip.stop()
+
+
+def test_window_title_has_the_commit_when_run_from_source_and_not_when_packaged(make_window, monkeypatch):
+    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert make_window().windowTitle() == f"ikari ({head})"
+    monkeypatch.setattr(mw.sys, "frozen", True, raising=False)
+    assert make_window().windowTitle() == "ikari"
+    monkeypatch.undo()
+    monkeypatch.setattr(mw.os.path, "exists", lambda p: False)  # no .git anywhere above the package
+    assert make_window().windowTitle() == "ikari"
+
+
+def test_a_tables_model_and_its_fade_go_with_the_table():
+    # The fade's tick asks the table which rows are on screen: a model outliving its table kept ticking and asked
+    # a table that was gone (a crash in CI).
+    import shiboken6
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from subsentiment.gui.tables import POST_COLUMNS, TablePage
+    QApplication.instance() or QApplication([])
+    page = TablePage(POST_COLUMNS, 1)
+    page.show()
+    row = lambda i: {"id": f"p{i}", "sentiment": 0.1, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731
+                     "score": 1, "num_comments": 1, "author": "a", "created_utc": 0.0}
+    model = page.model
+    model.set_rows([row(1)])
+    model.append_rows([row(2)])
+    assert model._fade.isActive()
+    page.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert not shiboken6.isValid(model)

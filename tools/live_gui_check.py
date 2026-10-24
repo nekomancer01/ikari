@@ -58,9 +58,9 @@ def main() -> None:
     spent = [0.0]
     queue = w._queue_new_rows
 
-    def timed():
+    def timed(*args):  # the window passes the rows the worker sent, when it sends them
         t = time.perf_counter()
-        queue()
+        queue(*args)
         spent[0] += time.perf_counter() - t
     w._queue_new_rows = timed
 
@@ -90,13 +90,23 @@ def main() -> None:
     w.coverage_act.trigger()
     cov = w.coverage
     t0 = time.time()
-    while (cov.count_job.busy or not cov.days) and time.time() - t0 < 180:
+    while (cov.count_job.busy or cov.reading() or not cov.days) and time.time() - t0 < 180:
         app.processEvents()
         time.sleep(0.01)
 
+    def cell_at(row, col):  # a row gets its widgets as it comes near the view
+        cov.day_table.scrollTo(cov.day_table.model().index(row, col))
+        return cov.day_table.cellWidget(row, col)
+
+    def read_in():  # Coverage reads what's saved on threads
+        while cov.reading():
+            app.processEvents()
+            time.sleep(0.01)
+
     def rows():
+        read_in()
         for row, d in enumerate(cov.days):
-            cell = cov.day_table.cellWidget(row, 1)
+            cell = cell_at(row, 1)
             side = cell.note.text() if cell.note.isVisible() else cell.side.text()
             gone = w.store.removed_per_day(sub, d, d + 86400).get(d, 0)
             print(f"  {coverage.day_text(d)}: {cell.main.text()} | {side} | "
@@ -107,9 +117,9 @@ def main() -> None:
     day = cov.days[row]
     cov.day_table.selectRow(row)
     run(f"Coverage Download all, {coverage.day_text(day)}",
-        cov.day_table.cellWidget(row, 2).findChild(QPushButton).click)
+        cell_at(row, 2).findChild(QPushButton).click)
     cov.day_table.selectRow(row)
-    app.processEvents()
+    read_in()
     if cov.all_comments.isEnabled():
         run(f"Coverage {cov.all_comments.text()}", cov.all_comments.click)
     else:

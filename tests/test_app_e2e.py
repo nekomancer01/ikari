@@ -1,6 +1,7 @@
 """The whole app driven like a user would: the real main window, fetch threads, HTTP client and store,
 talking to a fake Arctic Shift server on localhost. The rule checked throughout: nothing is requested
 unless the user asked for it, and each action requests only what it says."""
+import faulthandler
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ import sys
 import threading
 import time
 import types
+import weakref
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,7 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton  # noqa: E402
 
 from subsentiment import arctic_shift, collect  # noqa: E402
+from subsentiment.reddit import Post  # noqa: E402
 from subsentiment.gui import coverage, days  # noqa: E402
 from subsentiment.gui import tables  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
@@ -46,10 +49,23 @@ def wait_idle(w, timeout: float = 30) -> None:
     """Until the fetch the window is running has finished and its thread is cleaned up."""
     end = time.monotonic() + timeout
     while w.fetch_job.busy:
-        assert time.monotonic() < end, "fetch didn't finish"
+        if time.monotonic() >= end:
+            faulthandler.dump_traceback(all_threads=True)  # where the fetch is stuck, in the failure's output
+            raise AssertionError("fetch didn't finish")
         QApplication.processEvents()
         time.sleep(0.01)
     pump(50)
+    read_in(w)
+
+
+def read_in(w, timeout: float = 10) -> None:
+    """Until Download coverage has drawn what it read of the saved data: it reads on threads."""
+    end = time.monotonic() + timeout
+    while w.coverage.reading():
+        assert time.monotonic() < end, "Download coverage's read didn't finish"
+        QApplication.processEvents()
+        time.sleep(0.005)
+    QApplication.processEvents()
 
 
 @pytest.fixture
@@ -110,9 +126,17 @@ def in_range(env, w, sub="Python") -> int:
 
 def fetched_before(env, w, sub="python", rng="month") -> None:
     """Record ``rng`` as asked for by an earlier fetch of ``sub``, which Download coverage then lists, without
-    downloading it all again here."""
+    downloading it all again here. It lists only days with something saved: each day with nothing gets a skipped
+    image post, which no page shows."""
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData(rng))
-    env.store().save_tried(sub, collect.days_in(*w.fetch_form.bounds()))
+    store, asked = env.store(), collect.days_in(*w.fetch_form.bounds())
+    store.save_tried(sub, asked)
+    have = set(store.downloaded_days(sub))
+    for day in asked:
+        if day not in have:
+            store.save_post(Post(f"img{day}", sub, "img", "", "a", 1, 0.0, 0, day + 60, "u", "", image=True),
+                            0.0, "neutral")
+    store.commit()
 
 
 def fetch(w, sub="python", comments=True, rng="week", timeout: float = 30, **extra):
@@ -301,7 +325,7 @@ def test_image_posts_are_skipped_hidden_and_count_as_checked(env):
     cov = open_coverage(w)
     skipped = w.store.posts_per_day("python", cov.days[-1], cov.days[0] + DAY, images=True)
     assert sum(skipped.values()) == len(ids)
-    assert all(cov.day_table.cellWidget(r, 1).side.text() == "✓ Complete"
+    assert all(day_cell(cov, r, 1).side.text() == "✓ Complete"
                for r, d in enumerate(cov.days) if d >= w.fetch_form.bounds()[0] and d < coverage.today())
     fetch(w, comments=False)  # a repeat fetch doesn't save them either
     assert not {r["id"] for r in env.store().posts("python")} & ids
@@ -348,6 +372,67 @@ def test_the_fetch_drawer_keeps_a_random_sample_of_each_thread_and_remembers_it(
     w.close()
     again = env.window().fetch_form.comment_cap
     assert (again.count.value(), again.pick.currentData()) == (2, "random")
+
+
+def test_the_fetch_drawers_sample_downloads_only_part_of_a_big_days_comments_and_coverage_shows_it(env):
+    """Sample: each settled day keeps a random sample of its comments big enough for ±5 points at 95% (fewer than
+    385 on a day this size, by the finite population correction), from only the threads holding part of it; a
+    day of no more than 385 comments, and a post not counted yet, is downloaded whole."""
+    by_day: dict[int, list[dict]] = {}
+    for p in env.archive.posts:
+        if p["subreddit"] == "Python" and p["num_comments"]:
+            by_day.setdefault(int(p["created_utc"] // DAY), []).append(p)
+    for on in by_day.values():  # a 6-post day stays under the 385 a sample needs; a 12-post one has a big thread
+        for k, p in enumerate(on):
+            p["num_comments"] = 60 if len(on) < 6 else 2000 if k == 0 else 1
+    w = env.window()
+    w.fetch_form.comment_cap.pick.setCurrentIndex(w.fetch_form.comment_cap.pick.findData("sample"))
+    assert not w.fetch_form.comments_per_post.isEnabled()  # the sample sets its own size
+    fetch(w, comments=True)
+    s = env.store()
+    posts = {r["id"]: r for r in s.posts("python")}
+    saved: dict[int, int] = {}
+    for c in s.comments("python"):
+        day = int(posts[c["post_id"]]["created_utc"] // DAY * DAY)
+        saved[day] = saved.get(day, 0) + 1
+    asked = {q["link_id"] for p, q in env.archive.requests if p == TREE}
+    sampled = s.complete_keys("sampled", "python")
+    big, small = set(), set()
+    for day in {int(r["created_utc"] // DAY * DAY) for r in posts.values()}:
+        counts = s.comment_totals("python", day, day + DAY)
+        on = [posts[pid] for pid in counts]
+        if None in counts.values() or not any(counts.values()):
+            continue
+        sample = collect.Sample(counts)
+        total = sum(counts.values())
+        if total > collect.Sample.NEED:
+            big.add(day)
+            assert sample.size < collect.Sample.NEED and saved.get(day) == sample.size  # 2,000 or so: 323
+            fetched = {r["id"] for r in on} & asked
+            assert 0 < len(fetched) < len(on)  # not every thread: the saving
+            assert {r["id"] for r in on} <= sampled  # each holds its part of the sample, or has none in it
+        else:
+            small.add(day)
+            ids = {r["id"] for r in on}
+            whole, n = s.whole_threads_per_day("python", day, day + DAY)[day]
+            assert whole == n and not ids & sampled  # kept whole
+    assert big and small
+    env.archive.clear()
+    fetch(w, comments=True)  # asked again: the sample is held already, so no settled thread is asked for again
+    again = {q["link_id"] for p, q in env.archive.requests if p == TREE}
+    assert not again & sampled
+
+    fetched_before(env, w)
+    cov = open_coverage(w)
+    cov.comment_cap.pick.setCurrentIndex(cov.comment_cap.pick.findData("sample"))
+    end = time.monotonic() + 10
+    texts = lambda days: [day_cell(cov, cov._day_rows.index(d), 3).main.full_text() for d in days]
+    while not all(t.startswith("Sampled") for t in texts(big)) and time.monotonic() < end:
+        pump(20)
+    assert all(t.startswith("Sampled") for t in texts(big))  # sampled, not every comment saved
+    assert all(t.startswith("✓") for t in texts(small))  # every comment saved
+    w.close()
+    assert env.window().fetch_form.comment_cap.pick.currentData() == "sample"  # remembered
 
 
 def test_comments_come_with_a_fetch_when_asked(env):
@@ -736,6 +821,25 @@ def test_quitting_mid_fetch_exits_cleanly(env, tmp_path, mode):
     assert settings.value("fetch/subreddit") == "python"
 
 
+def test_widgets_left_for_the_garbage_collector_go_on_the_windows_thread_not_a_reading_one(env):
+    """A table reads rows on a thread, and Python collects garbage wherever enough objects are made: widgets of a
+    window closed earlier were deleted on that thread, which crashed Linux CI (a segfault). With the window open,
+    garbage waits for the window's thread."""
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QWidget
+    env.window()
+    where = []
+    for _ in range(20):
+        w = QWidget()
+        QTimer(w).start(1000)
+        w.me = w  # a cycle: only the garbage collector deletes it
+        where.append(weakref.ref(w, lambda _: where.append(threading.current_thread() is threading.main_thread())))
+        del w
+    worker.finish(worker.on_thread(lambda: [[] for _ in range(300_000)]))  # as many objects as a big table read
+    pump(300)
+    assert [w for w in where if isinstance(w, bool)] == [True] * 20
+
+
 def test_about_names_the_bundled_model(env, monkeypatch):
     shown = []
     monkeypatch.setattr(QMessageBox, "about", lambda parent, title, text: shown.append(text))
@@ -852,12 +956,20 @@ def test_when_the_server_says_no_requests_are_left_the_app_waits_for_the_reset(e
     assert not env.warnings and len(env.store().posts("python")) == in_range(env, w)
 
 
+def day_cell(cov, row: int, col: int):
+    """A day row's widget in a column, the row scrolled into view first as a user would: Download coverage gives
+    rows their widgets as they come near the view."""
+    cov.day_table.scrollTo(cov.day_table.model().index(row, col))
+    return cov.day_table.cellWidget(row, col)
+
+
 def open_coverage(w):
     w.coverage_act.trigger()
     end = time.monotonic() + 30
     while (w.coverage.count_job.busy or not w.coverage.days) and time.monotonic() < end:
         pump(20)
     pump(50)
+    read_in(w)
     return w.coverage
 
 
@@ -893,24 +1005,25 @@ def test_coverage_counts_posts_removed_from_reddit_as_checked(env):
     # The sidebar's fetch read every whole past day of the week to its end, so those days already read
     # complete. Forget that, as for days saved before fetches did, to see a day's share before Download all.
     whole = [r for r, d in enumerate(cov.days) if d >= w.fetch_form.bounds()[0] and d < coverage.today()]
-    assert whole and all(cov.day_table.cellWidget(r, 1).side.text() == "✓ Complete" for r in whole)
+    assert whole and all(day_cell(cov, r, 1).side.text() == "✓ Complete" for r in whole)
     w.store.db.execute("DELETE FROM complete")
     w.store.commit()
     cov.refresh_saved(rebuild=True)
     pump(50)
+    read_in(w)
     removed = w.store.removed_per_day("python", cov.days[-1], cov.days[0] + DAY)
     assert sum(removed.values()) > 0
     row, day = next((r, d) for r, d in enumerate(cov.days) if removed.get(d) and not no_total_day(cov, d))
-    cell = cov.day_table.cellWidget(row, 1)
+    cell = day_cell(cov, row, 1)
     saved = w.store.posts_per_day("python", day, day + DAY)[day]
     total = cov.totals["python"][day]
     assert cell.main.text() == f"{saved} saved"
     assert cell.side.text() == f"{100 * min(1, (saved + removed[day]) / total):.0f}%"
     assert f"{removed[day]} removed from Reddit" in cell.toolTip()
-    QTest.mouseClick(cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    QTest.mouseClick(day_cell(cov, row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     wait_idle(w)
     pump(100)
-    assert cov.day_table.cellWidget(row, 1).side.text() == "✓ Complete"
+    assert day_cell(cov, row, 1).side.text() == "✓ Complete"
 
 
 def no_total_day(cov, day):
@@ -955,7 +1068,7 @@ def test_coverage_stays_responsive_while_a_busy_day_downloads(env):
     cov.day_table.selectRow(row)
     pump(100)
     env.archive.delay = 0.02
-    QTest.mouseClick(cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    QTest.mouseClick(day_cell(cov, row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     worst = wait_idle_stalls(w)
     assert worst < 1.0
     t = cov.post_table
@@ -1001,19 +1114,59 @@ def test_a_days_download_all_that_hits_a_window_the_archive_cant_answer_saves_th
     monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.2)  # timeout back-offs, shortened further
     w = env.window()
     fetch(w, comments=False, rng="day")  # the day below isn't saved whole, so it can't be complete yet
+    fetched_before(env, w, rng="week")
     cov = open_coverage(w)
-    row, day = next((r, d) for r, d in enumerate(cov.days) if cov.totals["python"].get(d) and d < coverage.today())
-    in_day = sorted(p["created_utc"] for p in env.archive.posts
-                    if p["subreddit"] == "Python" and day <= p["created_utc"] < day + DAY)
+    in_day_of = {d: sorted(p["created_utc"] for p in env.archive.posts
+                           if p["subreddit"] == "Python" and d <= p["created_utc"] < d + DAY) for d in cov.days}
+    row, day = next((r, d) for r, d in enumerate(cov.days)
+                    if cov.totals["python"].get(d) and d < coverage.today() and in_day_of[d])
+    in_day = in_day_of[day]
     env.archive.stuck = [in_day[len(in_day) // 2] - 1]
-    QTest.mouseClick(cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    QTest.mouseClick(day_cell(cov, row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     wait_idle(w)
     pump(100)
     assert env.warnings == []
     assert "timed out" in w.progress_msg.text() and "Fetch failed" not in w.progress_msg.text()
-    assert cov.day_table.cellWidget(row, 1).side.text() != "✓ Complete"
+    assert day_cell(cov, row, 1).side.text() != "✓ Complete"
     saved = {r["created_utc"] for r in w.store.posts("python")}
     assert in_day[0] in saved and in_day[-1] in saved  # both ends of the day were still read
+
+
+def test_a_day_with_hours_the_archive_never_answers_doesnt_end_a_weeks_download(env, monkeypatch):
+    # Three hours of one day time out however narrow the window: that day is left not complete, and the
+    # download goes on through the other days and their comments, with no error box. It used to end the
+    # whole fetch with "Fetch failed" on that day.
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.2)  # timeout back-offs, shortened further
+    w = env.window()
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    after = w.fetch_form.bounds()[0]
+    bad = int(after // DAY * DAY) + 3 * DAY
+    env.archive.stuck = [bad + 8 * 3600 + s for s in range(0, 3 * 3600, 300)]
+    fetch(w)
+    assert env.warnings == [] and "Fetch failed" not in w.progress_msg.text()
+    s = env.store()
+    whole = {str(d) for d in range(int(after // DAY * DAY) + DAY, coverage.today(), DAY)}
+    assert s.complete_keys("posts", "python") == whole - {str(bad)}
+    saved = s.posts("python")
+    older = [r for r in saved if r["created_utc"] < bad]  # read after the bad day, as days go newest first
+    assert older and all(s.comment_ids(r["id"]) for r in older if r["num_comments"])  # and their comments
+    assert any(bad <= r["created_utc"] < bad + 8 * 3600 for r in saved)  # the bad day's first hours
+    assert "timed out on part of the range" in w.progress_msg.text()  # said, though older days read fine
+
+
+def test_a_download_stops_reading_days_once_the_archive_times_out_on_every_one(env, monkeypatch):
+    # When every post search times out, a week's download stops after TIMED_OUT_DAYS days that gave nothing,
+    # rather than putting each of the eight through the whole narrowing, and says to try again later.
+    monkeypatch.setattr(arctic_shift, "MAX_WAIT", 0.2)  # timeout back-offs, shortened further
+    w = env.window()
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    after = w.fetch_form.bounds()[0]
+    env.archive.stuck = [t for t in range(int(after) - DAY, int(time.time()) + DAY, 300)]
+    fetch(w)
+    assert env.warnings == [] and not env.store().posts("python")
+    assert "timed out" in w.progress_msg.text() and "try again" in w.progress_msg.text()
+    days_asked = {(int(q["after"]) + 1) // DAY for p, q in env.archive.requests if p == SEARCH}
+    assert len(days_asked) == collect.TIMED_OUT_DAYS
 
 
 def test_coverage_downloads_do_only_what_they_say(env):
@@ -1023,7 +1176,7 @@ def test_coverage_downloads_do_only_what_they_say(env):
     day_row = next(r for r, d in enumerate(cov.days) if cov.totals["python"].get(d))
     cov.day_table.selectRow(day_row)
     env.archive.clear()
-    QTest.mouseClick(cov.day_table.cellWidget(day_row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    QTest.mouseClick(day_cell(cov, day_row, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     wait_idle(w)
     assert set(env.archive.paths()) <= {SEARCH, IDS, AGG}  # the day's posts, no comments
     pump(100)
@@ -1067,6 +1220,7 @@ def test_coverage_counts_a_subreddit_picked_while_another_is_being_counted(env):
     env.archive.delays[AGG] = 1.0
     w.coverage_act.trigger()
     pump(200)
+    read_in(w)  # the days are read on a thread before their count is asked for
     assert w.coverage.count_job.busy  # python's count is still out
     w.datasets.setCurrentRow(next(i for i in range(w.datasets.count())
                                   if w.datasets.item(i).data(Qt.ItemDataRole.UserRole).lower() == "rust"))
@@ -1084,18 +1238,19 @@ def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
     # ticked; today (never counted) and complete days (no count needed) stay usable throughout.
     w = env.window()
     fetch(w, comments=False)
-    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
+    fetched_before(env, w, rng="month")
     complete = env.store().complete_keys("posts", "python")
     env.archive.clear()
     env.archive.delays[AGG] = 1.5
     w.coverage_act.trigger()
     pump(200)
+    read_in(w)  # the days are read on a thread before their count is asked for
     cov = w.coverage
     assert cov.count_job.busy
 
     def rows():
         for row, day in enumerate(cov.days):
-            yield day, cov.day_table.cellWidget(row, 1), cov.day_table.cellWidget(row, 2).findChild(QPushButton)
+            yield day, day_cell(cov, row, 1), day_cell(cov, row, 2).findChild(QPushButton)
 
     waiting = []
     for day, cell, button in rows():
@@ -1114,6 +1269,7 @@ def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
     while cov.count_job.busy and time.monotonic() < end:
         pump(20)
     pump(50)
+    read_in(w)  # what's saved is read again, on threads, once the count is in
     totals = cov.totals["python"]
     assert not any(cell.bar.waiting for _, cell, _ in rows())
     # Every day with posts to look for can be downloaded now; only past days the archive has none for can't.
@@ -1128,19 +1284,27 @@ def test_coverage_lists_the_days_fetches_asked_for_not_the_sidebars_dates(env):
     # fetches before had tried and might have missed posts on.
     w = env.window()
     fetch(w, sub="rust", comments=False, rng="day")
-    rust_days = collect.days_in(*w.fetch_form.bounds())
+    store = env.store()
+
+    def with_posts(sub, asked):  # the asked days the archive had posts for: the only ones listed
+        have = store.posts_per_day(sub, min(asked), max(asked) + DAY)
+        return [d for d in asked if d in have]
+    rust_days = with_posts("rust", collect.days_in(*w.fetch_form.bounds()))
     fetch(w, comments=False)  # a week of python
     cov = open_coverage(w)
-    week = collect.days_in(*w.fetch_form.bounds())
+    asked = collect.days_in(*w.fetch_form.bounds())
+    week = with_posts("python", asked)
+    assert 0 < len(week) <= len(asked) and rust_days
     assert cov.days == week and cov.day_table.rowCount() == len(week)
-    assert "8\u00a0days fetched before" in cov.subtitle.text()
+    assert f"{len(week)}\u00a0days downloaded" in cov.subtitle.text()
     env.archive.clear()
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))  # dates set, nothing fetched
     w.fetch_form.date_from.setDate(w.fetch_form.date_to.date().addDays(-2))
     pump(500)
     cov.refresh_saved()
+    read_in(w)
     assert cov.days == week and env.archive.paths() == []
-    # A fetch that's stopped or saves nothing still tried its days: they're listed, to download what it missed.
+    # A fetch that's stopped or saves nothing leaves no day with anything saved: none are added to the list.
     env.archive.fail(SEARCH, *[SLOW_DOWN] * 200)
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
@@ -1148,16 +1312,19 @@ def test_coverage_lists_the_days_fetches_asked_for_not_the_sidebars_dates(env):
     w.stop_btn.click()
     wait_idle(w)
     cov.refresh_saved()
-    assert cov.days == collect.days_in(*w.fetch_form.bounds()) and len(cov.days) == 31
+    read_in(w)
+    assert cov.days == week
     rust = next(i for i in range(w.datasets.count())
                 if w.datasets.item(i).data(Qt.ItemDataRole.UserRole).lower() == "rust")
     w.datasets.setCurrentRow(rust)  # each subreddit lists its own
     pump(200)
+    read_in(w)
     assert cov.days == rust_days
 
 
-def test_coverage_of_data_saved_before_tried_days_were_kept_spans_the_saved_days(env):
-    # Databases from before ikari kept the days each fetch asked for: the first saved post's day to the last's.
+def test_coverage_lists_every_day_with_posts_saved_whether_or_not_a_fetch_asked_for_it(env):
+    # Data from an import or from before ikari kept the days each fetch asked for has days on the charts that
+    # no fetch recorded; they must be listed too, or they can't be downloaded again or deleted.
     w = env.window()
     fetch(w, comments=False)
     s = env.store()
@@ -1165,9 +1332,11 @@ def test_coverage_of_data_saved_before_tried_days_were_kept_spans_the_saved_days
     for table in ("posts", "removed_posts"):
         s.db.execute(f"DELETE FROM {table} WHERE created_utc >= ?", (NOW - 2 * DAY,))
     s.commit()
-    first, last = s.db.execute("SELECT MIN(created_utc), MAX(created_utc) FROM posts").fetchone()
+    saved = sorted({int(r[0] // DAY * DAY) for r in s.db.execute("SELECT created_utc FROM posts WHERE image = 0")},
+                   reverse=True)
+    assert saved and s.tried_days("python") != saved  # a saved day no fetch recorded: none are recorded at all
     cov = open_coverage(w)
-    assert cov.days == collect.days_in(first, last + 1)
+    assert cov.days == saved
 
 
 def test_closing_the_app_while_a_coverage_count_is_out_doesnt_freeze_it(env):
@@ -1176,6 +1345,7 @@ def test_closing_the_app_while_a_coverage_count_is_out_doesnt_freeze_it(env):
     env.archive.delays[AGG] = 8
     w.coverage_act.trigger()
     pump(200)
+    read_in(w)  # the days are read on a thread before their count is asked for
     assert w.coverage.count_job.busy
     start = time.monotonic()
     w.close()
@@ -1213,7 +1383,7 @@ def test_stop_on_the_coverage_page_is_disabled_once_pressed(env):
     # The day's Download all is four requests sent at once, so at 0.15 s each it was over in about 0.34 s
     # and Stop was sometimes already off when the test looked at 0.3 s.
     env.archive.delay = 1.0
-    QTest.mouseClick(cov.day_table.cellWidget(1, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    QTest.mouseClick(day_cell(cov, 1, 2).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     pump(300)
     assert cov.isVisible() and w.stop_btn.isVisible() and w.stop_btn.isEnabled()  # the strip under the header
     QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
@@ -1229,6 +1399,7 @@ def test_coverage_left_and_opened_again_mid_count_counts_without_an_error(env):
     env.archive.delays[AGG] = 1.5
     w.coverage_act.trigger()
     pump(200)
+    read_in(w)  # the days are read on a thread before their count is asked for
     w.show_page("overview")  # the count goes on while another page shows
     w.coverage_act.trigger()
     end = time.monotonic() + 15
@@ -1375,12 +1546,16 @@ def test_every_view_keeps_up_with_the_rows_shown_while_a_fetch_waits(env):
         assert words.get(word, 0) == sum(word in r["title"].split() for r in rows) > 0, word
     assert {word for _, word, *_ in o.words.placed()} <= set(words) and o.words.placed()
     pump(800)  # what reads the store again does so once a second
+    read_in(w)
     assert w.fetch_job.busy
     assert w.storage_info.text().startswith(f"{want}\xa0posts")
     c = w.coverage
     saved = env.store().posts_per_day("Burst", c.days[-1], c.days[0] + DAY)
     for row, day in enumerate(c.days):
-        shown = c.day_table.cellWidget(row, 1).main.text()  # "12 of 20", "3 saved so far" or "No posts"
+        if c.day_table.isRowHidden(row):  # a day with no posts, saved or counted, isn't listed
+            assert not saved.get(day), day
+            continue
+        shown = day_cell(c, row, 1).main.text()  # "12 of 20", "3 saved so far" or "No posts"
         assert int(re.match(r"[\d,]*", shown).group().replace(",", "") or 0) == saved.get(day, 0), (day, shown)
     w._stop_fetch()
     wait_idle(w)
@@ -1487,13 +1662,14 @@ def test_a_stopped_download_all_goes_on_from_where_it_got_to(env, monkeypatch):
     fetched_before(env, w, "bigday", "week")
     cov = open_coverage(w)
     row = cov.days.index(day)
-    button = lambda: cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn))  # noqa: E731
+    button = lambda: day_cell(cov, row, 2).findChild(type(w.fetch_btn))  # noqa: E731
     env.archive.delay = 1.0  # a page a second for each part of the day, so Stop lands partway
     env.archive.clear()
     QTest.mouseClick(button(), Qt.MouseButton.LeftButton)
     end = time.monotonic() + 30
     in_day = lambda: {r["id"] for r in env.store().posts("bigday") if day <= r["created_utc"] < day + DAY}  # noqa: E731
-    while len(env.archive.paths()) < 6 and time.monotonic() < end:  # the first pages are in, the next asked for
+    # Two rounds of pages in and the next asked for. After only the first round, a slow runner had two pages saved.
+    while len(env.archive.paths()) < 9 and time.monotonic() < end:
         pump(20)
     QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
     wait_idle(w)
@@ -1535,7 +1711,7 @@ def test_a_count_that_keeps_timing_out_doesnt_hold_up_a_download(env, monkeypatc
                and any(d <= p["created_utc"] < d + DAY for p in env.archive.posts if p["subreddit"] == "Python"))
     # An uncounted day's Download all now waits for its count, so the same download is started as its button
     # would once enabled: what's checked here is that the count's back-offs don't hold up a download.
-    assert not cov.day_table.cellWidget(row, 2).findChild(type(w.fetch_btn)).isEnabled()
+    assert not day_cell(cov, row, 2).findChild(type(w.fetch_btn)).isEnabled()
     cov._download_day(cov.days[row])
     wait_idle(w)
     paths = env.archive.paths()
@@ -1625,15 +1801,41 @@ def test_a_days_comments_downloaded_once_read_complete_even_where_the_archive_co
     fetch(w, sub="bigthreads", comments=False, rng="week")
     cov = open_coverage(w)
     row = cov.days.index(day)
-    QTest.mouseClick(cov.day_table.cellWidget(row, 4).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    QTest.mouseClick(day_cell(cov, row, 4).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
     wait_idle(w)
     end = time.monotonic() + 10
-    while cov.threads_job.busy and time.monotonic() < end:
+    while cov.reading() and time.monotonic() < end:
         pump(20)
     pump(100)
-    assert cov.day_table.cellWidget(row, 3).main.full_text() == "✓ 5\u00a0threads"  # on main: 4 of 5 threads
+    assert day_cell(cov, row, 3).main.full_text() == "✓ 5\u00a0threads"  # on main: 4 of 5 threads
     assert len(env.store().comment_ids("bd00002")) == 400  # the whole tree, not 55 of it
     assert env.store().open_threads("bigthreads", [day]) == []  # nothing left to offer again
+
+
+def test_a_huge_thread_whose_tree_comes_back_collapsed_is_read_whole_from_the_comment_search(env):
+    # A tree the archive collapses whatever the limit came back the same way on every download, so its day never
+    # read complete and Coverage offered it again and again.
+    day = busy_day(env, "hugethread", 5)
+    big = next(p for p in env.archive.posts if p["id"] == "bd00002")
+    big.update(num_comments=1500, tree=1500, collapsed=True, same_second=150,  # a burst sharing one second too
+               retrieved_on=big["created_utc"] + 40 * 3600)
+    w = env.window()
+    fetch(w, sub="hugethread", comments=False, rng="week")
+    cov = open_coverage(w)
+    row = cov.days.index(day)
+    QTest.mouseClick(day_cell(cov, row, 4).findChild(type(w.fetch_btn)), Qt.MouseButton.LeftButton)
+    wait_idle(w, 60)
+    end = time.monotonic() + 10
+    while cov.reading() and time.monotonic() < end:
+        pump(20)
+    pump(100)
+    row = cov.days.index(day)  # replies written on later days list those days above it
+    assert day_cell(cov, row, 3).main.full_text() == "✓ 5\u00a0threads"
+    saved = env.store().comments("hugethread")
+    assert len([c for c in saved if c["post_id"] == "bd00002"]) == 1500
+    depth = {c["id"]: c["depth"] for c in saved}
+    assert depth["bd00002c3"] == 1 and depth["bd00002c1000"] == 0 and depth["bd00002c1003"] == 1  # from the parents
+    assert env.store().open_threads("hugethread", [day]) == []
 
 
 def test_download_all_comments_asks_nothing_for_posts_that_turn_out_to_have_none(env):

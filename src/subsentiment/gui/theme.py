@@ -12,14 +12,16 @@ Tabular figures are switched on so numbers line up in columns.
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QObject, QPointF, QRectF, Qt, QVariantAnimation
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRectF, Qt, QVariantAnimation
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QLinearGradient, QPainter, QPalette, QPen
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import (QApplication, QCalendarWidget, QComboBox, QDateEdit, QLineEdit, QPlainTextEdit, QPushButton,
+                               QSpinBox, QTableView, QWidget)
 
 from subsentiment.gui import native
 
@@ -28,8 +30,9 @@ ASSETS = Path(__file__).parent / "assets"
 THEMES = {
     "light": {
         "bg0": "#f1f1f1",
-        # Panels and the cards on them are white; "soft" is the gray of a hover or a chosen row, "head" a table's.
-        "panel": "#ffffff", "soft": "#f5f5f5", "head": "#f6f6f6",
+        # Panels and the cards on them are white; "soft" is the gray of a hover or a chosen row, "head" a table's,
+        # "press" a button held down.
+        "panel": "#ffffff", "soft": "#f5f5f5", "head": "#f6f6f6", "press": "#e9e9eb",
         "edge": (0, 0, 0, 24),  # hairline borders and dividers, about #e8e8e8 on white
         "text": "#1f1f1f", "muted": "#737373", "faint": "#a3a3a3",
         "accent": "#0163ff", "on_accent": "#ffffff", "button": "#0163ff",
@@ -39,7 +42,7 @@ THEMES = {
     },
     "dark": {
         "bg0": "#0e0e10",
-        "panel": "#18181b", "soft": "#242428", "head": "#1f1f23",
+        "panel": "#18181b", "soft": "#242428", "head": "#1f1f23", "press": "#303036",
         "edge": (255, 255, 255, 24),
         "text": "#ededef", "muted": "#9d9da3", "faint": "#6c6c72",
         "accent": "#3d86ff", "on_accent": "#ffffff",
@@ -159,7 +162,7 @@ def _icons(t: dict) -> Path:
 
 def stylesheet(t: dict) -> str:
     icons = _icons(t).as_posix()  # forward slashes; urls are quoted below for paths with spaces
-    panel, soft, head = t["panel"], t["soft"], t["head"]
+    panel, soft, head, press = t["panel"], t["soft"], t["head"], t["press"]
     display = f'"{DISPLAY_FAMILY}"'
     edge, sel = _rgba(t["edge"]), _rgba(t["selection"])
     return f"""
@@ -169,8 +172,8 @@ QMainWindow, QDialog {{ background: {t['bg0']}; }}
 QToolTip {{ background: {t['menu']}; color: {t['text']}; border: 1px solid {edge}; border-radius: 8px; padding: 6px 8px; }}
 
 /* Panels: "true" is a page-level panel (the sidebar, the main area), "tile" and "solid" the cards on one */
-QFrame[glass="true"] {{ background: {panel}; border: 1px solid {edge}; border-radius: 16px; }}
-QFrame[glass="tile"], QFrame[glass="solid"] {{ background: {panel}; border: 1px solid {edge}; border-radius: 10px; }}
+/* Outline paints their card and edge; the transparent border keeps the 1 px it takes in the layout */
+QFrame[glass] {{ background: transparent; border: 1px solid transparent; }}
 QFrame[choice="true"] {{ background: {soft}; border: none; border-radius: 13px; }}
 QFrame[role="divider"] {{ background: {edge}; border: none; min-height: 1px; max-height: 1px; }}
 QLabel {{ background: transparent; border: none; }}
@@ -183,20 +186,20 @@ QLabel[role="caption"], QLabel[role="muted"] {{ color: {t['muted']}; font-weight
 QLabel[role="status"] {{ color: {t['muted']}; padding: 2px 6px; }}
 
 /* Inputs */
+/* Inputs, tables and panels: Outline paints the edge on whole device pixels, so style sheet borders stay transparent */
 QLineEdit, QSpinBox, QComboBox, QDateEdit {{
-    background: {panel}; border: 1px solid {edge}; border-radius: 8px;
+    background: {panel}; border: 1px solid transparent; border-radius: 8px;
     padding: 5px 10px; min-height: 20px; max-height: 20px; selection-background-color: {t['accent']}; selection-color: {t['on_accent']};
 }}
 QComboBox[pill="true"] {{ border-radius: 15px; padding: 5px 10px 5px 12px; font-weight: 500; }}
-QLineEdit:hover, QSpinBox:hover, QComboBox:hover, QDateEdit:hover {{ border-color: {t['faint']}; }}
-QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QComboBox:on, QDateEdit:focus {{ border: 1px solid {t['accent']}; }}
+/* Hover and focus change Outline's color; these rules keep Qt repainting the input when they change */
+QLineEdit:hover, QSpinBox:hover, QComboBox:hover, QDateEdit:hover, QPlainTextEdit:hover,
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QComboBox:on, QDateEdit:focus, QPlainTextEdit:focus {{ border-color: transparent; }}
 QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled, QDateEdit:disabled {{ color: {t['faint']}; background: {soft}; }}
 QPlainTextEdit {{
-    background: {panel}; border: 1px solid {edge}; border-radius: 8px; padding: 4px 6px;
+    background: {panel}; border: 1px solid transparent; border-radius: 8px; padding: 4px 6px;
     selection-background-color: {t['accent']}; selection-color: {t['on_accent']};
 }}
-QPlainTextEdit:hover {{ border-color: {t['faint']}; }}
-QPlainTextEdit:focus {{ border: 1px solid {t['accent']}; }}
 QComboBox::drop-down, QDateEdit::drop-down {{ border: none; width: 26px; background: transparent; }}
 QComboBox::down-arrow, QDateEdit::down-arrow {{ image: url("{icons}/{_mode}-down.svg"); width: 12px; height: 12px; }}
 QDateEdit {{ padding-right: 26px; }}
@@ -231,24 +234,38 @@ QCheckBox::indicator:hover {{ border-color: {t['accent']}; }}
 QCheckBox::indicator:checked {{ background: {t['accent']}; border-color: {t['accent']}; image: url("{icons}/{_mode}-check.svg"); }}
 QCheckBox:disabled {{ color: {t['faint']}; }}
 
-/* Buttons: outlined pills, the main action filled with the accent */
+/* Buttons: outlined pills, the main action filled with the accent. Outline paints the outlines (Outline.shape has the
+   radii below), so their style sheet borders are transparent; the filled main action keeps its own. */
 QPushButton {{
-    background: {panel}; border: 1px solid {edge}; border-radius: 14px; padding: 8px 16px; font-weight: 500;
+    background: {panel}; border: 1px solid transparent; border-radius: 14px; padding: 8px 16px; font-weight: 500;
 }}
 QPushButton:hover {{ background: {soft}; }}
-QPushButton:pressed {{ background: {head}; }}
-QPushButton:disabled {{ color: {t['faint']}; background: {panel}; border-color: {edge}; }}
-QPushButton:focus {{ border-color: {t['accent']}; }}
-QPushButton:checked {{ background: {sel}; border-color: {t['accent']}; }}  /* a toggle button that is on */
+QPushButton:pressed {{ background: {press}; }}
+QPushButton:disabled {{ color: {t['faint']}; background: {panel}; }}
+QPushButton:focus {{ border-color: transparent; }}  /* Outline turns accent; this keeps Qt repainting on focus */
+QPushButton:checked {{ background: {sel}; }}  /* a toggle button that is on */
 QPushButton[primary="true"] {{ color: {t['on_accent']}; border: 1px solid {t['button']}; background: {t['button']}; }}
 QPushButton[primary="true"]:hover {{ background: {QColor(t['button']).darker(110).name()}; }}
+QPushButton[primary="true"]:pressed {{ background: {QColor(t['button']).darker(122).name()}; }}
 QPushButton[primary="true"]:focus {{ border-color: {QColor(t['button']).darker(125).name()}; }}
 QPushButton[primary="true"]:disabled {{ color: rgba(255, 255, 255, 190); background: {t['faint']}; border-color: {t['faint']}; }}
 QPushButton[flat="true"] {{ background: transparent; border: 1px solid transparent; color: {t['muted']}; }}
 QPushButton[flat="true"]:hover {{ background: {soft}; color: {t['text']}; }}
-QPushButton[flat="true"]:checked {{ background: {panel}; border-color: {edge}; color: {t['text']}; }}  /* like a chosen tab */
+QPushButton[flat="true"]:pressed {{ background: {press}; color: {t['text']}; }}
+QPushButton[flat="true"]:checked {{ background: {panel}; color: {t['text']}; }}  /* like a chosen tab */
 QPushButton[flat="true"]:disabled {{ color: {t['faint']}; }}
 QPushButton[small="true"] {{ padding: 3px 9px; border-radius: 8px; font-size: 9pt; }}
+/* Pill sizes, each fully round: "compact" 28 px high, "bar" 32 px to sit level with the boxes and choices beside it,
+   "glyph" a one-character button 24 px high (a list row's download) */
+QPushButton[pill="compact"] {{ padding: 5px 12px; border-radius: 14px; }}
+QPushButton[pill="bar"] {{ padding: 7px 16px; border-radius: 16px; }}
+QPushButton[pill="glyph"] {{ padding: 3px 0; border-radius: 12px; }}
+/* A choice's words sit in its soft track, so a hover there tints rather than turning the track's own gray */
+QFrame[choice="true"] QPushButton {{ padding: 4px 12px; border-radius: 10px; }}
+QFrame[choice="true"][small="true"] QPushButton {{ padding: 3px 10px; }}
+QFrame[choice="true"] QPushButton[flat="true"]:hover {{ background: {edge}; color: {t['text']}; }}
+QFrame[choice="true"] QPushButton[flat="true"]:pressed {{ background: {_rgba((*t['edge'][:3], t['edge'][3] * 2))}; }}
+QFrame[choice="true"] QPushButton[flat="true"]:checked {{ background: {panel}; color: {t['text']}; }}
 
 /* Tabs: plain words, the chosen one an outlined pill */
 QTabWidget::pane {{ border: none; top: 0; }}
@@ -263,7 +280,7 @@ QTabBar::tab:selected {{ color: {t['text']}; background: {panel}; border-color: 
 
 /* Tables and lists: a ruled table in an outlined box, its header row tinted */
 QTableView {{
-    background: {panel}; border: 1px solid {edge}; border-radius: 10px; gridline-color: transparent; font-weight: 400;
+    background: {panel}; border: 1px solid transparent; border-radius: 10px; gridline-color: transparent; font-weight: 400;
     selection-background-color: {sel}; selection-color: {t['text']}; alternate-background-color: {panel};
 }}
 QListWidget {{
@@ -337,6 +354,7 @@ def apply(app: QApplication, requested: str = "system", reduce_transparency: boo
     for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
         pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(t["faint"]))
     app.setPalette(pal)
+    Outline.install(app)
     (window or app).setStyleSheet(stylesheet(t))
 
 
@@ -417,6 +435,100 @@ class MoodTint(QObject):
         self._window.update()
 
 
+class Outline(QObject):
+    """Rounded outlines on whole device pixels: the panels' cards, the tables' boxes and the inputs' edges.
+
+    A style sheet border is 1 logical px, 1.5 device pixels at 150% scaling, so it landed as a solid pixel and
+    a half-toned one beside it, and its corner arcs and straight sides were drawn apart and met in a nub: the
+    fuzzy edge. Outline strokes one path a whole number of device pixels wide on pixel centres, with the
+    same amount of ink as the theme's 1 px edge. One filter on the app paints it after the widget's own paint
+    event, under its children; the style sheet keeps those borders transparent, so layouts don't move.
+    """
+
+    RADII = {"true": 16, "tile": 10, "solid": 10}  # the panels' "glass" kinds
+    INPUTS = (QLineEdit, QSpinBox, QComboBox, QDateEdit, QPlainTextEdit)
+    BUTTON_RADII = {"compact": 14, "bar": 16, "glyph": 12}  # the style sheet's QPushButton[pill] sizes
+
+    @classmethod
+    def install(cls, app: QApplication) -> None:
+        if app.property("outline") is not True:
+            app.installEventFilter(cls(app))
+            app.setProperty("outline", True)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() != QEvent.Type.Paint or not isinstance(obj, QWidget):
+            return False
+        shape = self.shape(obj)
+        if shape is None:
+            return False
+        obj.event(event)  # the widget's own paint first, so the outline sits on its background
+        radius, fill = shape
+        p = QPainter(obj)
+        self.draw(p, QRectF(obj.rect()), radius, self.color(obj), fill)
+        p.end()
+        return True
+
+    def shape(self, w: QWidget) -> tuple[float, QColor | None] | None:
+        """(corner radius, card fill or None) for a widget that takes an outline, else None."""
+        kind = w.property("glass")
+        if kind in self.RADII:
+            return self.RADII[kind], QColor(tokens()["panel"])
+        if isinstance(w, QTableView):
+            return (10, None) if not isinstance(w.parentWidget(), QCalendarWidget) else None
+        if isinstance(w, self.INPUTS):
+            if isinstance(w, QLineEdit) and not w.hasFrame():  # the text box inside a spin box or date field
+                return None
+            return (15 if w.property("pill") is True else 8), None
+        if isinstance(w, QPushButton):  # the filled main action, and a flat one until it's chosen, have no outline
+            if w.property("primary") is True or (w.property("flat") is True and not w.isChecked()):
+                return None
+            parent = w.parentWidget()
+            if parent is not None and parent.property("choice") is True:
+                return 10, None
+            return self.BUTTON_RADII.get(w.property("pill"), 8 if w.property("small") is True else 14), None
+        return None
+
+    def color(self, w: QWidget) -> QColor:
+        t = tokens()
+        if isinstance(w, self.INPUTS) and w.isEnabled():
+            if w.hasFocus() or (isinstance(w, QComboBox) and w.view().isVisible()):
+                return QColor(t["accent"])
+            if w.underMouse():
+                return QColor(t["faint"])
+        if isinstance(w, QPushButton) and w.isEnabled() and w.property("flat") is not True:
+            if w.hasFocus() or w.isChecked():  # a toggle that is on
+                return QColor(t["accent"])
+        return QColor(*t["edge"])
+
+    @staticmethod
+    def draw(p: QPainter, rect: QRectF, radius: float, edge: QColor, fill: QColor | None = None) -> None:
+        """``rect`` (logical) outlined in ``edge``, filled with ``fill`` if given, snapped to device pixels."""
+        p.save()
+        d = p.deviceTransform()  # the device pixel ratio and the widget's offset, often half a pixel at 150%
+        dpr = d.m11()
+        dev = (p.worldTransform() * d).mapRect(rect)
+        # The whole device pixels inside the rect; drawn in device pixels from here on.
+        left, top = math.ceil(dev.left() - 0.01), math.ceil(dev.top() - 0.01)
+        right, bottom = math.floor(dev.right() + 0.01), math.floor(dev.bottom() + 0.01)
+        p.setWorldTransform(d.inverted()[0])
+        width = max(1, int(dpr + 0.25))  # 1 device pixel at 100-150%, 2 at 175-200%
+        if edge.alpha() < 255:  # the ink of a 1 logical px line, in whole pixels
+            edge = QColor(edge)
+            edge.setAlpha(min(255, round(edge.alpha() * dpr / width)))
+        r = radius * dpr
+        box = QRectF(left, top, right - left, bottom - top)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if fill is not None:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill)
+            p.drawRoundedRect(box, r, r)
+        half = width / 2
+        p.setPen(QPen(edge, width))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(box.adjusted(half, half, -half, -half), r - half, r - half)
+        p.restore()
+
+
 def paint_popup(widget: QWidget, shadow: int) -> None:
     """A popup's card: the menu color in a rounded hairline outline, inset by ``shadow`` px for a soft shadow
     around it. The popup window needs WA_TranslucentBackground so the corners and shadow show through."""
@@ -430,9 +542,7 @@ def paint_popup(widget: QWidget, shadow: int) -> None:
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(color)
         p.drawRoundedRect(card.adjusted(-i, -i + 3, i, i + 3), 14 + i, 14 + i)
-    p.setBrush(QColor(t["menu"]))
-    p.setPen(QPen(QColor(*t["edge"][:3], min(255, t["edge"][3] * 2)), 1))
-    p.drawRoundedRect(card.adjusted(0.5, 0.5, -0.5, -0.5), 14, 14)
+    Outline.draw(p, card, 14, QColor(*t["edge"][:3], min(255, t["edge"][3] * 2)), QColor(t["menu"]))
 
 
 def paint_backdrop(widget: QWidget, over_native: bool = False, mood: QPointF | None = None) -> None:

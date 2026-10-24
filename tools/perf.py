@@ -157,14 +157,14 @@ def downloading(w, page: str, beat: "Heartbeat") -> None:
     rng = random.Random(3)
     corpus = Corpus(rng)
     bodies = [corpus.text(rng.randint(3, 40)) for _ in range(5000)]
-    plain = fake_archive.comment_tree
+    plain = fake_archive.thread
 
-    def tree(post, limit):  # comments as long as real ones, not a word each
-        items = plain(post, limit)
-        for i, item in enumerate(items):
-            item["data"]["body"] = bodies[(int(post["id"][2:]) * 400 + i) % len(bodies)]
+    def thread(post):  # comments as long as real ones, not a word each
+        items = plain(post)
+        for i, d in enumerate(items):
+            d["body"] = bodies[(int(post["id"][2:]) * 400 + i) % len(bodies)]
         return items
-    fake_archive.comment_tree = tree
+    fake_archive.thread = thread
     sub, day = w.current, int(time.time() // DAY * DAY) - 3 * DAY
     posts = [{"id": f"dl{k:03d}", "subreddit": sub, "title": corpus.text(8), "selftext": "", "author": "a",
               "score": 50, "upvote_ratio": 0.9, "num_comments": 400, "created_utc": day + 600 * k,

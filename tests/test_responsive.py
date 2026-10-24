@@ -376,3 +376,26 @@ def test_new_points_from_a_fetch_are_painted_once_while_the_mouse_is_over_the_ch
                                                       Qt.KeyboardModifier.NoModifier))
             chart.repaint()
     assert len(drawn) == 3
+
+
+def test_opening_a_big_subreddit_on_a_thread_leaves_the_garbage_collector_to_free_what_goes(window, monkeypatch):
+    # Garbage is collected on the window's thread only (worker.Collector). Opening a big subreddit holds it off while
+    # the thread reads, but froze everything alive at the end once: a closed window's widgets, and every opened
+    # subreddit's connections once they were let go, then stayed for good.
+    import gc
+    import weakref
+    w = window
+    monkeypatch.setattr(mw.MainWindow, "LOAD_THREAD_FROM", 0)
+    w._loaded.clear()
+    frozen = gc.get_freeze_count()
+
+    class Cycle:
+        pass
+    c = Cycle()
+    c.me = c
+    gone = weakref.ref(c)
+    del c
+    w._show_dataset("Other")
+    until(lambda: w.current == "Other" and not w.load_job.busy)
+    until(lambda: gone() is None)  # collected by the window's collector
+    assert gc.get_freeze_count() == frozen
