@@ -25,6 +25,7 @@ def rjson(self, *a, **k):
 requests.Response.json = rjson
 
 def main():
+    faulthandler.enable(all_threads=True)  # a crash prints every thread's stack
     sub, rng, minutes, page = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
     tmp = tempfile.mkdtemp(prefix="samplelag-")
     app = QApplication([]); app.setOrganizationName("samplelag"); app.setApplicationName("samplelag")
@@ -45,7 +46,9 @@ def main():
         now = clock.elapsed(); gaps.append((now - last[0], now)); last[0] = now
     hb = QTimer(); hb.timeout.connect(beat); hb.start(1)
     stalls = open(tmp + "/stalls.txt", "w+")
-    arm = QTimer(); arm.timeout.connect(lambda: faulthandler.dump_traceback_later(0.15, file=stalls)); arm.start(10)
+    arm = QTimer(); arm.timeout.connect(lambda: faulthandler.dump_traceback_later(0.15, file=stalls))
+    if not os.environ.get("NO_STALLS"):  # stall dumps off, to rule them out
+        arm.start(10)
     t0 = time.monotonic(); nxt = 0
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
     w.show_page(page)
@@ -81,7 +84,7 @@ def main():
     print("window thread in stalls:"); [print(" ", c, k) for k, c in main_tops.most_common(10)]
     print("other threads in stalls:"); [print(" ", c, k) for k, c in other.most_common(10)]
     print("data dir:", tmp)
-    os._exit(0)
+    sys.stdout.flush(); os._exit(0)
 
 if __name__ == "__main__":
     main()

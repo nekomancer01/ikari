@@ -153,7 +153,6 @@ class Download:
         self.saved_whole: set[str] = set()  # saved posts whose whole thread is saved (when filling threads)
         self.saved_count: dict[str, int] = {}  # comments saved per post (when filling threads up to a cap)
         self.n_comments = self.errors = 0
-        self.gave_up = False  # the archive kept failing comment requests; the rest are left for the next fetch
         self.timed_out = False  # some part of the range was skipped, as the archive kept timing out on it
 
     def progress(self, done: int, total: int, msg: str) -> None:  # remembered, to come back to after a wait
@@ -345,16 +344,15 @@ class Download:
                 or (pid in repicked and r["comments_ok"] is None and not r["has_comments"])  # picked, never asked
                 or (fill and pid not in self.saved_whole and not (cap and self.saved_count.get(pid, 0) >= cap)))]
         todo = self.sampled([p for p in todo if p.num_comments != 0])  # None (not settled yet) still gets looked up
-        if self.gave_up:
-            tried: set[str] = set()
-        else:
-            get = self.take_sample if self.sample else (lambda p: client.fetch_all_comments(p, cap, req.comment_pick)) \
-                if fill else (lambda p: (client.fetch_comments(p, cap, req.comment_pick), False))
-            failed, tried, self.gave_up, added = self.each_thread(todo, get, cap=cap, progress=report)
-            self.errors += failed
-            self.n_comments += added
-            self.mark_sampled(tried)
-        if self.gave_up:
+        # Threads failing one after another stop this part's (its day's): the rest are left for the next fetch. The
+        # next day tries again, so one bad stretch of a year's download doesn't leave every day after it without.
+        get = self.take_sample if self.sample else (lambda p: client.fetch_all_comments(p, cap, req.comment_pick)) \
+            if fill else (lambda p: (client.fetch_comments(p, cap, req.comment_pick), False))
+        failed, tried, gave_up, added = self.each_thread(todo, get, cap=cap, progress=report)
+        self.errors += failed
+        self.n_comments += added
+        self.mark_sampled(tried)
+        if gave_up:
             rest = [p for p in todo if p.id not in tried]  # not tried this time: retried on the next fetch
             self.errors += len(rest)
             for p in rest:

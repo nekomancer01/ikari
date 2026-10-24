@@ -467,6 +467,21 @@ def test_a_whole_range_gets_each_days_comments_before_the_next_days_posts(tmp_pa
     assert steps == [step for d in (2, 1, 0) for step in [("posts", d)] + [("comments", d)] * 3]
 
 
+def test_a_day_whose_threads_keep_failing_leaves_only_that_days_comments_for_the_next_fetch(tmp_path):
+    # Five threads failing in a row used to end comments for the rest of the job: on a year's download, every day
+    # after went without, each marked failed in a moment. Failing threads stop their own day; the next tries again.
+    s = store_with(tmp_path, [])
+    c = DayClient(per_day=collect.GIVE_UP_AFTER + 2, days=3, num_comments=2)
+    c.failing = {p.id for p in c.posts if p.id.startswith("d2")}  # the newest day, read first
+    result = collect.run(c, s, collect.FetchRequest("python", after=D0, before=D0 + 3 * 86400, limit=None))
+    asked = [call[1] for call in c.calls if call[0] == "comments"]
+    assert sum(pid.startswith("d2") for pid in asked) == collect.GIVE_UP_AFTER  # that day stopped asking
+    assert {p.id for p in c.posts if not p.id.startswith("d2")} <= set(asked)  # the older days were still asked
+    assert result.comments == 2 * (collect.GIVE_UP_AFTER + 2)
+    failed = {r["id"] for r in s.posts_between("python", None, None) if r["comments_ok"] == 0}
+    assert failed == c.failing  # retried on the next fetch
+
+
 def test_stopping_after_a_day_keeps_its_comments(tmp_path):
     s = store_with(tmp_path, [])
     c = DayClient(days=3, num_comments=2)
