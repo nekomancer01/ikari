@@ -1440,7 +1440,7 @@ class CoveragePage(VerticalScrollArea):
         self._deleting = (sub, days, None)
         self.status.setText(f"Deleting {plural(len(days), 'day')} of r/{sub}…")
         self.delete_job.start(worker)
-        self.window_.set_deleting(True)
+        self.window_.set_writing()
         self._show_ticked()
 
     @Slot(object)
@@ -1455,7 +1455,7 @@ class CoveragePage(VerticalScrollArea):
     def _on_delete_ended(self) -> None:
         """Its thread is done, so the saved data can be written again; every page shows what's left."""
         sub, days, got = self._deleting
-        self.window_.set_deleting(False)
+        self.window_.set_writing()
         if isinstance(got, tuple):
             if (self.subreddit or "").lower() == sub.lower():
                 self.untick(days)

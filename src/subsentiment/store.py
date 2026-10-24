@@ -132,6 +132,11 @@ SCHEMA_VERSION = 4  # 4: text searchable (Search); 1: derivable comment permalin
 # from its post's.)
 PACKED = {"posts": ("title", "selftext", "author", "permalink", "url"), "comments": ("parent_id", "author", "body")}
 SETTLE = 2 * 86400  # a day is packed once it's this old: scores have settled, so its rows rarely change
+# Store.upgrade's packing waits this long between two days about once a second, so a save waiting for the lock gets
+# it: SQLite's busy handler tries again every 100 ms, and the next day's transaction began within microseconds, so a
+# fetch saving beside it failed with "database is locked" (the owner's database, 14 s into its first start).
+BREATHE = 0.12
+ELSEWHERE = 50_000  # Store.upgrade packs this many rows or more in a process of its own (_pack_elsewhere)
 _ZSTD_LEVEL = 12
 # A row's packed column: 0 its text is in the row; 1 in its day's pack; 2 in its day's pack, but its score was set
 # again since (Store.rescore), so the pack's copy of its numbers is out of date until the day is packed again.
@@ -603,9 +608,10 @@ class _Stopping:
         return self.event.is_set() or parent is not None and not parent.is_alive()
 
 
-def _pack_all(path: str, pack: bool, stop) -> None:
-    """A big Store.upgrade's packing (if ``pack``) and search index, in a process of its own, splitting words in a
-    few more. ``stop`` (a multiprocessing Event) ends it between days, its word-splitting processes with it."""
+def _pack_all(path: str, pack: bool, stop, index: bool = True) -> None:
+    """A big Store.upgrade's packing (if ``pack``) and search index (if ``index``), in a process of its own,
+    splitting words in a few more. ``stop`` (a multiprocessing Event) ends it between days, its word-splitting
+    processes with it."""
     stop = _Stopping(stop)
     store = Store(path)
     pool = None
@@ -616,13 +622,14 @@ def _pack_all(path: str, pack: bool, stop) -> None:
         pool = None
     try:
         if pack:
-            store.pack_settled(vacuum=False, stop=stop, split=pool, old=True)
+            store.pack_settled(vacuum=False, stop=stop, split=pool, old=True, breathe=BREATHE)
             if stop.is_set():
                 return
             store.drop_rebuilt_links()
             if store._left_to_pack():
                 return
-        store.index_text(stop)
+        if index:
+            store.index_text(stop)
     finally:
         if pool is not None:
             pool.shutdown(cancel_futures=True)
@@ -747,12 +754,19 @@ class Store:
         a big one, so the app runs it on its own thread, and splits the words in worker processes. A copy of the
         database is kept until every settled day is packed, across starts if it's cut short: each day is its own
         transaction, checked before it's committed (see pack_settled), so a day not reached is left as it was
-        and packed next time. Then (and for version 3, only) it indexes the text for search (index_text)."""
+        and packed next time. Then (and for version 3, only) it indexes the text for search (index_text).
+        On a database already upgraded it packs ELSEWHERE or more rows left unpacked, as an import leaves them
+        (import_from takes them unpacked: 700,000 from a 230 MB database, which the next fetch then packed as it
+        ended, holding it up for 100 s)."""
         self = cls(path)
         try:
             for table in PACKED:
                 self._index_unpacked(table)
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
+            if version == SCHEMA_VERSION:  # (a few are left for the next fetch to pack as it ends)
+                if self._left_to_pack() >= ELSEWHERE:
+                    self._pack_elsewhere(stop, index=False)
+                return
             if version not in (1, 2, 3):
                 return
             pack = version < 3  # 3 only needs its search index
@@ -768,9 +782,9 @@ class Store:
                     copy.close()
                 os.replace(part, backup)
             rows = self.db.execute("SELECT (SELECT COUNT(*) FROM posts) + (SELECT COUNT(*) FROM comments)").fetchone()[0]
-            elsewhere = rows >= 50_000 and self._pack_elsewhere(stop, pack)
+            elsewhere = rows >= ELSEWHERE and self._pack_elsewhere(stop, pack)
             if not elsewhere and pack:
-                self.pack_settled(vacuum=False, stop=stop, old=True)
+                self.pack_settled(vacuum=False, stop=stop, old=True, breathe=BREATHE)
                 self.drop_rebuilt_links()
             if pack and self._left_to_pack():
                 return  # stopped, or some day couldn't be packed: carried on at the next start
@@ -853,14 +867,14 @@ class Store:
         self.search.put(kind, [(r[0], packed.get(r[0], r[4:]) if r[3] else r[4:]) for r in rows])
         self.db.commit()
 
-    def _pack_elsewhere(self, stop: threading.Event | None, pack: bool = True) -> bool:
+    def _pack_elsewhere(self, stop: threading.Event | None, pack: bool = True, index: bool = True) -> bool:
         """Pack in a process of its own (`_pack_all`), so a minute of it doesn't take the interpreter from the
         window this thread is in; ``stop`` ends it, between days or mid-day (its transaction is then rolled
         back). False if no process could be started here."""
         context = multiprocessing.get_context("spawn")
         try:
             stopping = context.Event()
-            worker = context.Process(target=_pack_all, args=(str(self.path), pack, stopping), daemon=False)
+            worker = context.Process(target=_pack_all, args=(str(self.path), pack, stopping, index), daemon=False)
             worker.start()
         except Exception:  # noqa: BLE001
             return False
@@ -885,12 +899,13 @@ class Store:
         return ((now if now is not None else time.time()) - SETTLE) // 86400 * 86400
 
     def pack_settled(self, now: float | None = None, vacuum: bool = True, stop: threading.Event | None = None,
-                     split: ProcessPoolExecutor | None = None, old: bool = False) -> int:
+                     split: ProcessPoolExecutor | None = None, old: bool = False, breathe: float = 0.0) -> int:
         """Pack every settled day that has rows not packed yet (ones saved since the day was last packed, or
         never packed), rows whose scores were set since (packed 2), or a pack saved in the format before
         frames when ``old`` (Store.upgrade's, which runs it in a process of its own). Each day is one transaction:
         the new pack is checked to read back exactly the text it replaces before the rows' copies are cleared.
-        ``split``: worker processes to split the words in. Returns how many days were packed."""
+        ``split``: worker processes to split the words in. ``breathe``: seconds to wait about once a second, between
+        days, for other connections' saves (BREATHE). Returns how many days were packed."""
         self.db.commit()
         before = self._settled_before(now)
         days: dict[tuple, set[str]] = {}  # (kind, subreddit, day) -> ids of its rows not packed yet
@@ -902,6 +917,7 @@ class Store:
             for sub, day in self.db.execute("SELECT subreddit, day FROM packs WHERE kind = ? AND cols IS NULL", (kind,)) if old else ():
                 days.setdefault((kind, sub, day), set())
         done = 0
+        rested = time.monotonic()
         for (kind, sub, day), ids in sorted(days.items()):
             if stop is not None and stop.is_set():
                 break
@@ -919,6 +935,9 @@ class Store:
                     raise
             except Exception:  # noqa: BLE001 - busy, or text that can't be packed: leave the day as it is
                 continue
+            if breathe and time.monotonic() - rested >= 1.0:  # (12% longer: 8 s on the owner's 64 s)
+                time.sleep(breathe)
+                rested = time.monotonic()
         # The cleared text leaves its pages part empty, which only a VACUUM gives back; not as the app closes.
         if done and vacuum and not (stop is not None and stop.is_set()):
             self.search.optimize(pages=2000)  # what the fetch's saves added to the search index, a few MB of it
