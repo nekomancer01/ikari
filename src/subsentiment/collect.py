@@ -25,6 +25,11 @@ TIMED_OUT_DAYS = 2
 # Days in a row whose threads kept failing (GIVE_UP_AFTER in a row) before no later day's comments are asked for:
 # the archive can't give comments just now, and each day would only add more failing requests.
 GAVE_UP_DAYS = 2
+# Downloading every post, days in a row are read together, as one range, when the days read so far say they hold
+# about BATCH_POSTS posts between them (a page for each slice: four requests, as one day takes), up to BATCH_DAYS:
+# a quiet subreddit's month took four searches a day, whatever the day held, and a comment round of its own each.
+BATCH_POSTS = 400
+BATCH_DAYS = 31
 
 
 @dataclass
@@ -228,56 +233,81 @@ class Download:
                            timed_out=self.timed_out)
 
     def by_day(self, updated: list[Post]) -> tuple[list[Post], list[Post], list[Post]]:
-        """Every post of the range, a day at a time, newest first: each day's posts, then their comments, so a
-        long fetch fills in as it goes and Stop keeps whole days. Returns (picked, new, settled) as run uses
-        them."""
+        """Every post of the range, newest first, a run of days at a time (see batch): each run's posts, then their
+        comments, so a long fetch fills in as it goes and Stop keeps whole runs. Returns (picked, new, settled) as
+        run uses them."""
         req, progress = self.req, self.progress
         picked: list[Post] = []
         new: list[Post] = []
         settled: list[Post] = []
         days = [(d, d + DAY) for d in req.days] if req.days else _days(self.name, self.store, req.after, req.before)
         seen: set[str] = set()  # saved posts on the days read, whose comments those days took care of
-        fruitless = 0  # days in a row the archive timed out on without giving a post
-        for k, (lo, hi) in enumerate(days):
+        fruitless = 0  # runs in a row the archive timed out on without giving a post
+        rate = None  # posts a second on the days read last, saved ones too; None: not known, or it timed out
+        k = n = 0
+        while k < len(days):
             if self.should_stop() or fruitless >= TIMED_OUT_DAYS:
                 break
-            whole = hi - lo == DAY and lo % DAY == 0
-            when = time.strftime("%a %d %b", time.gmtime(lo))
+            n = self.batch(days, k, rate, 2 * n)
+            lo, hi = days[k + n - 1][0], days[k][1]
+            when = " to ".join(dict.fromkeys(time.strftime("%a %d %b", time.gmtime(t)) for t in (lo, hi - 1)))
+            which = f"Day {k + 1}" if n == 1 else f"Days {k + 1}-{k + n}"
 
-            def say(_msg, k=k, when=when):
+            def say(_msg, k=k, which=which, when=when):
                 # Short, as the window shows one line: the bar counts days, this says which and how many.
-                progress(k, len(days), f"Day {k + 1} of {len(days)}, {when}: {len(self.streamed):,} new posts")
+                progress(k, len(days), f"{which} of {len(days)}, {when}: {len(self.streamed):,} new posts")
 
-            def report(done, total, _msg, k=k, when=when):
-                progress(k, len(days), f"Day {k + 1} of {len(days)}, {when}: comments on {done:,} of "
-                                       f"{total:,} posts")
+            def report(done, total, _msg, k=k, which=which, when=when):
+                progress(k, len(days), f"{which} of {len(days)}, {when}: comments on {done:,} of {total:,} posts")
             say("")
-            in_day = {pid for pid, r in self.stored.items() if lo <= (r["created_utc"] or 0) < hi}
-            seen |= in_day
-            got = self.read(lo, hi, MAX_DAY_POSTS, True, say, whole_day=whole, skip=in_day)
-            fruitless = fruitless + 1 if getattr(self.client, "timed_out", False) and not got else 0
+            in_run = {pid for pid, r in self.stored.items() if lo <= (r["created_utc"] or 0) < hi}
+            seen |= in_run
+            got = self.read(lo, hi, MAX_DAY_POSTS * n, True, say, skip=in_run)
+            timed_out = getattr(self.client, "timed_out", False)
+            fruitless = fruitless + 1 if timed_out and not got else 0
+            rate = None if timed_out or self.should_stop() else (len(got) + len(in_run)) / (hi - lo)
             day_new, day_settled = self.settle(got)
             picked += got
             new += day_new
             settled += day_settled
             day_updated = [p for p in updated if lo <= p.created_utc < hi] + day_settled
-            self.comments(got, day_updated, in_day.__contains__, report)
+            self.comments(got, day_updated, in_run.__contains__, report)
+            k += n
         # Days already downloaded in full aren't read again, but their saved posts can still be owed comments.
         self.comments([], [p for p in updated if p.id not in seen], lambda pid: pid not in seen, progress)
         if days:
             progress(len(days), len(days), f"{len(self.streamed):,} new posts from r/{self.name}")
         return picked, new, settled
 
+    @staticmethod
+    def batch(days: list[tuple[float, float]], k: int, rate: float | None, most: int) -> int:
+        """How many of ``days`` (newest first) from the k-th to read together: the ones right before it, one after
+        another, that ``rate`` (posts a second, from the days read last) says hold about BATCH_POSTS between them,
+        and no more than ``most`` (twice the last run): today, or a day the archive has nothing for yet, can read
+        as quiet on a busy subreddit, so runs grow a step at a time. One while the rate isn't known: the first
+        day, and after a stretch the archive timed out on."""
+        n = 1
+        while (rate is not None and n < min(most, BATCH_DAYS) and k + n < len(days)
+               and days[k + n][1] == days[k + n - 1][0]
+               and rate * (days[k][1] - days[k + n][0]) <= BATCH_POSTS):
+            n += 1
+        return n
+
     def save_streamed(self, batch: list[Post]) -> None:
-        """New posts, saved and announced the moment they're downloaded, so a UI can show them right away."""
+        """New posts, saved and announced the moment they're downloaded, so a UI can show them right away. One
+        commit for the batch: a commit each, hundreds after Stop (what slices still running had), took over 30 s
+        on a Windows runner, each one written through to disk."""
+        new = False
         for p in batch:
             if p.id not in self.stored and p.id not in self.streamed:
                 self.store.save_post(p, *self.score(p.text))
-                self.store.commit()
                 self.streamed.add(p.id)
-                self.saved()
+                new = True
+        if new:
+            self.store.commit()
+            self.saved()
 
-    def read(self, after, before, limit: int, everything: bool, say, whole_day: bool = True,
+    def read(self, after, before, limit: int, everything: bool, say,
              skip: Collection[str] | None = None) -> list[Post]:
         """Posts of [after, before) up to ``limit``. An even sample skips everything already saved, so a repeat
         fetch adds new posts; top mode ranks everything, then keeps the ones that aren't saved yet."""
@@ -285,7 +315,8 @@ class Download:
         skip = self.stored.keys() if skip is None else skip
         # Where earlier fetches got to, so a stopped download goes on from there. Not for a day that's complete,
         # where Check again looks through all of it for posts the archive has taken in since.
-        again = after is not None and str(int(after)) in store.complete_keys("posts", name)
+        whole = _whole_days(after, before)
+        again = bool(whole and {str(d) for d in whole} & store.complete_keys("posts", name))
         got = client.fetch_posts(name, after, before, limit, req.query, top=req.top,
                                  skip=() if req.top else skip,
                                  progress=say, should_stop=self.should_stop, on_posts=self.save_streamed,
@@ -301,12 +332,15 @@ class Download:
         for p in getattr(client, "take_images", list)():  # same for image posts, kept hidden
             store.save_post(p, None, None)
         store.commit()
-        # Complete only when every part of the day was read to its end: a fetch that stopped at the limit, or
-        # was stopped, may have missed posts. A day that isn't over yet can still get posts, so it never is,
+        # Each whole UTC day of the range is complete only when every part of it was read to its end (no stretch
+        # the client left unread is on it, as days read together can differ): a fetch that stopped at the limit,
+        # or was stopped, may have missed posts. A day that isn't over yet can still get posts, so it never is,
         # and a keyword search only reads the posts that match.
-        if (everything and whole_day and after is not None and before is not None and before <= time.time()
-                and not req.query and not self.should_stop() and getattr(client, "exhausted", False)):
-            store.mark_complete("posts", name, str(int(after)))
+        if everything and not req.query and not self.should_stop():
+            unread = [] if getattr(client, "exhausted", False) else getattr(client, "unread", None) or [(after, before)]
+            for day in whole:
+                if day + DAY <= time.time() and not any(lo < day + DAY and hi > day for lo, hi in unread):
+                    store.mark_complete("posts", name, str(day))
         return got
 
     def settle(self, picked: list[Post]) -> tuple[list[Post], list[Post]]:
@@ -524,6 +558,13 @@ def days_in(after: float, before: float) -> list[int]:
     first = int(after // DAY * DAY)
     last = int(math.ceil(before / DAY) * DAY) - DAY
     return list(range(last, first - 1, -DAY))
+
+
+def _whole_days(after: float | None, before: float | None) -> list[int]:
+    """Starts of the UTC days wholly inside [after, before)."""
+    if after is None or before is None:
+        return []
+    return list(range(int(math.ceil(after / DAY) * DAY), int(before) - DAY + 1, DAY))
 
 
 def _days(name: str, store: Store, after: float | None, before: float | None) -> list[tuple[float, float]]:

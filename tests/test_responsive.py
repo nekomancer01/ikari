@@ -14,7 +14,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QSettings, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSettings, Qt  # noqa: E402
 from PySide6.QtGui import QMouseEvent, QWheelEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
@@ -129,6 +129,42 @@ def test_new_points_from_a_fetch_dont_crossfade_the_chart(window):
     chart = window.overview.timeline
     chart.set_points([(d, mean + 0.1, n) for d, mean, n in chart.points])
     assert not motion.fading(chart)
+
+
+def test_a_window_edge_dragged_places_the_word_cloud_once_the_size_holds_still(window, monkeypatch):
+    w = window
+    cloud = w.overview.words
+    cloud.repaint()
+    places = count_calls(monkeypatch, WordCloud, "_place")
+    before = cloud.size()
+    for i in range(1, 11):  # a step a frame
+        w.resize(1280 - 12 * i, 760 - 6 * i)
+        QApplication.processEvents()
+        w.repaint()
+    assert places == [] and cloud.size() != before  # the words as placed, centred in the cloud meanwhile
+    box, word = cloud._placed[0][:2]
+    assert cloud.word_at(box.center() + QPointF(*cloud._offset())) == word
+    until(lambda: not cloud._resizing.isActive() and cloud._placing is None
+          and cloud._placed_for[:2] == (cloud.width(), cloud.height()))
+    assert len(places) == 1 and cloud._offset() == (0, 0)
+    assert all(QRectF(cloud.rect()).contains(b[0]) for b in cloud.placed())
+
+
+def test_a_range_button_eases_the_chart_before_the_tables_and_words_catch_up(window, monkeypatch):
+    w = window
+    monkeypatch.setattr(motion, "_os_allows", True)  # CI's Windows runner has animations off
+    monkeypatch.setattr(motion, "_wanted", True)
+    chart = w.overview.timeline
+    easing = []  # whether the chart was still easing as each table load or word count started
+    for cls, name in ((type(w.comments_tab), "set_rows_steps"), (WordTally, "count")):
+        real = getattr(cls, name)
+        monkeypatch.setattr(cls, name, lambda self, *a, real=real, **k: easing.append(chart.zoom.running())
+                            or real(self, *a, **k))
+    key = next(k for k, b in chart.presets.items() if b.isEnabled() and k not in ("All", chart.preset))
+    chart.presets[key].click()
+    assert chart.zoom.running()
+    until(lambda: len(easing) >= 3 and not w._span_slices.running() and w.word_tally.ready)
+    assert not any(easing)
 
 
 def reads_of(monkeypatch, store) -> list:
@@ -574,3 +610,103 @@ def test_scrolling_a_table_moves_its_rows_and_draws_only_the_new_ones(tmp_path):
     assert out["dpr"] == "1.5", run.stdout
     assert int(out["worst"]) <= 1, run.stdout  # the same pixels as drawing it all again, but for a gradient's rounding
     assert float(out["drawn"]) < 0.5, run.stdout  # only the rows that came into view, not the whole table
+
+
+CARDS_AT_150 = """
+import sys, time
+import numpy as np
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSettings, Qt
+from PySide6.QtGui import QColor, QPainter
+from PySide6.QtWidgets import QApplication, QWidget
+from subsentiment.gui import main_window as mw, motion, theme
+app = QApplication([])
+app.setOrganizationName("subsentiment-test")
+app.setApplicationName("cards-150")
+theme.load_fonts(app)
+theme.apply(app, "light")
+QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, sys.argv[2])
+QSettings().setValue("updates/auto", False)
+motion.set_enabled(False)
+w = mw.MainWindow(sys.argv[1])
+w.resize(1280, 760)
+w.show()
+def pump(done, seconds=20):
+    end = time.monotonic() + seconds
+    while not done() and time.monotonic() < end:
+        app.processEvents()
+        time.sleep(0.005)
+pump(lambda: w.current and not w._span_slices.running() and w.word_tally.ready)
+pump(lambda: False, 1.0)
+print("dpr", w.devicePixelRatioF())
+charts = (w.overview.timeline, w.overview.distribution, w.overview.words)
+# A frame of the timeline alone (a zoom's) paints it and nothing under it.
+class Painted(QObject):
+    seen = []
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Paint:
+            self.seen.append(type(obj).__name__)
+        return False
+painted, x = Painted(), charts[0]
+while x is not None:
+    x.installEventFilter(painted)
+    x = x.parentWidget()
+pump(lambda: False, 0.3)
+painted.seen.clear()
+charts[0].update()
+pump(lambda: painted.seen, 2)
+pump(lambda: False, 0.1)
+print("painted", ",".join(painted.seen))
+pixels = lambda i: np.frombuffer(i.constBits(), np.uint8).reshape(i.height(), -1)[:, :4 * i.width()].astype(int)
+def drawn():
+    # Every pixel painted again over magenta: one left magenta is one nothing painted (a seam at an edge that falls
+    # between device pixels).
+    store = w.backingStore().paintDevice()
+    p = QPainter(store)
+    p.fillRect(store.rect(), QColor(255, 0, 255))
+    p.end()
+    for widget in [w, *w.findChildren(QWidget)]:
+        widget.update()
+    app.processEvents()
+    image = w.backingStore().paintDevice()
+    image = image.copy(0, 0, round(w.width() * 1.5), round(w.height() * 1.5))
+    return pixels(image)
+unpainted, worst = 0, 0
+for page in ("overview", "words"):
+    w.show_page(page)
+    pump(lambda: False, 0.3)
+    for i in range(6):  # edges on whole and half device pixels
+        w.resize(1280 - 7 * i, 760 - 5 * i)
+        cloud = w.overview.words if page == "overview" else w.words_page.body
+        pump(lambda: not cloud._resizing.isActive() and cloud._placing is None  # the words placed for the size,
+             and cloud._placed_for[:2] == (cloud.width(), cloud.height())  # and eased there
+             and cloud._anim.state() != cloud._anim.State.Running)
+        own = drawn()
+        unpainted += int((own.reshape(own.shape[0], -1, 4) == (255, 0, 255, 255)).all(axis=2).sum())
+        for c in charts:
+            c.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        worst = max(worst, int(np.abs(own - drawn()).max()))  # with the card painted under them, as before
+        for c in charts:
+            c.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+print("unpainted", unpainted)
+print("worst", worst)
+"""
+
+
+def test_the_charts_and_clouds_paint_their_card_so_a_frame_of_one_paints_nothing_under_it(tmp_path):
+    # A zoom's frame repainted the window's backdrop, page, panel and card under the timeline as well (about half
+    # the window at 150%, through six layers), and a resize step all of that under the clouds and charts too.
+    db = str(tmp_path / "big.db")
+    fill(db)
+    screen = tmp_path / "screen.json"  # 150% as Windows sets it
+    screen.write_text('{"screens": [{"name": "s", "x": 0, "y": 0, "width": 1920, "height": 1200, "logicalDpi": 144, '
+                      '"logicalBaseDpi": 96, "dpr": 1}]}')
+    run = subprocess.run([sys.executable, "-X", "faulthandler", "-c", CARDS_AT_150, db, str(tmp_path / "cfg150")],
+                         capture_output=True, text=True, timeout=240, cwd=tmp_path,
+                         env=dict(os.environ, QT_QPA_PLATFORM=f"offscreen:configfile={screen.name}"))
+    assert run.returncode == 0, run.stderr[-2000:]
+    out = dict(line.split(" ", 1) for line in run.stdout.splitlines() if " " in line)
+    assert out["dpr"] == "1.5", run.stdout
+    assert out["painted"] == "TimelineChart", run.stdout
+    assert out["unpainted"] == "0", run.stdout  # no stray pixels where an edge falls between device pixels
+    assert int(out["worst"]) <= 1, run.stdout  # the same pixels as the card under them, but for a gradient's rounding

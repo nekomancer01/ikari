@@ -126,15 +126,14 @@ def in_range(env, w, sub="Python") -> int:
 
 def fetched_before(env, w, sub="python", rng="month") -> None:
     """Record ``rng`` as asked for by an earlier fetch of ``sub``, which Download coverage then lists, without
-    downloading it all again here. It lists only days with something saved: each day with nothing gets a skipped
-    image post, which no page shows."""
+    downloading it all again here. It lists only days with something saved: each day with nothing gets one post."""
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData(rng))
     store, asked = env.store(), collect.days_in(*w.fetch_form.bounds())
     store.save_tried(sub, asked)
     have = set(store.downloaded_days(sub))
     for day in asked:
         if day not in have:
-            store.save_post(Post(f"img{day}", sub, "img", "", "a", 1, 0.0, 0, day + 60, "u", "", image=True),
+            store.save_post(Post(f"img{day}", sub, "img", "", "a", 1, 0.0, 0, day + 60, "u", ""),
                             0.0, "neutral")
     store.commit()
 
@@ -1271,9 +1270,12 @@ def test_coverage_days_wait_for_their_count_before_they_can_be_downloaded(env):
     pump(50)
     read_in(w)  # what's saved is read again, on threads, once the count is in
     totals = cov.totals["python"]
-    assert not any(cell.bar.waiting for _, cell, _ in rows())
-    # Every day with posts to look for can be downloaded now; only past days the archive has none for can't.
-    assert all(button.isEnabled() == (totals.get(day) != 0 or str(day) in complete or day == cov.days[0])
+    assert not any(cell.bar.waiting and not cell.bar.isHidden() for _, cell, _ in rows())  # (a day whose count is
+    # below what's saved shows no bar)
+    # Every day with posts to look for can be downloaded now; only past days the archive has none for can't
+    # (a day with one saved and none counted has a count that can't be right, and is downloaded whole).
+    assert all(button.isEnabled() == (totals.get(day) != 0 or str(day) in complete or day == cov.days[0]
+                                      or cov._day_state[day][0] > 0)
                for day, _, button in rows())
     assert cov.download_ticked.isEnabled()
     assert set(env.archive.paths()) == {AGG}  # waiting downloaded nothing
@@ -1358,11 +1360,31 @@ def test_closing_the_app_while_a_coverage_count_is_out_doesnt_freeze_it(env):
     assert not w.coverage.count_job.busy  # the count still ends and is tidied up
 
 
+def test_a_months_download_of_a_quiet_subreddit_reads_its_days_together(env):
+    # Each day took four searches of its own, whatever it held: a month of a subreddit posting three a day was
+    # over a hundred. Quiet days in a row are read as one range now, and each is still marked complete.
+    w = env.window()
+    env.archive.clear()
+    fetch(w, sub="rust", comments=False, rng="month")
+    after, before = w.fetch_form.bounds()
+    assert len(collect.days_in(after, before)) > 28
+    # Today alone, then runs of 2, 4, 8 and 16 days, each as many searches as one day (it was 124).
+    assert env.archive.paths().count(SEARCH) <= 6 * arctic_shift.SLOTS_PER_DAY
+    assert len(env.store().posts("rust")) == in_range(env, w, "rust")
+    whole = {str(d) for d in range(int(after // DAY * DAY) + DAY, coverage.today(), DAY)}
+    assert env.store().complete_keys("posts", "rust") == whole
+    cov = open_coverage(w)
+    marked = [day_cell(cov, row, 1).side.text() for row, day in enumerate(cov.days) if str(day) in whole]
+    assert marked and all(m == "✓ Complete" for m in marked)
+
+
 def test_a_fetch_ending_leaves_the_user_on_the_subreddit_they_switched_to(env):
     w = env.window()
     fetch(w, sub="rust", comments=False)
     fetch(w, comments=False)
-    env.archive.delay = 0.15
+    # Slow enough that the month is still downloading when the user switches: quiet days are read together, so
+    # at 0.15 s a request it was over first.
+    env.archive.delay = 0.5
     w.fetch_form.subreddit.setText("python")
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
@@ -1667,7 +1689,7 @@ def test_a_stopped_download_all_goes_on_from_where_it_got_to(env, monkeypatch):
     env.archive.clear()
     QTest.mouseClick(button(), Qt.MouseButton.LeftButton)
     end = time.monotonic() + 30
-    in_day = lambda: {r["id"] for r in env.store().posts("bigday") if day <= r["created_utc"] < day + DAY}  # noqa: E731
+    in_day = lambda: {r["id"] for r in env.store().posts("bigday") if day <= r["created_utc"] < day + DAY and not r["id"].startswith("img")}  # noqa: E731
     # Two rounds of pages in and the next asked for. After only the first round, a slow runner had two pages saved.
     while len(env.archive.paths()) < 9 and time.monotonic() < end:
         pump(20)

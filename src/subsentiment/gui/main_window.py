@@ -140,6 +140,7 @@ def when_text(ts: float | None) -> str:
 
 class MainWindow(QMainWindow):
     LOAD_THREAD_FROM = 10_000  # saved posts and comments; a subreddit this big is read on a thread
+    SPAN_SETTLE_MS = 300  # the timeline's span held still this long has settled (see _on_view_changed)
     EXPORT_APART_FROM = 10_000  # rows; an export this big is written in a process of its own (Store.export)
     # A big saved subreddit to show at the start is read before the window is made. The app sets it False, so the
     # window shows at once and the subreddit fills in once it's read on a thread.
@@ -240,7 +241,7 @@ class MainWindow(QMainWindow):
         # The tables follow the timeline's span once it settles, not at every step of a drag or a zoom.
         self._span_settled = QTimer(self)
         self._span_settled.setSingleShot(True)
-        self._span_settled.setInterval(300)
+        self._span_settled.setInterval(self.SPAN_SETTLE_MS)
         self._span_settled.timeout.connect(self._span_settle)
         self._span_slices = Slices(self)
         self._queued: dict[str, list] = {"posts": [], "comments": []}
@@ -1146,7 +1147,7 @@ class MainWindow(QMainWindow):
         if self.current and not self._following:  # a fetch or the scope moved it, not the user
             days.save_range(self.settings, self.current, self.span, self._preset)
         self._render_span(moving=True)
-        self._span_settled.start()
+        self._span_settled.start(self.SPAN_SETTLE_MS)
 
     def _show_span(self) -> None:
         """Show the counted days on the timeline and the span every page counts, without telling the window
@@ -1158,7 +1159,12 @@ class MainWindow(QMainWindow):
         chart.blockSignals(False)
 
     def _span_settle(self) -> None:
-        """The span stopped moving: what follows it at its own pace catches up, a step a frame."""
+        """The span stopped moving: what follows it at its own pace catches up, a step a frame. Not while the
+        timeline still eases there (a range button's zoom): started under its last frames, that held them up."""
+        easing = self.overview.timeline.zoom
+        if easing.running():
+            self._span_settled.start(max(1, easing.left()))
+            return
         self._render_span()
         self._span_settled.stop()
         # Steps left over from a span before this one: the tables may still show it, so go through them all.

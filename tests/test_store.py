@@ -768,6 +768,16 @@ def test_read_spans_merge_and_go_with_the_subreddit(tmp_path):
     s.close()
 
 
+def test_downloaded_days_leave_out_days_with_only_skipped_image_posts(tmp_path):
+    s = Store(tmp_path / "t.db")
+    d = 86400 * 20000
+    s.save_post(Post("text", "Python", "t", "", "a", 1, 0.9, 0, d + 50, "u", ""), 0.0, "neutral")
+    s.save_post(Post("pic", "Python", "t", "", "a", 1, 0.9, 0, d + 86400 + 50, "u", "", image=True), 0.0, "neutral")
+    s.save_tried("Python", [d + 2 * 86400])
+    assert s.downloaded_days("python") == [d]  # not the picture's day, nor the day asked for with nothing saved
+    s.close()
+
+
 def test_tried_days_join_and_fall_back_to_the_saved_days_before_any_were_kept(tmp_path):
     s = Store(tmp_path / "t.db")
     d = 86400 * 20000
