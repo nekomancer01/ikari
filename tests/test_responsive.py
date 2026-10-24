@@ -238,6 +238,46 @@ def test_a_theme_switch_during_a_page_fade_doesnt_hold_that_fade_still(window, m
     assert not motion.fading(w.content)
 
 
+def test_a_theme_switch_and_reduce_transparency_restyle_no_more_than_they_change(window):
+    """A restyle takes Qt about 0.2 ms a widget at 150%, so: Reduce transparency (which only changes how the
+    backdrop paints) restyles nothing, and the outlines' filter sees only the widgets that can take an outline,
+    not every event of every widget in the app."""
+    from PySide6.QtCore import QEvent, QObject
+    from PySide6.QtWidgets import QLabel, QPushButton
+    w = window
+    restyled = []
+
+    class Watch(QObject):
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.Type.StyleChange:
+                restyled.append(obj)
+            return False
+    watch = Watch()
+    w._set_theme("light")
+    QApplication.processEvents()
+    label = next(x for x in w.findChildren(QLabel) if x.isVisible() and x.objectName() != "motion-snapshot")
+    button = next(x for x in w.findChildren(QPushButton) if x.isVisible())
+    label.installEventFilter(watch)
+    w._set_reduce(True)
+    QApplication.processEvents()
+    assert not restyled
+    w._set_reduce(False)
+    w._set_theme("dark")
+    QApplication.processEvents()
+    assert restyled  # the theme does restyle
+    until(lambda: not motion.fading(w))  # (nothing under its still paints)
+    seen = []  # what Outline's filter is called with (Qt calls it, so it's watched from Python's side)
+    code = theme.Outline.eventFilter.__code__
+    sys.setprofile(lambda frame, what, arg: seen.append(frame.f_locals["obj"])
+                   if what == "call" and frame.f_code is code else None)
+    try:
+        label.repaint()
+        button.repaint()
+    finally:
+        sys.setprofile(None)
+    assert label not in seen and button in seen
+
+
 def test_a_wait_shows_the_throbber_only_once_it_has_gone_on_for_a_second(monkeypatch):
     from PySide6.QtWidgets import QFrame, QVBoxLayout, QWidget
     from subsentiment.gui import widgets

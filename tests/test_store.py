@@ -550,6 +550,63 @@ def test_import_merges_another_database_keeping_the_copy_fetched_last(tmp_path, 
     assert len(mine.subreddits()) == 2  # a failed import changes nothing and the store still works
 
 
+def test_the_start_after_an_import_packs_the_many_rows_it_took(tmp_path, monkeypatch):
+    # import_from takes rows unpacked. 700,000 from the owner's 230 MB database were then packed by the next fetch
+    # as it ended, which held it up for 100 s; now Store.upgrade packs them, in a process of its own.
+    theirs = Store(tmp_path / "theirs.db")
+    for i in range(60):
+        theirs.save_post(make_post(i, ts=1_700_000_000.0 + i * 3600), 0.5, "positive")
+        theirs.save_comment(Comment(f"c{i}", f"p{i}", "Python", f"t3_p{i}", "b", f"hi {i}", 1, 1_700_000_100 + i * 3600,
+                                    0, "u"), 0.2, "positive")
+    theirs.commit()
+    theirs.pack_settled()
+    theirs.close()
+    mine = Store(tmp_path / "mine.db")
+    assert mine.import_from(tmp_path / "theirs.db") == (60, 60)
+    assert mine._left_to_pack() == 120
+    mine.close()
+    Store.upgrade(tmp_path / "mine.db")  # fewer than ELSEWHERE: left for the next fetch
+    mine = Store(tmp_path / "mine.db")
+    assert mine._left_to_pack() == 120
+    mine.close()
+    monkeypatch.setattr(store, "ELSEWHERE", 100)
+    Store.upgrade(tmp_path / "mine.db")
+    mine = Store(tmp_path / "mine.db")
+    assert mine._left_to_pack() == 0
+    assert sorted(r["title"] for r in mine.posts("python")) == sorted(f"title {i}" for i in range(60))
+    assert sorted(r["body"] for r in mine.comments("python")) == sorted(f"hi {i}" for i in range(60))
+    assert len(mine.search.matches("comments", "hi")) == 60  # still searchable
+    mine.close()
+
+
+def test_a_save_waiting_for_the_lock_gets_it_between_two_days_being_upgraded(tmp_path, monkeypatch):
+    # The owner's database upgrading on its first start packed day after day, each day's transaction begun as the
+    # last one ended, and a fetch saving meanwhile failed with "database is locked" 14 s in.
+    import threading
+    import time
+    path = tmp_path / "subsentiment.db"
+    shutil.copy(V2_DB, path)
+    writing = Store._write_pack
+
+    def slow(self, *a, **k):  # a big day takes a while to pack, all of it holding the lock
+        time.sleep(0.4)
+        return writing(self, *a, **k)
+    monkeypatch.setattr(Store, "_write_pack", slow)
+    upgrading = threading.Thread(target=Store.upgrade, args=(path,))
+    upgrading.start()
+    time.sleep(0.6)
+    fetch = sqlite3.connect(path, timeout=2.0)  # (the default is 5 s)
+    try:
+        fetch.execute("INSERT INTO notes (subreddit, day, label, text, saved_at) VALUES ('python', 0, 'a', 'b', 0)")
+        fetch.commit()
+    finally:
+        fetch.close()
+        upgrading.join()
+    s = Store(path)
+    assert s._left_to_pack() == 0 and s.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    s.close()
+
+
 def test_image_posts_are_hidden_from_every_read_and_counted_apart(tmp_path):
     s = Store(tmp_path / "x.db")
     s.save_post(make_post(1), 0.5, "positive")
