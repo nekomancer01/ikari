@@ -16,7 +16,8 @@ from contextlib import contextmanager
 from typing import Callable, Iterator
 
 import requests
-from PySide6.QtCore import QCoreApplication, QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QCoreApplication, QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QCursor, QGuiApplication
 
 from subsentiment import collect
 from subsentiment.arctic_shift import ArcticShiftClient, RateLimiter
@@ -357,10 +358,18 @@ class Collector(QObject):
     """Python's garbage collector, run on the window's thread only. Left to itself it collects whenever enough
     objects have been made, on whichever thread made them: a table reading rows on a thread then deleted the
     widgets of a window closed earlier, there, and Qt crashed (a segfault in Linux CI). So the automatic one is
-    off, and every TICK this collects here instead.
+    off, and every TICK this collects here instead. A pass through every object took 0.15-0.2 s with a big
+    subreddit open, and asked for by name every ten seconds or so it held up a frame each time (live, a year's
+    download). So, as Python's own collector does, it goes through them all only once the objects that have
+    lasted since make a quarter as many again (or after LONGEST, as objects let go since don't lower that count),
+    and then not while the mouse is moving or held, unless that has gone on for DEFER: a drag or a hover doesn't
+    catch one. (A wheel moves nothing that can be asked about cheaply, so a scroll still can.)
     `start` once a QApplication is up; `lasting` holds it off."""
 
     TICK = 100  # ms
+    STILL = 1.0  # seconds the mouse has been left alone before the whole pass
+    DEFER = 10.0  # seconds the whole pass waits for that at most
+    LONGEST = 300.0  # seconds between whole passes at most
     _one: Collector | None = None
     _held = 0  # `lasting` reads going on
     _lock = threading.Lock()
@@ -372,6 +381,11 @@ class Collector(QObject):
         self._timer.setInterval(self.TICK)
         self._timer.timeout.connect(self.collect)
         self._timer.start()
+        self._mouse = None  # where the mouse was at the last tick
+        self._moved = self._due = 0.0  # when it last moved or was held; since when the whole pass is due
+        self._lasting = 0  # objects in the oldest generation after the last whole pass
+        self._since = 0  # objects moved into it since
+        self._last = time.monotonic()  # when the last whole pass ran
 
     @classmethod
     def start(cls) -> None:
@@ -384,7 +398,21 @@ class Collector(QObject):
         # The youngest generation every time (the objects made since, however many were let go meanwhile), and an
         # older one, with those younger, once that many collections of the one below it have gone by.
         counts, limits = gc.get_count(), gc.get_threshold()
-        gc.collect(2 if counts[2] >= limits[2] else 1 if counts[1] >= limits[1] else 0)
+        generation = 1 if counts[1] >= limits[1] else 0
+        now = time.monotonic()
+        if counts[2] >= limits[2] and (self._since >= self._lasting // 4 or now - self._last >= self.LONGEST):
+            mouse = QCursor.pos()
+            if mouse != self._mouse or QGuiApplication.mouseButtons() != Qt.MouseButton.NoButton:
+                self._mouse, self._moved = mouse, now
+            self._due = self._due or now
+            if now - self._moved >= self.STILL or now - self._due >= self.DEFER:
+                generation, self._due = 2, 0.0
+        young = len(gc.get_objects(0)) + len(gc.get_objects(1)) if generation == 1 else 0
+        freed = gc.collect(generation)
+        if generation == 1:
+            self._since += max(0, young - freed)  # what's left moved on to the oldest
+        elif generation == 2:
+            self._lasting, self._since, self._last = len(gc.get_objects(2)), 0, now
 
     @classmethod
     @contextmanager
@@ -548,6 +576,7 @@ class StoreRead(QObject):
         self._asked: tuple | None = None
         self._next: tuple | None = None
         self._answer = None
+        self._forgot = False  # the read under way was asked before `forget`
 
     @property
     def busy(self) -> bool:
@@ -558,6 +587,12 @@ class StoreRead(QObject):
         if not self.job.busy:
             self._start()
 
+    def forget(self) -> None:
+        """Reads asked for so far give no answer: what they'd bring has been read some other way since."""
+        self._next = None
+        self._answer = None
+        self._forgot = True
+
     def close(self) -> None:
         """As the app closes: a read under way is waited for, and its answer dropped."""
         self._next = None
@@ -567,14 +602,15 @@ class StoreRead(QObject):
             self.job.qthread.wait(3000)
 
     def _start(self) -> None:
-        self._asked, self._next, self._answer = self._next, None, None
+        self._asked, self._next, self._answer, self._forgot = self._next, None, None, False
         worker = StoreWorker(self.db_path, self.method, *self._asked)
         worker.finished.connect(self._on_answer)  # a bound method, so it's handled on this object's thread
         self.job.start(worker)
 
     @Slot(object)
     def _on_answer(self, answer) -> None:
-        self._answer = answer
+        if not self._forgot:
+            self._answer = answer
 
     @Slot()
     def _ended(self) -> None:
