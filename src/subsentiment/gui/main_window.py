@@ -35,7 +35,7 @@ from subsentiment.gui.widgets import (
     ElidedLabel, ProgressBar, QuietScrollBars, ShrinkingComboBox, StatusLabel, Throbber, fit_to_screen, label, panel,
     plural, section,
 )
-from subsentiment.gui.worker import BackgroundJob, FetchWorker, LoadWorker, Slices, ThreadScorer, finish
+from subsentiment.gui.worker import BackgroundJob, Collector, FetchWorker, LoadWorker, Slices, ThreadScorer, finish
 from subsentiment.reddit import normalize_subreddit, subreddit_error
 from subsentiment.store import Store, scoring_at_least
 
@@ -181,6 +181,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, db_path: str):
         super().__init__()
+        Collector.start()  # garbage is collected on this thread from here on, never on a reading thread
         self.setWindowTitle(self.title_text())
         self.resize(fit_to_screen(QSize(1320, 860), QGuiApplication.primaryScreen()))
         self.db_path = db_path
@@ -681,6 +682,8 @@ class MainWindow(QMainWindow):
             return "Scoring saved items\u2026"
         if self.coverage.delete_job.busy:
             return "Deleting days\u2026"
+        if self.coverage.reading() and self.coverage.isVisible():
+            return "Reading saved days\u2026"
         if not (self.fetch_job.busy and self._showing_fetch()):
             if self._span_slices.running():
                 return "Filling the tables\u2026"
@@ -752,6 +755,7 @@ class MainWindow(QMainWindow):
     def _stop_fetch(self) -> None:
         if self.fetch_job.busy:
             self.fetch_job.stop()
+            self.coverage.clear_queue()  # Stop stops the downloads queued after it too
             self._stopping = True
             self.progress_msg.setText("Stopping…")
             self.stop_btn.setEnabled(False)
@@ -933,6 +937,7 @@ class MainWindow(QMainWindow):
         self._live.stop()
         self._flush_rows()
         self.coverage.fetch_ended(self.request, True)
+        self.coverage.clear_queue()  # the archive is likely failing the ones queued too
         # Show anything stored before the error, unless the user went to look at another subreddit.
         self._refresh_datasets(select=self.request.subreddit if self._follow else None)
         kept = self.current and self.current.lower() == self.request.subreddit.lower()
@@ -1428,5 +1433,6 @@ class MainWindow(QMainWindow):
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
         return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job,
-                                    self.coverage.threads_job, self.load_job, self.rescore.job)
+                                    self.coverage.days_read.job, self.coverage.posts_read.job, self.load_job,
+                                    self.rescore.job)
                 if j.running()]

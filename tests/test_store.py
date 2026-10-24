@@ -788,16 +788,18 @@ def test_deleting_days_forgets_them_whole_and_leaves_other_days_and_subreddits_a
     before = {sub: (s.posts(sub), s.comments(sub)) for sub in ("Python", "rust")}
     assert s.posts("python")[0]["title"] == "title Python2"  # its pack is in the cache now
 
-    assert s.delete_days("python", [days[1] + 5000]) == (1, 2)  # any second of the day names it; the image post isn't shown
+    # Any second of the day names it; the image post isn't shown. The comments go: the post's two, and the late
+    # reply to the day before's post written on it (the timeline counts it on the day it was written).
+    assert s.delete_days("python", [days[1] + 5000]) == (1, 3)
 
     posts, comments = before["Python"]
     assert s.posts("Python") == [r for r in posts if r["id"] != "Python1"]
-    assert s.comments("Python") == [r for r in comments if r["post_id"] != "Python1"]
+    assert s.comments("Python") == [r for r in comments if r["post_id"] != "Python1" and r["id"] != "cPython0_1"]
     assert (s.posts("rust"), s.comments("rust")) == before["rust"]
     assert s.posts_per_day("Python", days[0], days[2] + 86400, images=True) == {}
     assert s.removed_per_day("Python", days[0], days[2] + 86400) == {days[0]: 1}
     assert s.complete_keys("posts", "python") == {str(days[0]), str(days[2])}
-    assert s.complete_keys("comments", "python") == {"Python0", "Python2"}
+    assert s.complete_keys("comments", "python") == {"Python0", "Python2"}  # Python0's late reply isn't fetched again
     assert len(s.complete_keys("posts", "rust")) == 3
     assert s.read_spans("python") == [(days[0], days[0] + 86399), (days[2], days[2] + 86399)]
     assert s.read_spans("rust") == [(days[0], days[2] + 86399)]
@@ -807,8 +809,8 @@ def test_deleting_days_forgets_them_whole_and_leaves_other_days_and_subreddits_a
     packs = {(k, sub, day): store._unpack(blob)["rows"] for k, sub, day, blob in s.db.execute("SELECT kind, subreddit, day, data FROM packs")}
     assert ("posts", "python", days[1] // 86400) not in packs
     assert set(packs["comments", "python", days[2] // 86400]) == {"cPython2_0"}
-    assert set(packs["comments", "python", days[1] // 86400]) == {"cPython0_1"}
-    assert len(packs) == 2 * 7 - 1
+    assert ("comments", "python", days[1] // 86400) not in packs  # every comment written on the day is gone
+    assert len(packs) == 2 * 7 - 2
 
     # They don't come back: not when the settled days are packed again, nor when the file is opened anew.
     assert s.pack_settled() == 0

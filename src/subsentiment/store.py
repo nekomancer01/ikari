@@ -1278,13 +1278,17 @@ class Store:
         return sorted({d for a, b in spans for d in range(a, b + 1, 86400)}, reverse=True)
 
     def downloaded_days(self, subreddit: str) -> list[int]:
-        """UTC days (their starts, newest first) with a post saved, whether or not a fetch recorded asking for
-        them (imported or older data): Download coverage lists these, so every day on the charts can be
-        downloaded again or deleted. Skipped image posts count, they were downloaded; days asked for with
-        nothing saved don't."""
+        """UTC days (their starts, newest first) with a post or a comment saved, whether or not a fetch recorded
+        asking for them (imported or older data): Download coverage lists these, so every day on the charts can
+        be downloaded again or deleted, a day with only replies to older posts too. Skipped image posts count,
+        they were downloaded; days asked for with nothing saved don't. A comment's day is read from its day's
+        pack, or from its row while it has none (the comments_unpacked index), not from every comment's row."""
         return [r["d"] for r in self.db.execute(
-            "SELECT DISTINCT CAST(created_utc / 86400 AS INTEGER) * 86400 d FROM posts "
-            "WHERE subreddit = ? COLLATE NOCASE ORDER BY d DESC", (subreddit,))]
+            "SELECT CAST(created_utc / 86400 AS INTEGER) * 86400 d FROM posts WHERE subreddit = ? COLLATE NOCASE "
+            "UNION SELECT day * 86400 FROM packs WHERE kind = 'comments' AND subreddit = ? "
+            "UNION SELECT CAST(created_utc / 86400 AS INTEGER) * 86400 FROM comments "
+            "WHERE subreddit = ? COLLATE NOCASE AND packed != 1 ORDER BY d DESC",
+            (subreddit, subreddit.lower(), subreddit))]
 
     def save_tried(self, subreddit: str, days) -> None:
         """Record these UTC days (their starts) as asked for, joined to the ones before."""
@@ -1412,6 +1416,32 @@ class Store:
             "WHERE k.kind = 'sampled' AND k.subreddit = ? AND p.created_utc >= ? AND p.created_utc < ?",
             (subreddit.lower(), after, before))}
 
+    def coverage_days(self, subreddit: str, cap: int = 0, since: float = 0) -> dict:
+        """What Download coverage lists, in one read: the "days" with posts saved (downloaded_days), and per day the
+        posts "saved", the removed and skipped image posts seen ("checked"), the archive "counts" asked for at or
+        after ``since``, the "threads" done at ``cap`` (whole_threads_per_day), the days a sample was through
+        ("sampled", when ``cap`` is SAMPLED), and the days "complete"."""
+        with self.snapshot():
+            days = self.downloaded_days(subreddit)
+            if not days:
+                return {"days": []}
+            after, before = days[-1], days[0] + 86400
+            checked = self.removed_per_day(subreddit, after, before)
+            for day, n in self.posts_per_day(subreddit, after, before, images=True).items():
+                checked[day] = checked.get(day, 0) + n
+            return {"days": days, "saved": self.posts_per_day(subreddit, after, before), "checked": checked,
+                    "counts": self.archive_counts(subreddit, after, before, since),
+                    "threads": self.whole_threads_per_day(subreddit, after, before, cap),
+                    "sampled": self.sampled_days(subreddit, after, before) if cap == SAMPLED else set(),
+                    "complete": self.complete_keys("posts", subreddit)}
+
+    def coverage_posts(self, subreddit: str, day: int, cap: int = 0) -> tuple[list, set[str], set[str]]:
+        """A UTC day's saved posts for Download coverage (comment_coverage), with the ids of posts whose comments
+        are complete, and complete so far."""
+        with self.snapshot():
+            return (self.comment_coverage(subreddit, day, day + 86400, cap), self.complete_keys("comments", subreddit),
+                    self.complete_keys("comments_so_far", subreddit))
+
     def posts_by_ids(self, ids) -> list[sqlite3.Row]:
         ids = list(ids)
         return self._unpacked("posts", self.db.execute(f"SELECT * FROM posts WHERE id IN ({','.join('?' * len(ids))})", ids))
@@ -1538,10 +1568,13 @@ class Store:
 
     def delete_days(self, subreddit: str, days) -> tuple[int, int]:
         """Forget what's saved from some UTC days (their starts) of a subreddit: the posts created on them, the
-        comments on those posts, their text in the day packs, and every record of downloading them (complete
-        days and threads, read-through spans, removed posts seen), so each day shows as never downloaded and
-        a download reads it again in full. Timeline notes stay. One transaction. Returns the (posts, comments)
-        deleted that the app shows (image posts and their comments are deleted too, but never shown)."""
+        comments on those posts and every comment written on them (on a post of another day too: the timeline
+        counts a comment on its own day), their text in the day packs, and every record of downloading them
+        (complete days and threads, read-through spans, removed posts seen), so each day shows as never
+        downloaded and a download reads it again in full. Another day's post that loses replies keeps its
+        record of being downloaded, so the replies don't come back to the deleted days. Timeline notes stay.
+        One transaction. Returns the (posts, comments) deleted that the app shows (image posts and their
+        comments are deleted too, but never shown)."""
         sub, days = subreddit.lower(), sorted({int(d) // 86400 * 86400 for d in days})
         if not days:
             return 0, 0
@@ -1549,20 +1582,24 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.execute("CREATE TEMP TABLE gone (id TEXT PRIMARY KEY)")
+            self.db.execute("CREATE TEMP TABLE gone_comments (id TEXT PRIMARY KEY)")
             for d in days:
                 self.db.execute("INSERT OR IGNORE INTO temp.gone SELECT id FROM posts WHERE subreddit = ? COLLATE NOCASE "
                                 "AND created_utc >= ? AND created_utc < ?", (subreddit, d, d + 86400))
+                self.db.execute("INSERT OR IGNORE INTO temp.gone_comments SELECT id FROM comments WHERE subreddit = ? "
+                                "COLLATE NOCASE AND created_utc >= ? AND created_utc < ?", (subreddit, d, d + 86400))
+            self.db.execute("INSERT OR IGNORE INTO temp.gone_comments SELECT id FROM comments WHERE post_id IN temp.gone")
             shown = self.db.execute(
                 "SELECT (SELECT COUNT(*) FROM posts WHERE image = 0 AND id IN temp.gone), (SELECT COUNT(*) FROM comments "
-                "c WHERE c.post_id IN temp.gone AND " + NOT_IMAGE + ")").fetchone()
+                "c WHERE c.id IN temp.gone_comments AND " + NOT_IMAGE + ")").fetchone()
             # The comments' text sits in the packs of the days they were written, beside other posts' comments.
             repack: dict[int, set[str]] = {}
             for r in self.db.execute("SELECT id, CAST(created_utc / 86400 AS INTEGER) d FROM comments "
-                                     "WHERE packed != 0 AND post_id IN temp.gone"):
+                                     "WHERE packed != 0 AND id IN temp.gone_comments"):
                 repack.setdefault(r["d"], set()).add(r["id"])
-            self.search.drop("comments", [i for (i,) in self.db.execute("SELECT id FROM comments WHERE post_id IN temp.gone")])
+            self.search.drop("comments", [i for (i,) in self.db.execute("SELECT id FROM temp.gone_comments")])
             self.search.drop("posts", [i for (i,) in self.db.execute("SELECT id FROM temp.gone")])
-            self.db.execute("DELETE FROM comments WHERE post_id IN temp.gone")
+            self.db.execute("DELETE FROM comments WHERE id IN temp.gone_comments")
             self.db.execute("DELETE FROM comment_fetches WHERE post_id IN temp.gone")
             self.db.execute("DELETE FROM complete WHERE kind IN ('comments', 'comments_so_far', 'sampled') AND subreddit = ? "
                             "AND key IN temp.gone", (sub,))
@@ -1591,6 +1628,7 @@ class Store:
             raise
         finally:
             self.db.execute("DROP TABLE IF EXISTS temp.gone")
+            self.db.execute("DROP TABLE IF EXISTS temp.gone_comments")
         self._compact()  # (a cached pack is let go when it's next read: it was changed or removed since)
         return shown[0], shown[1]
 
