@@ -1360,11 +1360,31 @@ def test_closing_the_app_while_a_coverage_count_is_out_doesnt_freeze_it(env):
     assert not w.coverage.count_job.busy  # the count still ends and is tidied up
 
 
+def test_a_months_download_of_a_quiet_subreddit_reads_its_days_together(env):
+    # Each day took four searches of its own, whatever it held: a month of a subreddit posting three a day was
+    # over a hundred. Quiet days in a row are read as one range now, and each is still marked complete.
+    w = env.window()
+    env.archive.clear()
+    fetch(w, sub="rust", comments=False, rng="month")
+    after, before = w.fetch_form.bounds()
+    assert len(collect.days_in(after, before)) > 28
+    # Today alone, then runs of 2, 4, 8 and 16 days, each as many searches as one day (it was 124).
+    assert env.archive.paths().count(SEARCH) <= 6 * arctic_shift.SLOTS_PER_DAY
+    assert len(env.store().posts("rust")) == in_range(env, w, "rust")
+    whole = {str(d) for d in range(int(after // DAY * DAY) + DAY, coverage.today(), DAY)}
+    assert env.store().complete_keys("posts", "rust") == whole
+    cov = open_coverage(w)
+    marked = [day_cell(cov, row, 1).side.text() for row, day in enumerate(cov.days) if str(day) in whole]
+    assert marked and all(m == "✓ Complete" for m in marked)
+
+
 def test_a_fetch_ending_leaves_the_user_on_the_subreddit_they_switched_to(env):
     w = env.window()
     fetch(w, sub="rust", comments=False)
     fetch(w, comments=False)
-    env.archive.delay = 0.15
+    # Slow enough that the month is still downloading when the user switches: quiet days are read together, so
+    # at 0.15 s a request it was over first.
+    env.archive.delay = 0.5
     w.fetch_form.subreddit.setText("python")
     w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("month"))
     QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
