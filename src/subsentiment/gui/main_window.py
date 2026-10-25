@@ -1369,8 +1369,10 @@ class MainWindow(QMainWindow):
             return
         if QMessageBox.question(
                 self, "Delete saved data",
-                f"Delete the {len(self._saved['posts']):,} posts and {len(self._saved['comments']):,} comments saved for "
-                f"r/{self.current}{', and its timeline notes' if self.store.notes(self.current) else ''}? "
+                f"Delete the {plural(len(self._saved['posts']), 'post')} and "
+                f"{plural(len(self._saved['comments']), 'comment')} saved for "
+                f"r/⁠{self.current}"  # a word joiner: "r/" doesn't wrap away from the name
+                f"{', and its timeline notes' if self.store.notes(self.current) else ''}? "
                 "This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_subreddit(self.current)
