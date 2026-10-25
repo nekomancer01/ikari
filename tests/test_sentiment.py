@@ -113,6 +113,22 @@ def test_praise_that_a_mishap_never_happens_is_not_sarcasm():
         assert sentiment.score(text)[1] == "negative", text
 
 
+def test_an_apology_for_manners_does_not_make_a_comment_negative():
+    # The classifier learned "sorry" from raters who read every apology as remorse: these all came out negative
+    for text in ("Sorry if this has been asked before, which build is best for a beginner?",
+                 "Edit: sorry for formatting, on mobile", "sorry, I meant the second boss", "Oh. Sorry.",
+                 "Sorry about that! Edited with the details.", "I'm so sorry for the late reply, it works now"):
+        assert sentiment.score(text)[1] != "negative", text
+    assert sentiment.score("Thanks! Sorry for the late reply.")[1] == "positive"
+
+
+def test_sorry_as_sympathy_pity_or_before_a_disagreement_still_reads_negative():
+    for text in ("I'm so sorry for your loss.", "Sorry to hear that, the crash lost all my saves too",
+                 "I'm sorry you had to go through that.", "I feel sorry for the devs", "[NAME]. I'm sorry.",
+                 "Sorry, but this update is garbage."):
+        assert sentiment.score(text)[1] == "negative", text
+
+
 def test_a_post_of_many_short_lines_scores_quickly():
     # Quote stripping matched "\s*" across line breaks, so a long post of short lines took seconds.
     import time
