@@ -448,7 +448,8 @@ class CoveragePage(VerticalScrollArea):
         self.days: list[int] = []
         self.totals: dict[str, dict[int, int]] = {}  # subreddit (lowercase) -> day -> archive count
         self._totals_day = today()  # the UTC day self.totals were asked on: a count is good for that day only
-        self.count_error = ""
+        self.count_error = ""  # what the status line says of the days that couldn't be counted
+        self._uncounted: set[int] = set()  # days a count was asked for that didn't come: not asked for again
         self.count_job = BackgroundJob(self)
         self.count_job.ended.connect(self._on_count_done)
         self._counting: tuple[str, float, float] = ("", 0.0, 0.0)  # what the running count asked for
@@ -695,7 +696,7 @@ class CoveragePage(VerticalScrollArea):
             self.ticked.clear()
             self._anchor = None
             self._asking = False
-            self.count_error = ""
+            self.count_error, self._uncounted = "", set()
         self._show_resume()
         if self.isVisible():
             self.refresh_saved(rebuild=True)
@@ -760,15 +761,16 @@ class CoveragePage(VerticalScrollArea):
         if self._days_for != (self.subreddit or "").lower():
             return  # the days listed are another subreddit's: its own are counted once they're read
         totals = self.totals.get(self._days_for, {})
-        missing = [d for d in self.days if d not in totals and d < today()]
-        if missing and not self.count_job.busy and not self.count_error:
+        # Not the days that couldn't be counted, which would be asked for in a loop, but the ones listed since are.
+        missing = [d for d in self.days if d not in totals and d < today() and d not in self._uncounted]
+        if missing and not self.count_job.busy:
             self._count(min(missing), max(missing) + DAY)
 
     def _totals(self, kept: dict[int, int]) -> dict[int, int]:
         """The listed days' archive counts asked for today, in this session or ``kept`` from an earlier one: a
         count is asked for at most once a UTC day."""
         if self._totals_day != today():  # past midnight UTC: yesterday's counts are asked for again
-            self.totals, self._totals_day, self.count_error = {}, today(), ""
+            self.totals, self._totals_day, self.count_error, self._uncounted = {}, today(), "", set()
         totals = self.totals.setdefault(self.subreddit.lower(), {})
         missing = [d for d in self.days if d not in totals and d < today()]
         if missing:
@@ -797,10 +799,6 @@ class CoveragePage(VerticalScrollArea):
         else:
             self.day_rows.redraw()
         self._apply_filter()
-        self.ticked &= set(self._shown_days())
-        shown = self._shown_days()
-        if shown and self._selected_day() not in shown:  # the picked day went: pick the first one listed
-            self.day_table.selectRow(self.days.index(shown[0]))
         # The heading above names the subreddit.
         self.subtitle.setText(f"{range_text(self.days[-1], self.days[0])} · {plural(len(self.days), 'day')} "
                               "downloaded")
@@ -889,13 +887,12 @@ class CoveragePage(VerticalScrollArea):
         return posts - whole
 
     def _on_filter(self, _key: str) -> None:
-        """Only the days shown stay ticked, so Download and Delete never act on days out of sight."""
         self._apply_filter()
-        self.ticked &= set(self._shown_days())
         self._show_ticked()
 
     def _apply_filter(self) -> None:
-        """Hide the days the filter above the list leaves out."""
+        """Hide the days the filter above the list leaves out. Only the days shown stay ticked, so Download and
+        Delete never act on days out of sight, and a picked day hidden shows its posts no longer."""
         key = self.filter.value()
         if key == "comments" and self._threads_for[:1] != ((self.subreddit or "").lower(),):
             key = "all"  # the whole threads aren't counted yet: nothing is hidden until they are
@@ -904,6 +901,13 @@ class CoveragePage(VerticalScrollArea):
                 key == "comments" and not self._missing_threads(day))
             self.day_table.setRowHidden(row, hide)
         self.day_rows.fill()  # days the filter brings back may be on screen now
+        shown = self._shown_days()
+        self.ticked &= set(shown)
+        if self._selected_day() not in shown:  # the picked day went: pick the first one listed, if any is
+            if shown:
+                self.day_table.selectRow(self.days.index(shown[0]))
+            else:
+                self.day_table.clearSelection()
 
     def _shown_days(self) -> list[int]:
         return [d for r, d in enumerate(self._day_rows) if not self.day_table.isRowHidden(r)]
@@ -1129,7 +1133,7 @@ class CoveragePage(VerticalScrollArea):
         done = r["id"] in self._comments_done
         so_far = r["num_comments"] is None and r["id"] in self._comments_so_far
         total = r["num_comments"]
-        capped = bool(r["whole"]) and not (done or so_far or (bool(total) and r["saved_comments"] >= total))
+        capped = bool(r["whole"]) and total != 0 and not (done or so_far or (bool(total) and r["saved_comments"] >= total))
         sampled = capped and self.comment_cap.sampling
         state = (r["id"], r["title"], r["saved_comments"], r["num_comments"], done, so_far, capped, sampled, self.busy)
         if self._post_drawn.get(i) == state:
@@ -1241,8 +1245,8 @@ class CoveragePage(VerticalScrollArea):
     def _on_count_failed(self, message: str) -> None:
         if not self._count_is_current():
             return
-        self.count_error = message
-        self.status.setText(f"Couldn't get totals from Arctic Shift: {message} Press Recount to try again.")
+        self.count_error = f"Couldn't get totals from Arctic Shift: {message}"
+        self.status.setText(self.count_error + " Press Recount to try again.")
 
     @Slot()
     def _on_count_done(self) -> None:
@@ -1253,23 +1257,25 @@ class CoveragePage(VerticalScrollArea):
             self.refresh_saved()
             return
         totals = self.totals.get(self.subreddit.lower(), {})
-        if sub != self.subreddit.lower() or any(d not in totals and d < today() and not after <= d < before
+        if sub == self.subreddit.lower():  # some days timed out: they aren't asked for again in a loop
+            self._uncounted |= {d for d in self.days if after <= d < before and d not in totals}
+        if sub != self.subreddit.lower() or any(d not in totals and d < today() and d not in self._uncounted
                                                 for d in self.days):
             # The user picked another subreddit or range while this count ran: count that now. It used to
             # be taken for days that couldn't be counted, so they showed "total unknown" with no reason.
             self._count_missing()
             self.refresh_saved()
             return
-        if any(d not in totals and d < today() for d in self.days) and not self.count_error:
-            # some days timed out; don't ask again in a loop
-            self.count_error = "Some days couldn't be counted."
+        if self._uncounted & set(self.days):  # said again after a later count of other days cleared it
+            self.count_error = self.count_error or "Some days couldn't be counted."
+            self.status.setText(self.count_error + " Press Recount to try again.")
         self.refresh_saved()
 
     def _recount(self) -> None:
         """Ask for every listed day's count again, even ones already asked for today."""
         if self.subreddit and self.days and not self.count_job.busy:
             self.totals.pop(self.subreddit.lower(), None)
-            self.count_error = ""
+            self.count_error, self._uncounted = "", set()
             past = [d for d in self.days if d < today()]
             if past:
                 self._count(past[-1], past[0] + DAY)
@@ -1383,6 +1389,12 @@ class CoveragePage(VerticalScrollArea):
             self._remember_stopped(None)  # what was stopped is now read to the end
         if (self.subreddit or "").lower() == sub.lower():
             self.untick(days)
+
+    def forget_stopped(self, sub: str | None = None) -> None:
+        """The saved data of r/sub (of every subreddit for None) was deleted: no download of it is left to
+        resume, which would download the deleted days again."""
+        if self._stopped and (sub is None or self._stopped["subreddit"].lower() == sub.lower()):
+            self._remember_stopped(None)
 
     def _remember_stopped(self, stopped: dict | None) -> None:
         self._stopped = stopped
