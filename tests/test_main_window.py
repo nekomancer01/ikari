@@ -130,6 +130,16 @@ def test_delete_one_then_all(make_window, monkeypatch):
     assert "Nothing saved yet" in w.storage_info.text()
 
 
+def test_the_delete_question_keeps_r_slash_with_the_name(make_window, monkeypatch):
+    # At 150% the box wrapped "...saved for r/" | "name? This can't be undone."
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(a[2]) or QMessageBox.StandardButton.No)
+    w = make_window()
+    w._delete_dataset()
+    assert f"saved for r/⁠{w.current}?" in asked[0]
+    assert asked[0].replace(" ", " ").startswith("Delete the 1 post and 0 comments saved")  # not "1 posts"
+
+
 def test_the_window_says_which_database_it_has_open(make_window, tmp_path, monkeypatch):
     # Started under another home (sudo, a Flatpak IDE) the app opens a different, empty database, and nothing
     # on screen said where the one it had open was.
