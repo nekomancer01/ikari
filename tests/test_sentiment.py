@@ -119,6 +119,18 @@ def test_a_word_neither_scorer_knows_set_to_neutral_changes_no_score():
         assert lex.score(text, "vader") == pytest.approx(sentiment.score(text, "vader"), abs=1e-9), text
 
 
+def test_a_set_word_is_found_whichever_apostrophe_it_is_written_with():
+    """The word cloud reads "y’all" as "y'all", so a meaning set on either is found in both."""
+    for word, other in (("y'all", "y’all"), ("y’all", "y'all")):
+        lex = sentiment.Lexicon({word: 1.0})
+        for text in (f"{other} came to the meeting", f"{other.upper()} came to the meeting"):
+            assert lex.uses(text), text
+            assert lex.score(text)[1] == "positive", text
+            assert lex.score(text, "vader")[1] == "positive", text
+    lex = sentiment.Lexicon({"all": 1.0})
+    assert not lex.uses("y’all came") and lex.score("y’all came") == sentiment.score("y’all came")
+
+
 def test_a_set_word_keeps_its_meaning_next_to_punctuation_and_in_a_sarcastic_frame():
     assert sentiment.Lexicon({"grind": 1.0}).score("the grind-heavy content", "vader")[1] == "positive"
     assert sentiment.Lexicon({"crashes": 1.0}).score("gotta love when the game crashes")[1] == "positive"
