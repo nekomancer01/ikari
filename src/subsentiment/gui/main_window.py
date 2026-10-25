@@ -1074,7 +1074,8 @@ class MainWindow(QMainWindow):
         self._render_overview(restore=True)
         self._reload_span()
         self._show_notes()
-        if switching or self.words_page.meanings.subreddit is None:
+        # (Deleting what was shown sets current to None first: not switching, but its words go too.)
+        if switching or self.words_page.meanings.subreddit != self.current:
             self.words_page.meanings.set_subreddit(self.current, self.store.words(self.current) if self.current else {})
         self._update_delete_enabled()
         self.coverage.set_subreddit(self.current)

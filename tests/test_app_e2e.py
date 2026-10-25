@@ -434,6 +434,34 @@ def test_the_fetch_drawers_sample_downloads_only_part_of_a_big_days_comments_and
     assert env.window().fetch_form.comment_cap.pick.currentData() == "sample"  # remembered
 
 
+def test_the_fetch_drawers_sample_keeps_a_day_whole_while_some_of_its_posts_arent_counted(env):
+    """A day whose newest posts aren't counted yet (under 36 hours old) can't be sampled by its share: every thread
+    of it is saved whole and none is shown as a sample, rather than a sample sized without the uncounted ones."""
+    by_day: dict[int, list[dict]] = {}
+    for p in env.archive.posts:
+        if p["subreddit"] == "Python" and p["num_comments"]:
+            p["num_comments"] = 400  # every counted day is big enough to sample
+            by_day.setdefault(int(p["created_utc"] // DAY), []).append(p)
+    for p in by_day[max(by_day)][::2]:  # the newest settled day: half its posts not counted yet, as if newer
+        p["retrieved_on"], p["num_comments"] = p["created_utc"] + 60, 0
+    w = env.window()
+    w.fetch_form.comment_cap.pick.setCurrentIndex(w.fetch_form.comment_cap.pick.findData("sample"))
+    fetch(w, comments=True)
+    s = env.store()
+    sampled = s.complete_keys("sampled", "python")
+    mixed = 0
+    for day in {int(r["created_utc"] // DAY * DAY) for r in s.posts("python")}:
+        counts = s.comment_totals("python", day, day + DAY)
+        if None in counts.values() and any(counts.values()):
+            mixed += 1
+            saved = s.comment_counts("python", day, day + DAY)
+            assert all(saved.get(pid, 0) >= n for pid, n in counts.items() if n)  # counted threads saved whole
+            assert not set(counts) & sampled
+    assert mixed
+    assert sampled  # older days are still sampled
+    w.close()
+
+
 def test_comments_come_with_a_fetch_when_asked(env):
     w = env.window()
     fetch(w, comments=True)
@@ -490,6 +518,36 @@ def test_stop_ends_a_fetch_and_frees_the_form(env, monkeypatch):
     assert len(env.archive.paths()) == n == len(sent)  # nothing carries on after Stop
     assert w.fetch_btn.isEnabled() and not w.stop_btn.isEnabled() and w.fetch_form.subreddit.isEnabled()
     assert "Stopped" in w.progress_msg.text() or "stopped" in w.progress_msg.text().lower()
+
+
+def test_comments_a_stopped_fetch_owed_are_fetched_by_the_next_one(env):
+    # Stopped while a day's comments came in, the rest of its posts were left with none, and as the day had been
+    # read to its end (complete), fetching it again never asked for them.
+    w = env.window()
+    env.archive.delays["/api/comments/tree"] = 0.3
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(True)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    past = {p["id"] for p in env.archive.posts if p["created_utc"] < NOW // DAY * DAY}
+    end = time.monotonic() + 30  # Stop once two threads of a day before today, read to its end, are asked for
+    while len([q for p, q in list(env.archive.requests) if p == "/api/comments/tree"
+               and q["link_id"].removeprefix("t3_") in past]) < 2 and time.monotonic() < end:
+        pump(20)
+    QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    env.archive.delays.clear()
+    store = env.store()
+    complete = {int(d) for d in store.complete_keys("posts", "python")}
+    owed = lambda: {r["id"] for r in store.posts_between("python", None, None)  # noqa: E731
+                    if r["num_comments"] != 0 and not r["image"] and (r["created_utc"] // DAY * DAY) in complete} - {
+        c["post_id"] for c in store.comments("python")}
+    assert owed()  # a complete day's posts the stopped fetch never got to
+    env.archive.clear()
+    fetch(w, comments=False)  # without comments, none are asked for
+    assert "/api/comments/tree" not in env.archive.paths()
+    fetch(w)
+    assert not owed()
 
 
 def test_stop_takes_effect_at_once_even_while_requests_wait_out_timeouts(env, monkeypatch):
@@ -1911,3 +1969,29 @@ def test_one_server_error_is_neither_called_busy_nor_holds_up_the_fetch(env, mon
         pump(5)
     assert not [m for m in said if "busy" in m or "Waiting" in m], said
     assert not env.warnings and "Added" in w.progress_msg.text()
+
+
+@pytest.mark.parametrize("button", ["delete_btn", "delete_all_btn"])
+def test_deleting_the_last_subreddit_empties_the_words_page_and_its_words_stay_deleted(env, monkeypatch, button):
+    # Deleting the only subreddit saved left the Words page on its words, and a word set there was saved for it:
+    # a later fetch of it was scored by a word deleted with it.
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    w = env.window()
+    fetch(w, comments=False)
+    w.show_page("words")
+    meanings = w.words_page.meanings
+    QTest.keyClicks(meanings.entry, "festival")
+    QTest.keyClick(meanings.entry, Qt.Key.Key_Return)
+    row = meanings.rows["festival"]
+    QTest.mouseClick(row.slider, Qt.MouseButton.LeftButton, pos=QPoint(row.slider.width() - 4, row.slider.height() // 2))
+    assert w.store.words("python") == {"festival": 1.0}
+    QTest.mouseClick(getattr(w, button), Qt.MouseButton.LeftButton)
+    pump(50)
+    assert w.current is None and w.datasets.count() == 0
+    assert meanings.subreddit is None and meanings.rows == {} and not meanings.entry.isEnabled()
+    assert meanings.entry.placeholderText() == "Open a subreddit to set what its words mean"
+    meanings.changed.emit("festival", 0.8)  # a slider let go on the page as it was: nothing to set it for
+    assert w.store.db.execute("SELECT COUNT(*) FROM words").fetchone()[0] == 0
+    fetch(w, comments=False)
+    assert w.current.lower() == "python" and meanings.subreddit.lower() == "python"
+    assert meanings.rows == {} and w.store.words("python") == {}
