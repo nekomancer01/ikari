@@ -597,6 +597,8 @@ def test_delete_selected_asks_then_forgets_only_the_ticked_days_and_they_downloa
     QTest.mouseClick(c.delete_ticked, Qt.MouseButton.LeftButton)
     settle(w)
     asked = c.delete_question.text().replace("\u00a0", " ")
+    assert "r/\u2060Python" in asked  # a word joiner keeps "r/" on the name's line
+    asked = asked.replace("\u2060", "")
     assert "6 posts" in asked and "2 days" in asked and "r/Python" in asked and "can't be undone" in asked
     assert c.delete_confirm.text().replace("\u00a0", " ") == "Delete 2 days"
     tick(c, TODAY - 2 * DAY)  # ticked while it asks: the question follows
@@ -1090,3 +1092,49 @@ def test_a_download_starting_or_ending_only_marks_the_day_buttons(window, monkey
     assert drawn == [] and all(b.later for b in buttons)
     c.set_busy(False)
     assert drawn == [] and not any(b.later for b in buttons)
+
+
+def test_one_post_and_one_saved_item_read_in_the_singular(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    c.day_table.selectRow(c.days.index(TODAY - DAY))  # p0 alone, its comments not saved
+    settle(w)
+    assert c.post_table.rowCount() == 1
+    assert c.all_comments.text() == "Download all comments (1 post)"
+    assert coverage.share_text(1, 1, True, "post")[3] == "The 1 post the archive still has is saved."
+    assert coverage.share_text(2, 2, True, "post")[3] == "All 2 posts the archive still has are saved."
+
+
+def test_the_comment_threads_tooltip_follows_the_comment_cap(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals and c._threads and not c.reading())
+    row = c.days.index(TODAY - DAY)
+    assert day_cell(c, row, 3).toolTip().startswith("Every comment is saved on 0 of")
+    c.comment_cap.count.setValue(100)
+    settle(w, lambda: not c.reading())
+    assert day_cell(c, row, 3).toolTip().startswith("Every comment, or 100 on a bigger thread, is saved on 0 of")
+
+
+def test_a_post_with_more_comments_saved_than_the_archive_counted_says_so(window):
+    # The archive counts a post's comments when it re-checks it; ones written since are saved but not counted.
+    w = window
+    w.store.db.execute("UPDATE posts SET num_comments = 3 WHERE id = 'p0'")
+    w.store.save_comments([Comment(f"cp0{j}", "p0", "Python", "t3_p0", "b", "ok", j, TODAY - DAY + 600, 0, "u")
+                           for j in range(5)], [(0.0, "neutral")] * 5)
+    w.store.commit()
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    c.day_table.selectRow(c.days.index(TODAY - DAY))
+    settle(w)
+    cell = c.post_table.cellWidget(0, 1)
+    assert cell.main.text() == "5 saved"  # not "5 of 3"
+    assert "more than the 3 Arctic Shift counted" in cell.toolTip()
+    assert c.post_table.cellWidget(0, 2).findChild(QPushButton).text() == coverage.CHECK

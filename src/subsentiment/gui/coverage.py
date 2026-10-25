@@ -90,7 +90,8 @@ def share_text(saved: int, total: int | None, complete: bool, noun: str,
     of the archive's items ikari has seen were removed from Reddit: the archive's count includes them but
     they can't be saved, so they count as checked, and so do the image posts ikari skips."""
     if complete:
-        tip = f"All {plural(saved, noun)} the archive still has are saved."
+        tip = (f"The {plural(saved, noun)} the archive still has is saved." if saved == 1 else
+               f"All {plural(saved, noun)} the archive still has are saved.")
         if total is not None and total > saved:
             tip += f" Its count of {total:,} includes ones removed from Reddit."
         return f"{saved:,} saved", "✓ Complete", 1.0, tip
@@ -104,7 +105,10 @@ def share_text(saved: int, total: int | None, complete: bool, noun: str,
         return f"{saved:,} saved", "total unknown", None, "The archive hasn't counted these yet."
     if total == 0 and saved == 0:
         return f"No {noun}s", "", None, f"The archive has no {noun}s here."
-    share = min(1.0, saved / total) if total else 1.0
+    if total < saved:  # a post's count from before its newest comments: all of it is saved, and more
+        return (f"{saved:,} saved", "100%", 1.0, f"{plural(saved, noun)} saved, more than the {total:,} Arctic "
+                "Shift counted: its count is from before the newer ones were written.")
+    share = saved / total if total else 1.0
     return f"{saved:,} of {total:,}", f"{100 * share:.0f}%", share, ""
 
 
@@ -925,7 +929,7 @@ class CoveragePage(VerticalScrollArea):
     def _draw_day_threads(self, row: int, day: int) -> None:
         whole, posts = self._threads_on(day)
         if not self._changed(("threads", day), whole, posts, self.delete_job.busy, self.comment_cap.sampling,
-                             day in self._sampled):
+                             day in self._sampled, self.comment_cap.count.value()):  # the tooltip names the cap
             return
         cell: Cell = self.day_table.cellWidget(row, 3)
         button: RowButton = self.day_table.cellWidget(row, 4).findChild(RowButton)
@@ -1020,9 +1024,9 @@ class CoveragePage(VerticalScrollArea):
             saved = self.window_.store.posts_per_day(self.subreddit, days[0], days[-1] + DAY)
             count = sum(saved.get(d, 0) for d in days)
             when = day_text(days[0]) if n == 1 else f"{range_text(days[0], days[-1])} ({plural(n, 'day')})"
-            what = (f"{plural(count, 'post')} saved from {when} in r/{self.subreddit}, with their comments, every "
-                    f"comment written on {'that day' if n == 1 else 'those days'}," if count else
-                    f"the comments written on {when} in r/{self.subreddit}")
+            what = (f"{plural(count, 'post')} saved from {when} in r/\u2060{self.subreddit}, with their comments, "
+                    f"every comment written on {'that day' if n == 1 else 'those days'}," if count else
+                    f"the comments written on {when} in r/\u2060{self.subreddit}")
             self.delete_question.setText(
                 f"Delete {what} and their sentiment? The days show as not downloaded, ready to download again. "
                 "Timeline notes stay. This can't be undone.")
@@ -1098,7 +1102,7 @@ class CoveragePage(VerticalScrollArea):
         # has, there's nothing to say more came; once it has, a count above what's saved brings them back).
         todo = [r["id"] for r in rows if not r["whole"]]
         self._todo_comments = todo
-        self.all_comments.setText(f"Download all comments ({len(todo):,} posts)" if todo else "Download all comments")
+        self.all_comments.setText(f"Download all comments ({plural(len(todo), 'post')})" if todo else "Download all comments")
         self.all_comments.setEnabled(not self.busy and bool(todo))
         self._empty("No posts from this day are saved yet. Use the day's ↓ in the Posts column.")
         self.posts_empty.setVisible(not rows)
