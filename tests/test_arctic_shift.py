@@ -716,6 +716,19 @@ def test_a_capped_thread_is_read_whole_then_picked_top_scoring_or_at_random_the_
     assert len(everything) == 40 and whole  # the cap left nothing out
 
 
+def test_top_comments_put_unscored_ones_after_every_scored_one_even_below_minus_one():
+    # Unscored comments (not settled yet) ranked as if scored -1, above settled ones at -3.
+    p = Post("p1", "Python", "t", "", "a", 10, 0.9, 4, 1.0, "u", "")
+    tree = [node(comment("neg", "t3_p1", 1, score=-3, depth=0)),
+            node(comment("new1", "t3_p1", 2, score=1, settled=False, depth=0)),
+            node(comment("new2", "t3_p1", 3, score=1, settled=False, depth=0)),
+            node(comment("pos", "t3_p1", 4, score=5, depth=0))]
+    top, _ = client([ok(tree)]).fetch_all_comments(p, 2, "top")
+    assert [x.id for x in top] == ["pos", "neg"]
+    top, _ = client([ok(tree)]).fetch_all_comments(p, 3, "top")
+    assert [x.id for x in top] == ["pos", "neg", "new1"]
+
+
 class BusyArchive(ArchiveSession):
     """Times out on any page bigger than ``max_limit``, so the client retries with smaller pages."""
 

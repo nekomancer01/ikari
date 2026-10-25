@@ -1074,7 +1074,7 @@ def keep(comments: list[Comment], n: int, pick: str, post_id: str) -> list[Comme
     if pick == "random":
         ranked = sorted(comments, key=lambda c: hashlib.blake2b(f"{post_id}/{c.id}".encode(), digest_size=8).digest())
     else:
-        ranked = sorted(comments, key=lambda c: -1 if c.score is None else c.score, reverse=True)
+        ranked = sorted(comments, key=lambda c: (c.score is not None, c.score or 0), reverse=True)
     return ranked[:n]
 
 
