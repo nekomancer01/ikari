@@ -11,7 +11,7 @@ from typing import Callable, Collection
 import numpy as np
 import requests
 
-from subsentiment.arctic_shift import ArcticShiftClient, ArchiveDown, Stopped, in_parallel, keep
+from subsentiment.arctic_shift import INGEST_LAG, ArcticShiftClient, ArchiveDown, Stopped, in_parallel, keep
 from subsentiment.reddit import FetchError, Post, normalize_subreddit
 from subsentiment.sentiment import Lexicon
 from subsentiment.store import Store
@@ -271,6 +271,13 @@ class Download:
             timed_out = getattr(self.client, "timed_out", False)
             self.unread |= {d for d in days_in(lo, hi) for a, b in getattr(self.client, "unread", None) or ()
                             if a < d + DAY and b > d}
+            if self.sample:
+                # A day the range asked for cuts short, at its start or its end (not one that just isn't over
+                # yet), waits too, unless some fetch has read the rest of it: a sample planned from part of a
+                # day's posts gives each of them a share of the whole day.
+                spans, now = self.store.read_spans(self.name), time.time() - INGEST_LAG
+                self.unread |= {d for d in days_in(lo, hi) for x, y in ((d, lo), (hi, min(d + DAY, now)))
+                                if y > x and not any(a <= x and b >= y - 1 for a, b in spans)}
             fruitless = fruitless + 1 if timed_out and not got else 0
             rate = None if timed_out or self.should_stop() else (len(got) + len(in_run)) / (hi - lo)
             day_new, day_settled = self.settle(got)
@@ -341,12 +348,13 @@ class Download:
         store.commit()
         # Each whole UTC day of the range is complete only when every part of it was read to its end (no stretch
         # the client left unread is on it, as days read together can differ): a fetch that stopped at the limit,
-        # or was stopped, may have missed posts. A day that isn't over yet can still get posts, so it never is,
-        # and a keyword search only reads the posts that match.
+        # or was stopped, may have missed posts. A day that isn't over yet can still get posts, so it never is, nor
+        # one that ended less than INGEST_LAG ago (the archive can still be taking its last posts in, as read spans
+        # allow for too), and a keyword search only reads the posts that match.
         if everything and not req.query and not self.should_stop():
             unread = [] if getattr(client, "exhausted", False) else getattr(client, "unread", None) or [(after, before)]
             for day in whole:
-                if day + DAY <= time.time() and not any(lo < day + DAY and hi > day for lo, hi in unread):
+                if day + DAY <= time.time() - INGEST_LAG and not any(lo < day + DAY and hi > day for lo, hi in unread):
                     store.mark_complete("posts", name, str(day))
         return got
 
@@ -400,6 +408,19 @@ class Download:
         if not gave_up and not stopped:
             get = self.take_sample if self.sample else (lambda p: client.fetch_all_comments(p, cap, req.comment_pick)) \
                 if fill else (lambda p: (client.fetch_comments(p, cap, req.comment_pick), False))
+            # A capped thread picked again as its post's scores settled keeps the comments it had, rather than the new
+            # pick being saved beside them (about twice the cap, as nothing takes saved comments away): the ones still
+            # picked get their settled scores, and new ones only fill it up to the cap.
+            had = {p.id: ids for p in todo if p.id in refreshed and (ids := store.comment_ids(p.id))} \
+                if cap and not self.sample else {}
+            if had:
+                def get(p, get=get):
+                    comments, whole = get(p)
+                    if p.id not in had:
+                        return comments, whole
+                    kept = [c for c in comments if c.id in had[p.id]]
+                    kept += [c for c in comments if c.id not in had[p.id]][:max(0, cap - len(had[p.id]))]
+                    return kept, whole and len(kept) == len(comments)
             failed, tried, gave_up, added = self.each_thread(todo, get, cap=cap, progress=report)
             self.errors += failed
             self.n_comments += added
