@@ -1103,7 +1103,7 @@ def test_one_post_and_one_saved_item_read_in_the_singular(window):
     c.day_table.selectRow(c.days.index(TODAY - DAY))  # p0 alone, its comments not saved
     settle(w)
     assert c.post_table.rowCount() == 1
-    assert c.all_comments.text() == "Download all comments (1 post)"
+    assert c.all_comments.text() == "Download all comments (1 post)"
     assert coverage.share_text(1, 1, True, "post")[3] == "The 1 post the archive still has is saved."
     assert coverage.share_text(2, 2, True, "post")[3] == "All 2 posts the archive still has are saved."
 
