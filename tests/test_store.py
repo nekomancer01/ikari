@@ -711,6 +711,30 @@ def test_timeline_notes_are_kept_per_subreddit_and_day_and_go_with_its_data(tmp_
     assert s.notes("rust") == {}
 
 
+def test_a_note_or_word_the_database_is_too_busy_for_leaves_the_connection_reading_and_writing(tmp_path):
+    # Another connection holding the database past the busy timeout (a fetch giving the space back, say) failed
+    # the note with "database is locked" and left its transaction open: from then on this connection read the
+    # data as it was then, and every note or meaning saved after failed the same way.
+    s = Store(tmp_path / "x.db")
+    s.save_post(make_post(1), 0.5, "positive")
+    s.commit()
+    s.db.execute("PRAGMA busy_timeout = 0")
+    other = sqlite3.connect(tmp_path / "x.db", isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")
+    with pytest.raises(sqlite3.OperationalError):
+        s.save_note("Python", 86400 * 3, "UP", "")
+    with pytest.raises(sqlite3.OperationalError):
+        s.save_word("Python", "great", -1.0)
+    assert not s.db.in_transaction
+    other.execute("INSERT INTO notes VALUES ('python', 0, 'A', '', 0)")
+    other.execute("COMMIT")
+    assert s.notes("python") == {0: ("A", "")}  # what was saved meanwhile is read
+    s.save_note("Python", 86400 * 3, "UP", "")
+    s.save_word("Python", "great", -1.0)
+    assert s.notes("python") == {0: ("A", ""), 86400 * 3: ("UP", "")} and s.words("python") == {"great": -1.0}
+    other.close()
+
+
 def test_import_brings_notes_keeping_the_one_saved_last(tmp_path, monkeypatch):
     from subsentiment import store as store_mod
     when = iter([100.0, 200.0, 300.0, 400.0])
