@@ -256,12 +256,18 @@ def dot(tl, day: float) -> QPoint:
     return tl._spot(point, plot).toPoint()
 
 
+def click_note(tl, pos: QPoint) -> None:
+    """Click a day's dot or note label, and wait for its note: asked for once a double-click can't be coming."""
+    QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=pos)
+    pump(QApplication.styleHints().mouseDoubleClickInterval() + 100)
+
+
 def test_clicking_a_days_dot_adds_a_note_shown_on_the_chart_and_in_its_hover_box(window):
     w = window()
     tl = w.overview.timeline
     QTest.mouseClick(tl.presets["1m"], Qt.MouseButton.LeftButton)
     day = SAVED[-5]
-    QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=dot(tl, day))
+    click_note(tl, dot(tl, day))
     dialog = w.findChild(charts.NoteDialog)
     assert dialog.isVisible() and not dialog.save.isEnabled() and tl.view is not None  # no zoom either
     QTest.keyClicks(dialog.tag, "ABC")
@@ -278,7 +284,7 @@ def test_clicking_a_days_dot_adds_a_note_shown_on_the_chart_and_in_its_hover_box
 
     # The label is clickable too, and opens the note as it was; Remove takes it off.
     pill = tl._pills[0][0]
-    QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=pill.center().toPoint())
+    click_note(tl, pill.center().toPoint())
     dialog = w.findChild(charts.NoteDialog)
     assert (dialog.tag.text(), dialog.text.toPlainText()) == ("AB", "The big announcement")
     QTest.keyClicks(dialog.text, ", delayed")
@@ -295,7 +301,7 @@ def test_clicking_a_days_dot_adds_a_note_shown_on_the_chart_and_in_its_hover_box
     assert tl.notes == {}
     w._refresh_datasets(select="Python")
     QTest.mouseClick(tl.presets["1m"], Qt.MouseButton.LeftButton)
-    QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=dot(tl, day))
+    click_note(tl, dot(tl, day))
     dialog = w.findChild(charts.NoteDialog)
     QTest.mouseClick(next(b for b in dialog.findChildren(charts.QPushButton) if b.text() == "Remove"),
                      Qt.MouseButton.LeftButton)
@@ -331,7 +337,7 @@ def test_the_overview_timeline_shows_saved_notes_and_adds_them(window):
     tl = w.overview.timeline
     assert tl.notes == {SAVED[10]: ("OV", "from the overview")}
     QTest.mouseClick(tl.presets["1m"], Qt.MouseButton.LeftButton)
-    QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=dot(tl, SAVED[-3]))
+    click_note(tl, dot(tl, SAVED[-3]))
     dialog = w.findChild(charts.NoteDialog)
     QTest.keyClicks(dialog.tag, "TL")
     QTest.mouseClick(dialog.save, Qt.MouseButton.LeftButton)
@@ -389,3 +395,46 @@ def test_a_years_first_and_last_days_can_be_hovered_clicked_and_resized_at_the_e
     lo, hi, _ = tl._screen
     QTest.mouseMove(tl, QPoint(round(plot.left()) + 1, round(plot.center().y())))
     assert tl._hover and lo <= (tl._hover[1] + tl._hover[2]) / 2 <= hi
+
+
+def test_a_double_click_on_a_days_dot_shows_every_day_without_opening_its_note(window):
+    """A day's dot opens its note on a click, once a double-click (every day again) can't be on its way: the
+    first click of a double-click used to open the note, and the dialog then took the second click."""
+    w = window()
+    tl = w.overview.timeline
+    wait = QApplication.styleHints().mouseDoubleClickInterval() + 100
+    QTest.mouseClick(tl.presets["1m"], Qt.MouseButton.LeftButton)
+    at = dot(tl, SAVED[-5])
+    # As Qt sends one: press, release, press and double-click, release (QTest's double-click is that event alone).
+    QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=at)
+    QTest.mousePress(tl, Qt.MouseButton.LeftButton, pos=at, delay=50)
+    QTest.mouseDClick(tl, Qt.MouseButton.LeftButton, pos=at)
+    QTest.mouseRelease(tl, Qt.MouseButton.LeftButton, pos=at)
+    pump(wait)
+    assert w.findChild(charts.NoteDialog) is None and tl.view is None and tl.presets["All"].isChecked()
+    QTest.mouseClick(tl.presets["1m"], Qt.MouseButton.LeftButton)
+    QTest.mouseClick(tl, Qt.MouseButton.LeftButton, pos=dot(tl, SAVED[-5]))
+    w._refresh_datasets(select="rust")  # another subreddit picked before the note opened: not on its chart
+    pump(wait)
+    assert w.findChild(charts.NoteDialog) is None
+    w._refresh_datasets(select="Python")
+    click_note(tl, dot(tl, SAVED[-5]))
+    assert w.findChild(charts.NoteDialog).isVisible() and tl.view is not None
+
+
+def test_the_marked_range_button_is_the_span_shown(window):
+    """A range button longer than the days there are shows every day: All is marked then, not the range
+    button, which is disabled; it's still the one kept, so it takes over once there are more days."""
+    w = window()
+    tl = w.overview.timeline
+    QTest.mouseClick(tl.presets["1m"], Qt.MouseButton.LeftButton)
+    tl.set_points(tl.points[-10:])  # ten days: the month covers them all
+    assert tl.view is None and tl.preset == "1m" and not tl.presets["1m"].isEnabled()
+    assert [k for k, b in tl.presets.items() if b.isChecked()] == ["All"]
+    tl.set_points([(d, 0.1, 1) for d in SAVED])
+    assert tl.view == (LAST_END - 30 * DAY, LAST_END)
+    assert [k for k, b in tl.presets.items() if b.isChecked()] == ["1m"]
+    # A month remembered for a subreddit with a single day.
+    days.save_range(w.settings, "rust", None, "1m")
+    w._refresh_datasets(select="rust")
+    assert tl.view is None and [k for k, b in tl.presets.items() if b.isChecked()] == ["All"]
