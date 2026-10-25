@@ -574,6 +574,28 @@ def test_stopping_after_a_day_keeps_its_comments(tmp_path):
     assert {r["post_id"] for r in s.comments("python")} == {"d2p0", "d2p1", "d2p2"}
 
 
+def test_posts_a_stopped_day_owed_comments_get_them_from_the_next_fetch(tmp_path):
+    # Stop as a day's first thread came in left its other posts never asked about, and the day, read to its end,
+    # complete: fetching it again didn't read it, so they never got comments.
+    s = store_with(tmp_path, [])
+    c = DayClient(days=1, num_comments=2)
+    stop = threading.Event()
+    real = c.fetch_comments
+
+    def fetch_comments(post, limit, pick="top"):
+        stop.set()
+        return real(post, limit)
+    c.fetch_comments = fetch_comments
+    req = dict(after=D0, before=D0 + 86400, limit=None)
+    assert collect.run(c, s, collect.FetchRequest("python", **req), should_stop=stop.is_set).stopped
+    assert len({r["post_id"] for r in s.comments("python")}) < 3 and str(D0) in s.complete_keys("posts", "python")
+    c.fetch_comments = real
+    collect.run(c, s, collect.FetchRequest("python", **req, include_comments=False))  # not asked for: none fetched
+    assert len({r["post_id"] for r in s.comments("python")}) < 3
+    result = collect.run(c, s, collect.FetchRequest("python", **req))
+    assert {r["post_id"] for r in s.comments("python")} == {"d0p0", "d0p1", "d0p2"} and not result.comment_errors
+
+
 class WaitingClient(FakeClient):
     """Its post search has to wait out a pause the archive asked for, as a timeout or a 429 makes it."""
 
@@ -688,3 +710,58 @@ def test_coverage_sample_reads_only_the_threads_holding_part_of_it_then_counts_t
     assert s.open_threads("python", [day], cap=SAMPLED) == []
     c.calls.clear()
     assert collect.run(c, s, req).comments == 0 and not c.calls  # held already: nothing asked again
+
+
+class WholeTrees(DayClient):
+    """Each thread's tree as big as its post counts (100 where it isn't counted yet)."""
+
+    def fetch_all_comments(self, post, cap=0, pick="top"):
+        self.calls.append(("all", post.id, cap))
+        return [Comment(f"c{post.id}_{j}", post.id, "Python", "t3_" + post.id, "b", "ok", 1, T, 0, "u")
+                for j in range(100 if post.num_comments is None else post.num_comments)], True
+
+
+def test_a_day_with_posts_not_counted_yet_is_kept_whole_not_sampled_without_them(tmp_path):
+    # Half the day's posts aren't counted yet. The sample used to be sized for the counted half alone (278 of 1,000)
+    # while the uncounted threads were kept whole: 1,278 saved, 78% of them from half the day, marked a sample.
+    from subsentiment.store import SAMPLED
+    counted = [mk(i, num_comments=100) for i in range(10)]
+    uncounted = [mk(10 + i, score=None, num_comments=None) for i in range(10)]
+    s = store_with(tmp_path, counted + uncounted)
+    day = int(T // collect.DAY * collect.DAY)
+    req = collect.FetchRequest("python", comment_posts=tuple(s.open_threads("python", [day], cap=SAMPLED)),
+                               fill_threads=True, comment_pick=collect.SAMPLE)
+    collect.run(WholeTrees(), s, req)
+    saved = s.comment_counts("python", day, day + collect.DAY)
+    assert saved == {p.id: 100 for p in counted + uncounted}  # every comment: its share of the day isn't known yet
+    assert not s.complete_keys("sampled", "python")  # and not shown as a sample
+
+
+def test_a_days_sample_waits_for_the_rest_of_the_day_when_part_of_it_went_unread(tmp_path):
+    # The archive timed out on part of the day. Its saved half used to be sampled at its own size and held; once
+    # the rest came in, the first half kept its bigger share (27.8% against 7.5%).
+    class Patchy(WholeTrees):
+        cut = True
+
+        def fetch_posts(self, *a, **kw):
+            every, self.posts = self.posts, self.posts[:10] if self.cut else self.posts  # the first 12 hours
+            got = super().fetch_posts(*a, **kw)
+            self.posts = every
+            if self.cut:
+                self.exhausted, self.timed_out, self.unread = False, True, [(D0 + 39600, D0 + 86400)]
+            else:
+                self.timed_out, self.unread = False, []
+            return got
+    s = store_with(tmp_path, [])
+    c = Patchy(per_day=20, days=1, num_comments=100)
+    req = collect.FetchRequest("python", after=D0, before=D0 + 86400, limit=None, comment_pick=collect.SAMPLE)
+    collect.run(c, s, req)
+    assert len(s.posts("python")) == 10
+    assert not any(call[0] == "all" for call in c.calls) and not s.comments("python")  # held back, not sampled
+    assert not s.complete_keys("sampled", "python")
+    c.cut = False
+    collect.run(c, s, req)
+    sample = collect.Sample(s.comment_totals("python", D0, D0 + 86400))
+    saved = s.comment_counts("python", D0, D0 + 86400)
+    assert sample.population == 2000 and sum(saved.values()) == sample.size
+    assert all(saved.get(p.id, 0) == sample.quota(p.id) for p in c.posts)  # every post its share of the whole day
