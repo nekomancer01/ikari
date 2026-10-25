@@ -1071,6 +1071,9 @@ class CoveragePage(VerticalScrollArea):
             self.posts_title.setText("Posts")
             self._post_ids, self._post_rows, self._post_drawn = [], [], {}
             self.post_rows.reset(0)
+            # Gone with the posts, so a download ending can't offer the last day's threads under another subreddit.
+            self._todo_comments = []
+            self.all_comments.setText("Download all comments")
             self.all_comments.setEnabled(False)
             self._empty("Pick a day to see its posts.")
             self.posts_empty.setVisible(True)

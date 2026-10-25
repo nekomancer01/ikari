@@ -741,6 +741,48 @@ def test_the_window_keeps_painting_while_a_database_is_imported_and_nothing_else
     assert "Imported 1\xa0new post" in w.statusBar().currentMessage() and w.datasets.count() == 3
 
 
+def test_an_import_that_changes_words_meanings_scores_the_saved_items_again(make_window, tmp_path, monkeypatch):
+    # Importing a file that says "kill" is positive in r/linux left "kill it", saved here, negative; and the items
+    # taken from it stayed scored without this file's words.
+    from subsentiment.sentiment import Lexicon
+    ts = 1_700_000_000.0
+    mine = Store(tmp_path / "w.db")
+    mine.save_word("linux", "crashed", 1.0)
+    mine.save_post(Post("ours", "linux", "kill it", "", "a", 1, 0.9, 0, ts, "https://r/o/", ""),
+                   *mine.lexicon("linux").score("kill it"))
+    mine.commit()
+    mine.close()
+    theirs = Store(tmp_path / "other.db")
+    theirs.save_word("linux", "kill", 1.0)
+    theirs.save_post(Post("theirs", "linux", "the build crashed", "", "a", 1, 0.9, 0, ts, "https://r/t/", ""),
+                     *theirs.lexicon("linux").score("the build crashed"))
+    theirs.commit()
+    theirs.close()
+    assert Lexicon({}).score("kill it")[1] == "negative" and Lexicon({}).score("the build crashed")[1] == "neutral"
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", lambda *a, **k: (str(tmp_path / "other.db"), ""))
+    w = make_window()
+    w.show()
+    w.upgrading.join()
+    w._after_upgrade()
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/linux"))
+    assert {r["id"]: r["label"] for r in w.posts} == {"ours": "negative"}
+    w.import_act.trigger()
+    imported(w)
+    w.upgrading.join()  # scored again once what it took is packed
+    w._after_upgrade()
+    assert w.rescore.running() and not w.import_act.isEnabled()  # on its threads, as for a word set by hand
+    end = time.monotonic() + 20
+    while w.rescore.running():
+        assert time.monotonic() < end, "the rescore didn't end"
+        QApplication.processEvents()
+        time.sleep(0.01)
+    QApplication.processEvents()
+    assert w.store.words("linux") == {"crashed": 1.0, "kill": 1.0}
+    assert {r["id"]: r["label"] for r in w.store.posts("linux")} == {"ours": "positive", "theirs": "positive"}
+    assert {r["id"]: r["label"] for r in w.posts} == {"ours": "positive", "theirs": "positive"}  # the table too
+    assert w.import_act.isEnabled()
+
+
 def test_score_filters_hide_low_posts_and_low_comments_everywhere_and_are_remembered(make_window, tmp_path):
     from subsentiment.reddit import Comment
     s = Store(tmp_path / "w.db")
@@ -997,3 +1039,26 @@ def test_custom_dates_can_reach_a_day_begun_since_the_app_started(make_window):
     assert form.range.currentData() == "custom" and form.date_from.date() == yesterday.addDays(-3)  # left as picked
     form.date_to.setDate(QDate.currentDate())
     assert form.date_to.date() == QDate.currentDate()
+
+
+def test_check_for_updates_clicked_during_the_startup_check_still_answers(make_window, monkeypatch):
+    # The click came while the silent startup check was still waiting on GitHub, and was dropped: no answer at all.
+    from subsentiment import __version__, updater
+    w = make_window()
+    gate = threading.Event()
+
+    def slow():
+        gate.wait(5)
+        return updater.Release(__version__, "v" + __version__, "", "https://x", None, None)
+    monkeypatch.setattr(updater, "latest_release", slow)
+    told = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: told.append(a[2]))
+    w.updates.check(silent=True)
+    help_menu = next(a.menu() for a in w.menuBar().actions() if a.text() == "&Help")
+    next(a for a in help_menu.actions() if a.text().startswith("Check for updates")).trigger()
+    gate.set()
+    end = time.monotonic() + 5
+    while not told and time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert told == [f"You are up to date (version {__version__})."]

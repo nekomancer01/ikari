@@ -44,6 +44,16 @@ _COMPLAINT = re.compile(
     r"|freez(?:es|ing)|froze|stuck|delay(?:s|ed)?|cancel(?:l)?ed|outage|overtime|traffic)\b",
     re.IGNORECASE,
 )
+# Where a complaint word isn't one: a mishap that's been fixed or is gone ("it fixed my bug", "the lag is
+# finally gone", "no more crashes"), or a record broken.
+_HARMLESS = re.compile(
+    r"(?<!\bnot )(?<!\bnever )(?<!n't )\b(?:fixe[sd]|solved|resolved|patched|got rid of|no more|no longer)\s+"
+    r"(?:[\w'-]+\s+){0,3}?" + _COMPLAINT.pattern
+    + r"|" + _COMPLAINT.pattern + r"\s+(?:(?:is|are|was|were|has been|have been|got|all|now|finally|completely)\s+){0,3}"
+    r"(?:fixed|solved|resolved|patched|gone)\b"
+    r"|\b(?:break(?:s|ing)?|broke) (?:[\w'-]+ ){0,2}records?\b",
+    re.IGNORECASE,
+)
 
 
 @lru_cache(maxsize=1)
@@ -129,12 +139,12 @@ def _negative(cleaned: str, lexicon: Lexicon | None = None) -> bool:
 
 def is_sarcastic(cleaned: str, negative=_negative) -> bool:
     """True for obvious sarcasm in already-cleaned text (see the patterns above). ``negative`` says whether
-    what a positive frame is wrapped around reads negative."""
+    what a positive frame is wrapped around reads negative, leaving out any mishap it says is over."""
     if _SARCASM_MARKER.search(cleaned) or _EYEROLL.search(cleaned):
         return True
     if not _SARCASM_FRAME.search(cleaned):
         return False
-    rest = _SARCASM_FRAME.sub(" ", cleaned).strip(" ,.!?")
+    rest = _HARMLESS.sub(" ", _SARCASM_FRAME.sub(" ", cleaned)).strip(" ,.!?")
     return bool(rest) and negative(rest)
 
 
@@ -150,23 +160,26 @@ class Lexicon:
     NUDGE = 3.0  # how far the classifier's positive and negative logits move per unit the stand-ins moved VADER's
     MOST = 4.0  # the furthest they move
     BLANK = "zqikari"  # stands for a set word with no meaning of its own (stand-ins add a letter or more)
+    CURLY = str.maketrans("’", "'")  # a set word is found with either apostrophe, as the word cloud splits words
 
     def __init__(self, weights: dict[str, float] | None = None):
         self.weights = {self.key(w): max(-1.0, min(1.0, float(v))) for w, v in (weights or {}).items() if self.key(w)}
         self._find = None
         if self.weights:  # longest first, so a phrase wins over a word inside it
             words = sorted(self.weights, key=len, reverse=True)
-            self._find = re.compile(r"(?<![\w'])(?:" + "|".join(
-                r"\s+".join(map(re.escape, w.split())) for w in words) + r")(?![\w'])", re.IGNORECASE)
+            self._find = re.compile(r"(?<![\w'’])(?:" + "|".join(r"\s+".join(
+                re.escape(part.translate(self.CURLY)).replace("'", "['’]") for part in w.split()) for w in words)
+                + r")(?![\w'’])", re.IGNORECASE)
             # Letters only, so VADER keeps them whole, and nothing anyone writes. By casefold, as the search
             # ignores case the same way ("ſtuff" is found for "stuff"). A word set to neutral is BLANK, which VADER
             # doesn't know: a known word, even of valence 0, takes a lift from a "very" or "completely" before it.
-            self._stand_in = {w.casefold(): self.BLANK + "".join(chr(97 + int(d)) for d in str(i))
+            self._stand_in = {w.casefold().translate(self.CURLY): self.BLANK + "".join(chr(97 + int(d)) for d in str(i))
                               if self.weights[w] else self.BLANK for i, w in enumerate(words)}
-            self._spaced = {w.casefold(): bool(self.weights[w]) for w in words}
+            self._spaced = {w.casefold().translate(self.CURLY): bool(self.weights[w]) for w in words}
             self._analyzer = copy.copy(_analyzer())
             self._analyzer.lexicon = {**_analyzer().lexicon,
-                                      **{self._stand_in[w.casefold()]: v * self.VALENCE for w, v in self.weights.items() if v}}
+                                      **{self._stand_in[w.casefold().translate(self.CURLY)]: v * self.VALENCE
+                                         for w, v in self.weights.items() if v}}
         else:
             self._analyzer = _analyzer()
 
@@ -245,7 +258,7 @@ class Lexicon:
         """A set word's stand-in (or BLANK), in capitals where it was written in them, as VADER weighs those. One
         that means something is spaced off, so VADER reads it apart from what's joined on ("grind-heavy"); a
         neutral one isn't, so it reads just as the word did."""
-        word = self.key(m.group()).casefold()
+        word = self.key(m.group()).casefold().translate(self.CURLY)
         stand_in = self.BLANK if blank else self._stand_in.get(word)
         if stand_in is None:
             return m.group()
