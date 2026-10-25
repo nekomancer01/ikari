@@ -73,10 +73,10 @@ def pytest_collection_modifyitems(config, items):
 
 
 # Qt's warnings (a signal connected to nothing, a timer or child made on the wrong thread, a painter on a widget not
-# being painted) fail the test they came during. The offscreen platform the tests draw on can't move, raise or
-# resize windows the way a desktop does, and says so; those are left out.
+# being painted) fail the test they came during. Left out: the offscreen platform the tests draw on saying it can't
+# move, raise or resize windows the way a desktop does, and, on Windows, that it found no fonts folder in PySide6.
 QT_WARNINGS: list[str] = []
-OFFSCREEN = "This plugin does not support"
+OFFSCREEN = ("This plugin does not support", "QFontDatabase: Cannot find font directory")
 
 
 def qt_message(mode, context, message):
