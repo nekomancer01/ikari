@@ -227,6 +227,9 @@ class MainWindow(QMainWindow):
         self.load_job.ended.connect(self._load_wanted)
         self._wanted: str | None = None  # the subreddit (lowercased) being read on load_job's thread, to show then
         self._stopping = False  # Stop was pressed on the running fetch
+        # The running fetch is still saving (it hasn't finished or failed): its thread may go on packing what it
+        # saved for seconds after, saving nothing more.
+        self._saving = False
         self.current: str | None = None
         self.request: collect.FetchRequest | None = None
         self._live = QTimer(self)
@@ -792,6 +795,7 @@ class MainWindow(QMainWindow):
         self.fetch_job.start(worker)
         self._set_busy(True)
         self._stopping = False
+        self._saving = True
         self.progress_msg.setText(message)
         if self._drawer_key() == "fetch":  # the strip under the header follows it from here
             self.set_drawer("")
@@ -941,6 +945,7 @@ class MainWindow(QMainWindow):
         # Its thread may go on packing what it saved for a while: that isn't for Stop, which would only say
         # "Stopping…" over what it did and drop the downloads queued after it.
         self.stop_btn.setEnabled(False)
+        self._saving = False
         self._loaded.clear()  # what it saved (scores too) is read again, not shown from memory
         self._rescore_after_fetch()
         self.progress_msg.setText(finish_text(result, self.request))
@@ -982,6 +987,7 @@ class MainWindow(QMainWindow):
 
     def _on_failed(self, message: str) -> None:
         self.stop_btn.setEnabled(False)  # (as _on_finished)
+        self._saving = False
         self._loaded.clear()
         self._rescore_after_fetch()
         self._live.stop()
@@ -1135,8 +1141,9 @@ class MainWindow(QMainWindow):
             return
         # Saved to or deleted from since it was asked for, or read without its words while an upgrade ran that has
         # ended since: read it again (once this thread is done) rather than show it as it was. A running fetch's
-        # rows are counted in as they're saved instead (_open).
-        fetching = self.fetch_job.busy and self.request is not None and self.request.subreddit.lower() == key
+        # rows are counted in as they're saved instead (_open), but only while it saves: once it has finished, only
+        # packing what it saved, nothing more comes in.
+        fetching = self._saving and self.request is not None and self.request.subreddit.lower() == key
         wordless = not all(getattr(s, "words", True) for s in saved.values())
         if ((stats != self._stats.get(key) and not fetching)
                 or (wordless and not (self._wordless and self.upgrading.is_alive()))):
@@ -1454,19 +1461,23 @@ class MainWindow(QMainWindow):
         if error is not None:
             self.statusBar().clearMessage()
             QMessageBox.warning(self, "Delete failed", f"Couldn't delete the saved data.\n\n{error}")
-        elif sub:
-            for key in days.settings_keys(sub):
-                self.settings.remove(key)
-            self.statusBar().showMessage(f"Deleted the saved data for r/{sub}.", 8000)
         else:
-            self.settings.remove("ui/last_dataset")
-            self.settings.remove(days.SETTINGS_GROUP)
-            self.settings.remove(days.RANGE_GROUP)
-            self.statusBar().showMessage("Deleted all saved data.", 8000)
+            self._forget_settings(sub)
+            self.statusBar().showMessage(f"Deleted the saved data for r/{sub}." if sub else "Deleted all saved data.",
+                                         8000)
         # Another subreddit picked meanwhile stays shown.
         if error is None and (sub is None or (self.current or "").lower() == sub.lower()):
             self.current = None
         self._refresh_datasets()
+
+    def _forget_settings(self, subreddit: str | None) -> None:
+        """Forget what's remembered of a deleted subreddit (its span), or of every one (None) and which was shown."""
+        if subreddit:
+            for key in days.settings_keys(subreddit):
+                self.settings.remove(key)
+        else:
+            for key in ("ui/last_dataset", days.SETTINGS_GROUP, days.RANGE_GROUP):
+                self.settings.remove(key)
 
     def _export(self, kind: str) -> None:
         if not self.current or self.export_job.busy:
@@ -1563,6 +1574,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self.fetch_form.save()
         self.coverage.stop_count()
+        if self.delete_job.busy:  # its end isn't handled once the window has gone: what it deletes is forgotten now
+            self._forget_settings(self._deleting[0])
         self.settings.sync()  # app.main may end the process without Qt's usual clean-up
         if self.fetch_job.busy:
             # A fetch ending after this must not touch the closed store, so nothing it sends is handled.

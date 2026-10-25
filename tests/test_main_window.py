@@ -14,6 +14,7 @@ from PySide6.QtCore import QDate, QSettings, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
+from subsentiment.gui import days  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui.fetch_form import range_bounds  # noqa: E402
 from subsentiment.reddit import Post  # noqa: E402
@@ -1120,6 +1121,35 @@ def test_the_window_keeps_painting_while_saved_data_is_deleted_and_nothing_else_
     else:
         assert w.datasets.count() == 0 and w.current is None
         assert w.statusBar().currentMessage() == "Deleted all saved data."
+
+
+@pytest.mark.parametrize("method", ["delete_subreddit", "delete_all"])
+def test_closing_the_window_while_saved_data_is_deleted_still_forgets_its_settings(make_window, monkeypatch, method):
+    # The deletion's end isn't handled once the window has closed: the subreddit's posts went, but its remembered
+    # span stayed, and fetched again it opened on that span rather than every day.
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    going, deleting = threading.Event(), getattr(Store, method)
+
+    def slow(self, *args):
+        going.wait(10)
+        return deleting(self, *args)
+    monkeypatch.setattr(Store, method, slow)
+    w = make_window()
+    w.show()
+    w.upgrading.join()
+    w._after_upgrade()
+    shown = w.current
+    for key in days.settings_keys(shown):
+        w.settings.setValue(key, "2026-10-06")
+    (w._delete_dataset if method == "delete_subreddit" else w._delete_all)()
+    assert w.delete_job.busy and w.settings.contains("ui/last_dataset")
+    going.set()
+    w.close()
+    gone = days.settings_keys(shown) + (("ui/last_dataset",) if method == "delete_all" else ())
+    assert not any(QSettings().contains(k) for k in gone)
+    s = Store(w.db_path)
+    assert s.posts(shown) == []
+    s.close()
 
 
 def test_notes_and_words_meanings_wait_for_a_download_coverage_deletion(make_window, monkeypatch):

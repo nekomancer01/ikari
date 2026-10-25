@@ -33,6 +33,7 @@ from subsentiment.store import Store  # noqa: E402
 from subsentiment import store as store_mod  # noqa: E402
 
 from fake_archive import DAY, SLOW_DOWN, FakeArchive, make_posts  # noqa: E402
+from test_main_window import held_reads, opened, pick  # noqa: E402
 
 NOW = time.time()
 SEARCH, TREE, IDS, AGG = "/api/posts/search", "/api/comments/tree", "/api/posts/ids", "/api/posts/search/aggregate"
@@ -540,6 +541,39 @@ def test_stop_is_off_once_a_fetch_is_done_and_only_packing_what_it_saved(env, mo
     packing.set()
     wait_idle(w)
     assert w.progress_msg.text().startswith("Added") and queued == [True]
+
+
+def test_a_subreddit_being_read_as_a_fetch_into_it_ends_opens_with_what_it_saved(env, monkeypatch):
+    # Clicked, then fetched into while it was read on a thread, a big subreddit opened without what the fetch saved
+    # once the read came in while the fetch's thread only packed what it saved: the saved-data list counted the new
+    # posts, the pages didn't, until it was opened again.
+    s = env.store()
+    for sub in ("Python", "rust"):
+        s.save_post(Post(f"{sub}0", sub, "nice", "", "a", 1, 0.9, 0, NOW - 3 * DAY, "https://r", ""), 0.5, "positive")
+    s.commit()
+    packing, pack = threading.Event(), Store.pack_settled
+    monkeypatch.setattr(Store, "pack_settled", lambda self, *a, **k: packing.wait(30) and pack(self, *a, **k))
+    w = env.window()
+    w.upgrading.join()
+    w._after_upgrade()
+    pick(w, "rust")
+    opened(w)
+    monkeypatch.setattr(w, "LOAD_THREAD_FROM", 0)
+    going = held_reads(monkeypatch)
+    pick(w, "Python")
+    assert w.load_job.busy and w.current == "rust"
+    start_fetch(w, comments=False)
+    end = time.monotonic() + 30
+    while not w.progress_msg.text().startswith("Added"):  # it has finished; its thread packs what it saved
+        assert time.monotonic() < end and w.fetch_job.busy, w.progress_msg.text()
+        pump(10)
+    going.set()
+    opened(w)
+    saved = len(env.store().posts("python"))
+    assert saved > 1 and w.current == "Python" and len(w.posts) == saved
+    packing.set()
+    wait_idle(w)
+    assert len(w.posts) == saved
 
 
 def test_comments_a_stopped_fetch_owed_are_fetched_by_the_next_one(env):
