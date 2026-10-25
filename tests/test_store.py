@@ -921,6 +921,16 @@ def test_archive_counts_are_kept_with_when_they_were_asked(tmp_path):
     assert s.archive_counts("Python", 0, 3 * 86400) == {}
 
 
+def test_deleting_a_subreddit_forgets_its_archive_counts_only(tmp_path):
+    # Left behind, Coverage showed the old totals after a fresh download and didn't ask the archive again.
+    s = Store(tmp_path / "s.db")
+    s.save_archive_counts("Python", {86400: 5}, at=1000.0)
+    s.save_archive_counts("Linux", {86400: 3}, at=1000.0)
+    s.delete_subreddit("python")
+    assert s.archive_counts("Python", 0, 2 * 86400) == {}
+    assert s.archive_counts("Linux", 0, 2 * 86400) == {86400: 3}
+
+
 def test_open_threads_are_the_days_posts_without_every_comment(tmp_path):
     from subsentiment.reddit import Post
     s = Store(tmp_path / "s.db")

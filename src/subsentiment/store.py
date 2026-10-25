@@ -1588,7 +1588,7 @@ class Store:
                             "WHERE id = ?", [(s, label, i) for i, s, label in scores])
 
     # What's kept per subreddit (lowercased), besides its posts and comments.
-    _BY_SUBREDDIT = ("complete", "removed_posts", "notes", "words", "packs", "dicts", "vocab")
+    _BY_SUBREDDIT = ("complete", "removed_posts", "notes", "words", "packs", "dicts", "vocab", "archive_counts")
 
     def delete_subreddit(self, subreddit: str) -> None:
         for kind in PACKED:
@@ -1670,7 +1670,7 @@ class Store:
         return shown[0], shown[1]
 
     def delete_all(self) -> None:
-        for table in ("posts", "comments", "comment_fetches", "archive_counts", *self._BY_SUBREDDIT):
+        for table in ("posts", "comments", "comment_fetches", *self._BY_SUBREDDIT):
             self.db.execute(f"DELETE FROM {table}")
         self.search.clear()
         self._vocab.clear()
