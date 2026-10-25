@@ -1016,3 +1016,26 @@ def test_custom_dates_can_reach_a_day_begun_since_the_app_started(make_window):
     assert form.range.currentData() == "custom" and form.date_from.date() == yesterday.addDays(-3)  # left as picked
     form.date_to.setDate(QDate.currentDate())
     assert form.date_to.date() == QDate.currentDate()
+
+
+def test_check_for_updates_clicked_during_the_startup_check_still_answers(make_window, monkeypatch):
+    # The click came while the silent startup check was still waiting on GitHub, and was dropped: no answer at all.
+    from subsentiment import __version__, updater
+    w = make_window()
+    gate = threading.Event()
+
+    def slow():
+        gate.wait(5)
+        return updater.Release(__version__, "v" + __version__, "", "https://x", None, None)
+    monkeypatch.setattr(updater, "latest_release", slow)
+    told = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: told.append(a[2]))
+    w.updates.check(silent=True)
+    help_menu = next(a.menu() for a in w.menuBar().actions() if a.text() == "&Help")
+    next(a for a in help_menu.actions() if a.text().startswith("Check for updates")).trigger()
+    gate.set()
+    end = time.monotonic() + 5
+    while not told and time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert told == [f"You are up to date (version {__version__})."]
