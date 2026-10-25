@@ -208,10 +208,14 @@ def test_deleting_a_subreddit_forgets_its_span(window, monkeypatch):
     w.overview.timeline.set_view(D1, D1 + 3 * DAY)
     assert w.settings.contains(days.settings_keys("Python")[0])
     w._delete_dataset()
+    while w.delete_job.busy:  # (on a thread)
+        QApplication.processEvents()
     assert not any(w.settings.contains(k) for k in days.settings_keys("Python"))
     w._refresh_datasets(select="rust")
     QSettings().setValue(days.settings_keys("rust")[1], "2026-10-06")
     w._delete_all()
+    while w.delete_job.busy:
+        QApplication.processEvents()
     assert not {days.SETTINGS_GROUP, days.RANGE_GROUP} & set(w.settings.childGroups())
 
 

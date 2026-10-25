@@ -14,6 +14,7 @@ from PySide6.QtCore import QDate, QSettings, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
+from subsentiment.gui import days  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui.fetch_form import range_bounds  # noqa: E402
 from subsentiment.reddit import Post  # noqa: E402
@@ -123,8 +124,10 @@ def test_delete_one_then_all(make_window, monkeypatch):
     w = make_window()
     assert w.datasets.count() == 2 and w.delete_all_btn.isEnabled()
     w._delete_dataset()
+    deleted(w)  # (on a thread)
     assert w.datasets.count() == 1 and w.current is not None
     w._delete_all()
+    deleted(w)
     assert w.datasets.count() == 0 and w.current is None
     assert not w.delete_btn.isEnabled() and not w.delete_all_act.isEnabled()
     assert "Nothing saved yet" in w.storage_info.text()
@@ -1072,3 +1075,223 @@ def test_check_for_updates_clicked_during_the_startup_check_still_answers(make_w
         QApplication.processEvents()
         time.sleep(0.01)
     assert told == [f"You are up to date (version {__version__})."]
+
+
+def deleted(w, timeout: float = 30) -> None:
+    """Until the deletion the window started on its thread has ended."""
+    end = time.monotonic() + timeout
+    while w.delete_job.busy:
+        assert time.monotonic() < end, "the deletion didn't end"
+        QApplication.processEvents()
+        time.sleep(0.005)
+    QApplication.processEvents()
+
+
+@pytest.mark.parametrize("method", ["delete_subreddit", "delete_all"])
+def test_the_window_keeps_painting_while_saved_data_is_deleted_and_nothing_else_writes(make_window, monkeypatch, method):
+    # Dropping a subreddit's search text and giving the space back took 2.6 s on a 38 MB database, all of it
+    # with the window frozen; the owner's is six times bigger.
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    going, deleting = threading.Event(), getattr(Store, method)
+
+    def slow(self, *args):
+        going.wait(10)
+        return deleting(self, *args)
+    monkeypatch.setattr(Store, method, slow)
+    w = make_window()
+    w.show()
+    w.upgrading.join()
+    w._after_upgrade()
+    shown = w.current
+    started = time.monotonic()
+    (w._delete_dataset if method == "delete_subreddit" else w._delete_all)()
+    assert time.monotonic() - started < 5  # it waits on the thread, not here
+    assert w.delete_job.busy and w.writing() and w.waiting() == "Deleting saved data…"
+    assert not (w.fetch_btn.isEnabled() or w.import_act.isEnabled() or w.delete_act.isEnabled()
+                or w.delete_all_act.isEnabled() or w.words_page.meanings.isEnabled())
+    assert w.statusBar().currentMessage().startswith("Deleting")
+    w._edit_note(0)
+    assert not w.findChildren(mw.NoteDialog) and "once the deletion is done" in w.statusBar().currentMessage()
+    going.set()
+    deleted(w)
+    assert w.fetch_btn.isEnabled() and w.words_page.meanings.isEnabled()
+    if method == "delete_subreddit":
+        assert w.datasets.count() == 1 and w.current is not None and w.current != shown
+        assert w.statusBar().currentMessage() == f"Deleted the saved data for r/{shown}."
+    else:
+        assert w.datasets.count() == 0 and w.current is None
+        assert w.statusBar().currentMessage() == "Deleted all saved data."
+
+
+@pytest.mark.parametrize("method", ["delete_subreddit", "delete_all"])
+def test_closing_the_window_while_saved_data_is_deleted_still_forgets_its_settings(make_window, monkeypatch, method):
+    # The deletion's end isn't handled once the window has closed: the subreddit's posts went, but its remembered
+    # span stayed, and fetched again it opened on that span rather than every day.
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    going, deleting = threading.Event(), getattr(Store, method)
+
+    def slow(self, *args):
+        going.wait(10)
+        return deleting(self, *args)
+    monkeypatch.setattr(Store, method, slow)
+    w = make_window()
+    w.show()
+    w.upgrading.join()
+    w._after_upgrade()
+    shown = w.current
+    for key in days.settings_keys(shown):
+        w.settings.setValue(key, "2026-10-06")
+    (w._delete_dataset if method == "delete_subreddit" else w._delete_all)()
+    assert w.delete_job.busy and w.settings.contains("ui/last_dataset")
+    going.set()
+    w.close()
+    gone = days.settings_keys(shown) + (("ui/last_dataset",) if method == "delete_all" else ())
+    assert not any(QSettings().contains(k) for k in gone)
+    s = Store(w.db_path)
+    assert s.posts(shown) == []
+    s.close()
+
+
+def test_notes_and_words_meanings_wait_for_a_download_coverage_deletion(make_window, monkeypatch):
+    # A coverage deletion holds the database for its one transaction: a note saved meanwhile froze the window for
+    # the store's 5 s busy timeout and was then lost with "database is locked".
+    going, deleting = threading.Event(), Store.delete_days
+
+    def slow(self, *args):
+        going.wait(10)
+        return deleting(self, *args)
+    monkeypatch.setattr(Store, "delete_days", slow)
+    w = make_window()
+    w.show()
+    w.upgrading.join()
+    w._after_upgrade()
+    cov = w.coverage
+    cov.ticked = {1_700_000_000 // 86400 * 86400}
+    cov._asking = True
+    cov._delete_ticked()
+    assert cov.delete_job.busy and not w.words_page.meanings.isEnabled()
+    w._edit_note(0)
+    assert not w.findChildren(mw.NoteDialog) and "once the deletion is done" in w.statusBar().currentMessage()
+    going.set()
+    end = time.monotonic() + 30
+    while cov.delete_job.busy:
+        assert time.monotonic() < end, "the deletion didn't end"
+        QApplication.processEvents()
+        time.sleep(0.005)
+    QApplication.processEvents()
+    assert w.words_page.meanings.isEnabled()
+
+
+def test_a_note_or_meaning_the_database_is_too_busy_for_says_so_instead_of_failing(make_window, monkeypatch):
+    # Held past the busy timeout by another connection (a fetch giving the space back once it's done), the save
+    # raised out of the window's slot and the note was lost without a word.
+    import sqlite3
+
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(Store, "save_note", locked)
+    monkeypatch.setattr(Store, "save_word", locked)
+    w = make_window()
+    w._save_note(w.current, 1_700_000_000 // 86400 * 86400, "", "my note")
+    assert "Couldn't save the note" in w.statusBar().currentMessage()
+    w._set_word("nice", 1.0)
+    assert "Couldn't set what “nice” means" in w.statusBar().currentMessage()
+
+
+def held_reads(monkeypatch) -> threading.Event:
+    """Saved subreddits read on load_job's thread wait there, once read, until the event is set."""
+    from subsentiment.gui import rows
+    going, saved = threading.Event(), rows.Saved
+
+    class Held(saved):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            going.wait(30)
+    monkeypatch.setattr(rows, "Saved", Held)
+    return going
+
+
+def opened(w, timeout: float = 30) -> None:
+    """Until the subreddit read on load_job's thread is shown."""
+    end = time.monotonic() + timeout
+    while w.load_job.busy or w._wanted is not None:
+        assert time.monotonic() < end, "the read didn't end"
+        QApplication.processEvents()
+        time.sleep(0.005)
+    QApplication.processEvents()
+
+
+def pick(w, name: str) -> None:
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index(f"r/{name}"))
+
+
+def other_than(w) -> str:
+    return next(n for n in ("Python", "rust") if n != w.current)
+
+
+def test_rows_saved_while_a_subreddit_is_read_on_a_thread_show_once_it_opens(make_window, monkeypatch):
+    # A post saved into a big subreddit while it was being read (clicked as a fetch into it ended) was missing once
+    # it opened: the read from before was shown, though the saved-data list counted the new post.
+    w = make_window()
+    w.show()
+    w.upgrading.join()
+    w._after_upgrade()
+    monkeypatch.setattr(w, "LOAD_THREAD_FROM", 0)
+    going = held_reads(monkeypatch)
+    sub = other_than(w)
+    pick(w, sub)
+    assert w.load_job.busy and w._wanted == sub.lower()
+    w.store.save_post(Post("p9", sub, "nice", "", "a", 1, 0.9, 0, 1_700_000_000.0, "https://r", ""), 0.5, "positive")
+    w.store.commit()
+    w._refresh_datasets(select=sub)  # as a fetch into it ending does
+    going.set()
+    opened(w)
+    assert w.current == sub and len(w.posts) == 2 and w.posts_tab.model.rowCount() == 2
+
+
+def test_the_end_of_an_upgrade_leaves_the_subreddit_being_read_to_open(make_window, monkeypatch):
+    # The upgrade ending while another subreddit was being read showed the one before again over it: the list
+    # selected one subreddit while every page showed another, and clicking it did nothing.
+    w = make_window()
+    w.show()
+    w.upgrading.join()
+    w._after_upgrade()
+    packing = threading.Event()  # an import's rows being packed
+    w.upgrading = threading.Thread(target=packing.wait, args=(30,), daemon=True)
+    w.upgrading.start()
+    w._wordless = True
+    w._loaded.clear()
+    w._show_dataset(w.current)
+    assert not any(s.words for s in w._saved.values())  # read without its words meanwhile
+    monkeypatch.setattr(w, "LOAD_THREAD_FROM", 0)
+    going = held_reads(monkeypatch)
+    sub = other_than(w)
+    pick(w, sub)
+    assert w.load_job.busy and w._wanted == sub.lower()
+    packing.set()
+    w.upgrading.join()
+    w._after_upgrade()
+    going.set()
+    opened(w)
+    assert w.current == sub and w.datasets.currentItem().text() == f"r/{sub}"
+    assert all(s.words for s in w._saved.values())  # read again with its words, now they're packed
+
+
+def test_days_deleted_from_the_subreddit_shown_leave_the_one_being_read_to_open(make_window, monkeypatch):
+    # Download coverage deleting days of the subreddit shown while another was being read showed the first again
+    # over it.
+    w = make_window()
+    w.show()
+    w.upgrading.join()
+    w._after_upgrade()
+    first = w.current
+    monkeypatch.setattr(w, "LOAD_THREAD_FROM", 0)
+    going = held_reads(monkeypatch)
+    sub = other_than(w)
+    pick(w, sub)
+    assert w.load_job.busy and w._wanted == sub.lower()
+    w.days_deleted(first, 1, *w.store.delete_days(first, [1_700_000_000]))
+    assert w.datasets.currentItem().text() == f"r/{sub}"
+    going.set()
+    opened(w)
+    assert w.current == sub and w.datasets.currentItem().text() == f"r/{sub}" and len(w.posts) == 1
