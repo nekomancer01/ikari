@@ -16,7 +16,7 @@ import pytest
 # with --area. "shared" is the files that touch no Qt, SQLite, files, processes or OS calls and have never failed
 # on one OS only, so CI runs them once, on Linux. Every other area runs on each OS: Qt rendering and timing, the
 # SQLite Linux swaps in, paths and processes have all failed on just one of them.
-SHARED = {"test_arctic_shift.py", "test_lint.py", "test_reddit.py", "test_sentiment.py"}
+SHARED = {"test_arctic_shift.py", "test_lint.py", "test_properties.py", "test_reddit.py", "test_sentiment.py"}
 AREAS = {
     "shared": "the archive client, Reddit helpers and sentiment scoring",
     "layout-small": "the layout matrix on screens up to 1920 wide",

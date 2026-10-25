@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-xdist>=3", "pyinstaller", "ruff>=0.15"]
+dev = ["pytest>=8", "pytest-xdist>=3", "pyinstaller", "ruff>=0.15", "hypothesis>=6.100"]
 train = ["scikit-learn>=1.4", "scipy", "numpy"]
 
 [project.gui-scripts]
