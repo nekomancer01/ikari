@@ -574,6 +574,28 @@ def test_stopping_after_a_day_keeps_its_comments(tmp_path):
     assert {r["post_id"] for r in s.comments("python")} == {"d2p0", "d2p1", "d2p2"}
 
 
+def test_posts_a_stopped_day_owed_comments_get_them_from_the_next_fetch(tmp_path):
+    # Stop as a day's first thread came in left its other posts never asked about, and the day, read to its end,
+    # complete: fetching it again didn't read it, so they never got comments.
+    s = store_with(tmp_path, [])
+    c = DayClient(days=1, num_comments=2)
+    stop = threading.Event()
+    real = c.fetch_comments
+
+    def fetch_comments(post, limit, pick="top"):
+        stop.set()
+        return real(post, limit)
+    c.fetch_comments = fetch_comments
+    req = dict(after=D0, before=D0 + 86400, limit=None)
+    assert collect.run(c, s, collect.FetchRequest("python", **req), should_stop=stop.is_set).stopped
+    assert len({r["post_id"] for r in s.comments("python")}) < 3 and str(D0) in s.complete_keys("posts", "python")
+    c.fetch_comments = real
+    collect.run(c, s, collect.FetchRequest("python", **req, include_comments=False))  # not asked for: none fetched
+    assert len({r["post_id"] for r in s.comments("python")}) < 3
+    result = collect.run(c, s, collect.FetchRequest("python", **req))
+    assert {r["post_id"] for r in s.comments("python")} == {"d0p0", "d0p1", "d0p2"} and not result.comment_errors
+
+
 class WaitingClient(FakeClient):
     """Its post search has to wait out a pause the archive asked for, as a timeout or a 429 makes it."""
 
