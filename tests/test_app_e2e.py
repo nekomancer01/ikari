@@ -29,7 +29,7 @@ from subsentiment.gui import tables  # noqa: E402
 from subsentiment.gui import main_window as mw  # noqa: E402
 from subsentiment.gui import worker  # noqa: E402
 from subsentiment.gui.rail import PAGES  # noqa: E402
-from subsentiment.store import Store  # noqa: E402
+from subsentiment.store import SAMPLE_MARK, Store  # noqa: E402
 from subsentiment import store as store_mod  # noqa: E402
 
 from fake_archive import DAY, SLOW_DOWN, FakeArchive, make_posts  # noqa: E402
@@ -375,18 +375,18 @@ def test_the_fetch_drawer_keeps_a_random_sample_of_each_thread_and_remembers_it(
 
 
 def test_the_fetch_drawers_sample_downloads_only_part_of_a_big_days_comments_and_coverage_shows_it(env):
-    """Sample: each settled day keeps a random sample of its comments big enough for ±5 points at 95% (fewer than
-    385 on a day this size, by the finite population correction), from only the threads holding part of it; a
-    day of no more than 385 comments, and a post not counted yet, is downloaded whole."""
+    """Sample: each settled day keeps a random sample of its comments big enough for ±2 points at 99% (fewer than
+    4,148 on a day this size, by the finite population correction), from only the threads holding part of it; a
+    day of no more than 4,148 comments, and a post not counted yet, is downloaded whole."""
     by_day: dict[int, list[dict]] = {}
     for p in env.archive.posts:
         if p["subreddit"] == "Python" and p["num_comments"]:
             by_day.setdefault(int(p["created_utc"] // DAY), []).append(p)
-    # A 6-post day stays under the 385 a sample needs; a 12-post one has a big thread. Its small threads are counted as
+    # A 6-post day stays under the 4,148 a sample needs; a 12-post one has a big thread. Its small threads are counted as
     # the 2 comments the fake gives a thread at least: a count below its tree's size scales up its part of the sample.
     for on in by_day.values():
         for k, p in enumerate(on):
-            p["num_comments"] = 60 if len(on) < 6 else 2000 if k == 0 else 2
+            p["num_comments"] = 60 if len(on) < 6 else 20000 if k == 0 else 2
     w = env.window()
     w.fetch_form.comment_cap.pick.setCurrentIndex(w.fetch_form.comment_cap.pick.findData("sample"))
     assert not w.fetch_form.comments_per_post.isEnabled()  # the sample sets its own size
@@ -398,7 +398,7 @@ def test_the_fetch_drawers_sample_downloads_only_part_of_a_big_days_comments_and
         day = int(posts[c["post_id"]]["created_utc"] // DAY * DAY)
         saved[day] = saved.get(day, 0) + 1
     asked = {q["link_id"] for p, q in env.archive.requests if p == TREE}
-    sampled = s.complete_keys("sampled", "python")
+    sampled = s.complete_keys(SAMPLE_MARK, "python")
     big, small = set(), set()
     for day in {int(r["created_utc"] // DAY * DAY) for r in posts.values()}:
         counts = s.comment_totals("python", day, day + DAY)
@@ -409,7 +409,7 @@ def test_the_fetch_drawers_sample_downloads_only_part_of_a_big_days_comments_and
         total = sum(counts.values())
         if total > collect.Sample.NEED:
             big.add(day)
-            assert sample.size < collect.Sample.NEED and saved.get(day) == sample.size  # 2,000 or so: 323
+            assert sample.size < collect.Sample.NEED and saved.get(day) == sample.size  # 20,000 or so: 3,436
             fetched = {r["id"] for r in on} & asked
             assert 0 < len(fetched) < len(on)  # not every thread: the saving
             assert {r["id"] for r in on} <= sampled  # each holds its part of the sample, or has none in it
@@ -443,7 +443,7 @@ def test_the_fetch_drawers_sample_keeps_a_day_whole_while_some_of_its_posts_aren
     by_day: dict[int, list[dict]] = {}
     for p in env.archive.posts:
         if p["subreddit"] == "Python" and p["num_comments"]:
-            p["num_comments"] = 400  # every counted day is big enough to sample
+            p["num_comments"] = 4000  # every counted day is big enough to sample
             by_day.setdefault(int(p["created_utc"] // DAY), []).append(p)
     for p in by_day[max(by_day)][::2]:  # the newest settled day: half its posts not counted yet, as if newer
         p["retrieved_on"], p["num_comments"] = p["created_utc"] + 60, 0
@@ -451,7 +451,7 @@ def test_the_fetch_drawers_sample_keeps_a_day_whole_while_some_of_its_posts_aren
     w.fetch_form.comment_cap.pick.setCurrentIndex(w.fetch_form.comment_cap.pick.findData("sample"))
     fetch(w, comments=True)
     s = env.store()
-    sampled = s.complete_keys("sampled", "python")
+    sampled = s.complete_keys(SAMPLE_MARK, "python")
     mixed = 0
     for day in {int(r["created_utc"] // DAY * DAY) for r in s.posts("python")}:
         counts = s.comment_totals("python", day, day + DAY)

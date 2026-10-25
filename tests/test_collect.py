@@ -5,7 +5,7 @@ import time
 from subsentiment import collect
 from subsentiment.arctic_shift import RateLimiter
 from subsentiment.reddit import Comment, FetchError, Post
-from subsentiment.store import Store
+from subsentiment.store import SAMPLE_MARK, Store
 
 T = 1_790_000_000.0
 
@@ -651,34 +651,38 @@ def test_a_days_comments_skip_posts_whose_recheck_finds_nothing_to_download(tmp_
     assert [call[1] for call in c.calls if call[0] == "all"] == ["p1"]
 
 
-def test_a_days_sample_is_enough_for_five_points_and_gives_every_comment_the_same_chance():
-    # The textbook size: 1.96² · ¼ / 0.05² = 384.2, so 385 of a big day; the finite population correction asks
-    # fewer of a smaller one; a day of no more than 385 is kept whole.
-    assert collect.Sample.NEED == 385
-    assert collect.Sample({"a": 10 ** 7}).size == 385
-    assert collect.Sample({"a": 1000}).size == 278
-    small = collect.Sample({"a": 300, "b": 85, "c": None})
+def test_a_days_sample_is_enough_for_two_points_and_gives_every_comment_the_same_chance():
+    # The textbook size: 2.576² · ¼ / 0.02² = 4,147.4, so 4,148 of a big day (±2 points, 99% confidence); the finite
+    # population correction asks fewer of a smaller one; a day of no more than 4,148 is kept whole. ±5 points at 95%
+    # (385) kept about 500 of a 3,000 to 5,000 comment day; now such a day is kept whole, or keeps about 2,270 of 5,000.
+    assert collect.Sample.NEED == 4148
+    assert collect.Sample({"a": 10 ** 6}).size == 4131
+    assert collect.Sample({"a": 10000}).size == 2932
+    assert collect.Sample({"a": 5000}).size == 2268
+    for day in (3000, 4148):
+        assert collect.Sample({"a": day}).whole
+    small = collect.Sample({"a": 4000, "b": 1000, "c": None})
     assert small.whole and small.quota("a") is None and small.quota("c") is None
     # One busy thread among many small ones: its quota follows its share of the day's comments, so neither the
     # busy thread nor the small ones are favoured. Over many days, each comment's chance is the same, size / N.
     big_rate, small_rate = [], []
-    for day in range(200):
-        counts = {f"d{day}big": 3000, **{f"d{day}s{k}": 3 for k in range(1000)}}
+    for day in range(100):
+        counts = {f"d{day}big": 30000, **{f"d{day}s{k}": 30 for k in range(1000)}}
         s = collect.Sample(counts)
         quotas = {pid: s.quota(pid) for pid in counts}
-        assert sum(quotas.values()) == s.size == 362  # exactly the size: the day's lowest draws
-        big_rate.append(quotas[f"d{day}big"] / 3000)
-        small_rate.append(sum(q for pid, q in quotas.items() if not pid.endswith("big")) / 3000)
-    rate = 362 / 6000
-    assert abs(sum(big_rate) / 200 - rate) < 0.004 and abs(sum(small_rate) / 200 - rate) < 0.004
+        assert sum(quotas.values()) == s.size == 3880  # exactly the size: the day's lowest draws
+        big_rate.append(quotas[f"d{day}big"] / 30000)
+        small_rate.append(sum(q for pid, q in quotas.items() if not pid.endswith("big")) / 30000)
+    rate = 3880 / 60000
+    assert abs(sum(big_rate) / 100 - rate) < 0.002 and abs(sum(small_rate) / 100 - rate) < 0.002
     # The same posts give the same sample.
-    assert collect.Sample({"x": 900, "y": 40}).quotas == collect.Sample({"y": 40, "x": 900}).quotas
+    assert collect.Sample({"x": 9000, "y": 400}).quotas == collect.Sample({"y": 400, "x": 9000}).quotas
 
 
 def test_a_threads_part_follows_its_tree_where_the_archive_counted_it_short():
-    s = collect.Sample({"a": 1000, "b": 1000})
+    s = collect.Sample({"a": 10000, "b": 10000})
     q = s.quota("a")
-    tree = [Comment(f"c{j}", "a", "Python", "t3_a", "b", "ok", 1, T, 0, "u") for j in range(1250)]
+    tree = [Comment(f"c{j}", "a", "Python", "t3_a", "b", "ok", 1, T, 0, "u") for j in range(12500)]
     kept = s.keep("a", tree)
     assert len(kept) == round(q * 1.25)  # 1,250 in the tree: the same share of it
     assert {c.id for c in kept} == {c.id for c in s.keep("a", list(reversed(tree)))}  # picked by id, not order
@@ -686,7 +690,7 @@ def test_a_threads_part_follows_its_tree_where_the_archive_counted_it_short():
 
 def test_coverage_sample_reads_only_the_threads_holding_part_of_it_then_counts_the_day_done(tmp_path):
     from subsentiment.store import SAMPLED
-    posts = [mk(i, num_comments=2000 if i == 0 else 4) for i in range(300)]  # 3,196 comments on one day
+    posts = [mk(i, num_comments=40000 if i == 0 else 4) for i in range(300)]  # 41,196 comments on one day
     s = store_with(tmp_path, posts)
 
     class Sized(FakeClient):
@@ -702,7 +706,7 @@ def test_coverage_sample_reads_only_the_threads_holding_part_of_it_then_counts_t
     result = collect.run(c, s, req)
     sample = collect.Sample(s.comment_totals("python", day, day + collect.DAY))
     asked = [call[1] for call in c.calls if call[0] == "all"]
-    assert result.comments == sample.size == 344 and len(s.comments("python")) == 344
+    assert result.comments == sample.size == 3769 and len(s.comments("python")) == 3769
     assert "p0" in asked and 0 < len(asked) < 150  # the busy thread, and only some of the small ones
     assert all(call[2] == 0 for call in c.calls if call[0] == "all")  # each thread asked for whole, then cut
     assert s.whole_threads_per_day("python", day, day + collect.DAY, SAMPLED) == {day: (300, 300)}
@@ -725,7 +729,7 @@ def test_a_day_with_posts_not_counted_yet_is_kept_whole_not_sampled_without_them
     # Half the day's posts aren't counted yet. The sample used to be sized for the counted half alone (278 of 1,000)
     # while the uncounted threads were kept whole: 1,278 saved, 78% of them from half the day, marked a sample.
     from subsentiment.store import SAMPLED
-    counted = [mk(i, num_comments=100) for i in range(10)]
+    counted = [mk(i, num_comments=1000) for i in range(10)]
     uncounted = [mk(10 + i, score=None, num_comments=None) for i in range(10)]
     s = store_with(tmp_path, counted + uncounted)
     day = int(T // collect.DAY * collect.DAY)
@@ -733,8 +737,8 @@ def test_a_day_with_posts_not_counted_yet_is_kept_whole_not_sampled_without_them
                                fill_threads=True, comment_pick=collect.SAMPLE)
     collect.run(WholeTrees(), s, req)
     saved = s.comment_counts("python", day, day + collect.DAY)
-    assert saved == {p.id: 100 for p in counted + uncounted}  # every comment: its share of the day isn't known yet
-    assert not s.complete_keys("sampled", "python")  # and not shown as a sample
+    assert saved == {p.id: 1000 if p in counted else 100 for p in counted + uncounted}  # every comment: its share of the day isn't known yet
+    assert not s.complete_keys(SAMPLE_MARK, "python")  # and not shown as a sample
 
 
 def test_a_days_sample_waits_for_the_rest_of_the_day_when_part_of_it_went_unread(tmp_path):
@@ -753,15 +757,39 @@ def test_a_days_sample_waits_for_the_rest_of_the_day_when_part_of_it_went_unread
                 self.timed_out, self.unread = False, []
             return got
     s = store_with(tmp_path, [])
-    c = Patchy(per_day=20, days=1, num_comments=100)
+    c = Patchy(per_day=20, days=1, num_comments=1000)
     req = collect.FetchRequest("python", after=D0, before=D0 + 86400, limit=None, comment_pick=collect.SAMPLE)
     collect.run(c, s, req)
     assert len(s.posts("python")) == 10
     assert not any(call[0] == "all" for call in c.calls) and not s.comments("python")  # held back, not sampled
-    assert not s.complete_keys("sampled", "python")
+    assert not s.complete_keys(SAMPLE_MARK, "python")
     c.cut = False
     collect.run(c, s, req)
     sample = collect.Sample(s.comment_totals("python", D0, D0 + 86400))
     saved = s.comment_counts("python", D0, D0 + 86400)
-    assert sample.population == 2000 and sum(saved.values()) == sample.size
+    assert sample.population == 20000 and sum(saved.values()) == sample.size
     assert all(saved.get(p.id, 0) == sample.quota(p.id) for p in c.posts)  # every post its share of the whole day
+
+
+def test_a_day_sampled_at_the_old_size_is_topped_up_to_the_new_one(tmp_path, monkeypatch):
+    # Sampled at ±5 points (385 of the day, marked "sampled") before the sample grew: those marks don't hold the
+    # bigger sample, so the next sample download tops each thread up to its new part, keeping what it had.
+    posts = [mk(i, num_comments=1000) for i in range(10)]  # 10,000 comments on one day
+    s = store_with(tmp_path, posts)
+    day = int(T // collect.DAY * collect.DAY)
+    req = collect.FetchRequest("python", comment_posts=tuple(p.id for p in posts), fill_threads=True,
+                               comment_pick=collect.SAMPLE)
+    with monkeypatch.context() as m:
+        m.setattr(collect.Sample, "EXACT", 1.96 * 1.96 * 0.25 / 0.0025)
+        m.setattr(collect.Sample, "NEED", 385)
+        m.setattr(collect, "SAMPLE_MARK", "sampled")
+        collect.run(WholeTrees(), s, req)
+        old = s.comment_counts("python", day, day + collect.DAY)
+        assert sum(old.values()) == 370 and s.complete_keys("sampled", "python") == {p.id for p in posts}
+    sample = collect.Sample(s.comment_totals("python", day, day + collect.DAY))
+    assert sample.size == 2932
+    collect.run(WholeTrees(), s, req)
+    saved = s.comment_counts("python", day, day + collect.DAY)
+    assert saved == {p.id: sample.quota(p.id) for p in posts} and all(saved[p] >= n for p, n in old.items())
+    assert s.complete_keys(SAMPLE_MARK, "python") == {p.id for p in posts}
+    assert s.whole_threads_per_day("python", day, day + collect.DAY, -1) == {day: (10, 10)}

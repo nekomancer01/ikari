@@ -2,8 +2,8 @@
 
 Run from the repo root:  python tools/live_sample_check.py [days] [subreddit ...]
 Downloads every post and comment of each settled day into a throwaway database, works out which comments the day's
-sample keeps (collect.Sample), and prints both sets of shares and the biggest gap; the sample promises 5 points or
-less on about 19 days in 20. On the first day it also runs a real Sample download into a second database and checks
+sample keeps (collect.Sample), and prints both sets of shares and the biggest gap; the sample promises 2 points or
+less on about 99 days in 100. On the first day it also runs a real Sample download into a second database and checks
 it kept the same comments. Nothing of yours is touched.
 """
 from __future__ import annotations
@@ -66,9 +66,9 @@ def main() -> None:
                 want = {r["id"] for r in kept}
                 print(f"  a real Sample download kept {len(got)}, {len(got & want)} of them the same as above "
                       f"({len(ids)} threads open, the archive can change in between)", flush=True)
-    inside = sum(g <= 5 for g in gaps)
-    print(f"days within 5 points: {inside} of {len(gaps)}; worst gap {max(gaps):.1f} points (shares as "
-          + "/".join(LABELS) + ")")
+    inside = sum(g <= collect.Sample.MARGIN * 100 for g in gaps)
+    print(f"days within {collect.Sample.MARGIN * 100:.0f} points: {inside} of {len(gaps)}; worst gap {max(gaps):.1f} "
+          "points (shares as " + "/".join(LABELS) + ")")
 
 
 if __name__ == "__main__":
