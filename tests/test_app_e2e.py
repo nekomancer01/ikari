@@ -474,6 +474,19 @@ def test_comments_come_with_a_fetch_when_asked(env):
     assert " 0 comments" not in w.subheading.full_text() and "comment" in w.subheading.full_text()
 
 
+def test_posts_that_only_apologise_are_not_saved_as_negative(env):
+    apologies = ["Sorry if this has been asked before, which build is best?", "sorry, I meant the second boss",
+                 "Edit: sorry for formatting, on mobile"]
+    rust = [p for p in env.archive.posts if p["subreddit"] == "rust"]
+    for i, p in enumerate(rust):
+        p["title"], p["selftext"] = apologies[i % len(apologies)], ""
+    w = env.window()
+    fetch(w, sub="rust", comments=False)
+    saved = env.store().posts("rust")
+    assert saved and {r["title"] for r in saved} <= set(apologies)
+    assert [r["title"] for r in saved if r["label"] == "negative"] == []
+
+
 def test_score_recheck_only_runs_when_ticked(env):
     w = env.window()
     fetch(w, comments=False)

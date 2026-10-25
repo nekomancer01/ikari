@@ -64,6 +64,28 @@ _HARMLESS = re.compile(
 )
 
 
+# "Sorry" as manners, not mood: "sorry if this was asked", "sorry for the long post", "sorry, I meant the second
+# boss". The classifier learned it from GoEmotions, whose raters read every apology as remorse, so on its own it
+# pulled a comment to negative. Clean reads such a "sorry" as no word at all. One that's sympathy or pity keeps its
+# meaning: "sorry for your loss", "sorry to hear", "sorry you had to", "I feel sorry for", and one stressed ("so
+# sorry", "really sorry") unless what follows is plainly an apology ("so sorry for the late reply"). So does "sorry,
+# but" before a disagreement, and an "I'm sorry." said on its own, which is mostly sympathy for what came before.
+_APOLOGY = (r"\s*,?\s*(?:if\b|in advance\b|to (?:bother|ask|interrupt|be that|be the|butt|jump|nitpick|say)\b"
+            r"|for (?!(?:[\w'’]+\s+)?(?:loss|passing)\b)(?:the|my|any|all|this|that|being|asking|posting|bothering|not"
+            r"|spamming|rambling|wasting|interrupting|double|bad|poor|late|long|formatting|typos?)\b"
+            r"|about (?:that|this|the (?:confusion|wait|delay|formatting))\b|(?:i|i['’]m|im|i was|i should)\s)")
+_SORRY = re.compile(
+    r"(?P<kept>\b(?:feel|feels|felt|feeling|be|been|more)\s+sorry\b|\bsorry(?=\s*,?\s*but\b)"
+    r"|\b(?:i['’]?m|i am)\s+sorry(?=\s*(?:[.!…:;(]|$))"
+    r"|\b(?:so|really|truly|very|deeply|terribly|awfully|incredibly|super|genuinely|sincerely)\s+sorry\b(?!" + _APOLOGY
+    + r")|\bsorry(?=\s+(?:to (?:hear|learn|see|read)|for (?:[\w'’]+\s+)?(?:loss|passing)|about (?:your|ur|his|her|their)"
+    r"|for (?:you|him|her|them|those|anyone|everyone|people|the (?:people|family|families|victims?|kids?))\b"
+    r"|you\b|(?:that|this|it) (?:happened|is happening|you|happens)\b)))"
+    r"|\bsorry\b",
+    re.IGNORECASE,
+)
+
+
 @lru_cache(maxsize=1)
 def _analyzer() -> SentimentIntensityAnalyzer:
     return SentimentIntensityAnalyzer()
@@ -85,6 +107,7 @@ def clean(text: str) -> str:
     text = _QUOTE.sub(" ", text)
     text = _MD_LINK.sub(r"\1", text)
     text = _URL.sub(" ", text)
+    text = _SORRY.sub(lambda m: m.group() if m["kept"] else Lexicon.BLANK, text)
     return " ".join(text.split())
 
 
