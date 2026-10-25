@@ -11,4 +11,5 @@ build/
 dist/
 .venv-build/
 tools/.cache/
+.hypothesis/
 .vscode/
