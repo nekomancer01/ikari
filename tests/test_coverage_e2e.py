@@ -5,7 +5,6 @@ import os
 import threading
 import time
 
-from dataclasses import replace
 
 import pytest
 

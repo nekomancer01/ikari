@@ -16,7 +16,7 @@ import pytest
 # with --area. "shared" is the files that touch no Qt, SQLite, files, processes or OS calls and have never failed
 # on one OS only, so CI runs them once, on Linux. Every other area runs on each OS: Qt rendering and timing, the
 # SQLite Linux swaps in, paths and processes have all failed on just one of them.
-SHARED = {"test_arctic_shift.py", "test_reddit.py", "test_sentiment.py"}
+SHARED = {"test_arctic_shift.py", "test_lint.py", "test_reddit.py", "test_sentiment.py"}
 AREAS = {
     "shared": "the archive client, Reddit helpers and sentiment scoring",
     "layout-small": "the layout matrix on screens up to 1920 wide",
@@ -70,6 +70,33 @@ def pytest_collection_modifyitems(config, items):
         kept = set(map(id, keep))
         config.hook.pytest_deselected(items=[item for item in items if id(item) not in kept])
         items[:] = keep
+
+
+# Qt's warnings (a signal connected to nothing, a timer or child made on the wrong thread, a painter on a widget not
+# being painted) fail the test they came during. The offscreen platform the tests draw on can't move, raise or
+# resize windows the way a desktop does, and says so; those are left out.
+QT_WARNINGS: list[str] = []
+OFFSCREEN = "This plugin does not support"
+
+
+def qt_message(mode, context, message):
+    from PySide6.QtCore import QtMsgType
+    print(message, file=sys.stderr)
+    if mode != QtMsgType.QtDebugMsg and mode != QtMsgType.QtInfoMsg and not message.startswith(OFFSCREEN):
+        QT_WARNINGS.append(message)
+
+
+@pytest.fixture(autouse=True)
+def no_qt_warnings():
+    if "PySide6.QtCore" not in sys.modules:  # (the shared job has no Qt)
+        yield
+        return
+    from PySide6.QtCore import qInstallMessageHandler
+    qInstallMessageHandler(qt_message)
+    QT_WARNINGS.clear()
+    yield
+    found, QT_WARNINGS[:] = list(QT_WARNINGS), []
+    assert not found, "Qt warned:\n" + "\n".join(found)
 
 
 def pytest_sessionfinish(session, exitstatus):

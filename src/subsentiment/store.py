@@ -1101,7 +1101,7 @@ class Store:
         if not keep:
             return rows
         with Store._packs_lock:
-            Store._packs[self.path, *key] = (row[0], rows)
+            Store._packs[(self.path, *key)] = (row[0], rows)
             while len(Store._packs) > 512:  # about a year of days of a subreddit or two
                 Store._packs.popitem(last=False)
         return rows
