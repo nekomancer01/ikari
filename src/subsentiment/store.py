@@ -1545,13 +1545,15 @@ class Store:
             "SELECT day, label, text FROM notes WHERE subreddit = ?", (subreddit.lower(),))}
 
     def save_note(self, subreddit: str, day: int, label: str, text: str) -> None:
-        """Set the note on a day, or remove it when the label and description are both empty."""
-        if label or text:
-            self.db.execute("INSERT OR REPLACE INTO notes VALUES (?, ?, ?, ?, ?)",
-                            tuple(map(_storable, (subreddit.lower(), int(day), label, text, time.time()))))
-        else:
-            self.db.execute("DELETE FROM notes WHERE subreddit = ? AND day = ?", (subreddit.lower(), int(day)))
-        self.db.commit()
+        """Set the note on a day, or remove it when the label and description are both empty. Held past the busy
+        timeout, it raises and is rolled back: left open, its transaction kept this connection reading the data as
+        it was then, and failing every write after."""
+        with self.db:
+            if label or text:
+                self.db.execute("INSERT OR REPLACE INTO notes VALUES (?, ?, ?, ?, ?)",
+                                tuple(map(_storable, (subreddit.lower(), int(day), label, text, time.time()))))
+            else:
+                self.db.execute("DELETE FROM notes WHERE subreddit = ? AND day = ?", (subreddit.lower(), int(day)))
 
     def words(self, subreddit: str) -> dict[str, float]:
         """The words and phrases set to mean something of their own in a subreddit, as {word: weight}."""
@@ -1561,12 +1563,12 @@ class Store:
     def save_word(self, subreddit: str, word: str, weight: float | None) -> None:
         """Set what a word or phrase means in a subreddit, or with None let it mean what it usually does again."""
         word = Lexicon.key(word)
-        if weight is None:
-            self.db.execute("DELETE FROM words WHERE subreddit = ? AND word = ?", (subreddit.lower(), word))
-        else:
-            self.db.execute("INSERT OR REPLACE INTO words VALUES (?, ?, ?, ?)",
-                            (subreddit.lower(), _storable(word), max(-1.0, min(1.0, float(weight))), time.time()))
-        self.db.commit()
+        with self.db:  # (rolled back if it raises, as save_note)
+            if weight is None:
+                self.db.execute("DELETE FROM words WHERE subreddit = ? AND word = ?", (subreddit.lower(), word))
+            else:
+                self.db.execute("INSERT OR REPLACE INTO words VALUES (?, ?, ?, ?)",
+                                (subreddit.lower(), _storable(word), max(-1.0, min(1.0, float(weight))), time.time()))
         self._lexicons.pop(subreddit.lower(), None)
 
     def lexicon(self, subreddit: str) -> Lexicon:

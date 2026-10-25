@@ -33,6 +33,7 @@ from subsentiment.store import Store  # noqa: E402
 from subsentiment import store as store_mod  # noqa: E402
 
 from fake_archive import DAY, SLOW_DOWN, FakeArchive, make_posts  # noqa: E402
+from test_main_window import held_reads, opened, pick  # noqa: E402
 
 NOW = time.time()
 SEARCH, TREE, IDS, AGG = "/api/posts/search", "/api/comments/tree", "/api/posts/ids", "/api/posts/search/aggregate"
@@ -518,6 +519,61 @@ def test_stop_ends_a_fetch_and_frees_the_form(env, monkeypatch):
     assert len(env.archive.paths()) == n == len(sent)  # nothing carries on after Stop
     assert w.fetch_btn.isEnabled() and not w.stop_btn.isEnabled() and w.fetch_form.subreddit.isEnabled()
     assert "Stopped" in w.progress_msg.text() or "stopped" in w.progress_msg.text().lower()
+
+
+def test_stop_is_off_once_a_fetch_is_done_and_only_packing_what_it_saved(env, monkeypatch):
+    # Pressed while the fetch's thread packed what it saved (seconds on a big database), Stop replaced what the
+    # fetch did with a "Stopping…" that never went, and dropped the downloads queued after it.
+    packing, pack = threading.Event(), Store.pack_settled
+    monkeypatch.setattr(Store, "pack_settled", lambda self, *a, **k: packing.wait(30) and pack(self, *a, **k))
+    w = env.window()
+    w.upgrading.join()
+    w._after_upgrade()
+    queued = []
+    w.coverage._queue.append((("python", "posts", 0), lambda: queued.append(True)))  # a download queued after it
+    start_fetch(w, comments=False)
+    end = time.monotonic() + 30
+    while not w.progress_msg.text().startswith("Added"):
+        assert time.monotonic() < end and w.fetch_job.busy, w.progress_msg.text()
+        pump(10)
+    assert w.fetch_job.busy and not w.stop_btn.isEnabled()
+    QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
+    packing.set()
+    wait_idle(w)
+    assert w.progress_msg.text().startswith("Added") and queued == [True]
+
+
+def test_a_subreddit_being_read_as_a_fetch_into_it_ends_opens_with_what_it_saved(env, monkeypatch):
+    # Clicked, then fetched into while it was read on a thread, a big subreddit opened without what the fetch saved
+    # once the read came in while the fetch's thread only packed what it saved: the saved-data list counted the new
+    # posts, the pages didn't, until it was opened again.
+    s = env.store()
+    for sub in ("Python", "rust"):
+        s.save_post(Post(f"{sub}0", sub, "nice", "", "a", 1, 0.9, 0, NOW - 3 * DAY, "https://r", ""), 0.5, "positive")
+    s.commit()
+    packing, pack = threading.Event(), Store.pack_settled
+    monkeypatch.setattr(Store, "pack_settled", lambda self, *a, **k: packing.wait(30) and pack(self, *a, **k))
+    w = env.window()
+    w.upgrading.join()
+    w._after_upgrade()
+    pick(w, "rust")
+    opened(w)
+    monkeypatch.setattr(w, "LOAD_THREAD_FROM", 0)
+    going = held_reads(monkeypatch)
+    pick(w, "Python")
+    assert w.load_job.busy and w.current == "rust"
+    start_fetch(w, comments=False)
+    end = time.monotonic() + 30
+    while not w.progress_msg.text().startswith("Added"):  # it has finished; its thread packs what it saved
+        assert time.monotonic() < end and w.fetch_job.busy, w.progress_msg.text()
+        pump(10)
+    going.set()
+    opened(w)
+    saved = len(env.store().posts("python"))
+    assert saved > 1 and w.current == "Python" and len(w.posts) == saved
+    packing.set()
+    wait_idle(w)
+    assert len(w.posts) == saved
 
 
 def test_comments_a_stopped_fetch_owed_are_fetched_by_the_next_one(env):
@@ -1987,6 +2043,8 @@ def test_deleting_the_last_subreddit_empties_the_words_page_and_its_words_stay_d
     assert w.store.words("python") == {"festival": 1.0}
     QTest.mouseClick(getattr(w, button), Qt.MouseButton.LeftButton)
     pump(50)
+    while w.delete_job.busy:  # (on a thread)
+        pump(10)
     assert w.current is None and w.datasets.count() == 0
     assert meanings.subreddit is None and meanings.rows == {} and not meanings.entry.isEnabled()
     assert meanings.entry.placeholderText() == "Open a subreddit to set what its words mean"
