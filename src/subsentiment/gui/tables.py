@@ -1007,6 +1007,14 @@ class TablePage(QWidget):
                                    for r in self.view.selectionModel().selection()] or [self.model.order[:0]])
         current = self.view.currentIndex()
         current_at = int(self.model.order[current.row()]) if current.isValid() else None
+        if self.model.source is not source and (len(selected) or current_at is not None):
+            # Picked in other rows (another subreddit's, or these read again): found here by id, not by place.
+            shown = self.model.source.ids
+            ids = [shown[p] for p in [*selected.tolist(), *([] if current_at is None else [current_at])]]
+            at = source.where([i.decode() if isinstance(i, bytes) else i for i in ids])
+            if current_at is not None:
+                current_at, at = (int(at[-1]) if at[-1] >= 0 else None), at[:-1]
+            selected = at[at >= 0]
         if step is None or self.model.here(source, len(picked)):
             self.model.show(source, picked)
         else:

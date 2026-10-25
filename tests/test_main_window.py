@@ -409,6 +409,56 @@ def test_one_row_is_counted_as_one_row(make_window):
     assert w.posts_tab.count.text() == "1 row"
 
 
+def test_a_selection_doesnt_move_onto_other_rows_when_another_subreddit_is_shown(make_window, tmp_path):
+    """The selection was carried over by position: the post at the same place in the next subreddit's rows was
+    selected and current, one the user never picked."""
+    s = Store(tmp_path / "w.db")
+    for sub in ("Python", "rust"):
+        for i in range(10):
+            s.save_post(Post(f"{sub}{i}", sub, f"title {i}", "", "a", i, 0.9, 0, 1_600_000_000.0 - i * 3600,
+                             "https://r", ""), 0.0, "neutral")
+    s.commit()
+    s.close()
+    w = make_window()
+    w.show()
+    tab = w.posts_tab
+
+    def picked():
+        rows = sorted({i.row() for i in tab.view.selectionModel().selectedRows()})
+        current = tab.view.currentIndex()
+        return [tab.model.rows[r]["id"] for r in rows], tab.model.rows[current.row()]["id"] if current.isValid() else None
+
+    def show(sub):
+        w._refresh_datasets(sub)
+        end = time.monotonic() + 10
+        while w.current != sub or w._span_slices.running():
+            assert time.monotonic() < end
+            QApplication.processEvents()
+        QApplication.processEvents()
+    show("Python")
+    tab.view.selectRow(3)
+    chosen = picked()
+    assert chosen[0] == [chosen[1]] and chosen[1].startswith("Python")
+    show("rust")
+    assert picked() == ([], None)
+
+
+def test_rows_given_again_keep_the_selection_on_the_same_rows():
+    from subsentiment.gui.tables import TablePage
+    QApplication.instance() or QApplication([])
+    tab = TablePage(mw.POST_COLUMNS, stretch_col=2)
+
+    def rows(ids):
+        return [{"id": i, "title": i, "selftext": "", "author": "a", "score": 1, "num_comments": 0,
+                 "created_utc": 1_700_000_000.0 + n, "permalink": "/r/x", "sentiment": 0.0, "label": "neutral",
+                 "subreddit": "x"} for n, i in enumerate(ids)]
+    tab.load(rows(["a", "b", "c", "d"]))
+    tab.view.selectRow(tab.model.rows.index(next(r for r in tab.model.rows if r["id"] == "c")))
+    tab.load(rows(["x", "c", "y"]))  # the same row at another place: still the one picked
+    assert [tab.model.rows[i.row()]["id"] for i in tab.view.selectionModel().selectedRows()] == ["c"]
+    assert tab.model.rows[tab.view.currentIndex().row()]["id"] == "c"
+
+
 def test_posts_without_a_score_yet_sort_below_every_real_score(make_window):
     from subsentiment.gui.tables import POST_COLUMNS, RowsModel, SORT_ROLE
     model = RowsModel(POST_COLUMNS)
