@@ -434,6 +434,34 @@ def test_the_fetch_drawers_sample_downloads_only_part_of_a_big_days_comments_and
     assert env.window().fetch_form.comment_cap.pick.currentData() == "sample"  # remembered
 
 
+def test_the_fetch_drawers_sample_keeps_a_day_whole_while_some_of_its_posts_arent_counted(env):
+    """A day whose newest posts aren't counted yet (under 36 hours old) can't be sampled by its share: every thread
+    of it is saved whole and none is shown as a sample, rather than a sample sized without the uncounted ones."""
+    by_day: dict[int, list[dict]] = {}
+    for p in env.archive.posts:
+        if p["subreddit"] == "Python" and p["num_comments"]:
+            p["num_comments"] = 400  # every counted day is big enough to sample
+            by_day.setdefault(int(p["created_utc"] // DAY), []).append(p)
+    for p in by_day[max(by_day)][::2]:  # the newest settled day: half its posts not counted yet, as if newer
+        p["retrieved_on"], p["num_comments"] = p["created_utc"] + 60, 0
+    w = env.window()
+    w.fetch_form.comment_cap.pick.setCurrentIndex(w.fetch_form.comment_cap.pick.findData("sample"))
+    fetch(w, comments=True)
+    s = env.store()
+    sampled = s.complete_keys("sampled", "python")
+    mixed = 0
+    for day in {int(r["created_utc"] // DAY * DAY) for r in s.posts("python")}:
+        counts = s.comment_totals("python", day, day + DAY)
+        if None in counts.values() and any(counts.values()):
+            mixed += 1
+            saved = s.comment_counts("python", day, day + DAY)
+            assert all(saved.get(pid, 0) >= n for pid, n in counts.items() if n)  # counted threads saved whole
+            assert not set(counts) & sampled
+    assert mixed
+    assert sampled  # older days are still sampled
+    w.close()
+
+
 def test_comments_come_with_a_fetch_when_asked(env):
     w = env.window()
     fetch(w, comments=True)
