@@ -403,6 +403,47 @@ def test_the_result_counts_only_what_the_setting_changes_and_old_scores_apart(tm
         QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
 
 
+def test_a_word_written_with_a_curly_apostrophe_takes_the_meaning_set_on_it_in_the_cloud(tmp_path):
+    """The cloud shows "y’all" as "y'all"; a meaning set on that from the cloud found no saved item using it."""
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("subsentiment-test")
+    app.setApplicationName(tmp_path.name)
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path / "cfg"))
+    QSettings().setValue("updates/auto", False)
+    s = Store(tmp_path / "w.db")
+    texts = ["Y’all showed up today", "y’all came to the meeting", "y'all came to the meeting again"]
+    for i, title in enumerate(texts):
+        s.save_post(Post(f"p{i}", "town", title, "", "a", 1, 0.9, 0, 1_700_000_000.0 - i * 86400, "https://r", ""),
+                    *sentiment.score(title))
+    s.commit()
+    assert {r["label"] for r in s.posts("town")} == {"neutral"}
+    s.close()
+    w = mw.MainWindow(str(tmp_path / "w.db"))
+    try:
+        w.show()
+        w._refresh_datasets("town")
+        w.show_page("words")
+        QApplication.processEvents()
+        cloud, meanings = w.words_page.body, w.words_page.meanings
+        box = next(b for b, word, *_ in cloud.placed() if word == "y'all")  # all three, counted together
+        QTest.mouseClick(cloud, Qt.MouseButton.LeftButton, pos=box.center().toPoint())
+        row = meanings.rows["y'all"]
+        QTest.mouseClick(row.slider, Qt.MouseButton.LeftButton, pos=QPoint(row.slider.width() - 4, row.slider.height() // 2))
+        assert w.store.words("town") == {"y'all": 1.0}
+        end = time.monotonic() + 10
+        while w.rescore.running():
+            assert time.monotonic() < end
+            app.processEvents()
+            time.sleep(0.01)
+        app.processEvents()
+        assert row.result.text() == "✓ 3 of 3 saved items changed label"
+        assert {r["label"] for r in w.store.posts("town")} == {"positive"}
+    finally:
+        w.close()
+        QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
+
+
 def test_a_word_set_where_the_window_doesnt_have_every_row_rescores_from_the_saved_ones(tmp_path):
     """With a score filter on (or another subreddit shown), the rescore reads the subreddit itself. It failed at
     once: its read was asked for one minimum score, where it takes one for posts and one for comments."""
