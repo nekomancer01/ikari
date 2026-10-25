@@ -532,11 +532,11 @@ def test_import_merges_another_database_keeping_the_copy_fetched_last(tmp_path, 
     theirs.close()
     monkeypatch.setattr(store_mod.time, "time", clock.time)
 
-    assert mine.import_from(tmp_path / "theirs.db") == (1, 1)
+    assert mine.import_from(tmp_path / "theirs.db") == (1, 1, {})  # (no words set: nothing to score again)
     assert {r["id"]: r["sentiment"] for r in mine.db.execute("SELECT * FROM posts")} == {"p1": 0.9, "p2": 0.5, "p3": -0.5}
     assert [r["body"] for r in mine.comments("rust")] == ["hi"]
     assert mine.complete_keys("posts", "rust") == {"1699920000"}
-    assert mine.import_from(tmp_path / "theirs.db") == (0, 0)  # importing again adds nothing
+    assert mine.import_from(tmp_path / "theirs.db") == (0, 0, {})  # importing again adds nothing
     assert len(Store(tmp_path / "theirs.db").posts("rust")) == 1  # the imported file is left as it was
 
     (tmp_path / "junk.db").write_bytes(b"not a database at all" * 100)
@@ -562,7 +562,7 @@ def test_the_start_after_an_import_packs_the_many_rows_it_took(tmp_path, monkeyp
     theirs.pack_settled()
     theirs.close()
     mine = Store(tmp_path / "mine.db")
-    assert mine.import_from(tmp_path / "theirs.db") == (60, 60)
+    assert mine.import_from(tmp_path / "theirs.db") == (60, 60, {})
     assert mine._left_to_pack() == 120
     mine.close()
     Store.upgrade(tmp_path / "mine.db")  # fewer than ELSEWHERE: left for the next fetch
@@ -672,8 +672,8 @@ def test_import_keeps_image_posts_hidden_from_files_old_and_new(tmp_path):
     new.close()
 
     s = Store(tmp_path / "mine.db")
-    assert s.import_from(tmp_path / "old.db") == (1, 0)  # the picture's comment comes in hidden with it
-    assert s.import_from(tmp_path / "new.db") == (1, 0)
+    assert s.import_from(tmp_path / "old.db") == (1, 0, {})  # the picture's comment comes in hidden with it
+    assert s.import_from(tmp_path / "new.db") == (1, 0, {})
     assert [r["id"] for r in s.posts("python")] == ["c"]
     assert [r["id"] for r in s.posts("rust")] == ["p8"]
     assert "image" not in {r[1] for r in sqlite3.connect(tmp_path / "old.db").execute("PRAGMA table_info(posts)")}
@@ -825,6 +825,31 @@ def test_import_brings_word_meanings_keeping_the_one_saved_last(tmp_path, monkey
     mine.import_from(tmp_path / "theirs.db")
     assert mine.words("linux") == {"kill": 0.0, "zombie": 0.5}
     assert mine.lexicon("linux").score("kill the process")[1] == "neutral"
+
+
+def test_import_tells_which_words_saved_items_were_scored_by_with_another_meaning(tmp_path, monkeypatch):
+    # Importing a file that set "kill" positive left this one's saved "kill it" negative (the window rescores them).
+    from subsentiment import store as store_mod
+    when = iter([100.0, 200.0, 300.0, 400.0, 500.0, 600.0])
+    monkeypatch.setattr(store_mod.time, "time", lambda: next(when))
+    mine, theirs = Store(tmp_path / "mine.db"), Store(tmp_path / "theirs.db")
+    theirs.save_word("linux", "kill", 1.0)  # 100: theirs wins, ours had none
+    theirs.save_word("linux", "same", 0.5)  # 200: both mean the same
+    mine.save_word("linux", "same", 0.5)  # 300
+    theirs.save_word("linux", "older", 0.5)  # 400: ours, saved later, wins...
+    mine.save_word("linux", "older", -0.5)  # 500
+    mine.save_word("rust", "crash", 1.0)  # 600: ...as does this, which theirs hasn't
+    theirs.close()
+    monkeypatch.undo()
+    # No items taken from it: ours only change where its meaning won.
+    assert mine.import_from(tmp_path / "theirs.db")[2] == {"linux": {"kill"}}
+    theirs = Store(tmp_path / "theirs.db")
+    theirs.save_post(make_post(1, sub="Linux"), 0.0, "neutral")
+    theirs.save_post(make_post(2, sub="rust"), 0.0, "neutral")
+    theirs.commit()
+    theirs.close()
+    # Theirs were scored by its own words, wherever ours mean something else.
+    assert mine.import_from(tmp_path / "theirs.db")[2] == {"linux": {"older"}, "rust": {"crash"}}
 
 
 def test_deleting_days_forgets_them_whole_and_leaves_other_days_and_subreddits_as_they_were(tmp_path):
@@ -1008,7 +1033,7 @@ def test_a_subreddits_packs_share_a_dictionary_made_from_a_big_day(tmp_path):
     Store(other).close()
     store.DayPack.dicts.clear()
     o = Store(other)
-    assert o.import_from(path) == (1, 1500)  # another file's packs read with its own dictionary
+    assert o.import_from(path) == (1, 1500, {})  # another file's packs read with its own dictionary
     assert [r["body"] for r in o.comments("deltarune")] == [r["body"] for r in before]
     o.close()
     s.close()

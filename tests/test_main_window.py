@@ -728,6 +728,48 @@ def test_the_window_keeps_painting_while_a_database_is_imported_and_nothing_else
     assert "Imported 1\xa0new post" in w.statusBar().currentMessage() and w.datasets.count() == 3
 
 
+def test_an_import_that_changes_words_meanings_scores_the_saved_items_again(make_window, tmp_path, monkeypatch):
+    # Importing a file that says "kill" is positive in r/linux left "kill it", saved here, negative; and the items
+    # taken from it stayed scored without this file's words.
+    from subsentiment.sentiment import Lexicon
+    ts = 1_700_000_000.0
+    mine = Store(tmp_path / "w.db")
+    mine.save_word("linux", "crashed", 1.0)
+    mine.save_post(Post("ours", "linux", "kill it", "", "a", 1, 0.9, 0, ts, "https://r/o/", ""),
+                   *mine.lexicon("linux").score("kill it"))
+    mine.commit()
+    mine.close()
+    theirs = Store(tmp_path / "other.db")
+    theirs.save_word("linux", "kill", 1.0)
+    theirs.save_post(Post("theirs", "linux", "the build crashed", "", "a", 1, 0.9, 0, ts, "https://r/t/", ""),
+                     *theirs.lexicon("linux").score("the build crashed"))
+    theirs.commit()
+    theirs.close()
+    assert Lexicon({}).score("kill it")[1] == "negative" and Lexicon({}).score("the build crashed")[1] == "neutral"
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", lambda *a, **k: (str(tmp_path / "other.db"), ""))
+    w = make_window()
+    w.show()
+    w.upgrading.join()
+    w._after_upgrade()
+    w.datasets.setCurrentRow([w.datasets.item(i).text() for i in range(w.datasets.count())].index("r/linux"))
+    assert {r["id"]: r["label"] for r in w.posts} == {"ours": "negative"}
+    w.import_act.trigger()
+    imported(w)
+    w.upgrading.join()  # scored again once what it took is packed
+    w._after_upgrade()
+    assert w.rescore.running() and not w.import_act.isEnabled()  # on its threads, as for a word set by hand
+    end = time.monotonic() + 20
+    while w.rescore.running():
+        assert time.monotonic() < end, "the rescore didn't end"
+        QApplication.processEvents()
+        time.sleep(0.01)
+    QApplication.processEvents()
+    assert w.store.words("linux") == {"crashed": 1.0, "kill": 1.0}
+    assert {r["id"]: r["label"] for r in w.store.posts("linux")} == {"ours": "positive", "theirs": "positive"}
+    assert {r["id"]: r["label"] for r in w.posts} == {"ours": "positive", "theirs": "positive"}  # the table too
+    assert w.import_act.isEnabled()
+
+
 def test_score_filters_hide_low_posts_and_low_comments_everywhere_and_are_remembered(make_window, tmp_path):
     from subsentiment.reddit import Comment
     s = Store(tmp_path / "w.db")
