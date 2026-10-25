@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -209,6 +210,11 @@ class MainWindow(QMainWindow):
         self.load_job = BackgroundJob(self)  # reads a big saved subreddit
         self.import_job = BackgroundJob(self)  # merges another database in, on a connection of its own
         self.import_job.ended.connect(self._on_import_ended)
+        # Deletes a subreddit's saved data or all of it, on a connection of its own: dropping its search text and
+        # giving the space back take seconds on a big database, which the window spent frozen.
+        self.delete_job = BackgroundJob(self)
+        self.delete_job.ended.connect(self._on_delete_ended)
+        self._deleting: tuple = ()  # (the subreddit being deleted, None for all; None or the error it raised)
         self._importing: tuple = ()  # (the file being imported, what import_from returned or the error)
         # {subreddit: words} an import changed what its items were scored by: they're rescored once it's packed.
         self._imported_words: dict[str, set[str]] = {}
@@ -704,6 +710,8 @@ class MainWindow(QMainWindow):
             return "Scoring saved items\u2026"
         if self.coverage.delete_job.busy:
             return "Deleting days\u2026"
+        if self.delete_job.busy:
+            return "Deleting saved data\u2026"
         if self.import_job.busy:
             return "Importing saved data\u2026"
         if self.export_job.busy:
@@ -720,17 +728,22 @@ class MainWindow(QMainWindow):
         return None
 
     def set_writing(self) -> None:
-        """Download coverage's deletion or an import started or ended on its thread: nothing else writes while one
-        runs. An import holds the database for its one transaction (36 s for the owner's), so words' meanings and
-        notes, saved from this thread, wait for it too."""
+        """A deletion or an import started or ended on its thread: nothing else writes while one runs. Each holds
+        the database for its one transaction (36 s for the owner's import), so words' meanings and notes, saved
+        from this thread, wait for it too."""
         self.fetch_btn.setEnabled(not self.writing())
         self._update_delete_enabled()
         self.coverage.set_busy(self.writing())
-        self.words_page.meanings.setEnabled(not self.import_job.busy)
+        self.words_page.meanings.setEnabled(not self.holding())
 
     def writing(self) -> bool:
         """A fetch, a deletion or an import is changing the saved data."""
-        return self.fetch_job.busy or self.coverage.delete_job.busy or self.import_job.busy
+        return self.fetch_job.busy or self.holding()
+
+    def holding(self) -> bool:
+        """A deletion or an import is changing the saved data in one transaction, which holds the database until
+        it ends: past the store's busy timeout, a note or a word's meaning saved meanwhile was lost."""
+        return self.coverage.delete_job.busy or self.delete_job.busy or self.import_job.busy
 
     def _update_delete_enabled(self) -> None:
         idle = not self.writing()
@@ -925,6 +938,9 @@ class MainWindow(QMainWindow):
             self._refresh_datasets(reload=False, sets=sets)
 
     def _on_finished(self, result: collect.FetchResult) -> None:
+        # Its thread may go on packing what it saved for a while: that isn't for Stop, which would only say
+        # "Stopping…" over what it did and drop the downloads queued after it.
+        self.stop_btn.setEnabled(False)
         self._loaded.clear()  # what it saved (scores too) is read again, not shown from memory
         self._rescore_after_fetch()
         self.progress_msg.setText(finish_text(result, self.request))
@@ -965,6 +981,7 @@ class MainWindow(QMainWindow):
         self._render_overview()
 
     def _on_failed(self, message: str) -> None:
+        self.stop_btn.setEnabled(False)  # (as _on_finished)
         self._loaded.clear()
         self._rescore_after_fetch()
         self._live.stop()
@@ -1005,9 +1022,11 @@ class MainWindow(QMainWindow):
                             f"last fetched {when_text(d['last_fetched'])}")
             self.datasets.addItem(item)
         lowered = [n.lower() for n in names]
-        row = next((lowered.index(c.lower()) for c in (select, self.current) if c and c.lower() in lowered),
+        # (A subreddit still being read is the one about to be shown.)
+        row = next((lowered.index(c.lower()) for c in (select, self._wanted, self.current) if c and c.lower() in lowered),
                    0 if names else None)
-        if row is not None and not (self.fetch_job.busy and self._showing_fetch() and self.current.lower() not in lowered):
+        if row is not None and not (self._wanted is None and self.fetch_job.busy and self._showing_fetch()
+                                    and self.current.lower() not in lowered):
             self.datasets.setCurrentRow(row)  # (a fetch's subreddit with nothing saved yet has no row)
         else:
             self.datasets.setCurrentRow(-1)
@@ -1112,9 +1131,19 @@ class MainWindow(QMainWindow):
 
     def _on_loaded(self, read: tuple) -> None:
         (key, stats), saved = read
-        if self._wanted == key:
-            self._wanted = None
-            self._open(self._name_of(key), (stats, saved))
+        if self._wanted != key:
+            return
+        # Saved to or deleted from since it was asked for, or read without its words while an upgrade ran that has
+        # ended since: read it again (once this thread is done) rather than show it as it was. A running fetch's
+        # rows are counted in as they're saved instead (_open).
+        fetching = self.fetch_job.busy and self.request is not None and self.request.subreddit.lower() == key
+        wordless = not all(getattr(s, "words", True) for s in saved.values())
+        if ((stats != self._stats.get(key) and not fetching)
+                or (wordless and not (self._wordless and self.upgrading.is_alive()))):
+            self._show_dataset(self._name_of(key))
+            return
+        self._wanted = None
+        self._open(self._name_of(key), (stats, saved))
 
     def _after_upgrade(self) -> None:
         """Once the upgrade is done, read again what was read without its words while it ran."""
@@ -1129,8 +1158,9 @@ class MainWindow(QMainWindow):
         self._update_delete_enabled()
         for key in [k for k, (_, saved) in self._loaded.items() if not all(getattr(s, "words", True) for s in saved.values())]:
             del self._loaded[key]
+        # (A subreddit still being read is shown next, and read again first if it's read without its words.)
         wordless = not all(getattr(s, "words", True) for s in self._saved.values())
-        if wordless and self.current and not (self.fetch_job.busy and self._showing_fetch()):
+        if wordless and self.current and self._wanted is None and not (self.fetch_job.busy and self._showing_fetch()):
             self._show_dataset(self.current)
 
     def _on_load_failed(self, message: str) -> None:
@@ -1284,15 +1314,21 @@ class MainWindow(QMainWindow):
         """Add, change or remove the note on a day the timeline's dot was clicked on."""
         if not self.current:
             return
-        if self.import_job.busy:
-            self.statusBar().showMessage("Notes can be added once the import is done.", 5000)
+        if self.holding():
+            self.statusBar().showMessage(
+                f"Notes can be added once the {'import' if self.import_job.busy else 'deletion'} is done.", 5000)
             return
         dialog = NoteDialog(day, *self.store.notes(self.current).get(day, ("", "")), parent=self)
         dialog.chosen.connect(partial(self._save_note, self.current, day))
         dialog.open()
 
     def _save_note(self, subreddit: str, day: int, tag: str, text: str) -> None:
-        self.store.save_note(subreddit, day, tag, text)
+        try:
+            self.store.save_note(subreddit, day, tag, text)
+        except sqlite3.OperationalError:  # held past the busy timeout (a fetch giving the space back, say)
+            self.statusBar().showMessage("Couldn't save the note while the saved data is busy; try again in a moment.",
+                                         8000)
+            return
         self._show_notes()
 
     def _pick_word(self, word: str) -> None:
@@ -1303,7 +1339,12 @@ class MainWindow(QMainWindow):
     def _set_word(self, word: str, weight: float | None) -> None:
         sub = self.words_page.meanings.subreddit
         if sub:
-            self.store.save_word(sub, word, weight)
+            try:
+                self.store.save_word(sub, word, weight)
+            except sqlite3.OperationalError:  # (as _save_note)
+                self.statusBar().showMessage(f"Couldn't set what \u201c{word}\u201d means while the saved data is "
+                                             "busy; try again in a moment.", 8000)
+                return
             self._render_words()  # hovering it in the clouds tells what it's set to
             # The rows on screen are all there is of it, unless a score filter or a running fetch leaves some out.
             fetching = self.fetch_job.busy and self.request is not None and self.request.subreddit.lower() == sub.lower()
@@ -1353,14 +1394,16 @@ class MainWindow(QMainWindow):
         on every page. If nothing of it is left it stays shown, empty, so its days can be downloaded again from
         here. Another subreddit picked meanwhile stays shown."""
         self._loaded.pop(subreddit.lower(), None)
-        shown = (self.current or "").lower() == subreddit.lower()
+        # A subreddit still being read is the one shown next (and read again if it's this one: _on_loaded).
+        shown = (self._wanted or self.current or "").lower() == subreddit.lower()
         self._refresh_datasets(select=subreddit if shown else None, reload=False)
         if shown:
             if subreddit.lower() not in self._stats:
                 self.datasets.blockSignals(True)
                 self.datasets.setCurrentRow(-1)  # it has no row any more
                 self.datasets.blockSignals(False)
-            self._show_dataset(self.current)
+            if self._wanted is None:
+                self._show_dataset(self.current)
         self.statusBar().showMessage(f"Deleted {plural(posts, 'post')} and {plural(comments, 'comment')} saved from "
                                      f"{plural(days, 'day')} of r/{subreddit}.", 8000)
 
@@ -1375,13 +1418,7 @@ class MainWindow(QMainWindow):
                 f"{', and its timeline notes' if self.store.notes(self.current) else ''}? "
                 "This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
-        self.store.delete_subreddit(self.current)
-        self._loaded.clear()
-        for key in days.settings_keys(self.current):
-            self.settings.remove(key)
-        self.statusBar().showMessage(f"Deleted the saved data for r/{self.current}.", 8000)
-        self.current = None
-        self._refresh_datasets()
+        self._start_delete(self.current)
 
     def _delete_all(self) -> None:
         if self.writing() or not self.datasets.count():
@@ -1391,13 +1428,44 @@ class MainWindow(QMainWindow):
                 f"Delete everything saved for all {self.datasets.count()} subreddits? "
                 "This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
-        self.store.delete_all()
+        self._start_delete(None)
+
+    def _start_delete(self, subreddit: str | None) -> None:
+        """Delete what's saved for ``subreddit``, or everything (None), on delete_job's thread."""
+        worker = (StoreWorker(self.db_path, "delete_subreddit", subreddit) if subreddit
+                  else StoreWorker(self.db_path, "delete_all"))
+        worker.finished.connect(self._deleted)
+        worker.failed.connect(self._deleted)
+        self._deleting = (subreddit, None)
+        self.delete_job.start(worker)
+        self.set_writing()
+        self.statusBar().showMessage(f"Deleting the saved data for r/{subreddit}\u2026" if subreddit
+                                     else "Deleting all saved data\u2026")
+
+    @Slot(object)
+    def _deleted(self, got) -> None:
+        """None once deleted, or the error it raised."""
+        self._deleting = (self._deleting[0], got)
+
+    def _on_delete_ended(self) -> None:
+        sub, error = self._deleting
+        self.set_writing()
         self._loaded.clear()
-        self.settings.remove("ui/last_dataset")
-        self.settings.remove(days.SETTINGS_GROUP)
-        self.settings.remove(days.RANGE_GROUP)
-        self.statusBar().showMessage("Deleted all saved data.", 8000)
-        self.current = None
+        if error is not None:
+            self.statusBar().clearMessage()
+            QMessageBox.warning(self, "Delete failed", f"Couldn't delete the saved data.\n\n{error}")
+        elif sub:
+            for key in days.settings_keys(sub):
+                self.settings.remove(key)
+            self.statusBar().showMessage(f"Deleted the saved data for r/{sub}.", 8000)
+        else:
+            self.settings.remove("ui/last_dataset")
+            self.settings.remove(days.SETTINGS_GROUP)
+            self.settings.remove(days.RANGE_GROUP)
+            self.statusBar().showMessage("Deleted all saved data.", 8000)
+        # Another subreddit picked meanwhile stays shown.
+        if error is None and (sub is None or (self.current or "").lower() == sub.lower()):
+            self.current = None
         self._refresh_datasets()
 
     def _export(self, kind: str) -> None:
@@ -1530,7 +1598,8 @@ class MainWindow(QMainWindow):
         # An export writing its file stops within a few thousand rows and leaves none; one still reading the rows
         # (half its time) hasn't started the file, so app.main can end the process under it.
         self._export_stop.set()
-        for writing, wait in ((self.coverage.delete_job, 10000), (self.import_job, 0), (self.export_job, 1000)):
+        for writing, wait in ((self.coverage.delete_job, 10000), (self.delete_job, 10000), (self.import_job, 0),
+                              (self.export_job, 1000)):
             if writing.busy:
                 writing.worker.finished.disconnect()
                 writing.worker.failed.disconnect()
@@ -1545,7 +1614,7 @@ class MainWindow(QMainWindow):
     def running_threads(self) -> list[QThread]:
         """Fetch and count threads still running, such as one stuck on a slow request after the window
         closed."""
-        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job,
+        return [j.qthread for j in (self.fetch_job, self.coverage.count_job, self.coverage.delete_job, self.delete_job,
                                     self.coverage.days_read.job, self.coverage.posts_read.job, self.load_job,
                                     self.rescore.job, self.import_job, self.export_job)
                 if j.running()]

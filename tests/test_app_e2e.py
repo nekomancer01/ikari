@@ -520,6 +520,28 @@ def test_stop_ends_a_fetch_and_frees_the_form(env, monkeypatch):
     assert "Stopped" in w.progress_msg.text() or "stopped" in w.progress_msg.text().lower()
 
 
+def test_stop_is_off_once_a_fetch_is_done_and_only_packing_what_it_saved(env, monkeypatch):
+    # Pressed while the fetch's thread packed what it saved (seconds on a big database), Stop replaced what the
+    # fetch did with a "Stopping…" that never went, and dropped the downloads queued after it.
+    packing, pack = threading.Event(), Store.pack_settled
+    monkeypatch.setattr(Store, "pack_settled", lambda self, *a, **k: packing.wait(30) and pack(self, *a, **k))
+    w = env.window()
+    w.upgrading.join()
+    w._after_upgrade()
+    queued = []
+    w.coverage._queue.append((("python", "posts", 0), lambda: queued.append(True)))  # a download queued after it
+    start_fetch(w, comments=False)
+    end = time.monotonic() + 30
+    while not w.progress_msg.text().startswith("Added"):
+        assert time.monotonic() < end and w.fetch_job.busy, w.progress_msg.text()
+        pump(10)
+    assert w.fetch_job.busy and not w.stop_btn.isEnabled()
+    QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
+    packing.set()
+    wait_idle(w)
+    assert w.progress_msg.text().startswith("Added") and queued == [True]
+
+
 def test_comments_a_stopped_fetch_owed_are_fetched_by_the_next_one(env):
     # Stopped while a day's comments came in, the rest of its posts were left with none, and as the day had been
     # read to its end (complete), fetching it again never asked for them.
@@ -1987,6 +2009,8 @@ def test_deleting_the_last_subreddit_empties_the_words_page_and_its_words_stay_d
     assert w.store.words("python") == {"festival": 1.0}
     QTest.mouseClick(getattr(w, button), Qt.MouseButton.LeftButton)
     pump(50)
+    while w.delete_job.busy:  # (on a thread)
+        pump(10)
     assert w.current is None and w.datasets.count() == 0
     assert meanings.subreddit is None and meanings.rows == {} and not meanings.entry.isEnabled()
     assert meanings.entry.placeholderText() == "Open a subreddit to set what its words mean"
