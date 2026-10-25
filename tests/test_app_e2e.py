@@ -382,9 +382,11 @@ def test_the_fetch_drawers_sample_downloads_only_part_of_a_big_days_comments_and
     for p in env.archive.posts:
         if p["subreddit"] == "Python" and p["num_comments"]:
             by_day.setdefault(int(p["created_utc"] // DAY), []).append(p)
-    for on in by_day.values():  # a 6-post day stays under the 385 a sample needs; a 12-post one has a big thread
+    # A 6-post day stays under the 385 a sample needs; a 12-post one has a big thread. Its small threads are counted as
+    # the 2 comments the fake gives a thread at least: a count below its tree's size scales up its part of the sample.
+    for on in by_day.values():
         for k, p in enumerate(on):
-            p["num_comments"] = 60 if len(on) < 6 else 2000 if k == 0 else 1
+            p["num_comments"] = 60 if len(on) < 6 else 2000 if k == 0 else 2
     w = env.window()
     w.fetch_form.comment_cap.pick.setCurrentIndex(w.fetch_form.comment_cap.pick.findData("sample"))
     assert not w.fetch_form.comments_per_post.isEnabled()  # the sample sets its own size

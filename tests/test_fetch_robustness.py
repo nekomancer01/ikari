@@ -29,8 +29,8 @@ def post(pid, created, sub="Sub", removed=False, **extra):
 def archive(monkeypatch):
     made = []
 
-    def _make(posts):
-        a = FakeArchive(posts)
+    def _make(posts, **kw):
+        a = FakeArchive(posts, **kw)
         monkeypatch.setattr(arctic_shift, "BASE_URL", a.url)
         monkeypatch.setattr(arctic_shift, "MAX_WAIT", 1.2)
         made.append(a)
@@ -154,6 +154,73 @@ def test_numeric_ids_and_infinite_numbers_are_read(archive):
     c = arctic_shift.ArcticShiftClient(limiter=arctic_shift.RateLimiter(0), workers=1)
     got = {p.id: p for p in c.fetch_posts("Sub", DAY0, DAY0 + DAY, limit=10, skip={"12345"})}
     assert set(got) == {"p2"} and got["p2"].upvote_ratio == 0.0  # the saved one is recognised and skipped
+
+
+def quick_client():
+    return arctic_shift.ArcticShiftClient(limiter=arctic_shift.RateLimiter(0), workers=1)
+
+
+def test_a_day_the_range_cuts_short_is_sampled_from_the_whole_day(archive, tmp_path):
+    # Sampling the afternoon of a day sized its sample from the afternoon's thread alone (278 of its 1,000) and held
+    # it; a fetch of the whole day kept those 278 beside the morning's 165, where the whole day gives it 158. Holding
+    # such a day back instead gave it nothing, every time: a range from the Fetch form starts at a local midnight (here
+    # 05:00 UTC, as at UTC-5) or N days ago, so its first and last UTC days are cut short.
+    archive([post("early", DAY0 + 3600, num_comments=1000), post("late", DAY0 + 20 * 3600, num_comments=1000),
+             post("next", DAY0 + DAY + 3600, num_comments=1000), post("next2", DAY0 + DAY + 20 * 3600,
+                                                                     num_comments=1000)], rate=(10000, 1.0))
+    s, whole = Store(tmp_path / "s.db"), Store(tmp_path / "whole.db")
+    ids = ("early", "late", "next", "next2")
+    collect.run(quick_client(), s, collect.FetchRequest("Sub", after=DAY0 + 5 * 3600, before=DAY0 + DAY + 5 * 3600,
+                                                        limit=None, comment_pick=collect.SAMPLE))
+    req = collect.FetchRequest("Sub", after=DAY0, before=DAY0 + 2 * DAY, limit=None, comment_pick=collect.SAMPLE)
+    collect.run(quick_client(), whole, req)
+    want = {p: collect.Sample(whole.comment_totals("Sub", d, d + DAY)).quota(p)
+            for d in (DAY0, DAY0 + DAY) for p in ids if p in whole.comment_totals("Sub", d, d + DAY)}
+    assert all(want.values()) and {p: len(s.comment_ids(p)) for p in ids} == want
+    assert s.complete_keys("sampled", "sub") == set(ids)
+    collect.run(quick_client(), s, req)  # the whole days again: nothing more to add
+    assert {p: len(s.comment_ids(p)) for p in ids} == {p: len(whole.comment_ids(p)) for p in ids} == want
+
+
+def test_a_day_that_just_ended_isnt_complete_while_the_archive_can_still_take_posts_in(archive, tmp_path,
+                                                                                         monkeypatch):
+    # At 00:10 UTC the day before was marked downloaded in full, so a post the archive took in a few minutes
+    # later was never fetched: complete days aren't read again.
+    day = DAY0 + 2 * DAY
+    monkeypatch.setattr(time, "time", lambda: float(day + DAY + 600))
+    a = archive([post("p1", day + 3600)])
+    s = Store(tmp_path / "s.db")
+    req = collect.FetchRequest("Sub", after=day - 5 * DAY, limit=None, include_comments=False)
+    collect.run(quick_client(), s, req)
+    assert str(day) not in s.complete_keys("posts", "Sub") and str(day - DAY) in s.complete_keys("posts", "Sub")
+    a.posts.append(post("late", day + DAY - 60))  # taken in late
+    assert collect.run(quick_client(), s, req).posts == 1
+    assert {r["id"] for r in s.posts_between("Sub", day, day + DAY)} == {"p1", "late"}
+
+
+@pytest.mark.parametrize("cap", [200, 500])
+def test_a_cap_bigger_than_half_a_tree_request_is_met_on_a_big_thread(archive, tmp_path, cap):
+    # The tree is asked for TREE_LIMIT (300) comments at most, and a bigger thread comes back about half expanded:
+    # 150 were saved whatever the cap above that, and the post was never asked about again.
+    a = archive([post("big", DAY0 + 3600, num_comments=1000)], rate=(10000, 1.0))
+    s = Store(tmp_path / "s.db")
+    req = collect.FetchRequest("Sub", after=DAY0, before=DAY0 + DAY, limit=None, comments_per_post=cap)
+    assert collect.run(quick_client(), s, req).comments == cap
+    a.clear()
+    collect.run(quick_client(), s, req)
+    assert len(s.comment_ids("big")) == cap and "/api/comments/tree" not in a.paths()  # done with
+
+
+def test_refreshing_scores_keeps_a_capped_thread_to_its_cap(archive, tmp_path):
+    # The post's scores settled, so its thread was picked again: the new top 50 were saved beside the old ones.
+    young = post("young", DAY0 + 3600, score=1, num_comments=0, retrieved_on=DAY0 + 3660, tree=200)
+    archive([young], rate=(10000, 1.0))
+    s = Store(tmp_path / "s.db")
+    req = collect.FetchRequest("Sub", after=DAY0, before=DAY0 + DAY, limit=None, comments_per_post=50)
+    collect.run(quick_client(), s, req)
+    young.update(score=50, num_comments=200, retrieved_on=DAY0 + 40 * 3600)
+    assert collect.run(quick_client(), s, dataclasses.replace(req, refresh_scores=True)).updated == 1
+    assert len(s.comment_ids("young")) == 50
 
 
 def test_stop_keeps_the_posts_a_slow_slice_already_downloaded(archive, tmp_path):

@@ -5,13 +5,13 @@ import hashlib
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Collection
 
 import numpy as np
 import requests
 
-from subsentiment.arctic_shift import ArcticShiftClient, ArchiveDown, Stopped, in_parallel, keep
+from subsentiment.arctic_shift import INGEST_LAG, ArcticShiftClient, ArchiveDown, Stopped, in_parallel, keep
 from subsentiment.reddit import FetchError, Post, normalize_subreddit
 from subsentiment.sentiment import Lexicon
 from subsentiment.store import Store
@@ -198,8 +198,16 @@ class Download:
     def posts(self) -> FetchResult:
         """The posts of the range, and their comments (see run)."""
         req, store, name = self.req, self.store, self.name
-        # Asked for, whatever comes of it: Download coverage lists these days, to find what this fetch misses.
         end = time.time() if req.before is None else req.before
+        if self.sample and req.limit is None and not req.days:
+            # A sample is of each UTC day's comments, planned from all of the day's posts, so the whole of each UTC
+            # day the range touches is read: a range from the Fetch form starts at a local midnight, or N days ago,
+            # and a sample planned from part of a day gave its posts a share of the whole day (held for good), or,
+            # waiting for a read of the rest that never came, gave the day none.
+            start = end - 7 * DAY if req.after is None else req.after
+            self.req = req = replace(req, after=int(start // DAY * DAY),
+                                     before=None if req.before is None else math.ceil(end / DAY) * DAY)
+        # Asked for, whatever comes of it: Download coverage lists these days, to find what this fetch misses.
         store.save_tried(name, req.days or days_in(end - 7 * DAY if req.after is None else req.after, end))
         picked_days = set(req.days)
         self.stored = {r["id"]: r for r in store.posts_between(name, req.after, req.before)
@@ -341,12 +349,13 @@ class Download:
         store.commit()
         # Each whole UTC day of the range is complete only when every part of it was read to its end (no stretch
         # the client left unread is on it, as days read together can differ): a fetch that stopped at the limit,
-        # or was stopped, may have missed posts. A day that isn't over yet can still get posts, so it never is,
-        # and a keyword search only reads the posts that match.
+        # or was stopped, may have missed posts. A day that isn't over yet can still get posts, so it never is, nor
+        # one that ended less than INGEST_LAG ago (the archive can still be taking its last posts in, as read spans
+        # allow for too), and a keyword search only reads the posts that match.
         if everything and not req.query and not self.should_stop():
             unread = [] if getattr(client, "exhausted", False) else getattr(client, "unread", None) or [(after, before)]
             for day in whole:
-                if day + DAY <= time.time() and not any(lo < day + DAY and hi > day for lo, hi in unread):
+                if day + DAY <= time.time() - INGEST_LAG and not any(lo < day + DAY and hi > day for lo, hi in unread):
                     store.mark_complete("posts", name, str(day))
         return got
 
@@ -400,6 +409,19 @@ class Download:
         if not gave_up and not stopped:
             get = self.take_sample if self.sample else (lambda p: client.fetch_all_comments(p, cap, req.comment_pick)) \
                 if fill else (lambda p: (client.fetch_comments(p, cap, req.comment_pick), False))
+            # A capped thread picked again as its post's scores settled keeps the comments it had, rather than the new
+            # pick being saved beside them (about twice the cap, as nothing takes saved comments away): the ones still
+            # picked get their settled scores, and new ones only fill it up to the cap.
+            had = {p.id: ids for p in todo if p.id in refreshed and (ids := store.comment_ids(p.id))} \
+                if cap and not self.sample else {}
+            if had:
+                def get(p, get=get):
+                    comments, whole = get(p)
+                    if p.id not in had:
+                        return comments, whole
+                    kept = [c for c in comments if c.id in had[p.id]]
+                    kept += [c for c in comments if c.id not in had[p.id]][:max(0, cap - len(had[p.id]))]
+                    return kept, whole and len(kept) == len(comments)
             failed, tried, gave_up, added = self.each_thread(todo, get, cap=cap, progress=report)
             self.errors += failed
             self.n_comments += added
