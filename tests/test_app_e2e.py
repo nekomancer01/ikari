@@ -1969,3 +1969,29 @@ def test_one_server_error_is_neither_called_busy_nor_holds_up_the_fetch(env, mon
         pump(5)
     assert not [m for m in said if "busy" in m or "Waiting" in m], said
     assert not env.warnings and "Added" in w.progress_msg.text()
+
+
+@pytest.mark.parametrize("button", ["delete_btn", "delete_all_btn"])
+def test_deleting_the_last_subreddit_empties_the_words_page_and_its_words_stay_deleted(env, monkeypatch, button):
+    # Deleting the only subreddit saved left the Words page on its words, and a word set there was saved for it:
+    # a later fetch of it was scored by a word deleted with it.
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    w = env.window()
+    fetch(w, comments=False)
+    w.show_page("words")
+    meanings = w.words_page.meanings
+    QTest.keyClicks(meanings.entry, "festival")
+    QTest.keyClick(meanings.entry, Qt.Key.Key_Return)
+    row = meanings.rows["festival"]
+    QTest.mouseClick(row.slider, Qt.MouseButton.LeftButton, pos=QPoint(row.slider.width() - 4, row.slider.height() // 2))
+    assert w.store.words("python") == {"festival": 1.0}
+    QTest.mouseClick(getattr(w, button), Qt.MouseButton.LeftButton)
+    pump(50)
+    assert w.current is None and w.datasets.count() == 0
+    assert meanings.subreddit is None and meanings.rows == {} and not meanings.entry.isEnabled()
+    assert meanings.entry.placeholderText() == "Open a subreddit to set what its words mean"
+    meanings.changed.emit("festival", 0.8)  # a slider let go on the page as it was: nothing to set it for
+    assert w.store.db.execute("SELECT COUNT(*) FROM words").fetchone()[0] == 0
+    fetch(w, comments=False)
+    assert w.current.lower() == "python" and meanings.subreddit.lower() == "python"
+    assert meanings.rows == {} and w.store.words("python") == {}
