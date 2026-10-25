@@ -1152,6 +1152,28 @@ def test_an_sqlite_without_search_leaves_the_index_for_one_with_it(tmp_path, mon
     s.close()
 
 
+@needs_search
+def test_search_tables_this_sqlite_cant_read_are_left_for_one_that_can(tmp_path):
+    """A database whose search tables were made by a newer SQLite, with an option this one doesn't know: the probe
+    said ready (CREATE ... IF NOT EXISTS never opens a table that's there), so every save and delete raised."""
+    path = tmp_path / "subsentiment.db"
+    Store(path).close()
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA writable_schema = ON")
+    db.execute("UPDATE sqlite_master SET sql = replace(sql, 'detail=none', 'detail=none, futureopt=1') "
+               "WHERE type = 'table' AND name LIKE 'search_%'")
+    db.commit()
+    db.close()
+    s = Store(path)
+    assert not s.search.ready and s.db.execute("PRAGMA user_version").fetchone()[0] == 3
+    s.save_post(make_post(1), 0.5, "positive")
+    s.commit()
+    assert [r["id"] for r in s.posts("python")] == ["p1"]
+    s.delete_subreddit("python")
+    assert s.subreddits() == []
+    s.close()
+
+
 def test_an_older_sqlite_is_swapped_for_pysqlite3s_where_it_is_installed():
     import subprocess
     import sys
