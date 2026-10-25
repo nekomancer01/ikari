@@ -496,8 +496,8 @@ class Search:
                 if self.create:
                     self.db.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS search_{kind} USING fts5(text, content='', "
                                     "contentless_delete=1, detail=none)")
-                else:
-                    self.db.execute(f"SELECT 1 FROM search_{kind} LIMIT 0")
+                # Opened, as CREATE ... IF NOT EXISTS doesn't open one that's there (made by a newer SQLite, maybe).
+                self.db.execute(f"SELECT 1 FROM search_{kind} LIMIT 0")
             return True
         except sqlite3.OperationalError:  # an SQLite before 3.43, or one built without FTS5; or none made yet
             return False
@@ -1629,10 +1629,11 @@ class Store:
             shown = self.db.execute(
                 "SELECT (SELECT COUNT(*) FROM posts WHERE image = 0 AND id IN temp.gone), (SELECT COUNT(*) FROM comments "
                 "c WHERE c.id IN temp.gone_comments AND " + NOT_IMAGE + ")").fetchone()
-            # The comments' text sits in the packs of the days they were written, beside other posts' comments.
+            # The comments' text sits in the packs of the days they were written, beside other posts' comments; one
+            # saved again since it was packed (packed = 0) still has its old copy there.
             repack: dict[int, set[str]] = {}
             for r in self.db.execute("SELECT id, CAST(created_utc / 86400 AS INTEGER) d FROM comments "
-                                     "WHERE packed != 0 AND id IN temp.gone_comments"):
+                                     "WHERE id IN temp.gone_comments"):
                 repack.setdefault(r["d"], set()).add(r["id"])
             self.search.drop("comments", [i for (i,) in self.db.execute("SELECT id FROM temp.gone_comments")])
             self.search.drop("posts", [i for (i,) in self.db.execute("SELECT id FROM temp.gone")])
