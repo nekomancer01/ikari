@@ -179,8 +179,8 @@ class CommentCap(QObject):
         self.pick.setToolTip("Which comments a post keeps when it has more than that: the highest-scored, or a "
                              "random sample that stays the same each time the post is asked about.\n"
                              "Sample: enough of each day's comments, picked at random across its posts by how many "
-                             "each has, to measure the day's sentiment within ±5 points (95% confidence): 385 of "
-                             "a big day, fewer of a smaller one; a day of up to 385 comments is downloaded whole.")
+                             "each has, to measure the day's sentiment within ±2 points (99% confidence): 4,148 "
+                             "of a big day, fewer of a smaller one; a day of up to 4,148 comments is downloaded whole.")
         for signal in (self.count.valueChanged, self.pick.currentIndexChanged):
             signal.connect(lambda _: self.set_enabled(self._enabled))
         self.restore()

@@ -14,7 +14,7 @@ import requests
 from subsentiment.arctic_shift import INGEST_LAG, ArcticShiftClient, ArchiveDown, Stopped, in_parallel, keep
 from subsentiment.reddit import FetchError, Post, normalize_subreddit
 from subsentiment.sentiment import Lexicon
-from subsentiment.store import Store
+from subsentiment.store import SAMPLE_MARK, Store
 
 GIVE_UP_AFTER = 5  # consecutive posts whose comments couldn't be fetched before the rest are skipped
 DAY = 86400
@@ -79,7 +79,7 @@ SAMPLE = "sample"  # FetchRequest.comment_pick for a statistical sample of each 
 
 class Sample:
     """Which comments of one UTC day's saved posts make a simple random sample of the day's comments, big enough
-    that each share (positive, negative, neutral) it measures is within MARGIN of the whole day's 19 times in 20.
+    that each share (positive, negative, neutral) it measures is within MARGIN of the whole day's 99 times in 100.
     The day's comments are its posts' own counts (num_comments); the sample needs NEED of a big day, fewer of a
     smaller one (the finite population correction), and a day with no more than NEED is kept whole. So is a day with a
     post not counted yet (about its first 36 hours): its share of the day isn't known, and a sample sized without it,
@@ -91,8 +91,9 @@ class Sample:
     every comment of the day is as likely to be in as any other, so a busy thread gets its share and no more,
     and the same posts give the same sample each time it's asked for."""
 
-    Z, MARGIN = 1.96, 0.05  # 95% confidence, ±5 points
-    EXACT = Z * Z * 0.25 / (MARGIN * MARGIN)  # a share of 50% is the hardest to pin down: 384.2 comments
+    # 99% confidence, ±2 points: ±5 at 95% (385 comments) kept about 500 of a 3,000 to 5,000 comment day, too few.
+    Z, MARGIN = 2.576, 0.02
+    EXACT = Z * Z * 0.25 / (MARGIN * MARGIN)  # a share of 50% is the hardest to pin down: 4,147.4 comments
     NEED = math.ceil(EXACT)
 
     def __init__(self, counts: dict[str, int | None]):
@@ -491,12 +492,12 @@ class Download:
     def sampled(self, posts: list[Post]) -> list[Post]:
         """Of these saved posts, the ones whose threads the sample still wants comments from (every one, when not
         sampling). The rest, with no part in their day's sample or holding it already, are marked done for the
-        sample ("sampled"), as Download coverage counts them. Posts of a day that wasn't read to its end are left
+        sample (SAMPLE_MARK), as Download coverage counts them. Posts of a day that wasn't read to its end are left
         for a later fetch (see unread)."""
         if not self.sample:
             return posts
         store, name, todo = self.store, self.name, []
-        held = store.complete_keys("sampled", name)
+        held = store.complete_keys(SAMPLE_MARK, name)
         for p in posts:
             day = int(p.created_utc // DAY * DAY)
             if day in self.unread:
@@ -508,7 +509,7 @@ class Download:
             if q is None or (p.id not in held and self.saved_count.get(p.id, 0) < q):
                 todo.append(p)
             elif p.id not in held:
-                store.mark_complete("sampled", name, p.id)
+                store.mark_complete(SAMPLE_MARK, name, p.id)
         store.commit()
         return todo
 
@@ -526,7 +527,7 @@ class Download:
         now: done for the sample."""
         for pid in tried & self.kept.keys():
             if len(self.store.comment_ids(pid)) >= self.kept[pid]:
-                self.store.mark_complete("sampled", self.name, pid)
+                self.store.mark_complete(SAMPLE_MARK, self.name, pid)
         self.kept.clear()
         self.store.commit()
 

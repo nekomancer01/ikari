@@ -75,8 +75,9 @@ CREATE TABLE IF NOT EXISTS comment_fetches (
 );
 -- Ranges whose whole content ikari has fetched: kind "posts" keys a UTC day (its start, in epoch
 -- seconds) and kind "comments" keys a post id; "comments_so_far" keys a post whose whole thread was fetched
--- before the archive re-checked it, so more comments may still come; "sampled" a post holding its part of its
--- day's statistical sample of comments (collect.Sample), none for most. Used to show a day or thread as fully downloaded even
+-- before the archive re-checked it, so more comments may still come; "sampled 99/2" (store.SAMPLE_MARK) a post
+-- holding its part of its day's statistical sample of comments (collect.Sample), none for most ("sampled" for the
+-- smaller sample before it, no longer counted). Used to show a day or thread as fully downloaded even
 -- when the archive's totals (which count removed items) are higher than what could be saved.
 CREATE TABLE IF NOT EXISTS complete (
     kind TEXT NOT NULL, subreddit TEXT NOT NULL, key TEXT NOT NULL, fetched_at REAL,  -- subreddit lowercased
@@ -165,14 +166,18 @@ WHOLE_THREAD = (  # IFNULL: an uncounted post (num_comments NULL) would make "= 
 
 
 SAMPLED = -1  # thread_done's cap for Coverage's statistical sample (collect.Sample) instead of a number per thread
+# complete's kind for a post holding its part of its day's sample, named for the sample's size: a sample made at
+# another size (kind "sampled": ±5 points at 95%) isn't counted as done, so the next sample download tops it up.
+SAMPLE_MARK = "sampled 99/2"  # 99% confidence, ±2 points
+SAMPLE_MARKS = ("sampled", SAMPLE_MARK)  # every kind a sample has been marked with, for deleting a post
 
 
 def thread_done(cap: int = 0) -> str:
     """SQL, 1 or 0: post p's thread needs no more comment downloads. Saved whole (WHOLE_THREAD), or with a
     per-thread ``cap`` (Coverage's), holding that many comments: a download at that cap asks nothing more of it.
-    With SAMPLED, done once a sample download has its day's part of it saved (kind "sampled" in complete)."""
+    With SAMPLED, done once a sample download has its day's part of it saved (kind SAMPLE_MARK in complete)."""
     if cap == SAMPLED:
-        return (f"({WHOLE_THREAD} OR EXISTS (SELECT 1 FROM complete k WHERE k.kind = 'sampled' "
+        return (f"({WHOLE_THREAD} OR EXISTS (SELECT 1 FROM complete k WHERE k.kind = '{SAMPLE_MARK}' "
                 "AND k.subreddit = lower(p.subreddit) AND k.key = p.id))")
     return f"({WHOLE_THREAD} OR {SAVED_COMMENTS} >= {int(cap)})" if cap else WHOLE_THREAD
 
@@ -1447,11 +1452,11 @@ class Store:
         return {r["d"]: (r["whole"], r["n"]) for r in rows}
 
     def sampled_days(self, subreddit: str, after: float, before: float) -> set[int]:
-        """The UTC days in [after, before) with a post holding its part of a statistical sample (kind "sampled")."""
+        """The UTC days in [after, before) with a post holding its part of a statistical sample (kind SAMPLE_MARK)."""
         return {r[0] for r in self.db.execute(
             "SELECT DISTINCT CAST(p.created_utc / 86400 AS INTEGER) * 86400 FROM complete k JOIN posts p ON p.id = k.key "
-            "WHERE k.kind = 'sampled' AND k.subreddit = ? AND p.created_utc >= ? AND p.created_utc < ?",
-            (subreddit.lower(), after, before))}
+            "WHERE k.kind = ? AND k.subreddit = ? AND p.created_utc >= ? AND p.created_utc < ?",
+            (SAMPLE_MARK, subreddit.lower(), after, before))}
 
     def coverage_days(self, subreddit: str, cap: int = 0, since: float = 0) -> dict:
         """What Download coverage lists, in one read: the "days" with posts saved (downloaded_days), and per day the
@@ -1641,8 +1646,8 @@ class Store:
             self.search.drop("posts", [i for (i,) in self.db.execute("SELECT id FROM temp.gone")])
             self.db.execute("DELETE FROM comments WHERE id IN temp.gone_comments")
             self.db.execute("DELETE FROM comment_fetches WHERE post_id IN temp.gone")
-            self.db.execute("DELETE FROM complete WHERE kind IN ('comments', 'comments_so_far', 'sampled') AND subreddit = ? "
-                            "AND key IN temp.gone", (sub,))
+            self.db.execute("DELETE FROM complete WHERE kind IN ('comments', 'comments_so_far', ?, ?) AND subreddit = ? "
+                            "AND key IN temp.gone", (*SAMPLE_MARKS, sub))
             self.db.execute("DELETE FROM posts WHERE id IN temp.gone")
             self.db.executemany("DELETE FROM complete WHERE kind = 'posts' AND subreddit = ? AND key = ?",
                                 [(sub, str(d)) for d in days])

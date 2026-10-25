@@ -8,7 +8,7 @@ import time
 import pytest
 
 from subsentiment import arctic_shift, collect, sentiment
-from subsentiment.store import Store
+from subsentiment.store import SAMPLE_MARK, Store
 
 from fake_archive import DAY, FakeArchive, make_posts
 
@@ -165,9 +165,9 @@ def test_a_day_the_range_cuts_short_is_sampled_from_the_whole_day(archive, tmp_p
     # it; a fetch of the whole day kept those 278 beside the morning's 165, where the whole day gives it 158. Holding
     # such a day back instead gave it nothing, every time: a range from the Fetch form starts at a local midnight (here
     # 05:00 UTC, as at UTC-5) or N days ago, so its first and last UTC days are cut short.
-    archive([post("early", DAY0 + 3600, num_comments=1000), post("late", DAY0 + 20 * 3600, num_comments=1000),
-             post("next", DAY0 + DAY + 3600, num_comments=1000), post("next2", DAY0 + DAY + 20 * 3600,
-                                                                     num_comments=1000)], rate=(10000, 1.0))
+    archive([post("early", DAY0 + 3600, num_comments=10000), post("late", DAY0 + 20 * 3600, num_comments=10000),
+             post("next", DAY0 + DAY + 3600, num_comments=10000), post("next2", DAY0 + DAY + 20 * 3600,
+                                                                     num_comments=10000)], rate=(10000, 1.0))
     s, whole = Store(tmp_path / "s.db"), Store(tmp_path / "whole.db")
     ids = ("early", "late", "next", "next2")
     collect.run(quick_client(), s, collect.FetchRequest("Sub", after=DAY0 + 5 * 3600, before=DAY0 + DAY + 5 * 3600,
@@ -177,7 +177,7 @@ def test_a_day_the_range_cuts_short_is_sampled_from_the_whole_day(archive, tmp_p
     want = {p: collect.Sample(whole.comment_totals("Sub", d, d + DAY)).quota(p)
             for d in (DAY0, DAY0 + DAY) for p in ids if p in whole.comment_totals("Sub", d, d + DAY)}
     assert all(want.values()) and {p: len(s.comment_ids(p)) for p in ids} == want
-    assert s.complete_keys("sampled", "sub") == set(ids)
+    assert s.complete_keys(SAMPLE_MARK, "sub") == set(ids)
     collect.run(quick_client(), s, req)  # the whole days again: nothing more to add
     assert {p: len(s.comment_ids(p)) for p in ids} == {p: len(whole.comment_ids(p)) for p in ids} == want
 

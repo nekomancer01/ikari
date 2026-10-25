@@ -237,8 +237,8 @@ Things to know about the archive:
 - **Comments are capped per post, or sampled per day.** **Keep** sets how many comments each post keeps
   (50 by default, or All) and whether those are the top-scoring or a random sample that stays the same
   for each post. **Sample** instead keeps a random sample of each UTC day's comments, big enough for
-  every sentiment share to be within 5 points at 95% confidence (385 comments on a busy day, fewer on a
-  quiet one; a day with fewer is saved whole), and fetches only the threads that hold part of it.
+  every sentiment share to be within 2 points at 99% confidence (about 4,150 comments on a very busy day,
+  2,270 of a 5,000 comment day; a day of up to 4,148 is saved whole), and fetches only the threads that hold part of it.
   Coverage has its own cap for its downloads and shows sampled days as Sampled.
 - **Scores and comment counts arrive late.** The archive saves each post within seconds, then fetches
   it again later, usually about 36 hours after posting and sometimes up to a week. Until then
