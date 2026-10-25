@@ -762,7 +762,8 @@ class Rescore(QObject):
     def _texts(kind: str, rows):
         """(a call giving the row's (id, sentiment, label), its text) for each of ``rows`` (a list, or a
         rows.RowSource). As a tuple, a row found waiting to be scored is let alone by the garbage collector: as dicts,
-        those waiting doubled how long each of its passes held up the window."""
+        those waiting doubled how long each of its passes held up the window. A source's rows are the ones it had
+        to begin with: rows a fetch adds meanwhile were scored by it, with the words as set now."""
         def text(*parts):
             return (parts[0] or "") if kind == "comments" else f"{parts[0] or ''}\n\n{parts[1] or ''}".strip()
         if not isinstance(rows, RowSource):
@@ -770,7 +771,7 @@ class Rescore(QObject):
                 yield (lambda r=r: (r["id"], r["sentiment"], r["label"])), text(*(r[k] for k in TEXT[kind]))
             return
         ids, sentiment, label = rows.ids, rows.sentiment, rows.label
-        for i, parts in enumerate(zip(*(rows.values(k) for k in TEXT[kind]))):
+        for i, parts in zip(range(len(ids)), zip(*(rows.values(k) for k in TEXT[kind]))):
             yield (lambda i=i: (ids[i].decode() if isinstance(ids[i], bytes) else ids[i], float(sentiment[i]),
                                 LABELS[label[i]] if label[i] >= 0 else None)), text(*parts)
 
