@@ -1376,6 +1376,7 @@ class MainWindow(QMainWindow):
                 "This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_subreddit(self.current)
+        self.coverage.forget_stopped(self.current)
         self._loaded.clear()
         for key in days.settings_keys(self.current):
             self.settings.remove(key)
@@ -1392,6 +1393,7 @@ class MainWindow(QMainWindow):
                 "This can't be undone.") != QMessageBox.StandardButton.Yes:
             return
         self.store.delete_all()
+        self.coverage.forget_stopped()
         self._loaded.clear()
         self.settings.remove("ui/last_dataset")
         self.settings.remove(days.SETTINGS_GROUP)
