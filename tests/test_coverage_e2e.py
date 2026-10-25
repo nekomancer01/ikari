@@ -1090,3 +1090,24 @@ def test_a_download_starting_or_ending_only_marks_the_day_buttons(window, monkey
     assert drawn == [] and all(b.later for b in buttons)
     c.set_busy(False)
     assert drawn == [] and not any(b.later for b in buttons)
+
+
+def test_switching_to_a_subreddit_with_no_saved_days_leaves_no_comments_button_for_the_last_ones_posts(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    c.day_table.selectRow(c.days.index(TODAY - DAY))  # p0's day: its comments aren't saved
+    settle(w)
+    assert c.all_comments.isEnabled()
+    w.store.db.execute("DELETE FROM posts WHERE subreddit='rust'")  # r/rust lists no days
+    w.store.commit()
+    select(w, "rust")
+    settle(w)
+    assert c.days == [] and not c.all_comments.isEnabled()
+    c.set_busy(False)  # as the window does when any download or delete ends while the page shows
+    assert not c.all_comments.isEnabled() and c.all_comments.text() == "Download all comments"
+    QTest.mouseClick(c.all_comments, Qt.MouseButton.LeftButton)
+    settle(w)
+    assert downloads() == [] and not w.fetch_job.busy
