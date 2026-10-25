@@ -20,6 +20,13 @@ def test_quotes_and_code_are_ignored():
     assert sentiment.score(text)[1] == "positive"
 
 
+def test_quotes_sent_html_escaped_are_ignored_too():
+    # Reddit's text arrives with its markup escaped: a quoted line starts "&gt;", not ">"
+    text = "&gt; this is awful and terrible, I hate it\n\nI agree &amp; thanks"
+    assert sentiment.clean(text) == "I agree & thanks"
+    assert sentiment.score(text) == sentiment.score("> this is awful and terrible, I hate it\n\nI agree & thanks")
+
+
 def test_markdown_links_keep_their_text():
     assert sentiment.clean("see [the great docs](https://x.y)") == "see the great docs"
 
@@ -80,6 +87,30 @@ def test_praise_for_a_fixed_mishap_is_not_sarcasm():
         assert sentiment.score(text)[1] == "negative", text
     assert sentiment.is_sarcastic(sentiment.clean("Yay, another bug that never gets fixed"))
     assert sentiment.is_sarcastic(sentiment.clean("Gotta love how the crash is not fixed"))
+
+
+def test_praise_that_a_mishap_never_happens_is_not_sarcasm():
+    # "never crashes" and "no lag" say the mishap doesn't happen: the frame around them is sincere
+    for text in ("I love how this game never crashes",
+                 "Gotta love how it doesn't lag at all",
+                 "I love how there are zero bugs in this release",
+                 "Yay, no lag today!",
+                 "I love how stable it is, not a single crash",
+                 "I love when the traffic is light",
+                 "Gotta love how it runs for hours without a single crash"):
+        assert not sentiment.is_sarcastic(sentiment.clean(text)), text
+        assert sentiment.score(text)[1] == "positive", text
+    # one that happens all the same, or won't stop happening, still is a mishap
+    for text in ("I love how this game crashes every hour",
+                 "Gotta love how it never stops crashing",
+                 "Oh great, no fix for the lag again",
+                 "Yay, another bug that never gets fixed",
+                 "Gotta love how you can't go a day without a crash",
+                 "Love how it never runs without crashing"):
+        assert sentiment.is_sarcastic(sentiment.clean(text)), text
+    # "can't ... without" and "never ... without" say it happens every time: the praise is sarcastic
+    for text in ("Gotta love how you can't go a day without a crash", "Love how it never runs without crashing"):
+        assert sentiment.score(text)[1] == "negative", text
 
 
 def test_a_post_of_many_short_lines_scores_quickly():
