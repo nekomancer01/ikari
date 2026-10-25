@@ -520,6 +520,36 @@ def test_stop_ends_a_fetch_and_frees_the_form(env, monkeypatch):
     assert "Stopped" in w.progress_msg.text() or "stopped" in w.progress_msg.text().lower()
 
 
+def test_comments_a_stopped_fetch_owed_are_fetched_by_the_next_one(env):
+    # Stopped while a day's comments came in, the rest of its posts were left with none, and as the day had been
+    # read to its end (complete), fetching it again never asked for them.
+    w = env.window()
+    env.archive.delays["/api/comments/tree"] = 0.3
+    w.fetch_form.subreddit.setText("python")
+    w.fetch_form.include_comments.setChecked(True)
+    w.fetch_form.range.setCurrentIndex(w.fetch_form.range.findData("week"))
+    QTest.mouseClick(w.fetch_btn, Qt.MouseButton.LeftButton)
+    past = {p["id"] for p in env.archive.posts if p["created_utc"] < NOW // DAY * DAY}
+    end = time.monotonic() + 30  # Stop once two threads of a day before today, read to its end, are asked for
+    while len([q for p, q in list(env.archive.requests) if p == "/api/comments/tree"
+               and q["link_id"].removeprefix("t3_") in past]) < 2 and time.monotonic() < end:
+        pump(20)
+    QTest.mouseClick(w.stop_btn, Qt.MouseButton.LeftButton)
+    wait_idle(w)
+    env.archive.delays.clear()
+    store = env.store()
+    complete = {int(d) for d in store.complete_keys("posts", "python")}
+    owed = lambda: {r["id"] for r in store.posts_between("python", None, None)  # noqa: E731
+                    if r["num_comments"] != 0 and not r["image"] and (r["created_utc"] // DAY * DAY) in complete} - {
+        c["post_id"] for c in store.comments("python")}
+    assert owed()  # a complete day's posts the stopped fetch never got to
+    env.archive.clear()
+    fetch(w, comments=False)  # without comments, none are asked for
+    assert "/api/comments/tree" not in env.archive.paths()
+    fetch(w)
+    assert not owed()
+
+
 def test_stop_takes_effect_at_once_even_while_requests_wait_out_timeouts(env, monkeypatch):
     # Real waits (a timeout costs 2 s, then 4 s): r/AskReddit times out on most pages, so four requests
     # are sitting in backoffs when Stop is pressed.
