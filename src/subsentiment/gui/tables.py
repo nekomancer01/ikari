@@ -9,8 +9,8 @@ from itertools import islice
 from typing import Any, Callable
 
 import numpy as np
-from PySide6.QtCore import (QAbstractTableModel, QEvent, QItemSelectionModel, QModelIndex, QRect, QRectF, QSize, Qt,
-                            QTimer, QUrl, Signal)
+from PySide6.QtCore import (QAbstractTableModel, QEvent, QItemSelection, QItemSelectionModel, QItemSelectionRange,
+                            QModelIndex, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal)
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QHeaderView, QLineEdit, QStyle, QStyledItemDelegate,
@@ -1002,8 +1002,9 @@ class TablePage(QWidget):
                     if builds != self._builds:
                         return
             picked = np.concatenate(parts) if parts else at[:0]
-        chosen = self.view.selectionModel().selectedRows()
-        selected = {int(self.model.order[i.row()]) for i in chosen}
+        # Read as runs of rows, not an index a row: Ctrl+A on 100,000 rows is one run (selectedRows took seconds).
+        selected = np.concatenate([self.model.order[r.top():r.bottom() + 1]
+                                   for r in self.view.selectionModel().selection()] or [self.model.order[:0]])
         current = self.view.currentIndex()
         current_at = int(self.model.order[current.row()]) if current.isValid() else None
         if step is None or self.model.here(source, len(picked)):
@@ -1013,17 +1014,21 @@ class TablePage(QWidget):
             if order is None or builds != self._builds:
                 return
         self._last = (label, needle, picked) if needle else None
-        if current_at is not None or 0 < len(selected) <= 1000:  # rows picked before still are, if the filters show them
-            wanted = np.array(sorted(selected | ({current_at} - {None})), np.int64)
-            for i in np.flatnonzero(np.isin(self.model.order, wanted)).tolist():
-                p = int(self.model.order[i])
-                if p == current_at:
-                    self.view.selectionModel().setCurrentIndex(
-                        self.model.index(i, current.column()), QItemSelectionModel.SelectionFlag.NoUpdate)
-                if p in selected:
-                    self.view.selectionModel().select(
-                        self.model.index(i, 0),
-                        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        # Rows picked before still are, if the filters show them: selected again as runs of rows, in one go.
+        if current_at is not None:
+            at = np.flatnonzero(self.model.order == current_at)
+            if len(at):
+                self.view.selectionModel().setCurrentIndex(
+                    self.model.index(int(at[0]), current.column()), QItemSelectionModel.SelectionFlag.NoUpdate)
+        rows = np.flatnonzero(np.isin(self.model.order, selected)) if len(selected) else selected
+        if len(rows):
+            breaks = np.flatnonzero(np.diff(rows) != 1) + 1
+            # Added as whole rows in one go: QItemSelection.select merges each run into the ones before it, which
+            # took seconds with thousands of runs (a selection made with a filter on, the filter then cleared).
+            runs, index, last = QItemSelection(), self.model.createIndex, self.model.columnCount() - 1
+            runs += [QItemSelectionRange(index(a, 0), index(b, last))
+                     for a, b in zip(rows[np.r_[0, breaks]].tolist(), rows[np.r_[breaks - 1, len(rows) - 1]].tolist())]
+            self.view.selectionModel().select(runs, QItemSelectionModel.SelectionFlag.Select)
         if not self.filter.text():  # typing a filter keeps the columns as they are
             self._fit_due = True
             if self.isVisible():  # a page out of sight sizes them when it next shows

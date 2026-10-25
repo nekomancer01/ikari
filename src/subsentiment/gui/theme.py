@@ -24,7 +24,7 @@ from PySide6.QtGui import (QColor, QFont, QFontDatabase, QGuiApplication, QImage
 from PySide6.QtWidgets import (QApplication, QCalendarWidget, QComboBox, QDateEdit, QLineEdit, QPlainTextEdit, QProxyStyle,
                                QPushButton, QSpinBox, QTableView, QWidget)
 
-from subsentiment.gui import native
+from subsentiment.gui import motion, native
 
 ASSETS = Path(__file__).parent / "assets"
 
@@ -427,7 +427,7 @@ class MoodTint(QObject):
     def _go(self) -> None:
         target = self._target if self.enabled else QPointF(self.state.x(), 0.0)
         self._anim.stop()
-        if not self._window.isVisible():  # nothing to watch yet: jump straight there
+        if not self._window.isVisible() or not motion.enabled():  # nothing to watch yet, or motion off: jump there
             self._step(target)
             return
         self._anim.setStartValue(QPointF(self.state))

@@ -12,7 +12,7 @@ import bisect
 import math
 from functools import partial
 
-from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QFontMetricsF, QPainter, QPen, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QToolTip, QVBoxLayout, QWidget,
@@ -213,7 +213,8 @@ class TimelineChart(theme.OnCard):
 
     `notes` mark days the user picked out: each one's label sits on its point (a week or month's point shows
     the first in it), the hover box adds its description, and the navigator marks where it is. Clicking a day's
-    dot (or its label) sends `note_requested` with the day; clicking a week or month's zooms in to its days."""
+    dot (or its label) sends `note_requested` with the day, once the click can no longer turn out to be the
+    first of a double-click; clicking a week or month's zooms in to its days."""
 
     note_requested = Signal(int)
     view_changed = Signal()
@@ -236,6 +237,12 @@ class TimelineChart(theme.OnCard):
         self._pointer: QPointF | None = None  # where the pointer is over the chart
         self._drag: tuple | None = None  # (what, x where it started, view then)
         self._select: tuple[float, float] | None = None  # the band dragged across the plot, in x pixels
+        self._pressed_at = 0  # when the left button last went down, in event milliseconds
+        # A day's dot clicked: its note is asked for when a second click would no longer be a double-click,
+        # as the note's dialog would take that click and the double-click (every day again) would open it.
+        self._note_day = 0
+        self._note = QTimer(self, singleShot=True)
+        self._note.timeout.connect(lambda: self.note_requested.emit(self._note_day))
         self.notes: dict[int, tuple[str, str]] = {}  # {day start: (label, description)}
         self._note_days: list[int] = []
         self._pills: list[tuple[QRectF, tuple]] = []  # each note label as painted, and the point it is on
@@ -278,6 +285,7 @@ class TimelineChart(theme.OnCard):
         self._apply(False, follow=True)
 
     def set_notes(self, notes: dict[int, tuple[str, str]]) -> None:
+        self._note.stop()  # another subreddit's notes: a dot just clicked was one of the last one's days
         self.notes = dict(notes)
         self._note_days = sorted(self.notes)
         self._version += 1
@@ -422,7 +430,9 @@ class TimelineChart(theme.OnCard):
         for key, days in PRESETS:
             button = self.presets[key]
             button.setEnabled(days is None or days * DAY < b - a)  # a span longer than the days there are is All
-            button.setChecked(key == self.preset)
+            # A range button longer than the days there are shows every day: All is marked, though the button
+            # is still the one kept (and saved), to show the latest days once there are more.
+            button.setChecked(key == ("All" if self.view is None else self.preset))
 
     # -- geometry ---------------------------------------------------------------------------------------
 
@@ -740,6 +750,8 @@ class TimelineChart(theme.OnCard):
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
+        self._pressed_at = event.timestamp()
+        self._note.stop()  # clicked again: the note waiting is for a double-click or a click that's moved on
         plot, nav = self._areas()
         pos = event.position()
         if nav.adjusted(-6, -4, 6, 4).contains(pos):
@@ -798,7 +810,10 @@ class TimelineChart(theme.OnCard):
             self.set_view(self._t(x0, lo, hi, plot), self._t(x1, lo, hi, plot), animate=True)
         elif point := self._target(event.position()):
             if self.groups(lo, hi, plot.width())[0] == "day":
-                self.note_requested.emit(int(point[0]))
+                # A double-click is timed from the first press, so a click held down waits that much less.
+                self._note_day = int(point[0])
+                wait = QApplication.styleHints().mouseDoubleClickInterval() - (event.timestamp() - self._pressed_at)
+                self._note.start(max(0, wait))
             else:
                 self.set_view(point[0], point[1], animate=True)
 
@@ -815,6 +830,8 @@ class TimelineChart(theme.OnCard):
         return hit
 
     def mouseDoubleClickEvent(self, event) -> None:
+        self._note.stop()
+        self._drag = self._select = None  # its second release is no click on a dot
         if self._areas()[0].contains(event.position()):
             self.zoom_preset("All")
 

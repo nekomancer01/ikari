@@ -167,6 +167,29 @@ def test_background_mood_follows_the_dataset_and_can_be_turned_off(make_window):
     assert make_window().mood_act.isChecked() is False
 
 
+def test_with_reduce_motion_the_background_mood_jumps_to_another_subreddit(make_window, tmp_path, monkeypatch):
+    from subsentiment.gui import motion
+    monkeypatch.setattr(motion, "_os_allows", True)  # CI's Windows runner has animations off
+    monkeypatch.setattr(motion, "_wanted", True)
+    s = Store(tmp_path / "w.db")
+    for i in range(3):  # rust reads negative
+        s.save_post(Post(f"n{i}", "rust", "awful", "", "a", 1, 0.9, 0, 1_700_000_000.0, "https://r", ""), -0.5, "negative")
+    s.commit()
+    s.close()
+    w = make_window()
+    w.show()
+    w._show_dataset("Python")
+    QApplication.processEvents()
+    w._show_dataset("rust")  # with motion on it eases there
+    assert w.mood._anim.state() == w.mood._anim.State.Running
+    w.motion_act.setChecked(True)  # View > Reduce motion
+    w._show_dataset("Python")
+    assert w.mood._anim.state() != w.mood._anim.State.Running
+    assert (w.mood.state.x(), w.mood.state.y()) == (1.0, 1.0)
+    w._show_dataset("rust")
+    assert w.mood._anim.state() != w.mood._anim.State.Running and w.mood.state.x() < 0
+
+
 def test_background_mood_uses_the_chart_colors_in_both_themes(make_window):
     from PySide6.QtGui import QColor
     from subsentiment.gui import charts, theme
