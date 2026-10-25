@@ -732,7 +732,8 @@ class Rescore(QObject):
 
     def _search(self, sub: str, words: set[str], rows: dict):
         """Find the items using ``words``, yielding after each, and send them to be scored a chunk at a time."""
-        self._lexicon = (self.store.lexicon(sub).weights, frozenset(words))
+        # As saved now: the store's lexicon can be a second behind one an import saved on its own connection.
+        self._lexicon = (Lexicon(self.store.words(sub)).weights, frozenset(words))
         uses = Lexicon(dict.fromkeys(words, 0.0)).uses
         for kind in KINDS:  # a source's text is read first: on a thread, a big step at a time
             if isinstance(rows[kind], RowSource):
