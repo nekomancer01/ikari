@@ -1677,10 +1677,11 @@ class Store:
         self.db.commit()
         self._compact()
 
-    def import_from(self, path: str | Path) -> tuple[int, int]:
+    def import_from(self, path: str | Path) -> tuple[int, int, dict[str, set[str]]]:
         """Merge another ikari database into this one: rows this one lacks are added, and a row both have
         keeps the copy fetched (or, for a timeline note or a word's meaning, saved) last. Nothing is removed from either file. Returns (new posts, new comments),
-        image posts and their comments left out as they are everywhere.
+        image posts and their comments left out as they are everywhere, and {subreddit: words} whose meaning some
+        of its saved items were scored by is no longer what it is: they're to be scored again.
         Raises sqlite3.DatabaseError if path isn't an ikari database, ValueError if it is this one,
         FileNotFoundError if there's no file there."""
         if not Path(path).is_file():  # ATTACH would create an empty file there
@@ -1728,13 +1729,31 @@ class Store:
                     "SELECT subreddit, day, label, text, saved_at FROM other.notes o WHERE NOT EXISTS (SELECT 1 FROM "
                     "main.notes m WHERE m.subreddit = o.subreddit AND m.day = o.day "
                     "AND COALESCE(m.saved_at, 0) >= COALESCE(o.saved_at, 0))")
-            if "words" in tables:  # likewise a word both have set in a subreddit
+            # The words each subreddit's saved items were scored by with another meaning than they now have, for
+            # the window to score those items again (Rescore): this file's, where the other file's meaning wins...
+            rescore: dict[str, set[str]] = {}
+            theirs = "words" in tables
+            if theirs:
+                for sub, word in self.db.execute(
+                        "SELECT subreddit, word FROM other.words o WHERE NOT EXISTS (SELECT 1 FROM main.words m "
+                        "WHERE m.subreddit = o.subreddit AND m.word = o.word AND (m.weight = o.weight "
+                        "OR COALESCE(m.saved_at, 0) >= COALESCE(o.saved_at, 0)))"):
+                    rescore.setdefault(sub, set()).add(word)
+            if theirs:  # likewise a word both have set in a subreddit
                 self.db.execute(
                     "INSERT OR REPLACE INTO main.words (subreddit, word, weight, saved_at) "
                     "SELECT subreddit, word, weight, saved_at FROM other.words o WHERE NOT EXISTS (SELECT 1 FROM "
                     "main.words m WHERE m.subreddit = o.subreddit AND m.word = o.word "
                     "AND COALESCE(m.saved_at, 0) >= COALESCE(o.saved_at, 0))")
                 self._lexicons.clear()
+            # ...and those taken from it, where this file's meaning wins or it had none.
+            other_weight = ("SELECT o.weight FROM other.words o WHERE o.subreddit = m.subreddit AND o.word = m.word"
+                            if theirs else "SELECT NULL")
+            for sub, word in self.db.execute(
+                    f"SELECT subreddit, word FROM main.words m WHERE m.weight IS NOT ({other_weight}) AND subreddit IN "
+                    "(SELECT lower(subreddit) FROM main.posts WHERE id IN temp.taken_posts UNION "
+                    "SELECT lower(subreddit) FROM main.comments WHERE id IN temp.taken_comments)"):
+                rescore.setdefault(sub, set()).add(word)
             for i in range(0, len(imported), 500):
                 ids = imported[i:i + 500]
                 self._mark_images(self.db.execute(
@@ -1755,7 +1774,7 @@ class Store:
             for t in ("new_posts", "new_comments", "taken_posts", "taken_comments", "taken_comment_fetches"):
                 self.db.execute(f"DROP TABLE IF EXISTS temp.{t}")
             self.db.execute("DETACH DATABASE other")
-        return new_posts, new_comments
+        return new_posts, new_comments, rescore
 
     def _take_text(self, table: str) -> None:
         """Fill in the text of the rows import_from just took packed from the attached file, from its packs."""

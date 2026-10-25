@@ -1,6 +1,7 @@
 """Menu-driven "check for updates" flow: query GitHub, ask, download, hand off to the installer."""
 from __future__ import annotations
 
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -22,6 +23,7 @@ class UpdateFlow(QObject):
         self.window, self.settings = window, settings
         self._busy = False
         self._cancel = False
+        self._manual = False  # Check for updates was clicked while the startup check ran
         self._dialog: QProgressDialog | None = None
         self._checked.connect(self._on_checked)
         self._progress.connect(self._on_progress)
@@ -30,6 +32,11 @@ class UpdateFlow(QObject):
     def check(self, silent: bool = False) -> None:
         """silent=True is the startup check: say nothing unless a new version exists."""
         if self._busy:
+            if self._dialog is not None:  # a download is running: show its progress
+                self._dialog.raise_()
+                self._dialog.activateWindow()
+            elif not silent:  # the startup check is running: answer the click with its result
+                self._manual = True
             return
         self._busy = True
 
@@ -43,6 +50,7 @@ class UpdateFlow(QObject):
 
     def _on_checked(self, result, silent: bool) -> None:
         self._busy = False
+        silent, self._manual = silent and not self._manual, False
         if isinstance(result, updater.UpdateError):
             if not silent:
                 QMessageBox.warning(self.window, "Check for updates", str(result))
@@ -62,8 +70,11 @@ class UpdateFlow(QObject):
         box.setText(f"Version {rel.version} is available (you have {__version__}).")
         if rel.notes.strip():
             box.setInformativeText(rel.notes.strip()[:600])
+        # Run from source, an installer would set up a separate packaged copy and quit this one, so the
+        # release page is offered instead.
+        asset_url = rel.asset_url if getattr(sys, "frozen", False) else None
         install = None
-        if rel.asset_url:
+        if asset_url:
             install = box.addButton("Download and install", QMessageBox.ButtonRole.AcceptRole)
         else:
             install = box.addButton("Open release page", QMessageBox.ButtonRole.AcceptRole)
@@ -74,7 +85,7 @@ class UpdateFlow(QObject):
         if clicked is skip and skip is not None:
             self.settings.setValue("updates/skip", rel.version)
         elif clicked is install:
-            if rel.asset_url:
+            if asset_url:
                 self._download(rel)
             else:
                 QDesktopServices.openUrl(QUrl(rel.page_url))
@@ -117,8 +128,9 @@ class UpdateFlow(QObject):
             handed_off = updater.launch_installer(result)
         except updater.UpdateError as e:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(result.parent)))
-            QMessageBox.warning(self.window, "Update failed",
-                                f"{e}\n\nDownloaded {result.name}. Extract it over this copy to update.")
+            finish = ("Extract it over this copy to update." if result.suffix.lower() == ".zip"
+                      else "Open it to finish updating.")
+            QMessageBox.warning(self.window, "Update failed", f"{e}\n\nDownloaded {result.name}. {finish}")
             return
         if handed_off:
             QApplication.quit()
