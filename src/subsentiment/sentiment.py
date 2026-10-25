@@ -47,9 +47,12 @@ _COMPLAINT = re.compile(
 )
 # Where a complaint word isn't one: a mishap that's been fixed or is gone ("it fixed my bug", "the lag is
 # finally gone", "no more crashes"), one that doesn't happen ("never crashes", "not a single bug", "doesn't lag"),
-# light traffic, or a record broken.
+# light traffic, or a record broken. A "without" after a negation in the same clause ("can't go a day without a
+# crash", "never runs without crashing") says the mishap does happen: that's matched as ``kept`` and left in.
 _HARMLESS = re.compile(
-    r"(?<!\bnot )(?<!\bnever )(?<!n't )\b(?:fixe[sd]|solved|resolved|patched|got rid of|no more|no longer)\s+"
+    r"(?P<kept>\b(?:never|no|not|\w+n['’]t)\s[^.,;!?]*?\bwithout\s+(?:(?:a|an|the|any|single|one|real|major|big|even|once)\s+){0,2}"
+    + _COMPLAINT.pattern + r")"
+    r"|(?<!\bnot )(?<!\bnever )(?<!n't )\b(?:fixe[sd]|solved|resolved|patched|got rid of|no more|no longer)\s+"
     r"(?:[\w'-]+\s+){0,3}?" + _COMPLAINT.pattern
     + r"|" + _COMPLAINT.pattern + r"\s+(?:(?:is|are|was|were|has been|have been|got|all|now|finally|completely)\s+){0,3}"
     r"(?:fixed|solved|resolved|patched|gone)\b"
@@ -150,7 +153,7 @@ def is_sarcastic(cleaned: str, negative=_negative) -> bool:
         return True
     if not _SARCASM_FRAME.search(cleaned):
         return False
-    rest = _HARMLESS.sub(" ", _SARCASM_FRAME.sub(" ", cleaned)).strip(" ,.!?")
+    rest = _HARMLESS.sub(lambda m: m["kept"] or " ", _SARCASM_FRAME.sub(" ", cleaned)).strip(" ,.!?")
     return bool(rest) and negative(rest)
 
 
