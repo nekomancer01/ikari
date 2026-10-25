@@ -290,6 +290,19 @@ def test_typing_a_filter_keeps_the_selected_row_selected(window):
     assert tab.view.selectionModel().selectedRows() == []
 
 
+def test_typing_a_filter_after_select_all_keeps_the_rows_it_shows_selected(window):
+    # Ctrl+A on more than a thousand rows, then typing a filter, left nothing selected.
+    tab = window.comments_tab
+    tab.view.setFocus()
+    QTest.keyClick(tab.view, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+    assert len(tab.view.selectionModel().selectedRows()) == tab.model.rowCount() == COMMENTS
+    tab.filter.setText("great")
+    filtered(tab)
+    shown = tab.model.rowCount()
+    assert 1000 < shown < COMMENTS
+    assert len(tab.view.selectionModel().selectedRows()) == shown
+
+
 def test_rows_without_a_date_sort_with_the_dated_ones():
     m = RowsModel(POST_COLUMNS)
     row = lambda i, t: {"id": f"p{i}", "sentiment": 0.0, "label": "neutral", "title": "t", "selftext": "",  # noqa: E731

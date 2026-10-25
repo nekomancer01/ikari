@@ -54,6 +54,7 @@ def test_a_link_to_another_site_is_explained():
     ("https://v.redd.it/abc", "", "hosted:video", False, False),  # videos aren't image posts
     ("", "", "", False, False),
     (None, None, "", None, False),
+    ("http://[bad", "", "", False, False),  # a url urlsplit can't read (Invalid IPv6 URL)
 ])
 def test_is_image_post(url, text, hint, gallery, image):
     assert is_image_post(url, text, hint, gallery) is image

@@ -157,6 +157,29 @@ def test_background_mood_follows_the_dataset_and_can_be_turned_off(make_window):
     assert make_window().mood_act.isChecked() is False
 
 
+def test_with_reduce_motion_the_background_mood_jumps_to_another_subreddit(make_window, tmp_path, monkeypatch):
+    from subsentiment.gui import motion
+    monkeypatch.setattr(motion, "_os_allows", True)  # CI's Windows runner has animations off
+    monkeypatch.setattr(motion, "_wanted", True)
+    s = Store(tmp_path / "w.db")
+    for i in range(3):  # rust reads negative
+        s.save_post(Post(f"n{i}", "rust", "awful", "", "a", 1, 0.9, 0, 1_700_000_000.0, "https://r", ""), -0.5, "negative")
+    s.commit()
+    s.close()
+    w = make_window()
+    w.show()
+    w._show_dataset("Python")
+    QApplication.processEvents()
+    w._show_dataset("rust")  # with motion on it eases there
+    assert w.mood._anim.state() == w.mood._anim.State.Running
+    w.motion_act.setChecked(True)  # View > Reduce motion
+    w._show_dataset("Python")
+    assert w.mood._anim.state() != w.mood._anim.State.Running
+    assert (w.mood.state.x(), w.mood.state.y()) == (1.0, 1.0)
+    w._show_dataset("rust")
+    assert w.mood._anim.state() != w.mood._anim.State.Running and w.mood.state.x() < 0
+
+
 def test_background_mood_uses_the_chart_colors_in_both_themes(make_window):
     from PySide6.QtGui import QColor
     from subsentiment.gui import charts, theme
@@ -1016,3 +1039,26 @@ def test_custom_dates_can_reach_a_day_begun_since_the_app_started(make_window):
     assert form.range.currentData() == "custom" and form.date_from.date() == yesterday.addDays(-3)  # left as picked
     form.date_to.setDate(QDate.currentDate())
     assert form.date_to.date() == QDate.currentDate()
+
+
+def test_check_for_updates_clicked_during_the_startup_check_still_answers(make_window, monkeypatch):
+    # The click came while the silent startup check was still waiting on GitHub, and was dropped: no answer at all.
+    from subsentiment import __version__, updater
+    w = make_window()
+    gate = threading.Event()
+
+    def slow():
+        gate.wait(5)
+        return updater.Release(__version__, "v" + __version__, "", "https://x", None, None)
+    monkeypatch.setattr(updater, "latest_release", slow)
+    told = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: told.append(a[2]))
+    w.updates.check(silent=True)
+    help_menu = next(a.menu() for a in w.menuBar().actions() if a.text() == "&Help")
+    next(a for a in help_menu.actions() if a.text().startswith("Check for updates")).trigger()
+    gate.set()
+    end = time.monotonic() + 5
+    while not told and time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert told == [f"You are up to date (version {__version__})."]

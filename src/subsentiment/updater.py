@@ -230,14 +230,15 @@ def stage_portable_update(zip_path: Path, folder: Path, pid: int, exe_name: str)
         items = sorted(p.name for p in new.iterdir())
         if exe_name not in items or STAGING in items or not all(_SAFE_NAME.match(n) for n in items):
             raise UpdateError("The update archive does not look like an ikari build.")
-    except BaseException:
+        script = staging / "apply-update.cmd"
+        script.write_text(_SWAP_SCRIPT.format(
+            pid=int(pid), exe=exe_name, staging=STAGING,
+            items=" ".join(f'"{n}"' for n in items)).replace("\n", "\r\n"), encoding="ascii")
+    except BaseException as e:
         _rmtree(staging)
+        if isinstance(e, OSError):  # a full disk, a file the antivirus holds
+            raise UpdateError(f"Could not prepare the update: {e}") from e
         raise
-
-    script = staging / "apply-update.cmd"
-    script.write_text(_SWAP_SCRIPT.format(
-        pid=int(pid), exe=exe_name, staging=STAGING,
-        items=" ".join(f'"{n}"' for n in items)).replace("\n", "\r\n"), encoding="ascii")
     return script
 
 
@@ -270,15 +271,22 @@ def launch_installer(path: Path, platform: str = sys.platform) -> bool:
         script = stage_portable_update(path, exe.resolve().parent, os.getpid(), exe.name)
         # A hidden console for the script and everything it runs. The reset variable makes the
         # relaunched ikari.exe start fresh instead of treating itself as a child of this process.
-        subprocess.Popen(["cmd.exe", "/d", "/c", str(script)], close_fds=True,
-                         cwd=str(script.parent.parent),
-                         env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"},
-                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        try:
+            subprocess.Popen(["cmd.exe", "/d", "/c", str(script)], close_fds=True,
+                             cwd=str(script.parent.parent),
+                             env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"},
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        except OSError as e:
+            _rmtree(script.parent)
+            raise UpdateError(f"Could not start the update: {e}") from e
         return True
     if platform.startswith("win") and path.suffix.lower() == ".exe":
         # The Inno Setup wizard closes this app if it is still running, then installs over it.
-        subprocess.Popen([str(path), "/CLOSEAPPLICATIONS"], close_fds=True,
-                         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        try:
+            subprocess.Popen([str(path), "/CLOSEAPPLICATIONS"], close_fds=True,
+                             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        except OSError as e:  # blocked by the antivirus or SmartScreen
+            raise UpdateError(f"Could not start the installer: {e}") from e
         return True
     return False  # zip/dmg/AppImage: the caller reveals the file for the user
