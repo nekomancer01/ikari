@@ -5,7 +5,7 @@ import hashlib
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Collection
 
 import numpy as np
@@ -198,8 +198,16 @@ class Download:
     def posts(self) -> FetchResult:
         """The posts of the range, and their comments (see run)."""
         req, store, name = self.req, self.store, self.name
-        # Asked for, whatever comes of it: Download coverage lists these days, to find what this fetch misses.
         end = time.time() if req.before is None else req.before
+        if self.sample and req.limit is None and not req.days:
+            # A sample is of each UTC day's comments, planned from all of the day's posts, so the whole of each UTC
+            # day the range touches is read: a range from the Fetch form starts at a local midnight, or N days ago,
+            # and a sample planned from part of a day gave its posts a share of the whole day (held for good), or,
+            # waiting for a read of the rest that never came, gave the day none.
+            start = end - 7 * DAY if req.after is None else req.after
+            self.req = req = replace(req, after=int(start // DAY * DAY),
+                                     before=None if req.before is None else math.ceil(end / DAY) * DAY)
+        # Asked for, whatever comes of it: Download coverage lists these days, to find what this fetch misses.
         store.save_tried(name, req.days or days_in(end - 7 * DAY if req.after is None else req.after, end))
         picked_days = set(req.days)
         self.stored = {r["id"]: r for r in store.posts_between(name, req.after, req.before)
@@ -271,13 +279,6 @@ class Download:
             timed_out = getattr(self.client, "timed_out", False)
             self.unread |= {d for d in days_in(lo, hi) for a, b in getattr(self.client, "unread", None) or ()
                             if a < d + DAY and b > d}
-            if self.sample:
-                # A day the range asked for cuts short, at its start or its end (not one that just isn't over
-                # yet), waits too, unless some fetch has read the rest of it: a sample planned from part of a
-                # day's posts gives each of them a share of the whole day.
-                spans, now = self.store.read_spans(self.name), time.time() - INGEST_LAG
-                self.unread |= {d for d in days_in(lo, hi) for x, y in ((d, lo), (hi, min(d + DAY, now)))
-                                if y > x and not any(a <= x and b >= y - 1 for a, b in spans)}
             fruitless = fruitless + 1 if timed_out and not got else 0
             rate = None if timed_out or self.should_stop() else (len(got) + len(in_run)) / (hi - lo)
             day_new, day_settled = self.settle(got)

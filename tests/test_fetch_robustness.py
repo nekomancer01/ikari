@@ -160,21 +160,26 @@ def quick_client():
     return arctic_shift.ArcticShiftClient(limiter=arctic_shift.RateLimiter(0), workers=1)
 
 
-def test_a_day_the_range_cuts_short_isnt_sampled_until_the_rest_of_it_is_read(archive, tmp_path):
+def test_a_day_the_range_cuts_short_is_sampled_from_the_whole_day(archive, tmp_path):
     # Sampling the afternoon of a day sized its sample from the afternoon's thread alone (278 of its 1,000) and held
-    # it; a fetch of the whole day kept those 278 beside the morning's 165, where the whole day gives it 158.
-    archive([post("early", DAY0 + 3600, num_comments=1000), post("late", DAY0 + 20 * 3600, num_comments=1000)],
-            rate=(10000, 1.0))
+    # it; a fetch of the whole day kept those 278 beside the morning's 165, where the whole day gives it 158. Holding
+    # such a day back instead gave it nothing, every time: a range from the Fetch form starts at a local midnight (here
+    # 05:00 UTC, as at UTC-5) or N days ago, so its first and last UTC days are cut short.
+    archive([post("early", DAY0 + 3600, num_comments=1000), post("late", DAY0 + 20 * 3600, num_comments=1000),
+             post("next", DAY0 + DAY + 3600, num_comments=1000), post("next2", DAY0 + DAY + 20 * 3600,
+                                                                     num_comments=1000)], rate=(10000, 1.0))
     s, whole = Store(tmp_path / "s.db"), Store(tmp_path / "whole.db")
-    collect.run(quick_client(), s, collect.FetchRequest("Sub", after=DAY0 + 12 * 3600, before=DAY0 + 2 * DAY,
+    ids = ("early", "late", "next", "next2")
+    collect.run(quick_client(), s, collect.FetchRequest("Sub", after=DAY0 + 5 * 3600, before=DAY0 + DAY + 5 * 3600,
                                                         limit=None, comment_pick=collect.SAMPLE))
-    assert not s.comment_ids("late") and not s.complete_keys("sampled", "sub")  # waits for the rest of the day
     req = collect.FetchRequest("Sub", after=DAY0, before=DAY0 + 2 * DAY, limit=None, comment_pick=collect.SAMPLE)
-    collect.run(quick_client(), s, req)
     collect.run(quick_client(), whole, req)
-    sample = collect.Sample(whole.comment_totals("Sub", DAY0, DAY0 + DAY))
-    assert {p: len(s.comment_ids(p)) for p in ("early", "late")} == {
-        p: len(whole.comment_ids(p)) for p in ("early", "late")} == {p: sample.quota(p) for p in ("early", "late")}
+    want = {p: collect.Sample(whole.comment_totals("Sub", d, d + DAY)).quota(p)
+            for d in (DAY0, DAY0 + DAY) for p in ids if p in whole.comment_totals("Sub", d, d + DAY)}
+    assert all(want.values()) and {p: len(s.comment_ids(p)) for p in ids} == want
+    assert s.complete_keys("sampled", "sub") == set(ids)
+    collect.run(quick_client(), s, req)  # the whole days again: nothing more to add
+    assert {p: len(s.comment_ids(p)) for p in ids} == {p: len(whole.comment_ids(p)) for p in ids} == want
 
 
 def test_a_day_that_just_ended_isnt_complete_while_the_archive_can_still_take_posts_in(archive, tmp_path,
