@@ -63,6 +63,25 @@ def test_sarcasm_with_two_frames_and_an_everyday_complaint():
     assert not sentiment.is_sarcastic(sentiment.clean("Oh wow, my go-to for frozen fries"))
 
 
+def test_praise_for_a_fixed_mishap_is_not_sarcasm():
+    # the complaint word is about something that's over (or isn't a mishap), so the frame is sincere
+    for text in ("Thanks a lot for the help, it fixed my bug!",
+                 "Love how the devs fixed the crash so quickly, thank you",
+                 "Yay! Finally the bug is fixed, thank you so much",
+                 "Wow, what a great release, the bugs are all gone!",
+                 "Yay, I broke my personal record, so proud of myself!",
+                 "Oh great, my code finally works. Thanks everyone!"):
+        compound, label = sentiment.score(text)
+        assert label == "positive" and compound > 0, text
+    # a mishap that isn't over still is one
+    for text in ("Oh great, another crash. Thanks devs!",
+                 "Oh great, they fixed the bug and now it crashes on launch",
+                 "Thanks a lot for breaking my save"):
+        assert sentiment.score(text)[1] == "negative", text
+    assert sentiment.is_sarcastic(sentiment.clean("Yay, another bug that never gets fixed"))
+    assert sentiment.is_sarcastic(sentiment.clean("Gotta love how the crash is not fixed"))
+
+
 def test_a_post_of_many_short_lines_scores_quickly():
     # Quote stripping matched "\s*" across line breaks, so a long post of short lines took seconds.
     import time
