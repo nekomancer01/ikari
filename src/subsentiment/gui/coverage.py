@@ -1105,7 +1105,8 @@ class CoveragePage(VerticalScrollArea):
         # has, there's nothing to say more came; once it has, a count above what's saved brings them back).
         todo = [r["id"] for r in rows if not r["whole"]]
         self._todo_comments = todo
-        self.all_comments.setText(f"Download all comments ({plural(len(todo), 'post')})" if todo else "Download all comments")
+        self.all_comments.setText(f"Download all comments ({len(todo):,} post{'' if len(todo) == 1 else 's'})" if todo
+                                  else "Download all comments")
         self.all_comments.setEnabled(not self.busy and bool(todo))
         self._empty("No posts from this day are saved yet. Use the day's ↓ in the Posts column.")
         self.posts_empty.setVisible(not rows)
