@@ -210,6 +210,8 @@ class MainWindow(QMainWindow):
         self.import_job = BackgroundJob(self)  # merges another database in, on a connection of its own
         self.import_job.ended.connect(self._on_import_ended)
         self._importing: tuple = ()  # (the file being imported, what import_from returned or the error)
+        # {subreddit: words} an import changed what its items were scored by: they're rescored once it's packed.
+        self._imported_words: dict[str, set[str]] = {}
         # Writes a CSV file in a process of its own (Store.export): 650,000 comments took 23 s, with the
         # window frozen.
         self.export_job = BackgroundJob(self)
@@ -1119,6 +1121,10 @@ class MainWindow(QMainWindow):
             return
         self._upgraded.stop()
         self._wordless = False
+        # After it rather than beside it: its packing and the new scores' saving would wait on each other.
+        imported, self._imported_words = self._imported_words, {}
+        for sub, words in imported.items():
+            self.rescore.start(sub, words)
         self._update_delete_enabled()
         for key in [k for k, (_, saved) in self._loaded.items() if not all(getattr(s, "words", True) for s in saved.values())]:
             del self._loaded[key]
@@ -1329,6 +1335,7 @@ class MainWindow(QMainWindow):
         """The tables (and what export writes) take the rescored rows in one go: each update sorts a table again.
         The word clouds and tint follow."""
         rescored, self._rescored = self._rescored, {k: (None, []) for k in KINDS}
+        self._update_delete_enabled()  # import waits for it
         if self.current and self.current.lower() == sub:
             took = False
             for kind, tab in self.tabs.items():
@@ -1462,6 +1469,8 @@ class MainWindow(QMainWindow):
             return
         self._loaded.clear()
         self._wordless = True  # what it took is read without its words until it's packed (_after_upgrade)
+        for sub, words in got[2].items():
+            self._imported_words.setdefault(sub, set()).update(words)
         self.statusBar().showMessage(
             f"Imported {plural(got[0], 'new post')} and {plural(got[1], 'new comment')} from {path}", 8000)
         # What it took is packed there, as an older database's rows are (import is off till it's done).
