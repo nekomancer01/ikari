@@ -1138,3 +1138,24 @@ def test_a_post_with_more_comments_saved_than_the_archive_counted_says_so(window
     assert cell.main.text() == "5 saved"  # not "5 of 3"
     assert "more than the 3 Arctic Shift counted" in cell.toolTip()
     assert c.post_table.cellWidget(0, 2).findChild(QPushButton).text() == coverage.CHECK
+
+
+def test_switching_to_a_subreddit_with_no_saved_days_leaves_no_comments_button_for_the_last_ones_posts(window):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    c.day_table.selectRow(c.days.index(TODAY - DAY))  # p0's day: its comments aren't saved
+    settle(w)
+    assert c.all_comments.isEnabled()
+    w.store.db.execute("DELETE FROM posts WHERE subreddit='rust'")  # r/rust lists no days
+    w.store.commit()
+    select(w, "rust")
+    settle(w)
+    assert c.days == [] and not c.all_comments.isEnabled()
+    c.set_busy(False)  # as the window does when any download or delete ends while the page shows
+    assert not c.all_comments.isEnabled() and c.all_comments.text() == "Download all comments"
+    QTest.mouseClick(c.all_comments, Qt.MouseButton.LeftButton)
+    settle(w)
+    assert downloads() == [] and not w.fetch_job.busy
