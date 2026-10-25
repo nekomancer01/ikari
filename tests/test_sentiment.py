@@ -63,6 +63,25 @@ def test_sarcasm_with_two_frames_and_an_everyday_complaint():
     assert not sentiment.is_sarcastic(sentiment.clean("Oh wow, my go-to for frozen fries"))
 
 
+def test_praise_for_a_fixed_mishap_is_not_sarcasm():
+    # the complaint word is about something that's over (or isn't a mishap), so the frame is sincere
+    for text in ("Thanks a lot for the help, it fixed my bug!",
+                 "Love how the devs fixed the crash so quickly, thank you",
+                 "Yay! Finally the bug is fixed, thank you so much",
+                 "Wow, what a great release, the bugs are all gone!",
+                 "Yay, I broke my personal record, so proud of myself!",
+                 "Oh great, my code finally works. Thanks everyone!"):
+        compound, label = sentiment.score(text)
+        assert label == "positive" and compound > 0, text
+    # a mishap that isn't over still is one
+    for text in ("Oh great, another crash. Thanks devs!",
+                 "Oh great, they fixed the bug and now it crashes on launch",
+                 "Thanks a lot for breaking my save"):
+        assert sentiment.score(text)[1] == "negative", text
+    assert sentiment.is_sarcastic(sentiment.clean("Yay, another bug that never gets fixed"))
+    assert sentiment.is_sarcastic(sentiment.clean("Gotta love how the crash is not fixed"))
+
+
 def test_a_post_of_many_short_lines_scores_quickly():
     # Quote stripping matched "\s*" across line breaks, so a long post of short lines took seconds.
     import time
@@ -117,6 +136,18 @@ def test_a_word_neither_scorer_knows_set_to_neutral_changes_no_score():
     for text in texts:
         assert lex.score(text) == pytest.approx(sentiment.score(text), abs=1e-9), text
         assert lex.score(text, "vader") == pytest.approx(sentiment.score(text, "vader"), abs=1e-9), text
+
+
+def test_a_set_word_is_found_whichever_apostrophe_it_is_written_with():
+    """The word cloud reads "y’all" as "y'all", so a meaning set on either is found in both."""
+    for word, other in (("y'all", "y’all"), ("y’all", "y'all")):
+        lex = sentiment.Lexicon({word: 1.0})
+        for text in (f"{other} came to the meeting", f"{other.upper()} came to the meeting"):
+            assert lex.uses(text), text
+            assert lex.score(text)[1] == "positive", text
+            assert lex.score(text, "vader")[1] == "positive", text
+    lex = sentiment.Lexicon({"all": 1.0})
+    assert not lex.uses("y’all came") and lex.score("y’all came") == sentiment.score("y’all came")
 
 
 def test_a_set_word_keeps_its_meaning_next_to_punctuation_and_in_a_sarcastic_frame():
