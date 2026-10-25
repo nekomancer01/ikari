@@ -2,11 +2,16 @@
 archive sends, cuts time ranges and scores text. A failure prints the smallest input that breaks the rule."""
 import math
 
-from hypothesis import example, given, settings, strategies as st
+from hypothesis import HealthCheck, example, given, settings, strategies as st
 
 from subsentiment import arctic_shift as a
 from subsentiment.reddit import Comment, normalize_subreddit
 from subsentiment.sentiment import Lexicon, score
+
+# The suite runs a test per core, so a busy machine can slow one down: no time limit on an example or on making
+# inputs, which failed a run at random (only how many inputs are tried is set).
+settings.register_profile("loaded", deadline=None, suppress_health_check=[HealthCheck.too_slow])
+settings.load_profile("loaded")
 
 DAY = 86400
 # What json.loads can hand back: any mix of these, nested.
@@ -119,14 +124,13 @@ def agrees(compound: float, label: str) -> bool:
         label != "positive" or compound > 0) and (label != "negative" or compound < 0)
 
 
-@settings(deadline=None)
 @given(TEXT)
 def test_any_text_scores_in_range_with_a_label_that_agrees(text):
     for scorer in ("model", "vader"):
         assert agrees(*score(text, scorer))
 
 
-@settings(deadline=None, max_examples=50)
+@settings(max_examples=50)
 @given(st.dictionaries(st.sampled_from(["grind", "nerf", "buff", "dead", "mid", "goat", "ratio", "cope"]),
                        st.floats(-1, 1), min_size=1, max_size=4), TEXT)
 def test_a_subreddits_own_words_score_in_range_too(weights, text):
