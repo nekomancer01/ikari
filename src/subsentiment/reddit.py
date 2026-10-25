@@ -64,7 +64,10 @@ def is_image_post(url: str | None, selftext: str | None, post_hint: str = "", ga
         return False
     if post_hint == "image" or str(gallery).lower() == "true":  # the archive sometimes sends flags as text
         return True
-    parts = urlsplit(url or "")
+    try:
+        parts = urlsplit(url or "")
+    except ValueError:  # a url it can't read, such as "http://[bad" (an unclosed IPv6 host)
+        return False
     host, path = (parts.hostname or "").lower(), parts.path.lower()
     return (host in _IMAGE_HOSTS or path.endswith(_IMAGE_EXTENSIONS)
             or (host.endswith("reddit.com") and path.startswith("/gallery/")))
