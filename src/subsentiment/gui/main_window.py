@@ -1472,6 +1472,7 @@ class MainWindow(QMainWindow):
 
     def _forget_settings(self, subreddit: str | None) -> None:
         """Forget what's remembered of a deleted subreddit (its span), or of every one (None) and which was shown."""
+        self.coverage.forget_stopped(subreddit)
         if subreddit:
             for key in days.settings_keys(subreddit):
                 self.settings.remove(key)
