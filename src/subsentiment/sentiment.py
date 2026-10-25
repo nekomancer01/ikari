@@ -44,6 +44,16 @@ _COMPLAINT = re.compile(
     r"|freez(?:es|ing)|froze|stuck|delay(?:s|ed)?|cancel(?:l)?ed|outage|overtime|traffic)\b",
     re.IGNORECASE,
 )
+# Where a complaint word isn't one: a mishap that's been fixed or is gone ("it fixed my bug", "the lag is
+# finally gone", "no more crashes"), or a record broken.
+_HARMLESS = re.compile(
+    r"(?<!\bnot )(?<!\bnever )(?<!n't )\b(?:fixe[sd]|solved|resolved|patched|got rid of|no more|no longer)\s+"
+    r"(?:[\w'-]+\s+){0,3}?" + _COMPLAINT.pattern
+    + r"|" + _COMPLAINT.pattern + r"\s+(?:(?:is|are|was|were|has been|have been|got|all|now|finally|completely)\s+){0,3}"
+    r"(?:fixed|solved|resolved|patched|gone)\b"
+    r"|\b(?:break(?:s|ing)?|broke) (?:[\w'-]+ ){0,2}records?\b",
+    re.IGNORECASE,
+)
 
 
 @lru_cache(maxsize=1)
@@ -129,12 +139,12 @@ def _negative(cleaned: str, lexicon: Lexicon | None = None) -> bool:
 
 def is_sarcastic(cleaned: str, negative=_negative) -> bool:
     """True for obvious sarcasm in already-cleaned text (see the patterns above). ``negative`` says whether
-    what a positive frame is wrapped around reads negative."""
+    what a positive frame is wrapped around reads negative, leaving out any mishap it says is over."""
     if _SARCASM_MARKER.search(cleaned) or _EYEROLL.search(cleaned):
         return True
     if not _SARCASM_FRAME.search(cleaned):
         return False
-    rest = _SARCASM_FRAME.sub(" ", cleaned).strip(" ,.!?")
+    rest = _HARMLESS.sub(" ", _SARCASM_FRAME.sub(" ", cleaned)).strip(" ,.!?")
     return bool(rest) and negative(rest)
 
 

@@ -81,7 +81,9 @@ class Sample:
     """Which comments of one UTC day's saved posts make a simple random sample of the day's comments, big enough
     that each share (positive, negative, neutral) it measures is within MARGIN of the whole day's 19 times in 20.
     The day's comments are its posts' own counts (num_comments); the sample needs NEED of a big day, fewer of a
-    smaller one (the finite population correction), and a day with no more than NEED is kept whole.
+    smaller one (the finite population correction), and a day with no more than NEED is kept whole. So is a day with a
+    post not counted yet (about its first 36 hours): its share of the day isn't known, and a sample sized without it,
+    beside its thread kept whole, would hold far more of it than its share.
 
     The archive gives a thread whole or not at all (its tree can't sample or sort), so only threads holding part
     of the sample are fetched, and each keeps its quota, picked at random by keep. A quota comes from one draw per
@@ -98,7 +100,7 @@ class Sample:
         known = {pid: n for pid, n in counts.items() if n}
         self.counts = counts
         self.population = sum(known.values())
-        self.whole = self.population <= self.NEED
+        self.whole = self.population <= self.NEED or None in counts.values()
         self.size = self.population if self.whole else math.ceil(
             self.EXACT / (1 + (self.EXACT - 1) / self.population))
         self.quotas: dict[str, int] = {}
@@ -109,8 +111,8 @@ class Sample:
             self.quotas = {pid: int(np.count_nonzero(d <= line)) for pid, d in draws.items()}
 
     def quota(self, pid: str) -> int | None:
-        """How many of a post's comments the sample keeps; None for its whole thread: the day is small, or the post's
-        comments aren't counted yet (about its first 36 hours), so its share of the day isn't known."""
+        """How many of a post's comments the sample keeps; None for its whole thread: the day is small, or some post's
+        comments aren't counted yet (see Sample)."""
         n = self.counts.get(pid)
         if n is None or self.whole:
             return None
@@ -157,6 +159,9 @@ class Download:
         self.cap = 0 if self.sample else req.comments_per_post  # a sample asks for each thread whole, then cuts it
         self.fill = req.fill_threads or not self.cap  # keep asking for a thread until it's whole, or has cap saved
         self.samples: dict[int, Sample] = {}  # each UTC day's sample, planned once its posts are saved
+        # UTC days whose read left a stretch unread (the archive kept timing out on it): their samples wait for the
+        # fetch that reads the rest, as one planned without those posts would give the saved ones too big a share.
+        self.unread: set[int] = set()
         self.kept: dict[str, int] = {}  # threads read for the sample: how many comments each kept
         self.saved_whole: set[str] = set()  # saved posts whose whole thread is saved (when filling threads)
         self.saved_count: dict[str, int] = {}  # comments saved per post (when filling threads up to a cap)
@@ -264,6 +269,8 @@ class Download:
             seen |= in_run
             got = self.read(lo, hi, MAX_DAY_POSTS * n, True, say, skip=in_run)
             timed_out = getattr(self.client, "timed_out", False)
+            self.unread |= {d for d in days_in(lo, hi) for a, b in getattr(self.client, "unread", None) or ()
+                            if a < d + DAY and b > d}
             fruitless = fruitless + 1 if timed_out and not got else 0
             rate = None if timed_out or self.should_stop() else (len(got) + len(in_run)) / (hi - lo)
             day_new, day_settled = self.settle(got)
@@ -452,13 +459,16 @@ class Download:
     def sampled(self, posts: list[Post]) -> list[Post]:
         """Of these saved posts, the ones whose threads the sample still wants comments from (every one, when not
         sampling). The rest, with no part in their day's sample or holding it already, are marked done for the
-        sample ("sampled"), as Download coverage counts them."""
+        sample ("sampled"), as Download coverage counts them. Posts of a day that wasn't read to its end are left
+        for a later fetch (see unread)."""
         if not self.sample:
             return posts
         store, name, todo = self.store, self.name, []
         held = store.complete_keys("sampled", name)
         for p in posts:
             day = int(p.created_utc // DAY * DAY)
+            if day in self.unread:
+                continue
             if day not in self.samples:
                 self.samples[day] = Sample(store.comment_totals(name, day, day + DAY))
                 self.saved_count.update(store.comment_counts(name, day, day + DAY))
