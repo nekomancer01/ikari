@@ -342,10 +342,13 @@ class RateLimiter:
 
 
 def _number(value, default):
+    """A number from the archive; ``default`` for anything that isn't a finite one (JSON's NaN and Infinity included,
+    which int() can't take)."""
     try:
-        return float(value)
+        n = float(value)
     except (TypeError, ValueError):
         return default
+    return n if math.isfinite(n) else default
 
 
 def _meta(d: dict) -> dict:
@@ -355,8 +358,7 @@ def _meta(d: dict) -> dict:
 
 def _finite(value, kind=float):
     """A number from the archive as ``kind`` (int for a count: "1.5" is 1); 0 for anything that isn't a finite number."""
-    n = _number(value, 0.0)
-    return kind(n) if math.isfinite(n) else kind(0)
+    return kind(_number(value, 0.0))
 
 
 def _settled(d: dict) -> bool:
@@ -389,7 +391,7 @@ def _post(d: dict) -> Post:
         created_utc=_number(d.get("created_utc"), 0),
         permalink="https://www.reddit.com" + permalink,
         url=_text(d.get("url")),
-        image=is_image_post(d.get("url"), selftext, d.get("post_hint") or "", d.get("is_gallery")),
+        image=is_image_post(_text(d.get("url")), selftext, d.get("post_hint") or "", d.get("is_gallery")),
     )
 
 
@@ -1142,9 +1144,7 @@ def _walk(items: list, depth: int = 0):
         if not isinstance(d.get("depth"), int):  # missing, or null in a malformed record
             d["depth"] = depth
         yield d
-        replies = d.get("replies")
-        if isinstance(replies, dict):
-            yield from _walk((replies.get("data") or {}).get("children"), d["depth"] + 1)
+        yield from _walk(_children(d.get("replies")), d["depth"] + 1)
 
 
 def _collapsed(items: list) -> bool:
@@ -1152,13 +1152,19 @@ def _collapsed(items: list) -> bool:
     for item in items or ():
         if not isinstance(item, dict):
             continue
-        if item.get("kind") == "more" and ((item.get("data") or {}).get("children") or
-                                           (item.get("data") or {}).get("count")):
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        if item.get("kind") == "more" and (data.get("children") or data.get("count")):
             return True
-        replies = (item.get("data") or {}).get("replies")
-        if isinstance(replies, dict) and _collapsed((replies.get("data") or {}).get("children")):
+        if _collapsed(_children(data.get("replies"))):
             return True
     return False
+
+
+def _children(listing) -> list:
+    """A Listing's items ({"data": {"children": [...]}}); none for anything shaped otherwise."""
+    data = listing.get("data") if isinstance(listing, dict) else None
+    children = data.get("children") if isinstance(data, dict) else None
+    return children if isinstance(children, list) else []
 
 
 def _bucket_time(b) -> float | None:
@@ -1167,8 +1173,8 @@ def _bucket_time(b) -> float | None:
         return None
     v = b.get("created_utc", b.get("key", b.get("date")))
     if isinstance(v, (int, float)) or (isinstance(v, str) and v.replace(".", "", 1).isdigit()):
-        v = float(v)
-        return v / 1000 if v > 1e11 else v
+        v = _number(v, None)
+        return None if v is None else v / 1000 if v > 1e11 else v
     if isinstance(v, str):
         try:
             when = datetime.fromisoformat(v.replace("Z", "+00:00"))

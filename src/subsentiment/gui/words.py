@@ -22,7 +22,7 @@ from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPointF, QRectF, QSiz
                             QVariantAnimation, Signal)
 from PySide6.QtGui import QColor, QFontMetricsF, QLinearGradient, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLineEdit, QSizePolicy, QSlider, QToolTip, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLineEdit, QSlider, QToolTip, QVBoxLayout, QWidget,
 )
 
 from subsentiment.gui import motion, theme
@@ -812,17 +812,17 @@ class Rescore(QObject):
         """Keep the scores ``results`` of ``items`` [(kind, (id, sentiment, label), text)] to save, and tell what
         they changed."""
         using, changed, stale = self._tally.setdefault(sub, (set(), {}, set()))
-        for (kind, (rid, was, was_label), _), (s, label, usual, words) in zip(items, results):
+        for (kind, (rid, was, was_label), _), (s, new, usual, words) in zip(items, results):
             item = (kind, rid)
             using.add(item)
-            if label != usual:
-                changed[item] = (usual, label)
+            if new != usual:
+                changed[item] = (usual, new)
             else:
                 changed.pop(item, None)
-                if label != was_label:
+                if new != was_label:
                     stale.add(item)
-            if (s, label) != (was, was_label):
-                self._batch[kind].append({"id": rid, "sentiment": s, "label": label, "words": words})
+            if (s, new) != (was, was_label):
+                self._batch[kind].append({"id": rid, "sentiment": s, "label": new, "words": words})
         self._counts[3] += len(items)
         self._tick(sub)
 

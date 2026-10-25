@@ -2,7 +2,7 @@
 window's thread was doing in each stall, request sizes/timings/failures, and how the fetch ended.
 From the repo root:  QT_QPA_PLATFORM=offscreen python tools/live_sample_lag.py SUB RANGE MINUTES PAGE
 (e.g. linux_gaming year 20 overview). NO_STALLS=1 turns the stall dumps off. The throwaway data folder is printed at the end, kept to look at."""
-import collections, faulthandler, os, re, sys, tempfile, threading, time
+import collections, faulthandler, os, re, sys, tempfile, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 import requests
 from PySide6.QtCore import QElapsedTimer, QSettings, QTimer, Qt
