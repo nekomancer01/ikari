@@ -191,3 +191,34 @@ def test_windows_only_release_keeps_windows_updates_and_degrades_elsewhere():
     assert pick_asset(windows_only, "win32", portable=True)["name"].endswith(".zip")
     assert pick_asset(windows_only, "darwin") is None
     assert pick_asset(windows_only, "linux") is None
+
+
+def test_an_installer_that_wont_start_raises_update_error(tmp_path, monkeypatch):
+    # Popen's OSError wasn't an UpdateError, so the update flow showed nothing.
+    def blocked(*a, **k):
+        raise OSError(225, "Operation did not complete successfully because the file contains a virus")
+    monkeypatch.setattr(updater.subprocess, "Popen", blocked)
+    with pytest.raises(UpdateError, match="Could not start the installer"):
+        updater.launch_installer(tmp_path / "ikari-Setup-9.9.9.exe", "win32")
+
+
+def test_a_portable_update_that_cant_start_raises_update_error_and_cleans_up(tmp_path, monkeypatch):
+    app = tmp_path / "ikari"
+    app.mkdir()
+    (app / "ikari.exe").write_bytes(b"old")
+    z = make_zip(tmp_path / "ikari-9.9.9-windows-x64.zip", {"ikari/ikari.exe": "new", "ikari/_internal/a.dll": "x"})
+    monkeypatch.setattr(updater, "is_portable", lambda platform: True)
+    monkeypatch.setattr(updater.sys, "executable", str(app / "ikari.exe"))
+
+    def denied(*a, **k):
+        raise PermissionError(13, "Access is denied")
+    monkeypatch.setattr(updater.subprocess, "Popen", denied)
+    with pytest.raises(UpdateError, match="Could not start the update"):
+        updater.launch_installer(z, "win32")
+    assert not (app / updater.STAGING).exists()
+
+    # Writing the swap script fails the same way, and leaves nothing behind either.
+    monkeypatch.setattr(type(app), "write_text", denied)
+    with pytest.raises(UpdateError, match="Could not prepare the update"):
+        updater.stage_portable_update(z, app, 1, "ikari.exe")
+    assert not (app / updater.STAGING).exists()
