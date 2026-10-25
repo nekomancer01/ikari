@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-xdist>=3", "pyinstaller"]
+dev = ["pytest>=8", "pytest-xdist>=3", "pyinstaller", "ruff>=0.15"]
 train = ["scikit-learn>=1.4", "scipy", "numpy"]
 
 [project.gui-scripts]
@@ -33,6 +33,25 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A warning raised by the app's own code fails the test that raised it. Ignored: PySide calling
+# ExpandedClientAreaHint by the deprecated name it shares a value with (native/macos.py uses the new name), and
+# connections closed by the garbage collector rather than by close() (the windows' Saved rows aren't closed yet).
+filterwarnings = [
+    "error:::subsentiment",
+    "ignore:Enum value 'Qt..WindowType.MaximizeUsingFullscreenGeometryHint':DeprecationWarning",
+    "ignore::ResourceWarning",
+]
+
+# Lint for bugs, not style (tests/test_lint.py runs it): pyflakes (undefined and unused names, broken f-strings),
+# syntax newer than the oldest Python supported, bugbear and pylint's errors. Bugbear's loop-variable and zip
+# checks are off: the code's lambdas run before their loop moves on (yield from on_thread), and its zips pair
+# equal lengths on purpose.
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "B", "PLE"]
+ignore = ["B007", "B008", "B023", "B904", "B905"]
 
 [tool.setuptools.package-data]
 "subsentiment.gui" = ["assets/*"]

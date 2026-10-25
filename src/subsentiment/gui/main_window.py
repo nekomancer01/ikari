@@ -22,7 +22,7 @@ from subsentiment.analysis import Analysis
 from subsentiment.gui import days, motion, native, theme
 from subsentiment.gui.coverage import CoveragePage
 from subsentiment.gui.fetch_form import FetchForm
-from subsentiment.gui.charts import NoteDialog, TimelineChart
+from subsentiment.gui.charts import NoteDialog
 from subsentiment.gui.overview import OverviewPage, WordsPage
 from subsentiment.gui.rows import RowList, Rows, Saved, chosen
 from subsentiment.gui.words import KINDS, Rescore, WordTally
