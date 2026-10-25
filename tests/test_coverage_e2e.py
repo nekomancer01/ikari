@@ -1158,3 +1158,114 @@ def test_switching_to_a_subreddit_with_no_saved_days_leaves_no_comments_button_f
     QTest.mouseClick(c.all_comments, Qt.MouseButton.LeftButton)
     settle(w)
     assert downloads() == [] and not w.fetch_job.busy
+
+
+def test_a_post_with_no_comments_says_so_rather_than_at_cap(window):
+    w = window
+    w.store.save_post(post("z0", "Python", TODAY - DAY + 900, num_comments=0), 0.0, "neutral")
+    w.store.commit()
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    c.day_table.selectRow(c.days.index(TODAY - DAY))
+    settle(w)
+    cell = c.post_table.cellWidget([r["id"] for r in c._post_rows].index("z0"), 1)
+    # Its thread is whole with nothing in it: not "at cap" (or "sampled"), with a full bar and "the 0 per thread".
+    assert (cell.main.text(), cell.side.text()) == ("No comments", "")
+    assert cell.toolTip() == "The archive has no comments here."
+    assert cell.bar.share is None
+
+
+def test_days_that_couldnt_be_counted_say_so_and_days_listed_later_are_still_counted(window, monkeypatch):
+    w = window
+    counts = FakeArchive.day_counts
+
+    def leave_one_out(self, sub, after, before, should_stop=None):
+        got = counts(self, sub, after, before, should_stop)
+        got.pop(TODAY - 2 * DAY, None)  # the archive timed out on this day
+        return got
+    monkeypatch.setattr(FakeArchive, "day_counts", leave_one_out)
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    assert c.status.text() == "Some days couldn't be counted. Press Recount to try again."
+    assert len(counts_asked()) == 1
+    old = TODAY - 10 * DAY  # a day a fetch saved since
+    w.store.save_post(post("old1", "Python", old + 500), 0.0, "neutral")
+    w.store.save_tried("Python", [old])
+    w.store.commit()
+    c.refresh_saved()
+    settle(w)
+    assert len(counts_asked()) == 2  # counted, though another day couldn't be
+    assert day_cell(c, c.days.index(old), 1).main.text() == "1 of 10"
+    c.refresh_saved()
+    settle(w)
+    assert len(counts_asked()) == 2  # the day that couldn't be counted isn't asked for again in a loop
+    assert c.status.text() == "Some days couldn't be counted. Press Recount to try again."
+    assert downloads() == []
+
+
+@pytest.mark.parametrize("delete", ["delete_act", "delete_all_act"])
+def test_deleting_the_saved_data_drops_the_offer_to_resume_its_stopped_download(window, monkeypatch, delete):
+    w = window
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    reads = FakeArchive.fetch_posts
+
+    def stop_after_one(self, *a, **kw):
+        got = reads(self, *a, **kw)
+        w.fetch_job.stop()
+        return got
+    monkeypatch.setattr(FakeArchive, "fetch_posts", stop_after_one)
+    QTest.mouseClick(c.what.buttons["posts"], Qt.MouseButton.LeftButton)
+    tick(c, TODAY - DAY)
+    tick(c, TODAY - 3 * DAY, shift=True)
+    QTest.mouseClick(c.download_ticked, Qt.MouseButton.LeftButton)
+    settle(w, lambda: not w.fetch_job.busy)
+    assert c.resume_bar.isVisible()
+    monkeypatch.setattr(FakeArchive, "fetch_posts", reads)
+    monkeypatch.setattr(mw.QMessageBox, "question", lambda *a, **k: mw.QMessageBox.StandardButton.Yes)
+    getattr(w, delete).trigger()
+    settle(w)
+    assert c._stopped is None and not w.settings.value("coverage/stopped")
+    w.store.save_post(post("again", "Python", TODAY - 5 * DAY + 50), 0.0, "neutral")  # saved again later
+    w.store.save_tried("Python", [TODAY - 5 * DAY])
+    w.store.commit()
+    w._refresh_datasets()
+    select(w, "Python")
+    w.show_page("coverage")
+    settle(w)
+    assert not c.resume_bar.isVisible()
+    FakeArchive.calls = []
+    c._resume()
+    settle(w)
+    assert downloads() == []
+
+
+def test_a_filter_that_hides_the_picked_day_shows_the_posts_of_a_day_still_listed(window, monkeypatch):
+    w = window
+    counts = FakeArchive.day_counts
+
+    def one_on_the_day(self, sub, after, before, should_stop=None):
+        got = counts(self, sub, after, before, should_stop)
+        if TODAY - DAY in got:
+            got[TODAY - DAY] = 1  # p0 is all of it
+        return got
+    monkeypatch.setattr(FakeArchive, "day_counts", one_on_the_day)
+    select(w, "Python")
+    w.show_page("coverage")
+    c = w.coverage
+    settle(w, lambda: c.totals)
+    c.day_table.selectRow(c.days.index(TODAY - DAY))
+    settle(w)
+    assert [r["id"] for r in c._post_rows] == ["p0"]
+    QTest.mouseClick(c.filter.buttons["posts"], Qt.MouseButton.LeftButton)  # Missing posts: the day goes
+    settle(w)
+    assert TODAY - DAY not in c._shown_days()
+    assert c._selected_day() == c._shown_days()[0] == TODAY
+    assert [r["id"] for r in c._post_rows] == ["Python0"]
+    assert downloads() == []
