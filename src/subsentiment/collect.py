@@ -368,7 +368,7 @@ class Download:
         comments does); with fill_threads and a cap, until it has that many saved. ``in_part`` says whether a
         saved post's id belongs to this part."""
         req, store, stored, client = self.req, self.store, self.stored, self.client
-        if not req.include_comments or self.should_stop():
+        if not req.include_comments:
             return
         cap, fill = self.cap, self.fill
         refreshed = {p.id for p in updated}
@@ -381,13 +381,16 @@ class Download:
                 (r["comments_ok"] is not None and not r["comments_ok"])
                 or (pid in repicked and r["comments_ok"] is None and not r["has_comments"])  # picked, never asked
                 or (fill and pid not in self.saved_whole and not (cap and self.saved_count.get(pid, 0) >= cap)))]
-        todo = self.sampled([p for p in todo if p.num_comments != 0])  # None (not settled yet) still gets looked up
+        todo = [p for p in todo if p.num_comments != 0]  # None (not settled yet) still gets looked up
+        stopped = self.should_stop()  # before any was asked about: left owed, below
+        if not stopped:
+            todo = self.sampled(todo)
         # Threads failing one after another stop this part's (its day's): the rest are left for the next fetch. The
         # next day tries again, so one bad stretch of a year's download doesn't leave every day after it without;
         # after GAVE_UP_DAYS such days, no more are tried.
         tried: set[str] = set()
         gave_up = self.gave_up >= GAVE_UP_DAYS
-        if not gave_up:
+        if not gave_up and not stopped:
             get = self.take_sample if self.sample else (lambda p: client.fetch_all_comments(p, cap, req.comment_pick)) \
                 if fill else (lambda p: (client.fetch_comments(p, cap, req.comment_pick), False))
             failed, tried, gave_up, added = self.each_thread(todo, get, cap=cap, progress=report)
@@ -401,7 +404,14 @@ class Download:
             for p in rest:
                 store.mark_comments(p.id, ok=False, settled=False)
             store.commit()
-        if todo:
+        elif self.should_stop():
+            # Stopped before these were asked about: owed, so the next fetch asks. It may not read their day again
+            # (one read to its end is complete), and a post never asked about is otherwise left alone.
+            for p in todo:
+                if p.id not in tried and (p.id not in stored or stored[p.id]["comments_ok"] is None):
+                    store.mark_comments(p.id, ok=False, settled=False)
+            store.commit()
+        if todo and not stopped:
             report(len(todo), len(todo), "Done")
 
     def comment_posts(self) -> FetchResult:
@@ -542,7 +552,8 @@ class Download:
             comments, whole = got
             # by the subreddit's words as they are set now
             if (scores := self.score_all(store.lexicon(name), [c.body for c in comments])) is None:
-                continue  # stopped while scoring: left as if never asked
+                tried.discard(p.id)  # stopped while scoring: left as if never asked (owed, as comments says)
+                continue
             added += store.save_comments(comments, scores)  # a thread asked for again: only what's new counts
             store.mark_comments(p.id, ok=True, settled=p.score is not None)
             if whole:  # an unsettled thread may still be growing, so it's whole only "so far"
