@@ -322,6 +322,65 @@ def test_a_word_set_while_its_subreddit_is_fetched_is_rescored_again_after(windo
     app.processEvents()
 
 
+def test_rows_a_fetch_adds_to_the_subreddit_shown_while_it_is_rescored_leave_the_rescore_whole(tmp_path, monkeypatch):
+    """A fetch of the subreddit shown isn't held up by a rescore of it, and adds its rows to the very rows the rescore
+    goes through. Their text was read past the end of the ids taken at its start: it stopped with an IndexError,
+    a third of the items kept their old label, and the page said every one had changed."""
+    import sys
+    from subsentiment.gui import worker
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("subsentiment-test")
+    app.setApplicationName(tmp_path.name)
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path / "cfg"))
+    QSettings().setValue("updates/auto", False)
+    errors = []
+    monkeypatch.setattr(sys, "excepthook", lambda *e: errors.append(e[1]))
+    day, n = 1_700_000_000.0, 300
+    s = Store(tmp_path / "w.db")
+    s.save_post(Post("p0", "town", "Library reopened", "", "a", 1, 0.9, 0, day, "https://r", ""),
+                *sentiment.score("Library reopened"))
+    for i in range(n):
+        s.save_comment(Comment(f"c{i}", "p0", "town", "t3_p0", "b", "more grinding tonight", 1, day + 60 + i, 0,
+                               "/r/town/"), *sentiment.score("more grinding tonight"))
+    s.commit()
+    s.close()
+    w = mw.MainWindow(str(tmp_path / "w.db"))
+    try:
+        w.show()
+        QApplication.processEvents()
+        monkeypatch.setattr(worker.Slices, "BUDGET", 0.0)  # an item a frame, as a big subreddit takes many frames
+        m = w.words_page.meanings
+        m.pick("grinding")
+        m.rows["grinding"].set(1.0)
+        m._save(m.rows["grinding"])
+        end = time.monotonic() + 20
+        while w.rescore._counts[1] < 10:  # going through the rows shown
+            assert time.monotonic() < end
+            QApplication.processEvents()
+        s = Store(tmp_path / "w.db")  # a fetch of town saves three more
+        for i in range(n, n + 3):
+            s.save_comment(Comment(f"c{i}", "p0", "town", "t3_p0", "b", "grinding again", 1, day + 60 + i, 0,
+                                   "/r/town/"), *sentiment.Lexicon({"grinding": 1.0}).score("grinding again"))
+        s.commit()
+        new = [r for r in s.comments("town") if int(r["id"][1:]) >= n]
+        s.close()
+        w._count_new("comments", new)
+        end = time.monotonic() + 60
+        while w.rescore.running():
+            assert time.monotonic() < end
+            QApplication.processEvents()
+        QApplication.processEvents()
+        assert errors == []
+        want = sentiment.Lexicon({"grinding": 1.0}).score("more grinding tonight")[1]
+        assert want != sentiment.score("more grinding tonight")[1]
+        assert {r["label"] for r in w.store.comments("town") if int(r["id"][1:]) < n} == {want}
+        assert m.rows["grinding"].result.text() == f"\u2713 {n} of {n} saved items changed label"
+    finally:
+        w.close()
+        QSettings.setDefaultFormat(QSettings.Format.NativeFormat)
+
+
 def test_moving_the_span_keeps_the_words_both_spans_share_where_they_are(window, monkeypatch):
     """The owner: the cloud should move fluidly "not just when you scrape but when you move around the timeline"."""
     w, app = window, QApplication.instance()

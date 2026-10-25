@@ -168,6 +168,28 @@ def test_an_empty_subreddit_has_an_empty_index(tmp_path):
     index.close()
 
 
+def test_deleting_a_day_takes_out_its_comments_saved_again_since_they_were_packed(tmp_path):
+    """A refetch saves settled comments again (unpacked, their old copy still in the day's pack); deleting the
+    day before they're packed again left that copy in the pack, so the deleted day kept showing them and stayed
+    downloaded."""
+    s = Store(tmp_path / "x.db")
+    link = "https://www.reddit.com/r/Foo/comments/p1/t/"
+    s.save_post(Post("p1", "Foo", "title", "text", "a", 1, 0.9, 3, DAY0 + 100, link, ""), 0.5, "positive")
+    comments = [Comment(f"c{i}", "p1", "Foo", "t3_p1", "b", "hello world", 1, DAY0 + 200 + i, 0, f"{link}c{i}/")
+                for i in range(3)]
+    s.save_comments(comments, [(0.5, "positive")] * 3)
+    s.commit()
+    assert s.pack_settled() == 2
+    s.save_comments(comments, [(0.5, "positive")] * 3)
+    s.commit()
+    assert s.delete_days("foo", [DAY0]) == (1, 3)
+    assert s.db.execute("SELECT COUNT(*) FROM packs").fetchone()[0] == 0
+    assert s.downloaded_days("Foo") == []
+    index = RowIndex(s.path, "comments", "Foo")
+    assert len(index) == 0 and index.top_words() == []
+    index.close()
+
+
 @pytest.mark.parametrize("kind", ["posts", "comments"])
 def test_days_packed_again_count_only_what_changed_and_still_match(saved, kind):
     """Packing a day again takes out what its changed rows counted and adds what they count now."""
