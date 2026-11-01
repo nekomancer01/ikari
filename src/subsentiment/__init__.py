@@ -2,7 +2,7 @@
 import sqlite3
 import sys
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # Search (store.Search) needs SQLite 3.43 or later. Python on Linux uses the system's SQLite, older on many
 # (Ubuntu 22.04's is 3.37), so there every `import sqlite3` gets pysqlite3-binary's newer one instead.
